@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Safely remove paths beneath the current repo's .codex-tmp directory."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+
+SCRATCH_DIRNAME = ".codex-tmp"
+
+
+def fail(message: str) -> "NoReturn":
+    raise SystemExit(message)
+
+
+def repo_root() -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or "unknown git error"
+        fail(f"Not inside a git worktree: {stderr}")
+    return Path(result.stdout.strip()).resolve()
+
+
+def scratch_root(repo_root_path: Path) -> Path:
+    scratch_root_path = repo_root_path / SCRATCH_DIRNAME
+    if scratch_root_path.is_symlink():
+        fail(f"Refusing to operate on symlinked scratch root: {scratch_root_path}")
+    return scratch_root_path
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Remove files or directories beneath the current repo's .codex-tmp "
+            "without allowing path escape."
+        )
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help=f"Remove the entire {SCRATCH_DIRNAME} directory.",
+    )
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        help=(
+            "Paths relative to .codex-tmp/, or repo-relative paths that begin "
+            f"with {SCRATCH_DIRNAME}/."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.all == (len(args.paths) > 0):
+        parser.error("use either --all or one or more paths")
+    return args
+
+
+def lexical_target(raw: str, repo_root_path: Path, scratch_root: Path) -> Path:
+    if not raw:
+        fail("Empty path is not allowed")
+    raw_path = Path(raw)
+    scratch_component = Path(SCRATCH_DIRNAME)
+    if raw_path.is_absolute():
+        fail(f"Absolute paths are not allowed: {raw}")
+    if raw_path in {Path("."), scratch_component}:
+        fail("Refusing to remove the scratch root without --all")
+    if ".." in raw_path.parts:
+        fail(f"Parent traversal is not allowed: {raw}")
+
+    if raw_path.parts and raw_path.parts[0] == SCRATCH_DIRNAME:
+        target = repo_root_path / raw_path
+    else:
+        target = scratch_root / raw_path
+
+    try:
+        target.relative_to(scratch_root)
+    except ValueError:
+        fail(f"Target escapes {SCRATCH_DIRNAME}: {raw}")
+    return target
+
+
+def reject_symlinked_ancestors(target: Path, scratch_root: Path) -> None:
+    relative = target.relative_to(scratch_root)
+    current = scratch_root
+    for part in relative.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            fail(f"Refusing to traverse symlinked ancestor: {current}")
+
+
+def remove_path(target: Path) -> str:
+    target_text = str(target)
+    if not os.path.lexists(target_text):
+        return f"Missing: {target_text}"
+    if target.is_symlink():
+        target.unlink()
+    elif target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    return f"Removed: {target_text}"
+
+
+def remove_targets(paths: list[str], repo_root_path: Path, scratch_root: Path) -> list[str]:
+    results: list[str] = []
+    for raw in paths:
+        target = lexical_target(raw, repo_root_path, scratch_root)
+        reject_symlinked_ancestors(target, scratch_root)
+        results.append(remove_path(target))
+    return results
+
+
+def remove_all(scratch_root: Path) -> list[str]:
+    return [remove_path(scratch_root)]
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    repo_root_path = repo_root()
+    scratch_root_path = scratch_root(repo_root_path)
+
+    if args.all:
+        results = remove_all(scratch_root_path)
+    else:
+        results = remove_targets(args.paths, repo_root_path, scratch_root_path)
+
+    for line in results:
+        print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

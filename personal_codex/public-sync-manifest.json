@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "links": [
+    {
+      "source": "personal_codex/bin/codex-clean-tmp",
+      "target": "bin/codex-clean-tmp",
+      "kind": "file"
+    },
+    {
+      "source": "personal_codex/bin/codex-squash-merge-wip",
+      "target": "bin/codex-squash-merge-wip",
+      "kind": "file"
+    },
+    {
+      "source": "personal_codex/bin/codex-wip-branch",
+      "target": "bin/codex-wip-branch",
+      "kind": "file"
+    },
+    {
+      "source": "scripts/codex_personal_sync.py",
+      "target": "bin/codex-personal-sync",
+      "kind": "file"
+    }
+  ],
+  "reference_only": []
+}
