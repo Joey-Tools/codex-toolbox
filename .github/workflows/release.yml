@@ -27,6 +27,7 @@ concurrency:
 jobs:
   release:
     name: Build public toolbox release
+    if: github.event_name != 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
