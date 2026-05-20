@@ -9,8 +9,6 @@ on:
       - "scripts/**"
       - "tests/**"
   push:
-    branches:
-      - master
     paths:
       - ".github/workflows/release.yml"
       - "README.md"
@@ -29,6 +27,7 @@ concurrency:
 jobs:
   release:
     name: Build public toolbox release
+    if: github.event_name != 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -92,7 +91,7 @@ jobs:
 
   publish:
     name: Publish public toolbox release
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     needs: release
     runs-on: ubuntu-latest
     permissions:
@@ -168,6 +167,7 @@ jobs:
               dist / f"personal-codex-{sha}.tar.gz",
               dist / f"personal-codex-{sha}.sha256",
           ]
+          release_tag_prefix = "personal-codex-"
 
           def request_json(url, *, method="GET", payload=None):
               data = None
@@ -183,14 +183,29 @@ jobs:
               with urlopen(request, timeout=30) as response:
                   return json.loads(response.read().decode("utf-8"))
 
-          releases = request_json(f"{api_root}/repos/{repo}/releases?per_page=100")
+          def iter_releases():
+              page = 1
+              while True:
+                  releases = request_json(
+                      f"{api_root}/repos/{repo}/releases?per_page=100&page={page}"
+                  )
+                  if not releases:
+                      break
+                  yield from releases
+                  page += 1
+
           expected_asset_names = {asset.name for asset in assets}
           release = None
           uploaded_asset_names = set()
-          for release in releases:
-              asset_names = {asset["name"] for asset in release.get("assets", [])}
-              if release.get("target_commitish") != sha:
+          for candidate in iter_releases():
+              tag_name = candidate.get("tag_name", "")
+              asset_names = {asset["name"] for asset in candidate.get("assets", [])}
+              if (
+                  candidate.get("target_commitish") != sha
+                  or not tag_name.startswith(release_tag_prefix)
+              ):
                   continue
+              release = candidate
               if expected_asset_names <= asset_names:
                   if release.get("draft", False):
                       request_json(
@@ -213,7 +228,7 @@ jobs:
               timestamp = __import__("datetime").datetime.now(
                   __import__("datetime").timezone.utc
               ).strftime("%Y%m%d-%H%M%S")
-              tag = f"personal-codex-{timestamp}-{sha[:7]}"
+              tag = f"{release_tag_prefix}{timestamp}-{sha[:7]}"
               release = request_json(
                   f"{api_root}/repos/{repo}/releases",
                   method="POST",
@@ -259,7 +274,7 @@ jobs:
               print(f"Uploaded {uploaded['name']}")
               uploaded_asset_names.add(uploaded["name"])
 
-          if uploaded_asset_names != expected_asset_names:
+          if not expected_asset_names <= uploaded_asset_names:
               raise SystemExit(f"uploaded asset mismatch: {sorted(uploaded_asset_names)}")
           request_json(
               f"{api_root}/repos/{repo}/releases/{release['id']}",
