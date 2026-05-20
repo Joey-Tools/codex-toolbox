@@ -64,6 +64,10 @@ def _copy_source(repo_root: Path, staging_root: Path, source: Path) -> None:
         raise PackageError(f"refusing to package symlink source: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source_path.is_dir():
+        for child in source_path.rglob("*"):
+            if child.is_symlink():
+                relative_child = source / child.relative_to(source_path)
+                raise PackageError(f"refusing to package nested symlink source: {relative_child}")
         shutil.copytree(source_path, destination, symlinks=False)
     elif source_path.is_file():
         shutil.copy2(source_path, destination)

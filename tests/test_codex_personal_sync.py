@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -142,6 +143,39 @@ def write_rules_release(release_root: Path, *, agent_text: str = "agent\n") -> N
     )
 
 
+def write_private_skill_only_release(
+    release_root: Path,
+    *,
+    private_skill_text: str = "---\nname: private-skill\n---\n",
+) -> None:
+    personal_root = release_root / "personal_codex"
+    skill_root = personal_root / "skills" / "private-skill"
+    personal_root.mkdir(parents=True)
+    skill_root.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text(private_skill_text, encoding="utf-8")
+    (personal_root / "sync-manifest.json").write_text(
+        """
+{
+  "version": 1,
+  "owner": "private",
+  "base_release": {
+    "repo": "Joey-Tools/codex-toolbox"
+  },
+  "links": [
+    {
+      "source": "personal_codex/skills/private-skill",
+      "target": "skills/private-skill",
+      "kind": "skill"
+    }
+  ],
+  "reference_only": []
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def current_target(home: Path) -> str:
     return (home / "personal-sync" / "current").readlink().as_posix()
 
@@ -177,6 +211,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["install"])
             with self.assertRaises(SystemExit):
+                parser.parse_args(["install-private"])
+            with self.assertRaises(SystemExit):
                 parser.parse_args(["install-scheduler"])
 
     def test_default_release_repo_can_be_overridden_by_environment(self) -> None:
@@ -187,10 +223,63 @@ class CodexPersonalSyncTests(unittest.TestCase):
             parser = MODULE.build_parser()
 
         install_args = parser.parse_args(["install"])
+        install_private_args = parser.parse_args(["install-private"])
         scheduler_args = parser.parse_args(["install-scheduler"])
 
         self.assertEqual(install_args.repo, "ExampleOrg/example-codex")
+        self.assertEqual(install_private_args.repo, "ExampleOrg/example-codex")
+        self.assertEqual(install_private_args.base_repo, "Joey-Tools/codex-toolbox")
         self.assertEqual(scheduler_args.repo, "ExampleOrg/example-codex")
+
+    def test_empty_release_repo_environment_is_ignored(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_PERSONAL_SYNC_DEFAULT_REPO": "",
+                "CODEX_PERSONAL_SYNC_BASE_REPO": " ",
+            },
+        ):
+            parser = MODULE.build_parser()
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["install"])
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["install-private"])
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["install-scheduler"])
+
+        install_private_args = parser.parse_args(
+            ["install-private", "--repo", "ExampleOrg/private-codex"]
+        )
+        scheduler_args = parser.parse_args(
+            [
+                "install-scheduler",
+                "--repo",
+                "ExampleOrg/private-codex",
+                "--mode",
+                "private",
+            ]
+        )
+
+        self.assertEqual(install_private_args.base_repo, "Joey-Tools/codex-toolbox")
+        self.assertEqual(scheduler_args.base_repo, "Joey-Tools/codex-toolbox")
+
+    def test_base_release_repo_can_be_overridden_by_environment(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_PERSONAL_SYNC_DEFAULT_REPO": "ExampleOrg/private-codex",
+                "CODEX_PERSONAL_SYNC_BASE_REPO": "ExampleOrg/public-codex",
+            },
+        ):
+            parser = MODULE.build_parser()
+
+        install_private_args = parser.parse_args(["install-private"])
+        scheduler_args = parser.parse_args(["install-scheduler", "--mode", "private"])
+
+        self.assertEqual(install_private_args.base_repo, "ExampleOrg/public-codex")
+        self.assertEqual(scheduler_args.base_repo, "ExampleOrg/public-codex")
 
     def test_public_package_uses_public_manifest_allowlist(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir_raw:
@@ -234,6 +323,136 @@ class CodexPersonalSyncTests(unittest.TestCase):
             release_root = MODULE.safe_extract_archive(archive_path, temp_dir / "extract")
             entries = MODULE.validate_release_tree(release_root)
             self.assertEqual(len(entries), 4)
+
+    def test_package_builder_rejects_nested_directory_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            temp_dir = Path(temp_dir_raw)
+            repo_root = temp_dir / "repo"
+            source_root = repo_root / "personal_codex" / "skills" / "example"
+            source_root.mkdir(parents=True)
+            (source_root / "SKILL.md").write_text("---\nname: example\n---\n", encoding="utf-8")
+            (source_root / "leak").symlink_to(Path.home())
+            manifest_path = repo_root / "personal_codex" / "test-manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "links": [
+                            {
+                                "source": "personal_codex/skills/example",
+                                "target": "skills/example",
+                                "kind": "skill",
+                            }
+                        ],
+                        "reference_only": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(PACKAGE_SCRIPT_PATH),
+                    "--repo-root",
+                    str(repo_root),
+                    "--manifest",
+                    "personal_codex/test-manifest.json",
+                    "--sha",
+                    SHA1,
+                    "--output-dir",
+                    str(temp_dir / "dist"),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("nested symlink", result.stderr)
+
+    def test_install_private_downloads_public_base_and_overlay(self) -> None:
+        public_release = self.root / "public-release"
+        private_release = self.root / "private-release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(public_release, agent_text="public\n")
+        write_private_skill_only_release(private_release)
+        downloads: list[tuple[str, str | None]] = []
+
+        def fake_download(repo: str, destination: Path, *, sha: str | None = None):
+            downloads.append((repo, sha))
+            if repo == "Joey-Tools/codex-private-workflows":
+                return MODULE.DownloadedRelease(
+                    repo=repo,
+                    assets=MODULE.ReleaseAssets(
+                        tag_name="personal-codex-20260520-120000-2222222",
+                        sha=SHA2,
+                        archive_name=f"personal-codex-{SHA2}.tar.gz",
+                        checksum_name=f"personal-codex-{SHA2}.sha256",
+                    ),
+                    release_root=private_release,
+                )
+            if repo == "Joey-Tools/codex-toolbox":
+                return MODULE.DownloadedRelease(
+                    repo=repo,
+                    assets=MODULE.ReleaseAssets(
+                        tag_name="personal-codex-20260520-120000-1111111",
+                        sha=SHA1,
+                        archive_name=f"personal-codex-{SHA1}.tar.gz",
+                        checksum_name=f"personal-codex-{SHA1}.sha256",
+                    ),
+                    release_root=public_release,
+                )
+            raise AssertionError(f"unexpected repo: {repo}")
+
+        with mock.patch.object(MODULE, "download_and_extract_release", fake_download):
+            self.run_quietly(
+                MODULE.install_private_from_github,
+                "Joey-Tools/codex-private-workflows",
+                home,
+                base_repo="Fallback/base",
+                owner="private",
+                dry_run=False,
+            )
+
+        self.assertEqual(
+            downloads,
+            [
+                ("Joey-Tools/codex-private-workflows", None),
+                ("Joey-Tools/codex-toolbox", None),
+            ],
+        )
+        self.assertTrue((home / "bin" / "codex-personal-sync").is_symlink())
+        self.assertTrue((home / "skills" / "private-skill").is_symlink())
+        self.run_quietly(MODULE.verify_overlay, home, "private")
+
+    def test_private_scheduler_invokes_private_install_entrypoint(self) -> None:
+        home = self.root / "home" / ".codex"
+        args = MODULE._scheduler_install_args(
+            Path("/runner"),
+            "Joey-Tools/codex-private-workflows",
+            home,
+            mode="private",
+            base_repo="Joey-Tools/codex-toolbox",
+            owner="private",
+        )
+
+        self.assertEqual(
+            args,
+            [
+                "/runner",
+                "install-private",
+                "--repo",
+                "Joey-Tools/codex-private-workflows",
+                "--base-repo",
+                "Joey-Tools/codex-toolbox",
+                "--owner",
+                "private",
+                "--home",
+                str(home),
+            ],
+        )
 
     def test_select_release_assets_matches_tarball_and_checksum(self) -> None:
         release = {
@@ -679,6 +898,12 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=True)
 
         self.assertFalse(home.exists())
+
+    def test_private_rollback_is_rejected(self) -> None:
+        home = self.root / "home" / ".codex"
+
+        with self.assertRaisesRegex(MODULE.SyncError, "only public releases"):
+            self.run_quietly(MODULE.rollback, home, None, "private")
 
     def test_rollback_switches_to_requested_release(self) -> None:
         release_one = self.root / "release-one"
@@ -1143,6 +1368,32 @@ class CodexPersonalSyncTests(unittest.TestCase):
         )
         self.assertIn("codex-personal-sync.out.log", payload["StandardOutPath"])
 
+    def test_install_scheduler_no_enable_keeps_legacy_macos_plist(self) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        legacy_plist = (
+            self.root
+            / "home"
+            / "Library"
+            / "LaunchAgents"
+            / f"{MODULE.LEGACY_LAUNCHD_LABELS[0]}.plist"
+        )
+        legacy_plist.parent.mkdir(parents=True)
+        legacy_plist.write_text("legacy\n", encoding="utf-8")
+
+        self.run_quietly(
+            MODULE.install_scheduler,
+            home,
+            "owner/repo",
+            60,
+            "macos",
+            None,
+            dry_run=False,
+            enable=False,
+        )
+
+        self.assertTrue(legacy_plist.exists())
+
     def test_install_scheduler_runs_macos_enable_commands(self) -> None:
         home = self.root / "home" / ".codex"
         write_scheduler_runner(home)
@@ -1266,6 +1517,28 @@ class CodexPersonalSyncTests(unittest.TestCase):
         )
 
         self.assertFalse(plist_path.exists())
+
+    def test_uninstall_scheduler_no_disable_removes_legacy_macos_plist(self) -> None:
+        home = self.root / "home" / ".codex"
+        legacy_plist = (
+            self.root
+            / "home"
+            / "Library"
+            / "LaunchAgents"
+            / f"{MODULE.LEGACY_LAUNCHD_LABELS[0]}.plist"
+        )
+        legacy_plist.parent.mkdir(parents=True)
+        legacy_plist.write_text("legacy\n", encoding="utf-8")
+
+        self.run_quietly(
+            MODULE.uninstall_scheduler,
+            home,
+            "macos",
+            dry_run=False,
+            disable=False,
+        )
+
+        self.assertFalse(legacy_plist.exists())
 
     def test_uninstall_scheduler_runs_macos_disable_commands(self) -> None:
         home = self.root / "home" / ".codex"
