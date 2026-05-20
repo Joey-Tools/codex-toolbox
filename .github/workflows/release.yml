@@ -196,14 +196,15 @@ jobs:
           expected_asset_names = {asset.name for asset in assets}
           release = None
           uploaded_asset_names = set()
-          for release in iter_releases():
-              tag_name = release.get("tag_name", "")
-              asset_names = {asset["name"] for asset in release.get("assets", [])}
+          for candidate in iter_releases():
+              tag_name = candidate.get("tag_name", "")
+              asset_names = {asset["name"] for asset in candidate.get("assets", [])}
               if (
-                  release.get("target_commitish") != sha
+                  candidate.get("target_commitish") != sha
                   or not tag_name.startswith(release_tag_prefix)
               ):
                   continue
+              release = candidate
               if expected_asset_names <= asset_names:
                   if release.get("draft", False):
                       request_json(
