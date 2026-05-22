@@ -372,6 +372,67 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("nested symlink", result.stderr)
 
+    def test_package_builder_filters_generated_files_without_dropping_real_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            temp_dir = Path(temp_dir_raw)
+            repo_root = temp_dir / "repo"
+            source_root = repo_root / "personal_codex" / "skills" / "example"
+            cache_root = source_root / "__pycache__"
+            real_pyc_dir = source_root / "assets" / "fixture.pyc"
+            cache_root.mkdir(parents=True)
+            real_pyc_dir.mkdir(parents=True)
+            (source_root / "SKILL.md").write_text("---\nname: example\n---\n", encoding="utf-8")
+            (source_root / ".DS_Store").write_text("generated\n", encoding="utf-8")
+            (cache_root / "session_retrospective.cpython-314.pyc").write_bytes(b"generated")
+            (real_pyc_dir / "fixture.txt").write_text("keep\n", encoding="utf-8")
+            manifest_path = repo_root / "personal_codex" / "test-manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "links": [
+                            {
+                                "source": "personal_codex/skills/example",
+                                "target": "skills/example",
+                                "kind": "skill",
+                            }
+                        ],
+                        "reference_only": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            dist_dir = temp_dir / "dist"
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(PACKAGE_SCRIPT_PATH),
+                    "--repo-root",
+                    str(repo_root),
+                    "--manifest",
+                    "personal_codex/test-manifest.json",
+                    "--sha",
+                    SHA1,
+                    "--output-dir",
+                    str(dist_dir),
+                ],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            archive_path = dist_dir / f"personal-codex-{SHA1}.tar.gz"
+            with tarfile.open(archive_path, "r:gz") as archive:
+                member_names = archive.getnames()
+
+        joined_names = "\n".join(member_names)
+        self.assertIn(f"personal-codex-{SHA1}/personal_codex/skills/example/SKILL.md", member_names)
+        self.assertIn(f"personal-codex-{SHA1}/personal_codex/skills/example/assets/fixture.pyc/fixture.txt", member_names)
+        self.assertNotIn("__pycache__", joined_names)
+        self.assertNotIn(".DS_Store", joined_names)
+        self.assertNotIn(".cpython-314.pyc", joined_names)
+
     def test_install_private_downloads_public_base_and_overlay(self) -> None:
         public_release = self.root / "public-release"
         private_release = self.root / "private-release"
