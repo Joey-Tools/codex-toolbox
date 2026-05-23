@@ -383,6 +383,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             real_pyc_dir.mkdir(parents=True)
             (source_root / "SKILL.md").write_text("---\nname: example\n---\n", encoding="utf-8")
             (source_root / ".DS_Store").write_text("generated\n", encoding="utf-8")
+            (source_root / "generated.pyc").write_bytes(b"generated")
+            (source_root / "assets" / "generated.pyo").write_bytes(b"generated")
             (cache_root / "session_retrospective.cpython-314.pyc").write_bytes(b"generated")
             (real_pyc_dir / "fixture.txt").write_text("keep\n", encoding="utf-8")
             manifest_path = repo_root / "personal_codex" / "test-manifest.json"
@@ -431,6 +433,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertIn(f"personal-codex-{SHA1}/personal_codex/skills/example/assets/fixture.pyc/fixture.txt", member_names)
         self.assertNotIn("__pycache__", joined_names)
         self.assertNotIn(".DS_Store", joined_names)
+        self.assertNotIn("/generated.pyc", joined_names)
+        self.assertNotIn("/generated.pyo", joined_names)
         self.assertNotIn(".cpython-314.pyc", joined_names)
 
     def test_install_private_downloads_public_base_and_overlay(self) -> None:
