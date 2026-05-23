@@ -70,11 +70,11 @@ def _copy_source(repo_root: Path, staging_root: Path, source: Path) -> None:
         destination.mkdir(parents=True, exist_ok=True)
         for child in source_path.rglob("*"):
             relative_child = child.relative_to(source_path)
-            if _is_generated_path(relative_child, is_dir=child.is_dir()):
-                continue
             if child.is_symlink():
                 relative_child = source / relative_child
                 raise PackageError(f"refusing to package nested symlink source: {relative_child}")
+            if _is_generated_path(relative_child, is_dir=child.is_dir()):
+                continue
             destination_child = destination / relative_child
             if child.is_dir():
                 destination_child.mkdir(parents=True, exist_ok=True)
