@@ -420,6 +420,53 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("nested symlink", result.stderr)
 
+    def test_package_builder_rejects_top_level_generated_file_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_raw:
+            temp_dir = Path(temp_dir_raw)
+            repo_root = temp_dir / "repo"
+            source_root = repo_root / "personal_codex" / "skills" / "example"
+            source_root.mkdir(parents=True)
+            (source_root / "generated.pyc").write_bytes(b"generated")
+            manifest_path = repo_root / "personal_codex" / "test-manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "links": [
+                            {
+                                "source": "personal_codex/skills/example/generated.pyc",
+                                "target": "skills/example/generated.pyc",
+                                "kind": "skill",
+                            }
+                        ],
+                        "reference_only": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(PACKAGE_SCRIPT_PATH),
+                    "--repo-root",
+                    str(repo_root),
+                    "--manifest",
+                    "personal_codex/test-manifest.json",
+                    "--sha",
+                    SHA1,
+                    "--output-dir",
+                    str(temp_dir / "dist"),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("generated manifest source", result.stderr)
+
     def test_package_builder_filters_generated_files_without_dropping_real_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir_raw:
             temp_dir = Path(temp_dir_raw)

@@ -65,6 +65,8 @@ def _copy_source(repo_root: Path, staging_root: Path, source: Path) -> None:
         raise PackageError(f"manifest source is missing: {source}")
     if source_path.is_symlink():
         raise PackageError(f"refusing to package symlink source: {source}")
+    if _is_generated_path(source, is_dir=source_path.is_dir()):
+        raise PackageError(f"refusing generated manifest source: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source_path.is_dir():
         destination.mkdir(parents=True, exist_ok=True)
