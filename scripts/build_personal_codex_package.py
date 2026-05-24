@@ -14,6 +14,9 @@ from typing import Any
 
 DEFAULT_MANIFEST = Path("personal_codex/public-sync-manifest.json")
 RELEASE_MANIFEST = Path("personal_codex/sync-manifest.json")
+GENERATED_DIR_NAMES = frozenset({"__pycache__"})
+GENERATED_FILE_NAMES = frozenset({".DS_Store"})
+GENERATED_SUFFIXES = frozenset({".pyc", ".pyo"})
 
 
 class PackageError(RuntimeError):
@@ -62,13 +65,27 @@ def _copy_source(repo_root: Path, staging_root: Path, source: Path) -> None:
         raise PackageError(f"manifest source is missing: {source}")
     if source_path.is_symlink():
         raise PackageError(f"refusing to package symlink source: {source}")
+    if _is_generated_path(source, is_dir=source_path.is_dir()):
+        raise PackageError(f"refusing generated manifest source: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source_path.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
         for child in source_path.rglob("*"):
+            relative_child = child.relative_to(source_path)
             if child.is_symlink():
-                relative_child = source / child.relative_to(source_path)
+                relative_child = source / relative_child
                 raise PackageError(f"refusing to package nested symlink source: {relative_child}")
-        shutil.copytree(source_path, destination, symlinks=False)
+            if _is_generated_path(relative_child, is_dir=child.is_dir()):
+                continue
+            destination_child = destination / relative_child
+            if child.is_dir():
+                destination_child.mkdir(parents=True, exist_ok=True)
+            elif child.is_file():
+                destination_child.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(child, destination_child)
+            else:
+                relative_child = source / relative_child
+                raise PackageError(f"unsupported manifest source type: {relative_child}")
     elif source_path.is_file():
         shutil.copy2(source_path, destination)
     else:
@@ -89,8 +106,18 @@ def stage_release(repo_root: Path, manifest_path: Path, staging_root: Path) -> N
     )
 
 
+def _is_generated_path(path: Path, *, is_dir: bool | None = None) -> bool:
+    if any(part in GENERATED_DIR_NAMES for part in path.parts):
+        return True
+    if path.name in GENERATED_FILE_NAMES:
+        return True
+    if is_dir is True:
+        return False
+    return path.suffix in GENERATED_SUFFIXES
+
+
 def _iter_tar_paths(root: Path) -> list[Path]:
-    paths = [path for path in root.rglob("*") if path.name != ".DS_Store"]
+    paths = [path for path in root.rglob("*") if not _is_generated_path(path.relative_to(root), is_dir=path.is_dir())]
     return sorted(paths, key=lambda path: path.relative_to(root).as_posix())
 
 
