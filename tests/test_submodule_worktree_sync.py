@@ -29,7 +29,7 @@ SPEC.loader.exec_module(MODULE)
 
 def run_git(cwd: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", *args],
+        ["git", "-c", "commit.gpgsign=false", *args],
         cwd=cwd,
         check=True,
         text=True,
@@ -177,6 +177,21 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 MODULE.expected_sha(self.root, "third_party/libexample")
         finally:
             MODULE.git = original_git
+
+    def test_default_common_git_dir_does_not_suggest_target_submodule_update(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "source_common_git_dir": None,
+                "source_superproject": None,
+            },
+        )()
+
+        source_common_git_dir, source_superproject = MODULE.choose_source_common_git_dir(args, self.remote)
+
+        self.assertEqual(source_common_git_dir, (self.remote / ".git").resolve())
+        self.assertIsNone(source_superproject)
 
     def test_standard_separate_gitdir_checkout_is_not_managed(self) -> None:
         with self.assertRaises(MODULE.PlanError):

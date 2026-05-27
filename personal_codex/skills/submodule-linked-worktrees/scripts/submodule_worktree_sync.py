@@ -497,7 +497,7 @@ def choose_source_common_git_dir(args: argparse.Namespace, target_root: Path) ->
         source_root, _, source_common_git_dir = repo_paths(resolved_path(args.source_superproject))
         return source_common_git_dir, source_root
     _, _, target_common_git_dir = repo_paths(target_root)
-    return target_common_git_dir, target_root
+    return target_common_git_dir, None
 
 
 def parse_args() -> argparse.Namespace:
