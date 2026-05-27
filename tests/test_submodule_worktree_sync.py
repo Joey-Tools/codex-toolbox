@@ -81,6 +81,69 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
 
+    def test_script_imports_future_annotations(self) -> None:
+        first_lines = SCRIPT_PATH.read_text(encoding="utf-8").splitlines()[:4]
+
+        self.assertIn("from __future__ import annotations", first_lines)
+
+    def test_parse_gitmodules_rejects_unsafe_path(self) -> None:
+        content = """
+[submodule "custom-lib"]
+    path = third_party/../libexample
+    url = https://example.invalid/libexample.git
+"""
+
+        with self.assertRaisesRegex(MODULE.PlanError, "unsafe path segment"):
+            MODULE.parse_gitmodules(content, ".gitmodules")
+
+    def test_parse_gitmodules_rejects_unsafe_name(self) -> None:
+        content = """
+[submodule "../custom-lib"]
+    path = third_party/libexample
+    url = https://example.invalid/libexample.git
+"""
+
+        with self.assertRaisesRegex(MODULE.PlanError, "unsafe path segment"):
+            MODULE.parse_gitmodules(content, ".gitmodules")
+
+    def test_source_gitdir_rejects_symlink_escape(self) -> None:
+        common_git_dir = self.root / "escape-super" / ".git"
+        modules_dir = common_git_dir / "modules"
+        outside = self.root / "outside-gitdir"
+        modules_dir.mkdir(parents=True)
+        outside.mkdir()
+        (modules_dir / "custom-lib").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(MODULE.PlanError, "source gitdir.*escapes"):
+            MODULE.source_git_dir_for(common_git_dir, "custom-lib")
+
+    def test_worktree_path_rejects_symlink_escape(self) -> None:
+        target_super = self.root / "target-super"
+        outside = self.root / "outside-worktree"
+        target_super.mkdir()
+        outside.mkdir()
+        (target_super / "escape").symlink_to(outside, target_is_directory=True)
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="escape/libexample",
+            url=str(self.remote),
+        )
+
+        with self.assertRaisesRegex(MODULE.PlanError, "worktree path.*escapes"):
+            MODULE.sync_one(
+                root=self.root,
+                common_git_dir=self.named_common_git_dir,
+                source_superproject=None,
+                parent_source_git_dir=None,
+                parent_root=target_super,
+                submodule=submodule,
+                sha=self.sha,
+                depth=1,
+                recursive=False,
+                force_replace_empty=False,
+                dry_run=True,
+            )
+
     def test_standard_separate_gitdir_checkout_is_not_managed(self) -> None:
         with self.assertRaises(MODULE.PlanError):
             MODULE.prepare_target_path(

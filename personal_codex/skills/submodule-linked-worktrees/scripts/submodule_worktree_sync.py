@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 
 import argparse
 import configparser
@@ -56,6 +57,27 @@ def resolved_path(value: str) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def validate_relative_git_path(value: str, field: str, origin: str) -> str:
+    if not value:
+        raise PlanError(f"{field} in {origin} must not be empty")
+    if value.startswith("/"):
+        raise PlanError(f"{field} in {origin} must be relative: {value}")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise PlanError(f"{field} in {origin} contains an unsafe path segment: {value}")
+    return "/".join(parts)
+
+
+def contained_child_path(base: Path, relative_path: str, label: str) -> Path:
+    base_resolved = base.resolve()
+    candidate = (base / relative_path).resolve(strict=False)
+    try:
+        candidate.relative_to(base_resolved)
+    except ValueError as exc:
+        raise PlanError(f"{label} escapes {base}: {candidate}") from exc
+    return candidate
+
+
 def source_repo_args(source_git_dir: Path, work_tree: Path) -> list[str]:
     return [f"--git-dir={source_git_dir}", f"--work-tree={work_tree}"]
 
@@ -88,11 +110,19 @@ def parse_gitmodules(content: str, origin: str) -> list[Submodule]:
         if not section.startswith("submodule "):
             continue
         try:
-            path = parser.get(section, "path").strip()
+            path = validate_relative_git_path(
+                parser.get(section, "path").strip(),
+                f"path for [{section}]",
+                origin,
+            )
             url = parser.get(section, "url").strip()
         except configparser.Error as exc:
             raise PlanError(f"section [{section}] in {origin} is missing required keys: {exc}") from exc
-        name = section[len("submodule ") :].strip().strip('"')
+        name = validate_relative_git_path(
+            section[len("submodule ") :].strip().strip('"'),
+            f"name for [{section}]",
+            origin,
+        )
         modules.append(Submodule(name=name, path=path, url=url))
     return modules
 
@@ -131,11 +161,19 @@ def expected_sha_from_tree(source_git_dir: Path, work_tree: Path, treeish: str, 
 
 
 def source_git_dir_for(common_git_dir: Path, submodule_name: str) -> Path:
-    return common_git_dir / "modules" / submodule_name
+    return contained_child_path(
+        common_git_dir / "modules",
+        submodule_name,
+        f"source gitdir for submodule {submodule_name}",
+    )
 
 
 def nested_source_git_dir_for(parent_source_git_dir: Path, submodule_name: str) -> Path:
-    return parent_source_git_dir / "modules" / submodule_name
+    return contained_child_path(
+        parent_source_git_dir / "modules",
+        submodule_name,
+        f"nested source gitdir for submodule {submodule_name}",
+    )
 
 
 def is_valid_git_dir(source_git_dir: Path, work_tree: Path) -> bool:
@@ -378,7 +416,11 @@ def sync_one(
     force_replace_empty: bool,
     dry_run: bool,
 ) -> None:
-    worktree_path = parent_root / submodule.path
+    worktree_path = contained_child_path(
+        parent_root,
+        submodule.path,
+        f"worktree path for submodule {submodule.path}",
+    )
     display_path = relative_display_path(root, worktree_path)
     source_git_dir = (
         nested_source_git_dir_for(parent_source_git_dir, submodule.name)
