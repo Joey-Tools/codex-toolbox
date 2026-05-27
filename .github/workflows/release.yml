@@ -45,10 +45,16 @@ jobs:
           python3 -m py_compile \
             scripts/codex_personal_sync.py \
             scripts/build_personal_codex_package.py \
-            tests/test_codex_personal_sync.py
+            tests/test_codex_personal_sync.py \
+            tests/test_submodule_worktree_sync.py
 
       - name: Run tests
-        run: python3 -m unittest tests.test_codex_personal_sync tests.test_codex_clean_tmp tests.test_codex_git_helpers
+        run: |
+          python3 -m unittest \
+            tests.test_codex_personal_sync \
+            tests.test_codex_clean_tmp \
+            tests.test_codex_git_helpers \
+            tests.test_submodule_worktree_sync
 
       - name: Build release package
         run: |
