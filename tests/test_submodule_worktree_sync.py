@@ -144,6 +144,40 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 dry_run=True,
             )
 
+    def test_expected_sha_rejects_unmerged_index_entries(self) -> None:
+        original_git = MODULE.git
+
+        def fake_git(args: list[str], *, cwd: Path | None = None, check: bool = True) -> str:
+            self.assertEqual(args[:4], ["ls-files", "-s", "--", "third_party/libexample"])
+            return "\n".join(
+                [
+                    f"160000 {'a' * 40} 1\tthird_party/libexample",
+                    f"160000 {'b' * 40} 2\tthird_party/libexample",
+                    f"160000 {'c' * 40} 3\tthird_party/libexample",
+                ]
+            )
+
+        try:
+            MODULE.git = fake_git
+            with self.assertRaisesRegex(MODULE.PlanError, "unresolved index entries"):
+                MODULE.expected_sha(self.root, "third_party/libexample")
+        finally:
+            MODULE.git = original_git
+
+    def test_expected_sha_rejects_nonzero_index_stage(self) -> None:
+        original_git = MODULE.git
+
+        def fake_git(args: list[str], *, cwd: Path | None = None, check: bool = True) -> str:
+            self.assertEqual(args[:4], ["ls-files", "-s", "--", "third_party/libexample"])
+            return f"160000 {'a' * 40} 2\tthird_party/libexample"
+
+        try:
+            MODULE.git = fake_git
+            with self.assertRaisesRegex(MODULE.PlanError, "unresolved index stage 2"):
+                MODULE.expected_sha(self.root, "third_party/libexample")
+        finally:
+            MODULE.git = original_git
+
     def test_standard_separate_gitdir_checkout_is_not_managed(self) -> None:
         with self.assertRaises(MODULE.PlanError):
             MODULE.prepare_target_path(

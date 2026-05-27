@@ -146,9 +146,16 @@ def read_commit_gitmodules(source_git_dir: Path, work_tree: Path, commit: str) -
 
 def expected_sha(root: Path, rel_path: str) -> str:
     output = git(["ls-files", "-s", "--", rel_path], cwd=root)
-    fields = output.split()
+    lines = [line for line in output.splitlines() if line.strip()]
+    if not lines:
+        raise PlanError(f"{rel_path} is not a gitlink in the current index")
+    if len(lines) != 1:
+        raise PlanError(f"{rel_path} has unresolved index entries; resolve conflicts before syncing")
+    fields = lines[0].split()
     if len(fields) < 4 or fields[0] != "160000":
         raise PlanError(f"{rel_path} is not a gitlink in the current index")
+    if fields[2] != "0":
+        raise PlanError(f"{rel_path} has unresolved index stage {fields[2]}; resolve conflicts before syncing")
     return fields[1]
 
 
