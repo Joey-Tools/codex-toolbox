@@ -316,13 +316,17 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 f"personal-codex-{SHA1}/scripts/codex_personal_sync.py",
                 member_names,
             )
+            self.assertIn(
+                f"personal-codex-{SHA1}/personal_codex/skills/submodule-linked-worktrees/SKILL.md",
+                member_names,
+            )
             self.assertNotIn("cisco-trackers-lookup", joined_names)
             self.assertNotIn("remote-host-context", joined_names)
             self.assertNotIn("automations/", joined_names)
 
             release_root = MODULE.safe_extract_archive(archive_path, temp_dir / "extract")
             entries = MODULE.validate_release_tree(release_root)
-            self.assertEqual(len(entries), 4)
+            self.assertEqual(len(entries), 5)
 
     def test_package_builder_rejects_nested_directory_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir_raw:

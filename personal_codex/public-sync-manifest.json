@@ -20,6 +20,11 @@
       "source": "scripts/codex_personal_sync.py",
       "target": "bin/codex-personal-sync",
       "kind": "file"
+    },
+    {
+      "source": "personal_codex/skills/submodule-linked-worktrees",
+      "target": "skills/submodule-linked-worktrees",
+      "kind": "skill"
     }
   ],
   "reference_only": []

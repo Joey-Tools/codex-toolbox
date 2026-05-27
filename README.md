@@ -8,16 +8,21 @@ Public Codex release tooling and small helper binaries.
 python3 -m py_compile \
   scripts/codex_personal_sync.py \
   scripts/build_personal_codex_package.py \
-  tests/test_codex_personal_sync.py
+  tests/test_codex_personal_sync.py \
+  tests/test_submodule_worktree_sync.py
 
-python3 -m unittest tests.test_codex_personal_sync tests.test_codex_clean_tmp tests.test_codex_git_helpers
+python3 -m unittest \
+  tests.test_codex_personal_sync \
+  tests.test_codex_clean_tmp \
+  tests.test_codex_git_helpers \
+  tests.test_submodule_worktree_sync
 ```
 
 ## Release
 
 `Public Toolbox Release` validates pull requests and publishes `personal-codex-*`
-release assets from `master`. This public release owns the sync runner and small
-helper binaries:
+release assets from `master`. This public release owns the sync runner, small
+helper binaries, and public skills:
 
 - `personal-codex-<full-sha>.tar.gz`
 - `personal-codex-<full-sha>.sha256`
