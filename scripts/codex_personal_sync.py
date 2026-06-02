@@ -519,6 +519,8 @@ def plan_link_actions(
                 continue
             existing_owner = _link_managed_owner(home, target, entry_owners)
             if existing_owner is None:
+                if entry.owner == PUBLIC_OWNER and entry.target in OPTIONAL_PUBLIC_TARGETS:
+                    continue
                 raise SyncError(f"refusing to replace unmanaged symlink target: {target}")
             if existing_owner != entry.owner:
                 if entry.owner == PUBLIC_OWNER:

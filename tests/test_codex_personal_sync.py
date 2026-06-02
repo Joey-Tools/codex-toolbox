@@ -1084,6 +1084,24 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertEqual((home / "AGENTS.md").read_text(encoding="utf-8"), "local\n")
         self.assertTrue((home / "bin" / "example-tool").is_symlink())
 
+    def test_install_release_tree_preserves_existing_local_agents_symlink(self) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        dotfiles = self.root / "dotfiles"
+        write_minimal_release(release_root, agent_text="public\n")
+        home.mkdir(parents=True)
+        dotfiles.mkdir()
+        local_agents = dotfiles / "AGENTS.md"
+        local_agents.write_text("local\n", encoding="utf-8")
+        (home / "AGENTS.md").symlink_to(local_agents)
+
+        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+        self.assertEqual((home / "AGENTS.md").readlink(), local_agents)
+        self.assertEqual((home / "AGENTS.md").read_text(encoding="utf-8"), "local\n")
+        self.assertTrue((home / "bin" / "example-tool").is_symlink())
+
     def test_install_release_tree_rejects_existing_non_symlink(self) -> None:
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
