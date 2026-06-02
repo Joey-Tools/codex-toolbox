@@ -317,6 +317,10 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 member_names,
             )
             self.assertIn(
+                f"personal-codex-{SHA1}/personal_codex/AGENTS.md",
+                member_names,
+            )
+            self.assertIn(
                 f"personal-codex-{SHA1}/personal_codex/skills/submodule-linked-worktrees/SKILL.md",
                 member_names,
             )
@@ -326,7 +330,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
             release_root = MODULE.safe_extract_archive(archive_path, temp_dir / "extract")
             entries = MODULE.validate_release_tree(release_root)
-            self.assertEqual(len(entries), 5)
+            self.assertEqual(len(entries), 6)
 
     def test_package_builder_rejects_nested_directory_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir_raw:

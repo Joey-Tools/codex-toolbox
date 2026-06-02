@@ -2,6 +2,11 @@
   "version": 1,
   "links": [
     {
+      "source": "personal_codex/AGENTS.md",
+      "target": "AGENTS.md",
+      "kind": "file"
+    },
+    {
       "source": "personal_codex/bin/codex-clean-tmp",
       "target": "bin/codex-clean-tmp",
       "kind": "file"
