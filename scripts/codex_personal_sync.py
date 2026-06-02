@@ -1321,11 +1321,19 @@ def _collect_overlay_issues(home: Path, owner: str) -> list[str]:
         if os.readlink(target) != _desired_link_target(home, entry):
             issues.append(f"overlay target drift: {target}")
         public_entry = public_by_target.get(entry.target)
-        if public_entry is not None and not entry.override and entry.target not in OPTIONAL_PUBLIC_TARGETS:
+        if (
+            public_entry is not None
+            and not entry.override
+            and entry.target not in OPTIONAL_PUBLIC_TARGETS
+        ):
             issues.append(
                 f"target also exists in public manifest but lacks override=true: {target}"
             )
-        if public_entry is None and entry.override and entry.target not in OPTIONAL_PUBLIC_TARGETS:
+        if (
+            public_entry is None
+            and entry.override
+            and entry.target not in OPTIONAL_PUBLIC_TARGETS
+        ):
             issues.append(f"override target has no public base target: {target}")
 
     for public_entry in public_entries:

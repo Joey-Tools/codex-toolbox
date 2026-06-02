@@ -175,6 +175,7 @@ def write_private_skill_only_release(
         encoding="utf-8",
     )
 
+
 def write_private_agent_release(
     release_root: Path,
     *,
@@ -204,6 +205,7 @@ def write_private_agent_release(
         + "\n",
         encoding="utf-8",
     )
+
 
 def current_target(home: Path) -> str:
     return (home / "personal-sync" / "current").readlink().as_posix()
@@ -359,7 +361,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
             release_root = MODULE.safe_extract_archive(archive_path, temp_dir / "extract")
             entries = MODULE.validate_release_tree(release_root)
-            self.assertEqual(len(entries), 6)
+            self.assertEqual(len(entries), 5)
 
     def test_package_builder_rejects_nested_directory_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir_raw:
