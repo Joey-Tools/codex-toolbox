@@ -175,6 +175,35 @@ def write_private_skill_only_release(
         encoding="utf-8",
     )
 
+def write_private_agent_release(
+    release_root: Path,
+    *,
+    agent_text: str = "private\n",
+) -> None:
+    personal_root = release_root / "personal_codex"
+    personal_root.mkdir(parents=True)
+    (personal_root / "AGENTS.md").write_text(agent_text, encoding="utf-8")
+    (personal_root / "sync-manifest.json").write_text(
+        """
+{
+  "version": 1,
+  "owner": "private",
+  "base_release": {
+    "repo": "Joey-Tools/codex-toolbox"
+  },
+  "links": [
+    {
+      "source": "personal_codex/AGENTS.md",
+      "target": "AGENTS.md",
+      "kind": "file"
+    }
+  ],
+  "reference_only": []
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
 
 def current_target(home: Path) -> str:
     return (home / "personal-sync" / "current").readlink().as_posix()
@@ -1041,12 +1070,27 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(home / "bin" / "example-tool"))
         self.assertFalse(os.path.lexists(home / "bin" / "codex-personal-sync"))
 
+    def test_install_release_tree_preserves_existing_local_agents_file(self) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(release_root, agent_text="public\n")
+        home.mkdir(parents=True)
+        (home / "AGENTS.md").write_text("local\n", encoding="utf-8")
+
+        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+        self.assertFalse((home / "AGENTS.md").is_symlink())
+        self.assertEqual((home / "AGENTS.md").read_text(encoding="utf-8"), "local\n")
+        self.assertTrue((home / "bin" / "example-tool").is_symlink())
+
     def test_install_release_tree_rejects_existing_non_symlink(self) -> None:
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
         write_minimal_release(release_root)
-        home.mkdir(parents=True)
-        (home / "AGENTS.md").write_text("local\n", encoding="utf-8")
+        target = home / "bin" / "example-tool"
+        target.parent.mkdir(parents=True)
+        target.write_text("local\n", encoding="utf-8")
 
         with self.assertRaisesRegex(MODULE.SyncError, "non-symlink target"):
             self.run_quietly(
@@ -1057,6 +1101,57 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 dry_run=False,
             )
         self.assertFalse((home / "personal-sync").exists())
+
+    def test_install_private_keeps_legacy_agent_overlay_without_override(self) -> None:
+        public_release = self.root / "public-release"
+        private_release = self.root / "private-release"
+        home = self.root / "home" / ".codex"
+        write_agent_only_release(public_release, agent_text="public\n")
+        write_private_agent_release(private_release, agent_text="private\n")
+
+        def fake_download(repo: str, destination: Path, *, sha: str | None = None):
+            if repo == "Joey-Tools/codex-private-workflows":
+                return MODULE.DownloadedRelease(
+                    repo=repo,
+                    assets=MODULE.ReleaseAssets(
+                        tag_name="personal-codex-20260520-120000-2222222",
+                        sha=SHA2,
+                        archive_name=f"personal-codex-{SHA2}.tar.gz",
+                        checksum_name=f"personal-codex-{SHA2}.sha256",
+                    ),
+                    release_root=private_release,
+                )
+            if repo == "Joey-Tools/codex-toolbox":
+                return MODULE.DownloadedRelease(
+                    repo=repo,
+                    assets=MODULE.ReleaseAssets(
+                        tag_name="personal-codex-20260520-120000-1111111",
+                        sha=SHA1,
+                        archive_name=f"personal-codex-{SHA1}.tar.gz",
+                        checksum_name=f"personal-codex-{SHA1}.sha256",
+                    ),
+                    release_root=public_release,
+                )
+            raise AssertionError(f"unexpected repo: {repo}")
+
+        with mock.patch.object(MODULE, "download_and_extract_release", fake_download):
+            self.run_quietly(
+                MODULE.install_private_from_github,
+                "Joey-Tools/codex-private-workflows",
+                home,
+                base_repo="Fallback/base",
+                owner="private",
+                dry_run=False,
+            )
+
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+        self.assertEqual(
+            (home / "personal-sync" / "overlays" / "private" / "current").readlink().as_posix(),
+            f"releases/{SHA2}",
+        )
+        self.assertTrue((home / "AGENTS.md").is_symlink())
+        self.assertEqual((home / "AGENTS.md").read_text(encoding="utf-8"), "private\n")
+        self.run_quietly(MODULE.verify_overlay, home, "private")
 
     def test_dry_run_does_not_mutate_home(self) -> None:
         release_root = self.root / "release"
