@@ -27,5 +27,7 @@
       "kind": "skill"
     }
   ],
-  "reference_only": []
+  "reference_only": [
+    "personal_codex/AGENTS.md"
+  ]
 }

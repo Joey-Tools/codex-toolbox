@@ -29,6 +29,7 @@ DEFAULT_RELEASE_REPO_ENV = "CODEX_PERSONAL_SYNC_DEFAULT_REPO"
 DEFAULT_BASE_RELEASE_REPO_ENV = "CODEX_PERSONAL_SYNC_BASE_REPO"
 DEFAULT_PUBLIC_RELEASE_REPO = "Joey-Tools/codex-toolbox"
 PUBLIC_OWNER = "public"
+OPTIONAL_PUBLIC_TARGETS = frozenset({PurePosixPath("AGENTS.md")})
 OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 LAUNCHD_LABEL = "io.github.joey-tools.codex-personal-sync"
 LEGACY_LAUNCHD_LABELS = ("com.joeyteng.codex-personal-sync",)
@@ -491,23 +492,35 @@ def plan_link_actions(
         parent = target.parent
         public_entry = public_by_target.get(entry.target)
         if entry.owner != PUBLIC_OWNER:
-            if public_entry is not None and not entry.override:
+            if (
+                public_entry is not None
+                and not entry.override
+                and entry.target not in OPTIONAL_PUBLIC_TARGETS
+            ):
                 raise SyncError(
                     f"target {target} exists in public manifest; "
                     f"manifest owner {entry.owner} must declare override=true"
                 )
-            if public_entry is None and entry.override:
+            if (
+                public_entry is None
+                and entry.override
+                and entry.target not in OPTIONAL_PUBLIC_TARGETS
+            ):
                 raise SyncError(f"override target has no public base target: {target}")
         if _path_exists_or_is_link(parent) and not parent.is_dir():
             raise SyncError(f"link parent exists but is not a directory: {parent}")
         if _path_exists_or_is_link(target):
             if not target.is_symlink():
+                if entry.owner == PUBLIC_OWNER and entry.target in OPTIONAL_PUBLIC_TARGETS:
+                    continue
                 raise SyncError(f"refusing to replace non-symlink target: {target}")
             existing = os.readlink(target)
             if existing == desired:
                 continue
             existing_owner = _link_managed_owner(home, target, entry_owners)
             if existing_owner is None:
+                if entry.owner == PUBLIC_OWNER and entry.target in OPTIONAL_PUBLIC_TARGETS:
+                    continue
                 raise SyncError(f"refusing to replace unmanaged symlink target: {target}")
             if existing_owner != entry.owner:
                 if entry.owner == PUBLIC_OWNER:
@@ -519,7 +532,10 @@ def plan_link_actions(
                 ):
                     actions.append(LinkAction("replace", target, desired, entry.kind))
                     continue
-                if existing_owner != PUBLIC_OWNER or not entry.override:
+                if (
+                    existing_owner != PUBLIC_OWNER
+                    or (not entry.override and entry.target not in OPTIONAL_PUBLIC_TARGETS)
+                ):
                     raise SyncError(
                         f"target {target} is managed by {existing_owner}; "
                         f"manifest owner {entry.owner} must declare override=true"
@@ -1305,11 +1321,19 @@ def _collect_overlay_issues(home: Path, owner: str) -> list[str]:
         if os.readlink(target) != _desired_link_target(home, entry):
             issues.append(f"overlay target drift: {target}")
         public_entry = public_by_target.get(entry.target)
-        if public_entry is not None and not entry.override:
+        if (
+            public_entry is not None
+            and not entry.override
+            and entry.target not in OPTIONAL_PUBLIC_TARGETS
+        ):
             issues.append(
                 f"target also exists in public manifest but lacks override=true: {target}"
             )
-        if public_entry is None and entry.override:
+        if (
+            public_entry is None
+            and entry.override
+            and entry.target not in OPTIONAL_PUBLIC_TARGETS
+        ):
             issues.append(f"override target has no public base target: {target}")
 
     for public_entry in public_entries:
@@ -1320,7 +1344,10 @@ def _collect_overlay_issues(home: Path, owner: str) -> list[str]:
         if live_owner != owner:
             continue
         overlay_entry = overlay_by_target.get(public_entry.target)
-        if overlay_entry is None or not overlay_entry.override:
+        if (
+            public_entry.target not in OPTIONAL_PUBLIC_TARGETS
+            and (overlay_entry is None or not overlay_entry.override)
+        ):
             issues.append(f"public target is shadowed by undeclared overlay: {target}")
 
     for parent in sorted(_overlay_scan_parents(home, owner, overlay_entries, public_entries)):
