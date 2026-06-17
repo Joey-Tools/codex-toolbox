@@ -219,6 +219,15 @@ def write_scheduler_runner(home: Path) -> Path:
     return runner
 
 
+class PersonalGuidelinesContentTests(unittest.TestCase):
+    def test_agents_guidance_caps_untracked_git_status_output(self) -> None:
+        agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
+
+        self.assertIn("git status --short --untracked-files=no", agents)
+        self.assertIn("git ls-files --others --exclude-standard", agents)
+        self.assertIn("capped samples", agents)
+
+
 class CodexPersonalSyncTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory(prefix="codex-personal-sync.")
