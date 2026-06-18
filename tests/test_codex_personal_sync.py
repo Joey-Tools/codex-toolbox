@@ -227,6 +227,14 @@ class PersonalGuidelinesContentTests(unittest.TestCase):
         self.assertIn("git ls-files --others --exclude-standard", agents)
         self.assertIn("capped samples", agents)
 
+    def test_agents_guidance_caps_large_reference_rg_file_lists(self) -> None:
+        agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
+
+        self.assertIn("rg --count", agents)
+        self.assertIn("capped `rg -l", agents)
+        self.assertIn("high-frequency terms", agents)
+        self.assertIn("common UI words, dates, or numerals", agents)
+
 
 class CodexPersonalSyncTests(unittest.TestCase):
     def setUp(self) -> None:
