@@ -231,6 +231,7 @@ class PersonalGuidelinesContentTests(unittest.TestCase):
         agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
 
         self.assertIn("rg --count", agents)
+        self.assertIn("scoped/capped `rg --files", agents)
         self.assertIn("capped `rg -l", agents)
         self.assertIn("high-frequency terms", agents)
         self.assertIn("common UI words, dates, or numerals", agents)
