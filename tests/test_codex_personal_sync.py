@@ -230,7 +230,7 @@ class PersonalGuidelinesContentTests(unittest.TestCase):
     def test_agents_guidance_caps_large_reference_rg_file_lists(self) -> None:
         agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
 
-        self.assertIn("rg --count <exact-dir> | head -n 80", agents)
+        self.assertIn("rg --count <pattern> <exact-dir> | head -n 80", agents)
         self.assertIn("rg --files <exact-dir> | head -n 80", agents)
         self.assertIn("rg -l ... | head -n 80", agents)
         self.assertIn("high-frequency terms", agents)
