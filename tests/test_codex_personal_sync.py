@@ -236,6 +236,17 @@ class PersonalGuidelinesContentTests(unittest.TestCase):
         self.assertIn("high-frequency terms", agents)
         self.assertIn("common UI words, dates, or numerals", agents)
 
+    def test_agents_guidance_caps_process_table_output(self) -> None:
+        agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
+
+        self.assertIn("broad `ps` invocations", agents)
+        self.assertIn("ps -A", agents)
+        self.assertIn("ps axww", agents)
+        self.assertIn("ps -axo", agents)
+        self.assertIn("pgrep -af <pattern>", agents)
+        self.assertIn("ps -p <pid> -o pid=,ppid=,stat=,etime=,command=", agents)
+        self.assertIn("capped samples", agents)
+
 
 class CodexPersonalSyncTests(unittest.TestCase):
     def setUp(self) -> None:
