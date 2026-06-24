@@ -247,6 +247,15 @@ class PersonalGuidelinesContentTests(unittest.TestCase):
         self.assertIn("ps -p <pid> -o pid=,ppid=,stat=,etime=,command=", agents)
         self.assertIn("capped samples", agents)
 
+    def test_agents_guidance_caps_gh_actions_log_output(self) -> None:
+        agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
+
+        self.assertIn("gh run view", agents)
+        self.assertIn("--log-failed", agents)
+        self.assertIn("task-scoped file", agents)
+        self.assertIn("gh run view --json", agents)
+        self.assertIn("short key-line excerpts", agents)
+
 
 class CodexPersonalSyncTests(unittest.TestCase):
     def setUp(self) -> None:
