@@ -256,6 +256,15 @@ class PersonalGuidelinesContentTests(unittest.TestCase):
         self.assertIn("gh run view --json", agents)
         self.assertIn("short key-line excerpts", agents)
 
+    def test_agents_guidance_caps_curl_web_doc_output(self) -> None:
+        agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
+
+        self.assertIn("public specs, standards, or web docs", agents)
+        self.assertIn("curl", agents)
+        self.assertIn("do not stream the full HTML", agents)
+        self.assertIn("task-scoped file", agents)
+        self.assertIn("short snippets", agents)
+
 
 class CodexPersonalSyncTests(unittest.TestCase):
     def setUp(self) -> None:
