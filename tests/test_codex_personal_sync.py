@@ -220,50 +220,15 @@ def write_scheduler_runner(home: Path) -> Path:
 
 
 class PersonalGuidelinesContentTests(unittest.TestCase):
-    def test_agents_guidance_caps_untracked_git_status_output(self) -> None:
+    def test_agents_guidance_requires_bounded_command_output(self) -> None:
         agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
 
-        self.assertIn("git status --short --untracked-files=no", agents)
-        self.assertIn("git ls-files --others --exclude-standard", agents)
-        self.assertIn("capped samples", agents)
-
-    def test_agents_guidance_caps_large_reference_rg_file_lists(self) -> None:
-        agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
-
-        self.assertIn("rg --count <pattern> <exact-dir> | head -n 80", agents)
-        self.assertIn("rg --files <exact-dir> | head -n 80", agents)
-        self.assertIn("rg -l ... | head -n 80", agents)
-        self.assertIn("high-frequency terms", agents)
-        self.assertIn("common UI words, dates, or numerals", agents)
-
-    def test_agents_guidance_caps_process_table_output(self) -> None:
-        agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
-
-        self.assertIn("broad `ps` invocations", agents)
-        self.assertIn("ps -A", agents)
-        self.assertIn("ps axww", agents)
-        self.assertIn("ps -axo", agents)
-        self.assertIn("pgrep -af <pattern>", agents)
-        self.assertIn("ps -p <pid> -o pid=,ppid=,stat=,etime=,command=", agents)
-        self.assertIn("capped samples", agents)
-
-    def test_agents_guidance_caps_gh_actions_log_output(self) -> None:
-        agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
-
-        self.assertIn("gh run view", agents)
-        self.assertIn("--log-failed", agents)
-        self.assertIn("task-scoped file", agents)
-        self.assertIn("gh run view --json", agents)
-        self.assertIn("short key-line excerpts", agents)
-
-    def test_agents_guidance_caps_curl_web_doc_output(self) -> None:
-        agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
-
-        self.assertIn("public specs, standards, or web docs", agents)
-        self.assertIn("curl", agents)
-        self.assertIn("do not stream the full HTML", agents)
-        self.assertIn("task-scoped file", agents)
-        self.assertIn("short snippets", agents)
+        self.assertIn("large or unbounded output", agents)
+        self.assertIn("narrow its inputs or results", agents)
+        self.assertIn("capture complete output in a task-scoped file", agents)
+        self.assertIn("counts, candidate filenames, decisive key lines, or a short tail", agents)
+        self.assertIn("backstops, not execution-time bounds", agents)
+        self.assertNotIn("$bounded-command-output", agents)
 
 
 class CodexPersonalSyncTests(unittest.TestCase):
