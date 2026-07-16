@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
+import errno
 import functools
 import importlib.util
 import io
@@ -3258,6 +3259,48 @@ class StatusManagedStateSafetyTests(unittest.TestCase):
             MODULE.status(self.home)
 
         self.assertTrue(swapped)
+
+    def test_normalizes_managed_link_parent_open_race(self) -> None:
+        target = self.home / "skills" / "example"
+        real_open_directory = MODULE._open_directory_beneath
+        raced = False
+
+        def open_directory_with_race(home: Path, directory: Path) -> int:
+            nonlocal raced
+            if not raced and directory == target.parent:
+                raced = True
+                raise OSError(
+                    errno.ENOTDIR,
+                    "managed target parent changed",
+                    directory,
+                )
+            return real_open_directory(home, directory)
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(MODULE, "plan_link_actions", return_value=[]),
+            mock.patch.object(
+                MODULE,
+                "plan_stale_current_link_removals",
+                return_value=[],
+            ),
+            mock.patch.object(
+                MODULE,
+                "_open_directory_beneath",
+                side_effect=open_directory_with_race,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = MODULE.main(["status", "--home", str(self.home)])
+
+        self.assertTrue(raced)
+        self.assertEqual(result, 1)
+        self.assertIn(
+            "managed target changed during status validation",
+            stderr.getvalue(),
+        )
+        self.assertNotIn("Traceback", stderr.getvalue())
 
 
 class ManagedStateTransactionSafetyTests(unittest.TestCase):

@@ -81,7 +81,7 @@ superseded_by:
 - Public package and manifest validation now reject active removal records whose replacement target is neither present nor explicitly retired, matching the runtime release-set obligation before publication.
 - GitHub release-history validation bounds each response, the page count, the total release count, and batch Git input/output; it normalizes malformed or over-deep JSON without traceback leakage and resolves commit-graph order with a fixed number of Git processes. Every authenticated complete Release manifest is deduplicated and batch-loaded to prove skip-upgrade target hierarchy and WAL capacity, while all declared historical removal targets remain subject to the same checks for legacy and not-yet-released state.
 - GitHub CLI JSON parsing normalizes oversized integers and recursion failures for both single and concatenated-page responses, so malformed remote data cannot escape the synchronizer error boundary with a traceback.
-- Status reconciliation reads ledger-recorded links through descriptor-bound snapshots, rejecting managed-link parent replacement instead of following a redirected path.
+- Status reconciliation reads ledger-recorded links through descriptor-bound snapshots, rejects managed-link parent replacement instead of following a redirected path, and normalizes descriptor open/read races to sync-domain errors.
 - Cooperative installers lock the stable sync-home directory inode for the entire transaction, so replacing `personal-sync` or its named lock cannot admit a second synchronizer.
 - Current-release reads bind the owner root, `current`, `releases`, and the selected release through no-follow directory descriptors, then recheck every name and parent binding before returning a SHA; replacing the checked owner root can no longer redirect the read to a coherent attacker-controlled tree.
 - Same-content link and ledger inode racers moved during quarantine are restored exactly with no-replace renames; an occupied original name is preserved and reported instead of overwritten.
@@ -101,8 +101,8 @@ superseded_by:
 - Add a combined public/private manifest capacity gate when the private release job has both exact manifests; the installer already performs this aggregate preflight and fails safely, while repository CI currently proves capacity one owner at a time.
 
 ## Evidence
-- Repository test command — 604 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
-- Reconciliation safety module — 268 tests passed as part of the repository suite.
+- Repository test command — 605 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
+- Reconciliation safety module — 269 tests passed as part of the repository suite.
 - Runtime module — 153 tests passed.
 - Package builder safety module — 57 tests passed as part of the repository suite.
 - Manifest change validation module — 77 tests passed as part of the repository suite.

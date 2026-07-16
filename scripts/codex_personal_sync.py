@@ -14608,7 +14608,12 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> None:
         if record.owner != owner:
             continue
         target = home / Path(*record.target.parts)
-        actual_target = _read_optional_symlink_target_beneath(home, target)
+        try:
+            actual_target = _read_optional_symlink_target_beneath(home, target)
+        except OSError as error:
+            raise SyncError(
+                f"managed target changed during status validation: {target}"
+            ) from error
         if actual_target != record.link_target:
             state_issues.append(f"link mismatch: {target}")
     if state_issues:
