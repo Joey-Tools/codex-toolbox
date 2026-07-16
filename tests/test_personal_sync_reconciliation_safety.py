@@ -7896,6 +7896,32 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
             (os.lstat(private_target).st_dev, os.lstat(private_target).st_ino),
             private_identity,
         )
+        with contextlib.redirect_stdout(io.StringIO()):
+            MODULE.verify_overlay(self.home, "private")
+
+        conflicting_state = MODULE.ManagedState(
+            owners={"private": SHA_B},
+            links={
+                private_key: MODULE.ManagedLinkRecord(
+                    source=private_entry.source,
+                    target=private_entry.target,
+                    kind=private_entry.kind,
+                    owner="private",
+                    link_target=f"{private_target_value}.stale",
+                    release_sha=SHA_B,
+                )
+            },
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_load_managed_state",
+                return_value=conflicting_state,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(MODULE.SyncError, "verification failed"),
+        ):
+            MODULE.verify_overlay(self.home, "private")
 
         with contextlib.redirect_stdout(io.StringIO()):
             MODULE.uninstall_overlay(self.home, "private", dry_run=False)

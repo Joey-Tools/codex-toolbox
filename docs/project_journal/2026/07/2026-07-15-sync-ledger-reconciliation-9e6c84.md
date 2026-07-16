@@ -89,6 +89,7 @@ superseded_by:
 - Runtime and validation helpers retain Python 3.9 compatibility, with a dedicated CI lane covering the previously incompatible pending-state and release-history paths.
 - Manifest and durable synchronizer state versions require exact JSON integers, so booleans and numerically equal floats cannot select a schema version.
 - Checksum verification and archive extraction share one immutable snapshot, preventing a verified archive path from being replaced before extraction.
+- Overlay verification accepts exact desired symlinks that intentionally remain outside the ownership ledger, while still rejecting conflicting recorded ownership and preserving those links on uninstall.
 
 ## Next Steps
 - Monitor the first packaged release that exercises managed reconciliation and the dependent private overlay.

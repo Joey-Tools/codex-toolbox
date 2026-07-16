@@ -14708,9 +14708,17 @@ def verify_overlay(home: Path, owner: str) -> None:
             )
         for entry in current_release_entries(home, owner):
             record = state.links.get(entry.target)
-            if record is None or record.owner != owner:
+            expected_record = ManagedLinkRecord(
+                source=entry.source,
+                target=entry.target,
+                kind=entry.kind,
+                owner=owner,
+                link_target=_desired_link_target(home, entry),
+                release_sha=current_sha,
+            )
+            if record is not None and record != expected_record:
                 issues.append(
-                    f"managed link state is missing overlay target: "
+                    f"managed link state has a conflicting overlay target: "
                     f"{_entry_target_path(home, entry)}"
                 )
     if issues:
