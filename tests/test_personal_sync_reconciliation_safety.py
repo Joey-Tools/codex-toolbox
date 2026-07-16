@@ -11587,6 +11587,101 @@ class SchedulerInternalPathSafetyTests(unittest.TestCase):
 
 
 class ManifestPathEncodingSafetyTests(unittest.TestCase):
+    def test_runtime_rejects_non_integer_persisted_schema_versions(self) -> None:
+        for version in (True, 1.0):
+            with (
+                self.subTest(schema="managed-state", version=version),
+                self.assertRaisesRegex(MODULE.SyncError, "state version must be 1"),
+            ):
+                MODULE._managed_state_from_payload(
+                    Path("/unused"),
+                    {"version": version, "owners": {}, "links": []},
+                )
+
+            with (
+                self.subTest(schema="pending-batch", version=version),
+                self.assertRaisesRegex(MODULE.SyncError, "fields or version"),
+            ):
+                MODULE._parse_pending_link_batch(
+                    Path("/unused"),
+                    json.dumps({"version": version}).encode("utf-8"),
+                    MODULE.ManagedStateFileSnapshot(exists=False),
+                )
+
+            commit_payload = json.dumps(
+                {
+                    "version": version,
+                    "batch": "unused",
+                    "state_parent_identity": [1, 2],
+                    "state_after_identity": [3, 4],
+                    "state_after_sha256": "0" * 64,
+                }
+            ).encode("utf-8")
+            commit_snapshot = MODULE.ManagedStateFileSnapshot(
+                exists=True,
+                payload=commit_payload,
+                mode=0o600,
+                file_identity=(5, 6),
+            )
+            with (
+                self.subTest(schema="commit-evidence", version=version),
+                mock.patch.object(
+                    MODULE,
+                    "_read_pending_state_evidence",
+                    return_value=(
+                        commit_snapshot,
+                        MODULE.PENDING_STATE_COMMIT_EVIDENCE,
+                    ),
+                ),
+                self.assertRaisesRegex(MODULE.SyncError, "payload is invalid"),
+            ):
+                MODULE._read_pending_commit_evidence(
+                    Path("/unused"),
+                    Path("/unused/batch"),
+                    {},
+                    state_parent_identity=(1, 2),
+                    state_after=MODULE.ManagedStateFileSnapshot(
+                        exists=True,
+                        payload=b"{}",
+                        file_identity=(3, 4),
+                    ),
+                )
+
+            with tempfile.TemporaryDirectory(prefix="schema-version.") as tmpdir:
+                home = Path(tmpdir) / ".codex"
+                home.mkdir()
+                batch_name = "20260716T000000Z-1-1"
+                ticket_path = MODULE._pending_cleanup_ticket_path(home, batch_name)
+                ticket_path.parent.mkdir(parents=True)
+                ticket_path.write_text(
+                    json.dumps(
+                        {
+                            "version": version,
+                            "batch": batch_name,
+                            "batch_root_identity": [1, 2],
+                            "commit_marker": {},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                ticket_path.chmod(0o600)
+                with (
+                    self.subTest(schema="cleanup-ticket", version=version),
+                    self.assertRaisesRegex(MODULE.SyncError, "unsupported fields"),
+                ):
+                    MODULE._read_pending_cleanup_ticket(home, ticket_path)
+
+    def test_runtime_rejects_non_integer_manifest_versions(self) -> None:
+        for version in (True, 1.0):
+            with (
+                self.subTest(version=version),
+                self.assertRaisesRegex(MODULE.SyncError, "version must be 1"),
+            ):
+                MODULE._parse_manifest_data(
+                    {"version": version, "links": []},
+                    lambda _path: "directory",
+                )
+
     def test_runtime_rejects_json_nul_and_lone_surrogate_paths(self) -> None:
         payloads = {
             "source-nul": rb'{"version":1,"links":[{"source":"personal_codex/skills\u0000/example","target":"skills/example","kind":"skill"}]}',

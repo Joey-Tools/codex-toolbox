@@ -30,6 +30,14 @@ class PackageBuilderSafetyTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_rejects_non_integer_manifest_versions(self) -> None:
+        for version in (True, 1.0):
+            with (
+                self.subTest(version=version),
+                self.assertRaisesRegex(BUILDER.PackageError, "version must be 1"),
+            ):
+                BUILDER._manifest_sources({"version": version, "links": []})
+
     def git(self, repo: Path, *args: str, input_text: str | None = None) -> str:
         result = subprocess.run(
             ["git", *args],

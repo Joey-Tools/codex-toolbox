@@ -815,7 +815,8 @@ def _parse_manifest_data(
     path_kind: Callable[[PurePosixPath], str | None],
 ) -> ManifestData:
     _validate_manifest_unicode_scalars(data)
-    if data.get("version") != 1:
+    version = data.get("version")
+    if type(version) is not int or version != 1:
         raise SyncError("sync manifest version must be 1")
     manifest_owner = _validate_explicit_owner(
         data.get("owner", PUBLIC_OWNER),
@@ -2110,6 +2111,18 @@ def safe_extract_archive(archive_path: Path, destination: Path) -> Path:
             destination,
         )
         return release_root
+    finally:
+        snapshot.close()
+
+
+def verify_and_extract_archive(
+    archive_path: Path,
+    checksum_path: Path,
+    destination: Path,
+) -> tuple[Path, ReleaseTreeExpectation]:
+    snapshot = _verified_archive_snapshot(archive_path, checksum_path)
+    try:
+        return _safe_extract_archive_snapshot(snapshot, destination)
     finally:
         snapshot.close()
 
@@ -3652,7 +3665,8 @@ def _managed_state_from_payload(
         | None
     ) = None,
 ) -> ManagedState:
-    if data.get("version") != 1:
+    version = data.get("version")
+    if type(version) is not int or version != 1:
         raise SyncError("managed link state version must be 1")
 
     raw_owners = data.get("owners", {})
@@ -7707,7 +7721,10 @@ def _read_pending_commit_evidence(
         "state_parent_identity",
         "state_after_identity",
         "state_after_sha256",
-    } or data.get("version") != 1:
+    }:
+        raise SyncError("pending transaction commit evidence payload is invalid")
+    version = data.get("version")
+    if type(version) is not int or version != 1:
         raise SyncError("pending transaction commit evidence payload is invalid")
     if data.get("batch") != batch_root.name:
         raise SyncError("pending transaction commit evidence batch changed")
@@ -7747,7 +7764,10 @@ def _parse_pending_link_batch(
         "claims_before",
         "claims_after",
         "records",
-    } or data.get("version") != 4:
+    }:
+        raise SyncError("pending transaction has unsupported fields or version")
+    version = data.get("version")
+    if type(version) is not int or version != 4:
         raise SyncError("pending transaction has unsupported fields or version")
     batch_name = data.get("batch")
     if (
@@ -8614,7 +8634,12 @@ def _read_pending_cleanup_ticket(
             "batch",
             "batch_root_identity",
             "commit_marker",
-        } or data.get("version") != 1:
+        }:
+            raise SyncError(
+                f"pending cleanup ticket has unsupported fields: {batch_name}"
+            )
+        version = data.get("version")
+        if type(version) is not int or version != 1:
             raise SyncError(f"pending cleanup ticket has unsupported fields: {batch_name}")
         if data.get("batch") != batch_name:
             raise SyncError(f"pending cleanup ticket batch changed: {batch_name}")
@@ -14233,14 +14258,11 @@ def download_and_extract_release(
     archive_path = destination / assets.archive_name
     checksum_path = destination / assets.checksum_name
     extract_root = destination / "extract"
-    snapshot = _verified_archive_snapshot(archive_path, checksum_path)
-    try:
-        release_root, release_expectation = _safe_extract_archive_snapshot(
-            snapshot,
-            extract_root,
-        )
-    finally:
-        snapshot.close()
+    release_root, release_expectation = verify_and_extract_archive(
+        archive_path,
+        checksum_path,
+        extract_root,
+    )
     return DownloadedRelease(
         repo=repo,
         assets=assets,

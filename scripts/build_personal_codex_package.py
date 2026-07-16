@@ -461,7 +461,8 @@ def _validate_replacement_retirement_graph(
 
 
 def _manifest_sources(manifest: dict[str, Any]) -> list[Path]:
-    if manifest.get("version") != 1:
+    version = manifest.get("version")
+    if type(version) is not int or version != 1:
         raise PackageError("sync manifest version must be 1")
     manifest_owner = _validate_manifest_owner(
         manifest["owner"] if "owner" in manifest else PUBLIC_OWNER

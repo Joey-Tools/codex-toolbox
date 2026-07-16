@@ -50,6 +50,16 @@ def removed(skill: str, removed_id: str, *, legacy: bool = False):
 
 
 class SyncManifestChangeTests(unittest.TestCase):
+    def test_rejects_non_integer_manifest_versions(self) -> None:
+        for version in (True, 1.0):
+            data = manifest()
+            data["version"] = version
+            with (
+                self.subTest(version=version),
+                self.assertRaisesRegex(MODULE.ValidationError, "version must be 1"),
+            ):
+                MODULE._manifest_model(data)
+
     def test_manifest_active_link_limit_reserves_current_transaction_record(
         self,
     ) -> None:

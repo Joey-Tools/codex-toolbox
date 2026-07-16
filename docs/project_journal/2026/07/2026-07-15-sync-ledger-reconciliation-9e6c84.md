@@ -87,17 +87,19 @@ superseded_by:
 - Combined manifest validation rejects portable-key strict ancestor conflicts between one owner's active target and another owner's historical `removed.target`, while continuing to allow exact cross-owner migrations, same-owner hierarchy migrations, removed-vs-removed history, and replacement-target-only hierarchy.
 - Planned installs, public upgrades, and public rollbacks honor every retained overlay's optional `base_release.sha` before reconciliation or release staging. Pinned overlays must match the selected public SHA, paired installs remain supported, and unpinned overlays retain their existing follow-selected-base behavior.
 - Runtime and validation helpers retain Python 3.9 compatibility, with a dedicated CI lane covering the previously incompatible pending-state and release-history paths.
+- Manifest and durable synchronizer state versions require exact JSON integers, so booleans and numerically equal floats cannot select a schema version.
+- Checksum verification and archive extraction share one immutable snapshot, preventing a verified archive path from being replaced before extraction.
 
 ## Next Steps
 - Monitor the first packaged release that exercises managed reconciliation and the dependent private overlay.
 - Add a combined public/private manifest capacity gate when the private release job has both exact manifests; the installer already performs this aggregate preflight and fails safely, while repository CI currently proves capacity one owner at a time.
 
 ## Evidence
-- Repository test command — 588 tests passed with system Python 3.9.6 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
-- Reconciliation safety module — 257 tests passed.
+- Repository test command — 592 tests passed with system Python 3.9.6 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
+- Reconciliation safety module — 259 tests passed as part of the repository suite.
 - Runtime module — 153 tests passed.
-- Package builder safety module — 55 tests passed.
-- Manifest change validation module — 75 tests passed.
+- Package builder safety module — 56 tests passed as part of the repository suite.
+- Manifest change validation module — 76 tests passed as part of the repository suite.
 - Release baseline validation module — 24 tests passed.
 - Dedicated Python 3.9 compatibility selection — 9 tests passed.
 - Changed-file `ruff`, repository-wide `ruff`, `actionlint`, manifest change validation, project journal validation, Python compilation, and `git diff --check` passed.

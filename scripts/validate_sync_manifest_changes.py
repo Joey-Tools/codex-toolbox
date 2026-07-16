@@ -548,7 +548,8 @@ def _manifest_model(
     enforce_history_constraints: bool = True,
 ) -> dict[str, Any]:
     _validate_manifest_unicode_scalars(data)
-    if data.get("version") != 1:
+    version = data.get("version")
+    if type(version) is not int or version != 1:
         raise ValidationError("sync manifest version must be 1")
     owner = _owner_id(
         data["owner"] if "owner" in data else PUBLIC_OWNER,
