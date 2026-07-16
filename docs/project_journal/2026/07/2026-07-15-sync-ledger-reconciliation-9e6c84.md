@@ -77,10 +77,11 @@ superseded_by:
 - Release-manifest serialization rejects oversized string tokens before encoder materialization and streams formatted JSON into a bounded buffer; deep or oversized programmatic payloads fail with domain errors.
 - Current manifest reads validate a safe relative path before repository access, then bind the repository root, every ancestor, and the regular-file leaf through non-blocking no-follow descriptors across the bounded read.
 - Portable target overlap checks precompute normalized keys and use adjacent prefix comparisons, reducing validation from quadratic to `O(n log n)` without weakening case or Unicode collision checks.
-- Runtime, builder, and manifest-change validation now share owner, override, reserved-target, source-kind, `base_release`, removed-link field, and retirement-graph semantics, including exact `OWNER/REPOSITORY` validation for base releases; current validation revalidates the manifest plus every observed source/ancestor as one live worktree snapshot, while the baseline remains commit-bound.
+- Runtime, builder, and manifest-change validation now share owner, override, reserved-target, source-kind, `base_release`, removed-link field, and retirement-graph semantics, including exact `OWNER/REPOSITORY` validation and fail-closed unknown-field rejection for base releases; current validation revalidates the manifest plus every observed source/ancestor as one live worktree snapshot, while the baseline remains commit-bound.
 - Public package and manifest validation now reject active removal records whose replacement target is neither present nor explicitly retired, matching the runtime release-set obligation before publication.
 - GitHub release-history validation bounds each response, the page count, the total release count, and batch Git input/output; it normalizes malformed or over-deep JSON without traceback leakage and resolves commit-graph order with a fixed number of Git processes. Every authenticated complete Release manifest is deduplicated and batch-loaded to prove skip-upgrade target hierarchy and WAL capacity, while all declared historical removal targets remain subject to the same checks for legacy and not-yet-released state.
 - Cooperative installers lock the stable sync-home directory inode for the entire transaction, so replacing `personal-sync` or its named lock cannot admit a second synchronizer.
+- Current-release reads bind the owner root, `current`, `releases`, and the selected release through no-follow directory descriptors, then recheck every name and parent binding before returning a SHA; replacing the checked owner root can no longer redirect the read to a coherent attacker-controlled tree.
 - Same-content link and ledger inode racers moved during quarantine are restored exactly with no-replace renames; an occupied original name is preserved and reported instead of overwritten.
 - Overlay uninstall applies managed-link changes first, removes the outgoing `current` pointer second, and publishes the owner-free managed state last; precommit rollback and recovery reverse those mutations.
 - Overlay uninstall keeps the outgoing release descriptor-bound through state publication and rollback, retaining pending evidence whenever release identity drift makes rollback unsafe. An already-missing outgoing `current` pointer is represented by a durable `current/retire-absent` record, including bounded metadata, exact before-state transition validation, claim omission, and foreign-target-preserving recovery.
@@ -98,8 +99,8 @@ superseded_by:
 - Add a combined public/private manifest capacity gate when the private release job has both exact manifests; the installer already performs this aggregate preflight and fails safely, while repository CI currently proves capacity one owner at a time.
 
 ## Evidence
-- Repository test command — 597 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
-- Reconciliation safety module — 261 tests passed as part of the repository suite.
+- Repository test command — 599 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
+- Reconciliation safety module — 263 tests passed as part of the repository suite.
 - Runtime module — 153 tests passed.
 - Package builder safety module — 57 tests passed as part of the repository suite.
 - Manifest change validation module — 77 tests passed as part of the repository suite.

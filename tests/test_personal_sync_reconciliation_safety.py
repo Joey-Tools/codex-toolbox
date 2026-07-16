@@ -344,6 +344,24 @@ class ManifestSchemaSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.SyncError, "unsupported field"):
                 MODULE.load_manifest_data(release_root)
 
+    def test_runtime_rejects_unknown_base_release_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            release_root = Path(temp_dir) / "release"
+            write_skill_release(release_root)
+            manifest_path = release_root / MODULE.MANIFEST_RELATIVE_PATH
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload["base_release"] = {
+                "repo": "Joey-Tools/codex-toolbox",
+                "shaa": SHA_A,
+            }
+            manifest_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                r"unsupported field\(s\): shaa",
+            ):
+                MODULE.load_manifest_data(release_root)
+
     def test_owner_validation_rejects_manifest_changed_after_expectation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             release_root = Path(temp_dir) / "release"
@@ -1751,28 +1769,80 @@ class CurrentPointerSafetyTests(unittest.TestCase):
         current = home / "personal-sync" / "current"
         current.symlink_to(Path("releases") / SHA_A, target_is_directory=True)
 
-        release_a = releases_root / SHA_A
-        real_resolve = MODULE.Path.resolve
+        real_stat = MODULE.os.stat
         changed = False
 
-        def resolve_and_change(path: Path, *, strict: bool = False) -> Path:
+        def stat_and_change(path, *args, **kwargs):
             nonlocal changed
-            resolved = real_resolve(path, strict=strict)
-            if path == release_a and not changed:
+            metadata = real_stat(path, *args, **kwargs)
+            if (
+                path == current.name
+                and kwargs.get("dir_fd") is not None
+                and not changed
+            ):
                 changed = True
                 current.unlink()
                 current.symlink_to(
                     Path("releases") / SHA_B,
                     target_is_directory=True,
                 )
-            return resolved
+            return metadata
 
-        with mock.patch.object(MODULE.Path, "resolve", new=resolve_and_change):
+        with mock.patch.object(MODULE.os, "stat", side_effect=stat_and_change):
             with self.assertRaisesRegex(
                 MODULE.SyncError,
                 "changed during validation",
             ):
                 MODULE._current_sha(home)
+        self.assertTrue(changed)
+
+    def test_rejects_current_pointer_parent_replacement_after_binding(self) -> None:
+        home, _release_root = self._installed_home("parent-replacement")
+        sync_root = home / "personal-sync"
+        current = sync_root / "current"
+        current.symlink_to(Path("releases") / SHA_A, target_is_directory=True)
+        displaced_sync_root = home / "displaced-personal-sync"
+        replacement_sync_root = home / "replacement-personal-sync"
+        (replacement_sync_root / "releases" / SHA_B).mkdir(parents=True)
+        (replacement_sync_root / "current").symlink_to(
+            Path("releases") / SHA_B,
+            target_is_directory=True,
+        )
+        real_bound_directory_matches = MODULE._bound_directory_matches
+        swapped = False
+
+        def swap_after_first_match(
+            checked_home: Path,
+            directory: Path,
+            directory_fd: int,
+        ) -> bool:
+            nonlocal swapped
+            matches = real_bound_directory_matches(
+                checked_home,
+                directory,
+                directory_fd,
+            )
+            if directory == sync_root and matches and not swapped:
+                sync_root.rename(displaced_sync_root)
+                replacement_sync_root.rename(sync_root)
+                swapped = True
+            return matches
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_bound_directory_matches",
+                side_effect=swap_after_first_match,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "current pointer parent changed",
+            ),
+        ):
+            MODULE._current_sha(home)
+
+        self.assertTrue(swapped)
+        self.assertEqual(os.readlink(sync_root / "current"), f"releases/{SHA_B}")
 
     def test_rejects_non_exact_broken_or_unsafe_current_targets(self) -> None:
         cases = (

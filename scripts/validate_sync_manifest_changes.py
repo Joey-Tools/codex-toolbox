@@ -39,6 +39,7 @@ REMOVED_LINK_FIELDS = frozenset(
         "legacy",
     }
 )
+BASE_RELEASE_FIELDS = frozenset({"repo", "sha"})
 SYNC_INTERNAL_TARGET = PurePosixPath("personal-sync")
 PENDING_LINK_POINTER_TARGET = PurePosixPath(
     ".personal-sync-pending-transaction.json"
@@ -647,6 +648,12 @@ def _manifest_model(
         raw_base_release = {}
     if not isinstance(raw_base_release, dict):
         raise ValidationError("base_release must be an object when present")
+    unknown_fields = sorted(set(raw_base_release) - BASE_RELEASE_FIELDS)
+    if unknown_fields:
+        raise ValidationError(
+            "base_release has unsupported field(s): "
+            + ", ".join(unknown_fields)
+        )
     base_release_repo = raw_base_release.get("repo")
     if base_release_repo is not None and (
         not isinstance(base_release_repo, str)

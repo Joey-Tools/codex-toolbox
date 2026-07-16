@@ -1120,6 +1120,16 @@ class PackageBuilderSafetyTests(unittest.TestCase):
         invalid_cases = (
             ("not-object", manifest([]), "must be an object"),
             (
+                "unknown-field",
+                manifest(
+                    {
+                        "repo": "Joey-Tools/codex-toolbox",
+                        "shaa": "a" * 40,
+                    }
+                ),
+                r"unsupported field\(s\): shaa",
+            ),
+            (
                 "bad-repo",
                 manifest({"repo": "codex-toolbox"}),
                 "owner/repo string",

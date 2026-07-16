@@ -70,6 +70,7 @@ REMOVED_LINK_FIELDS = frozenset(
         "legacy",
     }
 )
+BASE_RELEASE_FIELDS = frozenset({"repo", "sha"})
 REGULAR_GIT_MODES = frozenset({b"100644", b"100755"})
 PUBLIC_OWNER = "public"
 RESERVED_TARGET_ROOTS = (
@@ -693,6 +694,12 @@ def _manifest_sources(manifest: dict[str, Any]) -> list[Path]:
         raw_base_release = {}
     if not isinstance(raw_base_release, dict):
         raise PackageError("base_release must be an object when present")
+    unknown_fields = sorted(set(raw_base_release) - BASE_RELEASE_FIELDS)
+    if unknown_fields:
+        raise PackageError(
+            "base_release has unsupported field(s): "
+            + ", ".join(unknown_fields)
+        )
     base_release_repo = raw_base_release.get("repo")
     if base_release_repo is not None and (
         not isinstance(base_release_repo, str)

@@ -991,6 +991,17 @@ class SyncManifestChangeTests(unittest.TestCase):
             ):
                 MODULE._manifest_model(current)
 
+        current = manifest("keep")
+        current["base_release"] = {
+            "repo": "owner/repository",
+            "shaa": "a" * 40,
+        }
+        with self.assertRaisesRegex(
+            MODULE.ValidationError,
+            r"unsupported field\(s\): shaa",
+        ):
+            MODULE._manifest_model(current)
+
         invalid_repositories = (
             "",
             "owner",

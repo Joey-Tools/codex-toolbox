@@ -123,6 +123,7 @@ REMOVED_LINK_FIELDS = frozenset(
         "legacy",
     }
 )
+BASE_RELEASE_FIELDS = frozenset({"repo", "sha"})
 LAUNCHD_LABEL = "io.github.joey-tools.codex-personal-sync"
 LEGACY_LAUNCHD_LABELS = ("com.joeyteng.codex-personal-sync",)
 SYSTEMD_UNIT = "codex-personal-sync"
@@ -1019,6 +1020,12 @@ def _parse_manifest_data(
         raw_base_release = {}
     if not isinstance(raw_base_release, dict):
         raise SyncError("base_release must be an object when present")
+    unknown_fields = sorted(set(raw_base_release) - BASE_RELEASE_FIELDS)
+    if unknown_fields:
+        raise SyncError(
+            "base_release has unsupported field(s): "
+            + ", ".join(unknown_fields)
+        )
     base_release_repo = raw_base_release.get("repo")
     if base_release_repo is not None and (
         not isinstance(base_release_repo, str)
@@ -14450,79 +14457,117 @@ def install_private_from_github(
 
 def _current_sha(home: Path, owner: str = PUBLIC_OWNER) -> str | None:
     current = _current_link(home, owner)
-    if not _ensure_safe_internal_parent(
-        home,
-        current,
-        create=False,
-        allow_missing=True,
-    ):
-        return None
-    if not _path_exists_or_is_link(current):
-        return None
-    current_metadata = os.lstat(current)
-    if not stat.S_ISLNK(current_metadata.st_mode):
-        raise SyncError(f"refusing non-symlink current pointer: {current}")
-
-    releases_root = _releases_root(home, owner)
-    _ensure_safe_internal_directory(
-        home,
-        releases_root,
-        create=False,
-        allow_missing=False,
-    )
-    raw_target_text = os.readlink(current)
-    raw_parts = raw_target_text.split("/")
-    if len(raw_parts) != 2 or raw_parts[0] != "releases":
-        raise SyncError(
-            f"current pointer must use releases/<sha> for owner {owner}"
-        )
+    current_parent = current.parent
     try:
-        sha = _validate_release_sha(raw_parts[1])
-    except SyncError as error:
+        current_parent_fd = _open_directory_beneath(home, current_parent)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
         raise SyncError(
-            f"current pointer has invalid release SHA for owner {owner}"
+            f"refusing unsafe current pointer parent: {current_parent}"
         ) from error
-    release_dir = releases_root / sha
+    releases_fd = -1
+    release_fd = -1
     try:
-        resolved = release_dir.resolve(strict=True)
-        resolved_releases_root = releases_root.resolve(strict=True)
-        resolved_relative = resolved.relative_to(resolved_releases_root)
-    except (OSError, ValueError) as error:
-        raise SyncError(f"current pointer is invalid for owner {owner}: {current}") from error
-    if resolved_relative.parts != (sha,):
-        raise SyncError(
-            f"current pointer must resolve exactly to a release directory for owner {owner}"
+        if not _bound_directory_matches(home, current_parent, current_parent_fd):
+            raise SyncError(f"current pointer parent changed: {current_parent}")
+        try:
+            current_metadata = os.stat(
+                current.name,
+                dir_fd=current_parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if not _bound_directory_matches(
+                home,
+                current_parent,
+                current_parent_fd,
+            ):
+                raise SyncError(f"current pointer parent changed: {current_parent}")
+            return None
+        if not stat.S_ISLNK(current_metadata.st_mode):
+            raise SyncError(f"refusing non-symlink current pointer: {current}")
+
+        raw_target_text = os.readlink(current.name, dir_fd=current_parent_fd)
+        raw_parts = raw_target_text.split("/")
+        if len(raw_parts) != 2 or raw_parts[0] != "releases":
+            raise SyncError(
+                f"current pointer must use releases/<sha> for owner {owner}"
+            )
+        try:
+            sha = _validate_release_sha(raw_parts[1])
+        except SyncError as error:
+            raise SyncError(
+                f"current pointer has invalid release SHA for owner {owner}"
+            ) from error
+
+        releases_root = _releases_root(home, owner)
+        release_dir = releases_root / sha
+        try:
+            releases_fd = os.open(
+                "releases",
+                _source_directory_flags(),
+                dir_fd=current_parent_fd,
+            )
+            release_metadata = os.stat(
+                sha,
+                dir_fd=releases_fd,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISLNK(release_metadata.st_mode)
+                or not stat.S_ISDIR(release_metadata.st_mode)
+            ):
+                raise SyncError(
+                    "current pointer must reference a non-symlink release "
+                    f"directory: {release_dir}"
+                )
+            release_fd = os.open(
+                sha,
+                _source_directory_flags(),
+                dir_fd=releases_fd,
+            )
+        except SyncError:
+            raise
+        except OSError as error:
+            raise SyncError(
+                f"current pointer is invalid for owner {owner}: {current}"
+            ) from error
+
+        current_metadata_after = os.stat(
+            current.name,
+            dir_fd=current_parent_fd,
+            follow_symlinks=False,
         )
-    release_metadata = os.lstat(release_dir)
-    if (
-        stat.S_ISLNK(release_metadata.st_mode)
-        or not stat.S_ISDIR(release_metadata.st_mode)
-    ):
-        raise SyncError(
-            f"current pointer must reference a non-symlink release directory: {release_dir}"
-        )
-    try:
-        current_metadata_after = os.lstat(current)
-        raw_target_after = os.readlink(current)
-        release_metadata_after = os.lstat(release_dir)
-        resolved_after = release_dir.resolve(strict=True)
+        raw_target_after = os.readlink(current.name, dir_fd=current_parent_fd)
+        if (
+            not stat.S_ISLNK(current_metadata_after.st_mode)
+            or (current_metadata_after.st_dev, current_metadata_after.st_ino)
+            != (current_metadata.st_dev, current_metadata.st_ino)
+            or raw_target_after != raw_target_text
+            or not _archive_entry_matches_fd(
+                current_parent_fd,
+                "releases",
+                releases_fd,
+            )
+            or not _archive_entry_matches_fd(releases_fd, sha, release_fd)
+        ):
+            raise SyncError(
+                f"current pointer changed during validation for owner {owner}"
+            )
+        if not _bound_directory_matches(home, current_parent, current_parent_fd):
+            raise SyncError(f"current pointer parent changed: {current_parent}")
+        return sha
     except OSError as error:
         raise SyncError(
             f"current pointer changed during validation for owner {owner}"
         ) from error
-    if (
-        not stat.S_ISLNK(current_metadata_after.st_mode)
-        or (current_metadata_after.st_dev, current_metadata_after.st_ino)
-        != (current_metadata.st_dev, current_metadata.st_ino)
-        or raw_target_after != raw_target_text
-        or (release_metadata_after.st_dev, release_metadata_after.st_ino)
-        != (release_metadata.st_dev, release_metadata.st_ino)
-        or resolved_after != resolved
-    ):
-        raise SyncError(
-            f"current pointer changed during validation for owner {owner}"
-        )
-    return sha
+    finally:
+        if release_fd >= 0:
+            _close_fd_quietly(release_fd)
+        if releases_fd >= 0:
+            _close_fd_quietly(releases_fd)
+        _close_fd_quietly(current_parent_fd)
 
 
 def status(home: Path, owner: str = PUBLIC_OWNER) -> None:
