@@ -63,6 +63,8 @@ superseded_by:
 - Manifest-change validation projects each complete single-owner transition through the runtime-owned serializer model: healthy claims, missing-link creates, replacements, removals, `retire-absent`, quarantine actions from all declared removal history, release expectations, managed state, and the `current` switch must fit both the 10,000-record/claim limits and the exact 16 MiB WAL byte limit before publication. The current profile is cached across release-history comparisons without rebuilding a 16 MiB payload.
 - Committed WAL batches are reclaimed through inode-bound external cleanup tickets published before the active pointer is cleared. Cleanup recursively stays beneath the exact quarantine root without following links, deletes the ticket last, resumes after interruption, and uses a bounded rotating startup scan so an old failing ticket cannot starve later work.
 - Cleanup ticket and temporary-file deletion first moves the named object to a high-entropy retained name, verifies the moved inode, mode, and payload through an open descriptor, and deletes only that exact object. Concurrent replacements remain preserved, while batch-root cleanup uses a deterministic isolation name so interruption between rename and `rmdir` resumes safely.
+- Each batch-content cleanup attempt, including interrupted recovery, moves every supported entry to a fresh parent/inode-encoded active name before identity revalidation and deletion. Mismatches become durable retained blockers that survive retries and require operator cleanup.
+- The cleanup race model covers non-adversarial concurrent path changes around private mode-`0700` sync state. A malicious process running as the same uid is outside scope because it already has equivalent authority to mutate the ledger, release trees, and quarantine directly; portable macOS/Linux APIs do not provide inode-conditional unlink.
 - At most eight generated quarantine transaction batches may be retained, counting both canonical and cleanup-isolated batch names. Pointerless staging failures and deliberately preserved audit batches therefore remain untouched but cannot grow without bound; new transactions fail before allocating another batch until cleanup or operator intervention restores capacity.
 - Active, removed, and replacement targets are rejected before portable-key construction when they exceed 4,096 UTF-8 bytes, 64 components, or 255 UTF-8 bytes in any single component. Target overlap and cross-version hierarchy checks compute each portable identity once and use sorted adjacent comparisons, bounding validation to `O(n log n)`.
 - Runtime, builder, and manifest-change validation reject invalid UTF-8 scalars throughout manifest JSON plus NUL or invalid encoding in path fields, and builders enforce the 4 MiB limit on the final serialized release manifest.
@@ -91,8 +93,8 @@ superseded_by:
 - Add a combined public/private manifest capacity gate when the private release job has both exact manifests; the installer already performs this aggregate preflight and fails safely, while repository CI currently proves capacity one owner at a time.
 
 ## Evidence
-- Repository test command — 583 tests passed with system Python 3.9.6 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
-- Reconciliation safety module — 252 tests passed.
+- Repository test command — 588 tests passed with system Python 3.9.6 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
+- Reconciliation safety module — 257 tests passed.
 - Runtime module — 153 tests passed.
 - Package builder safety module — 55 tests passed.
 - Manifest change validation module — 75 tests passed.

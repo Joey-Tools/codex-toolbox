@@ -8903,6 +8903,384 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(batch_root))
         self.assertFalse(os.path.lexists(ticket_path))
 
+    def test_cleanup_file_racer_is_retained_across_retries(self) -> None:
+        batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
+        victim = batch_root / "cleanup-race-file"
+        expected = batch_root / "cleanup-race-file-expected"
+        victim.write_text("expected\n", encoding="utf-8")
+        expected_identity = (victim.stat().st_dev, victim.stat().st_ino)
+        foreign_identity: tuple[int, int] | None = None
+        real_rename = MODULE._rename_noreplace_at
+
+        def replace_before_isolation(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal foreign_identity
+            if (
+                source_name == victim.name
+                and destination_name.startswith(
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+                )
+                and foreign_identity is None
+            ):
+                victim.rename(expected)
+                victim.write_text("foreign\n", encoding="utf-8")
+                foreign_identity = (victim.stat().st_dev, victim.stat().st_ino)
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=replace_before_isolation,
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+        self.assertIn("preserved as", stdout.getvalue())
+        retained = list(
+            batch_root.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX}*")
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_text(encoding="utf-8"), "foreign\n")
+        self.assertEqual(
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            foreign_identity,
+        )
+        self.assertEqual(expected.read_text(encoding="utf-8"), "expected\n")
+        self.assertEqual(
+            (expected.stat().st_dev, expected.stat().st_ino),
+            expected_identity,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()) as retry_stdout:
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+        self.assertIn("requires manual cleanup", retry_stdout.getvalue())
+        self.assertTrue(ticket_path.is_file())
+        self.assertEqual(retained[0].read_text(encoding="utf-8"), "foreign\n")
+        self.assertEqual(expected.read_text(encoding="utf-8"), "expected\n")
+
+    def test_cleanup_directory_racer_is_retained_across_retries(self) -> None:
+        batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
+        victim = batch_root / "cleanup-race-directory"
+        expected = batch_root / "cleanup-race-directory-expected"
+        victim.mkdir()
+        (victim / "sentinel").write_text("expected\n", encoding="utf-8")
+        expected_identity = (victim.stat().st_dev, victim.stat().st_ino)
+        foreign_identity: tuple[int, int] | None = None
+        real_rename = MODULE._rename_noreplace_at
+
+        def replace_before_isolation(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal foreign_identity
+            if (
+                source_name == victim.name
+                and destination_name.startswith(
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+                )
+                and foreign_identity is None
+            ):
+                victim.rename(expected)
+                victim.mkdir()
+                (victim / "sentinel").write_text("foreign\n", encoding="utf-8")
+                foreign_identity = (victim.stat().st_dev, victim.stat().st_ino)
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=replace_before_isolation,
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+        self.assertIn("preserved as", stdout.getvalue())
+        retained = list(
+            batch_root.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX}*")
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(
+            (retained[0] / "sentinel").read_text(encoding="utf-8"),
+            "foreign\n",
+        )
+        self.assertEqual(
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            foreign_identity,
+        )
+        self.assertEqual(
+            (expected / "sentinel").read_text(encoding="utf-8"),
+            "expected\n",
+        )
+        self.assertEqual(
+            (expected.stat().st_dev, expected.stat().st_ino),
+            expected_identity,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()) as retry_stdout:
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+        self.assertIn("requires manual cleanup", retry_stdout.getvalue())
+        self.assertTrue(ticket_path.is_file())
+        self.assertEqual(
+            (retained[0] / "sentinel").read_text(encoding="utf-8"),
+            "foreign\n",
+        )
+
+    def test_cleanup_resumes_after_active_entry_isolation_interruption(
+        self,
+    ) -> None:
+        batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
+        victim = batch_root / "cleanup-interrupted-file"
+        victim.write_text("cleanup\n", encoding="utf-8")
+        real_rename = MODULE._rename_noreplace_at
+        interrupted = False
+
+        def interrupt_after_isolation(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal interrupted
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if (
+                source_name == victim.name
+                and destination_name.startswith(
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+                )
+                and not interrupted
+            ):
+                interrupted = True
+                raise OSError("injected post-isolation interruption")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=interrupt_after_isolation,
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+        self.assertTrue(interrupted)
+        self.assertIn("post-isolation interruption", stdout.getvalue())
+        active = list(
+            batch_root.glob(f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}*")
+        )
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].read_text(encoding="utf-8"), "cleanup\n")
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+        self.assertFalse(os.path.lexists(batch_root))
+        self.assertFalse(os.path.lexists(ticket_path))
+
+    def test_cleanup_retry_reisolates_active_entry_before_deletion(self) -> None:
+        batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
+        victim = batch_root / "cleanup-retry-file"
+        victim.write_text("expected\n", encoding="utf-8")
+        expected_identity = (victim.stat().st_dev, victim.stat().st_ino)
+        real_rename = MODULE._rename_noreplace_at
+        interrupted = False
+
+        def interrupt_after_isolation(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal interrupted
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if (
+                source_name == victim.name
+                and destination_name.startswith(
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+                )
+                and not interrupted
+            ):
+                interrupted = True
+                raise OSError("injected post-isolation interruption")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=interrupt_after_isolation,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+        active = list(
+            batch_root.glob(f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}*")
+        )
+        self.assertEqual(len(active), 1)
+        expected = self.root / "cleanup-retry-file-expected"
+        foreign_identity: tuple[int, int] | None = None
+
+        def replace_before_reisolation(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal foreign_identity
+            if (
+                source_name == active[0].name
+                and destination_name.startswith(
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+                )
+                and foreign_identity is None
+            ):
+                active[0].rename(expected)
+                replacement = batch_root / source_name
+                replacement.write_text("foreign\n", encoding="utf-8")
+                foreign_identity = (
+                    replacement.stat().st_dev,
+                    replacement.stat().st_ino,
+                )
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=replace_before_reisolation,
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+        self.assertIn("preserved as", stdout.getvalue())
+        retained = list(
+            batch_root.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX}*")
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_text(encoding="utf-8"), "foreign\n")
+        self.assertEqual(
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            foreign_identity,
+        )
+        self.assertEqual(expected.read_text(encoding="utf-8"), "expected\n")
+        self.assertEqual(
+            (expected.stat().st_dev, expected.stat().st_ino),
+            expected_identity,
+        )
+        self.assertTrue(ticket_path.is_file())
+
+    def test_cleanup_resumes_mismatched_active_entry_as_retained(self) -> None:
+        batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
+        victim = batch_root / "cleanup-mismatched-active-file"
+        expected = self.root / "cleanup-mismatched-active-file-expected"
+        victim.write_text("expected\n", encoding="utf-8")
+        expected_identity = (victim.stat().st_dev, victim.stat().st_ino)
+        foreign_identity: tuple[int, int] | None = None
+        real_rename = MODULE._rename_noreplace_at
+        interrupted = False
+
+        def interrupt_after_mismatch_isolation(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal foreign_identity, interrupted
+            if (
+                source_name == victim.name
+                and destination_name.startswith(
+                    MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+                )
+                and not interrupted
+            ):
+                victim.rename(expected)
+                victim.write_text("foreign\n", encoding="utf-8")
+                foreign_identity = (victim.stat().st_dev, victim.stat().st_ino)
+                real_rename(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                )
+                interrupted = True
+                raise OSError("injected mismatched-isolation interruption")
+            real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=interrupt_after_mismatch_isolation,
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+        self.assertIn("mismatched-isolation interruption", stdout.getvalue())
+        active = list(
+            batch_root.glob(f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}*")
+        )
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].read_text(encoding="utf-8"), "foreign\n")
+
+        with contextlib.redirect_stdout(io.StringIO()) as retry_stdout:
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+        self.assertIn("preserved as", retry_stdout.getvalue())
+        retained = list(
+            batch_root.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX}*")
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_text(encoding="utf-8"), "foreign\n")
+        self.assertEqual(
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            foreign_identity,
+        )
+        self.assertEqual(expected.read_text(encoding="utf-8"), "expected\n")
+        self.assertEqual(
+            (expected.stat().st_dev, expected.stat().st_ino),
+            expected_identity,
+        )
+        self.assertTrue(ticket_path.is_file())
+
     def test_committed_recovery_removes_batch_and_external_ticket(self) -> None:
         batch, actions, _state, state_snapshot = self._stage_crash_batch()
         self._publish_pending_target(batch, actions)

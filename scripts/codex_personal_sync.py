@@ -22,7 +22,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from typing import Any
+from typing import Any, NoReturn
 import unicodedata
 import zlib
 
@@ -63,6 +63,13 @@ PENDING_CLEANUP_CURSOR_NAME = ".scan-cursor"
 PENDING_CLEANUP_CURSOR_TEMP_NAME = ".scan-cursor.tmp"
 PENDING_CLEANUP_RETAINED_PREFIX = ".retained-cleanup-"
 PENDING_CLEANUP_ISOLATED_BATCH_PREFIX = ".cleanup-ready-"
+PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX = ".cleanup-active-entry-"
+PENDING_CLEANUP_RETAINED_ENTRY_PREFIX = ".cleanup-retained-entry-"
+PENDING_CLEANUP_ENTRY_TOKEN_RE = re.compile(
+    r"^([0-9a-f]{1,16})-([0-9a-f]{1,16})-"
+    r"([0-9a-f]{1,16})-([0-9a-f]{1,16})-"
+    r"([0-9a-f]{1,8})-([0-9a-f]{16})$"
+)
 MAX_PENDING_CLEANUP_TICKET_BYTES = 4096
 PENDING_LINK_BATCH_RE = re.compile(
     r"^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$"
@@ -8928,6 +8935,135 @@ def _directory_mount_identity(directory_fd: int) -> tuple[int, int | None]:
     return device, mount_id
 
 
+def _pending_cleanup_entry_plan(
+    metadata: os.stat_result,
+) -> tuple[int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+    )
+
+
+def _pending_cleanup_entry_name(
+    prefix: str,
+    parent_identity: tuple[int, int],
+    planned: tuple[int, int, int],
+) -> str:
+    return (
+        f"{prefix}{parent_identity[0]:x}-{parent_identity[1]:x}-"
+        f"{planned[0]:x}-{planned[1]:x}-{planned[2]:x}-"
+        f"{os.urandom(8).hex()}"
+    )
+
+
+def _pending_cleanup_internal_entry_plan(
+    name: str,
+    prefix: str,
+    parent_identity: tuple[int, int],
+) -> tuple[int, int, int] | None:
+    if not name.startswith(prefix):
+        return None
+    match = PENDING_CLEANUP_ENTRY_TOKEN_RE.fullmatch(name[len(prefix) :])
+    if match is None:
+        return None
+    parsed_parent = (int(match.group(1), 16), int(match.group(2), 16))
+    if parsed_parent != parent_identity:
+        return None
+    return (
+        int(match.group(3), 16),
+        int(match.group(4), 16),
+        int(match.group(5), 16),
+    )
+
+
+def _retain_pending_cleanup_entry(
+    directory_fd: int,
+    name: str,
+    parent_identity: tuple[int, int],
+    planned: tuple[int, int, int],
+    *,
+    label: str,
+) -> NoReturn:
+    for _attempt in range(128):
+        retained_name = _pending_cleanup_entry_name(
+            PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
+            parent_identity,
+            planned,
+        )
+        try:
+            _rename_noreplace_at(
+                directory_fd,
+                name,
+                directory_fd,
+                retained_name,
+            )
+        except FileExistsError:
+            continue
+        except FileNotFoundError as error:
+            raise SyncError(f"{label}; isolated entry disappeared") from error
+        os.fsync(directory_fd)
+        raise SyncError(f"{label}; preserved as {retained_name}")
+    raise SyncError("failed to allocate a retained pending cleanup entry name")
+
+
+def _isolate_pending_cleanup_entry(
+    directory_fd: int,
+    name: str,
+    parent_identity: tuple[int, int],
+    planned: tuple[int, int, int],
+) -> tuple[str, os.stat_result]:
+    for _attempt in range(128):
+        active_name = _pending_cleanup_entry_name(
+            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+            parent_identity,
+            planned,
+        )
+        if active_name == name:
+            continue
+        try:
+            _rename_noreplace_at(
+                directory_fd,
+                name,
+                directory_fd,
+                active_name,
+            )
+        except FileExistsError:
+            continue
+        except FileNotFoundError as error:
+            raise SyncError(
+                f"pending cleanup entry disappeared before isolation: {name}"
+            ) from error
+        os.fsync(directory_fd)
+        break
+    else:
+        raise SyncError("failed to allocate an active pending cleanup entry name")
+    try:
+        current = os.stat(
+            active_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise SyncError(
+            f"pending cleanup isolated entry changed: {active_name}"
+        ) from error
+    if _pending_cleanup_entry_plan(current) != planned:
+        _retain_pending_cleanup_entry(
+            directory_fd,
+            active_name,
+            parent_identity,
+            planned,
+            label=f"pending cleanup entry changed before deletion: {name}",
+        )
+    # The verified active name is high entropy and exists only inside the
+    # locked, mode-0700 sync quarantine. Portable Unix APIs do not offer an
+    # inode-conditional unlink; a same-uid process deliberately observing and
+    # replacing this internal name is outside the installer threat model
+    # because it already has equivalent authority over sync state and releases.
+    return active_name, current
+
+
 def _remove_pending_batch_directory_contents(
     directory_fd: int,
     directory_identity: tuple[int, int],
@@ -8943,7 +9079,7 @@ def _remove_pending_batch_directory_contents(
         raise SyncError("pending cleanup directory identity changed")
     if _directory_mount_identity(directory_fd) != root_mount_identity:
         raise SyncError("pending cleanup directory crosses a mount boundary")
-    entries: list[tuple[str, os.stat_result]] = []
+    entries: list[tuple[str, tuple[int, int, int], bool]] = []
     with os.scandir(directory_fd) as iterator:
         for entry in iterator:
             if entry.name in skipped_names:
@@ -8951,6 +9087,16 @@ def _remove_pending_batch_directory_contents(
             if budget[0] <= 0:
                 raise SyncError("pending cleanup entry count exceeds the limit")
             budget[0] -= 1
+            retained_plan = _pending_cleanup_internal_entry_plan(
+                entry.name,
+                PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
+                directory_identity,
+            )
+            if retained_plan is not None:
+                raise SyncError(
+                    "pending cleanup retained entry requires manual cleanup: "
+                    f"{entry.name}"
+                )
             try:
                 metadata = entry.stat(follow_symlinks=False)
             except OSError as error:
@@ -8961,33 +9107,95 @@ def _remove_pending_batch_directory_contents(
                 raise SyncError(
                     f"pending cleanup entry crosses a device boundary: {entry.name}"
                 )
-            entries.append((entry.name, metadata))
+            active_plan = _pending_cleanup_internal_entry_plan(
+                entry.name,
+                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                directory_identity,
+            )
+            entries.append(
+                (
+                    entry.name,
+                    active_plan or _pending_cleanup_entry_plan(metadata),
+                    active_plan is not None,
+                )
+            )
 
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     directory_flags |= getattr(os, "O_CLOEXEC", 0)
     directory_flags |= getattr(os, "O_NOFOLLOW", 0)
     mutated = False
-    for name, planned in entries:
-        try:
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError as error:
-            raise SyncError(f"pending cleanup entry disappeared: {name}") from error
-        if (
-            (current.st_dev, current.st_ino) != (planned.st_dev, planned.st_ino)
-            or stat.S_IFMT(current.st_mode) != stat.S_IFMT(planned.st_mode)
-        ):
-            raise SyncError(f"pending cleanup entry identity changed: {name}")
+    for name, planned, already_active in entries:
+        if planned[2] not in {
+            stat.S_IFDIR,
+            stat.S_IFREG,
+            stat.S_IFLNK,
+        }:
+            raise SyncError(f"pending cleanup found an unsupported entry: {name}")
+        if planned[2] == stat.S_IFDIR and not already_active:
+            preflight_fd = -1
+            try:
+                preflight_fd = os.open(
+                    name,
+                    directory_flags,
+                    dir_fd=directory_fd,
+                )
+            except OSError:
+                pass
+            else:
+                try:
+                    if (
+                        _directory_identity(preflight_fd) == planned[:2]
+                        and _directory_mount_identity(preflight_fd)
+                        != root_mount_identity
+                    ):
+                        raise SyncError(
+                            "pending cleanup child crosses a mount boundary: "
+                            f"{name}"
+                        )
+                finally:
+                    _close_fd_quietly(preflight_fd)
+        active_name, current = _isolate_pending_cleanup_entry(
+            directory_fd,
+            name,
+            directory_identity,
+            planned,
+        )
+        mutated = True
         if stat.S_ISDIR(current.st_mode):
-            child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+            try:
+                child_fd = os.open(
+                    active_name,
+                    directory_flags,
+                    dir_fd=directory_fd,
+                )
+            except OSError:
+                _retain_pending_cleanup_entry(
+                    directory_fd,
+                    active_name,
+                    directory_identity,
+                    planned,
+                    label=f"pending cleanup child directory changed: {name}",
+                )
             try:
                 child_identity = _directory_identity(child_fd)
-                if child_identity != (planned.st_dev, planned.st_ino):
-                    raise SyncError(
-                        f"pending cleanup child directory changed: {name}"
+                if child_identity != planned[:2]:
+                    _retain_pending_cleanup_entry(
+                        directory_fd,
+                        active_name,
+                        directory_identity,
+                        planned,
+                        label=f"pending cleanup child directory changed: {name}",
                     )
                 if _directory_mount_identity(child_fd) != root_mount_identity:
-                    raise SyncError(
-                        f"pending cleanup child crosses a mount boundary: {name}"
+                    _retain_pending_cleanup_entry(
+                        directory_fd,
+                        active_name,
+                        directory_identity,
+                        planned,
+                        label=(
+                            "pending cleanup child crosses a mount boundary: "
+                            f"{name}"
+                        ),
                     )
                 _remove_pending_batch_directory_contents(
                     child_fd,
@@ -8996,40 +9204,104 @@ def _remove_pending_batch_directory_contents(
                     budget,
                     depth=depth + 1,
                 )
-                current = os.stat(
-                    name,
-                    dir_fd=directory_fd,
-                    follow_symlinks=False,
-                )
+                try:
+                    current = os.stat(
+                        active_name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    _retain_pending_cleanup_entry(
+                        directory_fd,
+                        active_name,
+                        directory_identity,
+                        planned,
+                        label=f"pending cleanup child directory changed: {name}",
+                    )
                 if (
                     not stat.S_ISDIR(current.st_mode)
-                    or (current.st_dev, current.st_ino) != child_identity
+                    or _pending_cleanup_entry_plan(current) != planned
                     or _directory_identity(child_fd) != child_identity
                 ):
-                    raise SyncError(
-                        f"pending cleanup child directory changed: {name}"
+                    _retain_pending_cleanup_entry(
+                        directory_fd,
+                        active_name,
+                        directory_identity,
+                        planned,
+                        label=f"pending cleanup child directory changed: {name}",
                     )
-                os.rmdir(name, dir_fd=directory_fd)
+                try:
+                    os.rmdir(active_name, dir_fd=directory_fd)
+                except OSError:
+                    _retain_pending_cleanup_entry(
+                        directory_fd,
+                        active_name,
+                        directory_identity,
+                        planned,
+                        label=f"pending cleanup child deletion changed: {name}",
+                    )
             finally:
                 _close_fd_quietly(child_fd)
         elif stat.S_ISREG(current.st_mode) or stat.S_ISLNK(current.st_mode):
-            os.unlink(name, dir_fd=directory_fd)
-        else:
-            raise SyncError(f"pending cleanup found an unsupported entry: {name}")
-        mutated = True
+            try:
+                os.unlink(active_name, dir_fd=directory_fd)
+            except OSError:
+                _retain_pending_cleanup_entry(
+                    directory_fd,
+                    active_name,
+                    directory_identity,
+                    planned,
+                    label=f"pending cleanup entry deletion changed: {name}",
+                )
         try:
-            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            os.stat(
+                active_name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
         except FileNotFoundError:
             pass
         else:
-            raise SyncError(f"pending cleanup entry reappeared: {name}")
+            _retain_pending_cleanup_entry(
+                directory_fd,
+                active_name,
+                directory_identity,
+                planned,
+                label=f"pending cleanup entry reappeared: {name}",
+            )
 
     with os.scandir(directory_fd) as iterator:
         for entry in iterator:
-            if entry.name not in skipped_names:
+            if entry.name in skipped_names:
+                continue
+            retained_plan = _pending_cleanup_internal_entry_plan(
+                entry.name,
+                PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
+                directory_identity,
+            )
+            if retained_plan is not None:
+                raise SyncError(
+                    "pending cleanup retained entry requires manual cleanup: "
+                    f"{entry.name}"
+                )
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as error:
                 raise SyncError(
                     f"pending cleanup directory gained an entry: {entry.name}"
-                )
+                ) from error
+            active_plan = _pending_cleanup_internal_entry_plan(
+                entry.name,
+                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                directory_identity,
+            )
+            _retain_pending_cleanup_entry(
+                directory_fd,
+                entry.name,
+                directory_identity,
+                active_plan or _pending_cleanup_entry_plan(metadata),
+                label=f"pending cleanup directory gained an entry: {entry.name}",
+            )
     if mutated:
         os.fsync(directory_fd)
 
