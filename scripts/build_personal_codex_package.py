@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from graphlib import CycleError, TopologicalSorter
@@ -44,6 +45,7 @@ MAX_ARCHIVE_MEMBER_PATH_DEPTH = 64
 MAX_MANIFEST_TARGET_PATH_BYTES = 4096
 MAX_MANIFEST_TARGET_COMPONENT_BYTES = 255
 MAX_MANIFEST_TARGET_PATH_DEPTH = 64
+MAX_OWNER_COMPONENT_BYTES = 255
 MAX_PENDING_LINK_RECORDS = 10_000
 MAX_PENDING_LINK_CLAIMS = 20_000
 # A first-install transaction also records and claims the owner's current link.
@@ -394,10 +396,15 @@ def _validate_manifest_target_path(raw: object, field: str) -> PurePosixPath:
 
 
 def _validate_manifest_owner(raw: object, field: str = "owner") -> str:
-    if not isinstance(raw, str) or OWNER_RE.fullmatch(raw) is None:
+    if (
+        not isinstance(raw, str)
+        or OWNER_RE.fullmatch(raw) is None
+        or len(raw.encode("utf-8")) > MAX_OWNER_COMPONENT_BYTES
+    ):
         raise PackageError(
             f"{field} must be a non-empty owner id containing only letters, "
-            "numbers, '.', '_', or '-'"
+            "numbers, '.', '_', or '-', and must not exceed "
+            f"{MAX_OWNER_COMPONENT_BYTES} UTF-8 bytes"
         )
     return raw
 
@@ -417,6 +424,7 @@ def _validate_removed_link_key(raw: object, field: str) -> str:
 
 def _validate_manifest_target_relationships(
     active_targets: list[PurePosixPath],
+    historical_targets: list[PurePosixPath],
     all_targets: list[PurePosixPath],
 ) -> None:
     spellings: dict[tuple[str, ...], PurePosixPath] = {}
@@ -445,6 +453,33 @@ def _validate_manifest_target_relationships(
                 f"manifest targets must not overlap: {parent} is an ancestor of {child}"
             )
 
+    historical_by_key = {
+        _portable_manifest_path_key(target): target
+        for target in historical_targets
+    }
+    ordered_historical_keys = sorted(historical_by_key)
+    for active_target in active_targets:
+        active_key = _portable_manifest_path_key(active_target)
+        historical_target: PurePosixPath | None = None
+        for prefix_length in range(1, len(active_key)):
+            historical_target = historical_by_key.get(active_key[:prefix_length])
+            if historical_target is not None:
+                break
+        if historical_target is None:
+            descendant_index = bisect_right(ordered_historical_keys, active_key)
+            if descendant_index < len(ordered_historical_keys):
+                descendant_key = ordered_historical_keys[descendant_index]
+                if (
+                    len(descendant_key) > len(active_key)
+                    and descendant_key[: len(active_key)] == active_key
+                ):
+                    historical_target = historical_by_key[descendant_key]
+        if historical_target is not None:
+            raise PackageError(
+                "managed target hierarchy changes are not supported: "
+                f"{historical_target} -> {active_target}"
+            )
+
 
 def _validate_replacement_retirement_graph(
     graph: dict[str, tuple[str, ...]],
@@ -470,6 +505,7 @@ def _manifest_sources(manifest: dict[str, Any]) -> list[Path]:
     sources: list[Path] = []
     active_targets: list[PurePosixPath] = []
     active_target_set: set[PurePosixPath] = set()
+    historical_targets: list[PurePosixPath] = []
     all_targets: list[PurePosixPath] = []
     for section in ("links", "reference_only"):
         items = manifest.get(section, [])
@@ -562,6 +598,7 @@ def _manifest_sources(manifest: dict[str, Any]) -> list[Path]:
             item.get("target"),
             "removed link target",
         )
+        historical_targets.append(target)
         all_targets.append(target)
         replacement_target = item.get("replacement_target")
         replacement: PurePosixPath | None = None
@@ -670,7 +707,11 @@ def _manifest_sources(manifest: dict[str, Any]) -> list[Path]:
         raise PackageError(
             "base_release.sha must be a 40-character lowercase hex SHA"
         )
-    _validate_manifest_target_relationships(active_targets, all_targets)
+    _validate_manifest_target_relationships(
+        active_targets,
+        historical_targets,
+        all_targets,
+    )
     return sources
 
 

@@ -863,6 +863,15 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                 self.assertNotIn("github.event.before", text)
                 self.assertNotIn("--base-ref HEAD^", text)
 
+    def test_release_workflow_extracts_the_verified_archive_snapshot(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(workflow.count("module.verify_and_extract_archive("), 2)
+        self.assertNotIn("module.verify_checksum(", workflow)
+        self.assertNotIn("module.safe_extract_archive(", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

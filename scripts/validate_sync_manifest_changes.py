@@ -25,9 +25,7 @@ from urllib.request import Request, urlopen
 
 
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-REMOVED_KEY_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9_.-]*:[A-Za-z0-9][A-Za-z0-9_.-]*$"
-)
+MAX_OWNER_COMPONENT_BYTES = 255
 KINDS = {"file", "directory", "skill"}
 PUBLIC_OWNER = "public"
 REMOVED_LINK_FIELDS = frozenset(
@@ -367,6 +365,24 @@ def _owner_id(raw: object, field: str) -> str:
             f"{field} must be a non-empty owner id containing only letters, "
             "numbers, '.', '_', or '-'"
         )
+    if len(raw.encode("utf-8")) > MAX_OWNER_COMPONENT_BYTES:
+        raise ValidationError(
+            f"{field} exceeds {MAX_OWNER_COMPONENT_BYTES} UTF-8 bytes"
+        )
+    return raw
+
+
+def _removed_link_key(raw: object, field: str) -> str:
+    if not isinstance(raw, str):
+        raise ValidationError(f"{field} must use owner:id keys")
+    owner, separator, removed_id = raw.partition(":")
+    if (
+        not separator
+        or ":" in removed_id
+        or ID_RE.fullmatch(removed_id) is None
+    ):
+        raise ValidationError(f"{field} must use owner:id keys")
+    _owner_id(owner, f"{field} owner")
     return raw
 
 
@@ -679,14 +695,13 @@ def _manifest_model(
             raise ValidationError(
                 f"removed link {removed_id} retires_replacements must be an array"
             )
-        retires_replacements = tuple(raw_retires)
-        if any(
-            not isinstance(key, str) or REMOVED_KEY_RE.fullmatch(key) is None
-            for key in retires_replacements
-        ):
-            raise ValidationError(
-                f"removed link {removed_id} retires_replacements must use owner:id keys"
+        retires_replacements = tuple(
+            _removed_link_key(
+                key,
+                f"removed link {removed_id} retires_replacements",
             )
+            for key in raw_retires
+        )
         if len(set(retires_replacements)) != len(retires_replacements):
             raise ValidationError(
                 f"removed link {removed_id} has duplicate retires_replacements entries"

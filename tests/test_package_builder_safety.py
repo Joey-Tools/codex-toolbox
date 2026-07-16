@@ -462,6 +462,12 @@ class PackageBuilderSafetyTests(unittest.TestCase):
             [Path("payload")],
         )
 
+        owner_at_limit = "o" * BUILDER.MAX_OWNER_COMPONENT_BYTES
+        self.assertEqual(
+            BUILDER._manifest_sources(manifest(owner=owner_at_limit)),
+            [Path("payload")],
+        )
+
         invalid_cases: list[tuple[str, dict[str, object], str]] = []
         explicit_null_owner = manifest(owner=None)
         invalid_cases.append(("manifest-owner-null", explicit_null_owner, "owner id"))
@@ -476,6 +482,11 @@ class PackageBuilderSafetyTests(unittest.TestCase):
 
         invalid_owner = manifest(owner="private/invalid")
         invalid_cases.append(("invalid-owner", invalid_owner, "owner id"))
+
+        overlong_owner = manifest(owner=owner_at_limit + "o")
+        invalid_cases.append(
+            ("overlong-owner", overlong_owner, "must not exceed 255")
+        )
 
         null_override = manifest(owner="private")
         null_override["links"][0]["override"] = None  # type: ignore[index]
@@ -687,6 +698,9 @@ class PackageBuilderSafetyTests(unittest.TestCase):
 
         missing_id = removed_link()
         del missing_id["id"]
+        overlong_retirement_owner = "o" * (
+            BUILDER.MAX_OWNER_COMPONENT_BYTES + 1
+        )
         invalid_cases = (
             ("removed-links-not-list", manifest({}), "must be a list"),
             ("removed-link-not-object", manifest(["retired"]), "must be objects"),
@@ -722,6 +736,19 @@ class PackageBuilderSafetyTests(unittest.TestCase):
                 "retire-key-invalid-id",
                 manifest([removed_link(retires_replacements=["private:invalid/id"])]),
                 "owner:id string",
+            ),
+            (
+                "retire-key-overlong-owner",
+                manifest(
+                    [
+                        removed_link(
+                            retires_replacements=[
+                                f"{overlong_retirement_owner}:retired"
+                            ]
+                        )
+                    ]
+                ),
+                "must not exceed 255",
             ),
             (
                 "retire-list-type",
@@ -763,6 +790,60 @@ class PackageBuilderSafetyTests(unittest.TestCase):
             ]
         )
         self.assertEqual(BUILDER._manifest_sources(valid), [Path("payload")])
+
+    def test_manifest_rejects_active_historical_target_hierarchy(self) -> None:
+        def manifest(
+            active_target: str,
+            historical_target: str,
+        ) -> dict[str, object]:
+            return {
+                "version": 1,
+                "owner": "private",
+                "links": [
+                    {
+                        "source": "payload",
+                        "target": active_target,
+                        "kind": "skill",
+                    }
+                ],
+                "removed_links": [
+                    {
+                        "id": "retired",
+                        "source": "retired/source",
+                        "target": historical_target,
+                        "kind": "skill",
+                    }
+                ],
+            }
+
+        for active_target, historical_target in (
+            ("skills/example", "skills/example/child"),
+            ("skills/example/child", "skills/example"),
+            (
+                "Skills/Cafe\N{COMBINING ACUTE ACCENT}",
+                "skills/caf\N{LATIN SMALL LETTER E WITH ACUTE}/child",
+            ),
+            (
+                "skills/caf\N{LATIN SMALL LETTER E WITH ACUTE}/child",
+                "Skills/Cafe\N{COMBINING ACUTE ACCENT}",
+            ),
+        ):
+            with self.subTest(
+                active_target=active_target,
+                historical_target=historical_target,
+            ), self.assertRaisesRegex(
+                BUILDER.PackageError,
+                "hierarchy changes are not supported",
+            ):
+                BUILDER._manifest_sources(
+                    manifest(active_target, historical_target)
+                )
+
+        exact_target = "skills/example"
+        self.assertEqual(
+            BUILDER._manifest_sources(manifest(exact_target, exact_target)),
+            [Path("payload")],
+        )
 
     def test_public_active_replacement_obligation_matches_runtime_semantics(
         self,

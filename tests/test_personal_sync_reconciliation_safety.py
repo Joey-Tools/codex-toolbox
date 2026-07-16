@@ -275,6 +275,35 @@ class InstallLockBindingSafetyTests(unittest.TestCase):
 
 
 class ManifestSchemaSafetyTests(unittest.TestCase):
+    def test_runtime_owner_component_byte_limit_matches_owner_sync_root(self) -> None:
+        owner_at_limit = "o" * MODULE.MAX_OWNER_COMPONENT_BYTES
+        owner_over_limit = owner_at_limit + "o"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            release_root = root / "release"
+            manifest = write_skill_release(release_root, owner=owner_at_limit)
+
+            self.assertEqual(manifest.owner, owner_at_limit)
+            self.assertEqual(
+                MODULE._owner_sync_root(root / "home", owner_at_limit),
+                root / "home" / "personal-sync" / "overlays" / owner_at_limit,
+            )
+
+            invalid_release_root = root / "invalid-release"
+            with self.assertRaisesRegex(MODULE.SyncError, "must not exceed 255"):
+                write_skill_release(invalid_release_root, owner=owner_over_limit)
+            with self.assertRaisesRegex(MODULE.SyncError, "must not exceed 255"):
+                MODULE._owner_sync_root(root / "home", owner_over_limit)
+
+            link_owner_release_root = root / "invalid-link-owner-release"
+            write_skill_release(link_owner_release_root, owner="private")
+            manifest_path = link_owner_release_root / MODULE.MANIFEST_RELATIVE_PATH
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload["links"][0]["owner"] = owner_over_limit
+            manifest_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.SyncError, "must not exceed 255"):
+                MODULE.load_manifest_data(link_owner_release_root)
+
     def test_runtime_rejects_explicit_null_manifest_and_link_owners(self) -> None:
         for field in ("manifest", "link"):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temp_dir:
@@ -571,10 +600,18 @@ class TargetPortabilityTests(unittest.TestCase):
 
         MODULE._validate_manifest_target_portability(manifests)
 
-    def test_allows_same_owner_active_removed_hierarchy_migration(self) -> None:
+    def test_rejects_same_owner_active_removed_hierarchy_migration(self) -> None:
         for active_target, removed_target in (
             ("skills/example", "skills/example/child"),
             ("skills/example/child", "skills/example"),
+            (
+                "Skills/Cafe\N{COMBINING ACUTE ACCENT}",
+                "skills/caf\N{LATIN SMALL LETTER E WITH ACUTE}/child",
+            ),
+            (
+                "skills/caf\N{LATIN SMALL LETTER E WITH ACUTE}/child",
+                "Skills/Cafe\N{COMBINING ACUTE ACCENT}",
+            ),
         ):
             manifest = self._target_manifest(
                 "private",
@@ -585,8 +622,21 @@ class TargetPortabilityTests(unittest.TestCase):
             with self.subTest(
                 active_target=active_target,
                 removed_target=removed_target,
+            ), self.assertRaisesRegex(
+                MODULE.SyncError,
+                "hierarchy changes are not supported",
             ):
                 MODULE._validate_manifest_target_portability([manifest])
+
+    def test_allows_same_owner_exact_active_removed_migration(self) -> None:
+        target = "skills/example"
+        manifest = self._target_manifest(
+            "private",
+            active=target,
+            removed=target,
+        )
+
+        MODULE._validate_manifest_target_portability([manifest])
 
     def test_rejects_portable_active_collision_and_ancestor(self) -> None:
         cases = (

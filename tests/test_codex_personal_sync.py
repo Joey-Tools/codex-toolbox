@@ -533,7 +533,11 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
             archive_path = dist_dir / f"personal-codex-{SHA1}.tar.gz"
             checksum_path = dist_dir / f"personal-codex-{SHA1}.sha256"
-            MODULE.verify_checksum(archive_path, checksum_path)
+            release_root, _release_expectation = MODULE.verify_and_extract_archive(
+                archive_path,
+                checksum_path,
+                temp_dir / "extract",
+            )
             with tarfile.open(archive_path, "r:gz") as archive:
                 member_names = archive.getnames()
 
@@ -558,7 +562,6 @@ class CodexPersonalSyncTests(unittest.TestCase):
             self.assertNotIn("remote-host-context", joined_names)
             self.assertNotIn("automations/", joined_names)
 
-            release_root = MODULE.safe_extract_archive(archive_path, temp_dir / "extract")
             entries = MODULE.validate_release_tree(release_root)
             self.assertEqual(len(entries), 5)
 
@@ -2645,19 +2648,26 @@ class CodexPersonalSyncTests(unittest.TestCase):
         archive.write_bytes(archive_payload)
         digest = hashlib.sha256(archive_payload).hexdigest()
         checksum.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
-        archive_identity = archive.stat().st_ino, archive.stat().st_size
+        archive_metadata = archive.stat()
+        archive_identity = (
+            archive_metadata.st_dev,
+            archive_metadata.st_ino,
+            archive_metadata.st_size,
+        )
         real_read = os.read
         rewritten = False
 
         def rewrite_after_archive_read(file_descriptor, size):
             nonlocal rewritten
-            payload = real_read(file_descriptor, size)
             metadata = os.fstat(file_descriptor)
-            if metadata.st_ino == archive_identity[0] and payload and not rewritten:
+            is_archive = (metadata.st_dev, metadata.st_ino) == archive_identity[:2]
+            payload = real_read(file_descriptor, min(size, 1) if is_archive else size)
+            if is_archive and payload and not rewritten:
                 rewritten = True
                 writer_fd = os.open(archive, os.O_RDWR)
                 try:
-                    os.lseek(writer_fd, -1, os.SEEK_END)
+                    # Rewrite a byte that the bounded first read has not copied yet.
+                    os.lseek(writer_fd, 1, os.SEEK_SET)
                     os.write(writer_fd, b"X")
                     os.fsync(writer_fd)
                 finally:
@@ -2667,12 +2677,16 @@ class CodexPersonalSyncTests(unittest.TestCase):
         with mock.patch.object(MODULE.os, "read", rewrite_after_archive_read):
             with self.assertRaisesRegex(
                 MODULE.SyncError,
-                "compressed archive changed while reading",
+                "compressed archive changed while reading|checksum mismatch",
             ):
                 MODULE.verify_checksum(archive, checksum)
 
         self.assertTrue(rewritten)
-        self.assertEqual((archive.stat().st_ino, archive.stat().st_size), archive_identity)
+        final_metadata = archive.stat()
+        self.assertEqual(
+            (final_metadata.st_dev, final_metadata.st_ino, final_metadata.st_size),
+            archive_identity,
+        )
 
     def test_download_extracts_verified_snapshot_after_archive_path_replacement(
         self,
@@ -4088,7 +4102,10 @@ class CodexPersonalSyncTests(unittest.TestCase):
         state_path = home / "personal-sync" / "state" / "managed-links.json"
         old_state = state_path.read_bytes()
 
-        with self.assertRaisesRegex(MODULE.SyncError, "manifest targets must not overlap"):
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "hierarchy changes are not supported",
+        ):
             self.run_quietly(
                 MODULE.install_release_tree,
                 release_two,
@@ -4133,7 +4150,10 @@ class CodexPersonalSyncTests(unittest.TestCase):
         state_path = home / "personal-sync" / "state" / "managed-links.json"
         old_state = state_path.read_bytes()
 
-        with self.assertRaisesRegex(MODULE.SyncError, "manifest targets must not overlap"):
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "hierarchy changes are not supported",
+        ):
             self.run_quietly(
                 MODULE.install_release_tree,
                 release_two,
@@ -4148,30 +4168,18 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertFalse((home / "personal-sync" / "releases" / SHA2).exists())
 
         fresh_home = self.root / "fresh-home" / ".codex"
-        self.run_quietly(
-            MODULE.install_release_tree,
-            release_two,
-            fresh_home,
-            SHA2,
-            dry_run=False,
-        )
-        self.run_quietly(
-            MODULE.install_release_tree,
-            release_two,
-            fresh_home,
-            SHA2,
-            dry_run=False,
-        )
-        self.assertTrue((fresh_home / "skills").is_symlink())
-        fresh_state = json.loads(
-            (
-                fresh_home / "personal-sync" / "state" / "managed-links.json"
-            ).read_text(encoding="utf-8")
-        )
-        self.assertEqual(
-            [entry["target"] for entry in fresh_state["links"]],
-            ["skills"],
-        )
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "hierarchy changes are not supported",
+        ):
+            self.run_quietly(
+                MODULE.install_release_tree,
+                release_two,
+                fresh_home,
+                SHA2,
+                dry_run=False,
+            )
+        self.assertFalse((fresh_home / "personal-sync").exists())
 
     def test_install_release_tree_rejects_tampered_managed_state(self) -> None:
         release_root = self.root / "release"

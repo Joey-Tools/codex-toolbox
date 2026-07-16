@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 from collections.abc import Callable
 import contextlib
 import ctypes
@@ -46,6 +47,7 @@ MAX_ARCHIVE_MEMBER_PATH_DEPTH = 64
 MAX_MANIFEST_TARGET_PATH_BYTES = 4096
 MAX_MANIFEST_TARGET_COMPONENT_BYTES = 255
 MAX_MANIFEST_TARGET_PATH_DEPTH = 64
+MAX_OWNER_COMPONENT_BYTES = 255
 STATE_RELATIVE_PATH = Path("state/managed-links.json")
 MAX_MANAGED_STATE_BYTES = 16 * 1024 * 1024
 QUARANTINE_RELATIVE_PATH = Path("quarantine")
@@ -552,14 +554,24 @@ def _validate_target_path(raw: object, field_name: str) -> PurePosixPath:
     return path
 
 
+def _owner_is_valid(raw: object) -> bool:
+    return (
+        isinstance(raw, str)
+        and OWNER_RE.fullmatch(raw) is not None
+        and len(raw.encode("utf-8")) <= MAX_OWNER_COMPONENT_BYTES
+    )
+
+
 def _validate_owner(raw: object, field_name: str = "owner") -> str:
     if raw is None:
         return PUBLIC_OWNER
-    if not isinstance(raw, str) or not OWNER_RE.fullmatch(raw):
+    if not _owner_is_valid(raw):
         raise SyncError(
             f"{field_name} must be a non-empty owner id containing only letters, "
-            "numbers, '.', '_', or '-'"
+            "numbers, '.', '_', or '-', and must not exceed "
+            f"{MAX_OWNER_COMPONENT_BYTES} UTF-8 bytes"
         )
+    assert isinstance(raw, str)
     return raw
 
 
@@ -721,6 +733,50 @@ def _validate_cross_owner_active_removed_target_hierarchy(
             )
 
 
+def _validate_same_owner_active_removed_target_hierarchy(
+    manifests: list[ManifestData],
+) -> None:
+    active_by_owner: dict[str, list[PurePosixPath]] = {}
+    historical_by_owner: dict[str, list[PurePosixPath]] = {}
+    for manifest in manifests:
+        active_by_owner.setdefault(manifest.owner, []).extend(
+            entry.target for entry in manifest.entries
+        )
+        historical_by_owner.setdefault(manifest.owner, []).extend(
+            removed.target for removed in manifest.removed_links
+        )
+
+    for owner, active_targets in active_by_owner.items():
+        historical_targets = historical_by_owner.get(owner, [])
+        historical_by_key = {
+            _portable_target_key(target): target for target in historical_targets
+        }
+        ordered_historical_keys = sorted(historical_by_key)
+        for active_target in active_targets:
+            active_key = _portable_target_key(active_target)
+            historical_target: PurePosixPath | None = None
+            for prefix_length in range(1, len(active_key)):
+                historical_target = historical_by_key.get(
+                    active_key[:prefix_length]
+                )
+                if historical_target is not None:
+                    break
+            if historical_target is None:
+                descendant_index = bisect_right(ordered_historical_keys, active_key)
+                if descendant_index < len(ordered_historical_keys):
+                    descendant_key = ordered_historical_keys[descendant_index]
+                    if (
+                        len(descendant_key) > len(active_key)
+                        and descendant_key[: len(active_key)] == active_key
+                    ):
+                        historical_target = historical_by_key[descendant_key]
+            if historical_target is not None:
+                raise SyncError(
+                    "managed target hierarchy changes are not supported for owner "
+                    f"{owner}: {historical_target} -> {active_target}"
+                )
+
+
 def _validate_manifest_target_portability(manifests: list[ManifestData]) -> None:
     active_targets: list[PurePosixPath] = []
     all_targets: list[PurePosixPath] = []
@@ -734,6 +790,7 @@ def _validate_manifest_target_portability(manifests: list[ManifestData]) -> None
                 all_targets.append(removed.replacement_target)
     _validate_portable_target_spellings(all_targets)
     _validate_non_overlapping_targets(active_targets)
+    _validate_same_owner_active_removed_target_hierarchy(manifests)
     _validate_cross_owner_active_removed_target_hierarchy(manifests)
 
 
@@ -2145,6 +2202,7 @@ def _personal_sync_root(home: Path) -> Path:
 
 
 def _owner_sync_root(home: Path, owner: str) -> Path:
+    owner = _validate_explicit_owner(owner)
     sync_root = _personal_sync_root(home)
     if owner == PUBLIC_OWNER:
         return sync_root
@@ -4922,7 +4980,7 @@ def _known_owners(home: Path, extra_owners: set[str] | None = None) -> set[str]:
     ):
         return owners
     for path in overlays_root.iterdir():
-        if OWNER_RE.fullmatch(path.name) is None:
+        if not _owner_is_valid(path.name):
             continue
         mode = os.lstat(path).st_mode
         if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
@@ -6375,7 +6433,7 @@ def _manifest_transition_capacity_profile(
     links: dict[str, dict[str, Any]],
     removed_links: dict[str, dict[str, Any]],
 ) -> ManifestTransitionCapacityProfile:
-    if OWNER_RE.fullmatch(owner) is None:
+    if not _owner_is_valid(owner):
         raise SyncError(f"manifest transition owner is invalid: {owner}")
     home = Path("/home/codex/.codex")
     release_sha = "f" * 40

@@ -751,6 +751,24 @@ class SyncManifestChangeTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ValidationError, "owner:id"):
             MODULE._manifest_model(current)
 
+    def test_replacement_retirement_owner_respects_component_limit(self) -> None:
+        boundary_owner = "o" * MODULE.MAX_OWNER_COMPONENT_BYTES
+        retirement = removed("replacement", "remove-replacement")
+        retirement["retires_replacements"] = [
+            f"{boundary_owner}:rename-retired"
+        ]
+        MODULE._manifest_model(manifest("keep", removed_links=[retirement]))
+
+        overflow_owner = boundary_owner + "o"
+        retirement["retires_replacements"] = [
+            f"{overflow_owner}:rename-retired"
+        ]
+        with self.assertRaisesRegex(
+            MODULE.ValidationError,
+            f"{MODULE.MAX_OWNER_COMPONENT_BYTES} UTF-8 bytes",
+        ):
+            MODULE._manifest_model(manifest("keep", removed_links=[retirement]))
+
     def test_same_owner_replacement_retirement_must_resolve(self) -> None:
         retirement = removed("replacement", "remove-replacement")
         retirement["retires_replacements"] = ["public:missing"]
@@ -871,9 +889,14 @@ class SyncManifestChangeTests(unittest.TestCase):
     def test_manifest_owner_and_link_policy_matches_runtime(self) -> None:
         inherited_private_owner = manifest("keep")
         inherited_private_owner["owner"] = "private"
+        boundary_owner = "o" * MODULE.MAX_OWNER_COMPONENT_BYTES
+        boundary_owner_manifest = manifest("keep")
+        boundary_owner_manifest["owner"] = boundary_owner
+        boundary_owner_manifest["links"][0]["owner"] = boundary_owner
         valid = (
             manifest("keep"),
             inherited_private_owner,
+            boundary_owner_manifest,
             {
                 **manifest("keep"),
                 "owner": "private",
@@ -904,6 +927,16 @@ class SyncManifestChangeTests(unittest.TestCase):
         invalid_link_owner = manifest("keep")
         invalid_link_owner["links"][0]["owner"] = "private owner"
         invalid.append(("link owner", invalid_link_owner))
+
+        overflow_owner = boundary_owner + "o"
+        overflow_manifest_owner = manifest("keep")
+        overflow_manifest_owner["owner"] = overflow_owner
+        invalid.append(("255 UTF-8 bytes", overflow_manifest_owner))
+
+        overflow_link_owner = manifest("keep")
+        overflow_link_owner["owner"] = "private"
+        overflow_link_owner["links"][0]["owner"] = overflow_owner
+        invalid.append(("255 UTF-8 bytes", overflow_link_owner))
 
         null_link_owner = manifest("keep")
         null_link_owner["links"][0]["owner"] = None

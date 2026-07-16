@@ -99,8 +99,11 @@ jobs:
           sha = __import__("os").environ["GITHUB_SHA"]
           archive_path = repo_root / "dist" / f"personal-codex-{sha}.tar.gz"
           checksum_path = repo_root / "dist" / f"personal-codex-{sha}.sha256"
-          module.verify_checksum(archive_path, checksum_path)
-          release_root = module.safe_extract_archive(archive_path, repo_root / "dist" / "extract")
+          release_root, _release_expectation = module.verify_and_extract_archive(
+              archive_path,
+              checksum_path,
+              repo_root / "dist" / "extract",
+          )
           entries = module.validate_release_tree(release_root)
           targets = {entry.target.as_posix() for entry in entries}
           runner = release_root / "scripts" / "codex_personal_sync.py"
@@ -157,8 +160,11 @@ jobs:
           sha = __import__("os").environ["GITHUB_SHA"]
           archive_path = repo_root / "dist" / f"personal-codex-{sha}.tar.gz"
           checksum_path = repo_root / "dist" / f"personal-codex-{sha}.sha256"
-          module.verify_checksum(archive_path, checksum_path)
-          release_root = module.safe_extract_archive(archive_path, repo_root / "dist" / "extract")
+          release_root, _release_expectation = module.verify_and_extract_archive(
+              archive_path,
+              checksum_path,
+              repo_root / "dist" / "extract",
+          )
           entries = module.validate_release_tree(release_root)
           targets = {entry.target.as_posix() for entry in entries}
           runner = release_root / "scripts" / "codex_personal_sync.py"
