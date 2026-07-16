@@ -1769,26 +1769,26 @@ class CurrentPointerSafetyTests(unittest.TestCase):
         current = home / "personal-sync" / "current"
         current.symlink_to(Path("releases") / SHA_A, target_is_directory=True)
 
-        real_stat = MODULE.os.stat
+        real_validate_release_sha = MODULE._validate_release_sha
         changed = False
 
-        def stat_and_change(path, *args, **kwargs):
+        def validate_and_change(raw, field_name="release SHA"):
             nonlocal changed
-            metadata = real_stat(path, *args, **kwargs)
-            if (
-                path == current.name
-                and kwargs.get("dir_fd") is not None
-                and not changed
-            ):
+            sha = real_validate_release_sha(raw, field_name)
+            if not changed:
                 changed = True
                 current.unlink()
                 current.symlink_to(
                     Path("releases") / SHA_B,
                     target_is_directory=True,
                 )
-            return metadata
+            return sha
 
-        with mock.patch.object(MODULE.os, "stat", side_effect=stat_and_change):
+        with mock.patch.object(
+            MODULE,
+            "_validate_release_sha",
+            side_effect=validate_and_change,
+        ):
             with self.assertRaisesRegex(
                 MODULE.SyncError,
                 "changed during validation",
