@@ -14608,7 +14608,8 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> None:
         if record.owner != owner:
             continue
         target = home / Path(*record.target.parts)
-        if not target.is_symlink() or os.readlink(target) != record.link_target:
+        actual_target = _read_optional_symlink_target_beneath(home, target)
+        if actual_target != record.link_target:
             state_issues.append(f"link mismatch: {target}")
     if state_issues:
         print(f"managed link state drift: {len(state_issues)} issue(s)")

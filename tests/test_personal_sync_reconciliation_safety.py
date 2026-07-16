@@ -3180,6 +3180,86 @@ class ManagedStateReadSafetyTests(unittest.TestCase):
         read_file.assert_not_called()
 
 
+class StatusManagedStateSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.home = self.root / "home"
+        self.release_root = self.root / "release"
+        write_skill_release(self.release_root)
+        install_quietly(self.release_root, self.home, SHA_A)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_rejects_managed_link_parent_swap(self) -> None:
+        target = self.home / "skills" / "example"
+        target_parent = target.parent
+        bound_parent = self.home / "skills-bound"
+        redirected_parent = self.root / "redirected-skills"
+        link_target = os.readlink(target)
+        real_load_state = MODULE._load_managed_state
+        real_is_symlink = Path.is_symlink
+        real_stat = MODULE.os.stat
+        armed = False
+        swapped = False
+
+        def swap_parent() -> None:
+            nonlocal swapped
+            swapped = True
+            target_parent.rename(bound_parent)
+            redirected_parent.mkdir()
+            (redirected_parent / target.name).symlink_to(
+                link_target,
+                target_is_directory=True,
+            )
+            target_parent.symlink_to(redirected_parent, target_is_directory=True)
+
+        def load_state_and_arm(path: Path):
+            nonlocal armed
+            state = real_load_state(path)
+            armed = True
+            return state
+
+        def is_symlink_then_swap(path: Path) -> bool:
+            result = real_is_symlink(path)
+            if armed and not swapped and path == target:
+                swap_parent()
+            return result
+
+        def stat_then_swap(path, *args, **kwargs):
+            if (
+                armed
+                and not swapped
+                and path == target.name
+                and kwargs.get("dir_fd") is not None
+                and kwargs.get("follow_symlinks") is False
+            ):
+                swap_parent()
+            return real_stat(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(MODULE, "plan_link_actions", return_value=[]),
+            mock.patch.object(
+                MODULE,
+                "plan_stale_current_link_removals",
+                return_value=[],
+            ),
+            mock.patch.object(
+                MODULE,
+                "_load_managed_state",
+                side_effect=load_state_and_arm,
+            ),
+            mock.patch.object(Path, "is_symlink", new=is_symlink_then_swap),
+            mock.patch.object(MODULE.os, "stat", side_effect=stat_then_swap),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(MODULE.SyncError, "managed target parent changed"),
+        ):
+            MODULE.status(self.home)
+
+        self.assertTrue(swapped)
+
+
 class ManagedStateTransactionSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
