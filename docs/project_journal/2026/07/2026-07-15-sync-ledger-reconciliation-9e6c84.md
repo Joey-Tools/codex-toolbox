@@ -3,7 +3,7 @@ id: 20260715-9e6c84
 title: Sync Ledger Reconciliation
 status: completed
 created: 2026-07-15
-updated: 2026-07-16
+updated: 2026-07-17
 branch: codex/sync-ledger-reconciliation
 pr:
 supersedes: []
@@ -91,7 +91,7 @@ superseded_by:
 - Add a combined public/private manifest capacity gate when the private release job has both exact manifests; the installer already performs this aggregate preflight and fails safely, while repository CI currently proves capacity one owner at a time.
 
 ## Evidence
-- Repository test command — 587 tests passed with system Python 3.9.6.
+- Repository test command — 583 tests passed with system Python 3.9.6 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
 - Reconciliation safety module — 252 tests passed.
 - Runtime module — 153 tests passed.
 - Package builder safety module — 55 tests passed.
