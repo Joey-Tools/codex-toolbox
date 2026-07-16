@@ -13875,7 +13875,7 @@ def _run_gh_json(args: list[str]) -> Any:
             completed.stdout,
             parse_int=_bounded_json_integer,
         )
-    except json.JSONDecodeError as error:
+    except (ValueError, RecursionError) as error:
         raise SyncError(f"gh returned invalid JSON: {error}") from error
 
 
@@ -13883,7 +13883,7 @@ def _run_gh_json_stream(args: list[str]) -> list[Any]:
     completed = _run_gh_process(args)
     if completed.returncode != 0:
         raise SyncError(completed.stderr.strip() or "gh command failed")
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(parse_int=_bounded_json_integer)
     values: list[Any] = []
     text = completed.stdout
     index = 0
@@ -13894,7 +13894,7 @@ def _run_gh_json_stream(args: list[str]) -> list[Any]:
             break
         try:
             value, index = decoder.raw_decode(text, index)
-        except json.JSONDecodeError as error:
+        except (ValueError, RecursionError) as error:
             raise SyncError(f"gh returned invalid paginated JSON: {error}") from error
         values.append(value)
     return values

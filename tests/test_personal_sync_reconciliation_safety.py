@@ -773,6 +773,65 @@ class ArchiveErrorNormalizationSafetyTests(unittest.TestCase):
             MODULE._scan_archive_snapshot(io.BytesIO(truncated))
 
 
+class GitHubJsonErrorNormalizationSafetyTests(unittest.TestCase):
+    @staticmethod
+    def _completed(stdout: str):
+        return MODULE.subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=stdout,
+            stderr="",
+        )
+
+    def test_run_gh_json_normalizes_oversized_integer(self) -> None:
+        completed = self._completed('{"id":' + "9" * 5000 + "}")
+
+        with mock.patch.object(MODULE, "_run_gh_process", return_value=completed):
+            with self.assertRaisesRegex(MODULE.SyncError, "gh returned invalid JSON"):
+                MODULE._run_gh_json(["api", "repos/owner/repo/releases"])
+
+    def test_run_gh_json_normalizes_deep_nesting(self) -> None:
+        completed = self._completed("[]")
+
+        with (
+            mock.patch.object(MODULE, "_run_gh_process", return_value=completed),
+            mock.patch.object(
+                MODULE.json,
+                "loads",
+                side_effect=RecursionError("maximum JSON depth exceeded"),
+            ),
+        ):
+            with self.assertRaisesRegex(MODULE.SyncError, "gh returned invalid JSON"):
+                MODULE._run_gh_json(["api", "repos/owner/repo/releases"])
+
+    def test_run_gh_json_stream_normalizes_oversized_integer(self) -> None:
+        completed = self._completed('[{"id":' + "9" * 5000 + "}]")
+
+        with mock.patch.object(MODULE, "_run_gh_process", return_value=completed):
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "gh returned invalid paginated JSON",
+            ):
+                MODULE._run_gh_json_stream(["api", "repos/owner/repo/releases"])
+
+    def test_run_gh_json_stream_normalizes_deep_nesting(self) -> None:
+        completed = self._completed("[]")
+        decoder = mock.Mock()
+        decoder.raw_decode.side_effect = RecursionError(
+            "maximum JSON depth exceeded"
+        )
+
+        with (
+            mock.patch.object(MODULE, "_run_gh_process", return_value=completed),
+            mock.patch.object(MODULE.json, "JSONDecoder", return_value=decoder),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "gh returned invalid paginated JSON",
+            ):
+                MODULE._run_gh_json_stream(["api", "repos/owner/repo/releases"])
+
+
 class PendingTransactionCapacitySafetyTests(unittest.TestCase):
     def test_same_release_reserves_current_action_before_release_staging(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
