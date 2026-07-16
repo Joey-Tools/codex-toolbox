@@ -2010,6 +2010,7 @@ class AtomicMoveSafetyTests(unittest.TestCase):
             home = Path(temp_dir) / "home"
             target = home / "skills" / "moving"
             target.parent.mkdir(parents=True)
+            displaced = target.with_name("moving-before-race")
             real_bound_directory_matches = MODULE._bound_directory_matches
             real_rename_noreplace = MODULE._rename_noreplace_at
             target_parent_checks = 0
@@ -2036,7 +2037,12 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 nonlocal raced, racer_identity
                 if source_name == target.name and not raced:
                     raced = True
-                    os.unlink(source_name, dir_fd=source_parent_fd)
+                    os.rename(
+                        source_name,
+                        displaced.name,
+                        src_dir_fd=source_parent_fd,
+                        dst_dir_fd=source_parent_fd,
+                    )
                     os.symlink(
                         "created-source",
                         source_name,
@@ -2097,6 +2103,7 @@ class AtomicMoveSafetyTests(unittest.TestCase):
             target = home / "skills" / "moving"
             target.parent.mkdir(parents=True)
             target.symlink_to("expected-source")
+            displaced = target.with_name("moving-before-race")
             real_rename_noreplace = MODULE._rename_noreplace_at
             raced = False
             racer_identity: tuple[int, int] | None = None
@@ -2110,7 +2117,12 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 nonlocal raced, racer_identity
                 if source_name == target.name and not raced:
                     raced = True
-                    os.unlink(source_name, dir_fd=source_parent_fd)
+                    os.rename(
+                        source_name,
+                        displaced.name,
+                        src_dir_fd=source_parent_fd,
+                        dst_dir_fd=source_parent_fd,
+                    )
                     os.symlink(
                         "expected-source",
                         source_name,
@@ -2317,6 +2329,7 @@ class ReconcileTransactionSafetyTests(unittest.TestCase):
         target = self.home / "skills" / "old"
         target.parent.mkdir(parents=True)
         target.symlink_to("old-source")
+        displaced = target.with_name("old-before-race")
         action = planned_reconcile_action(
             self.home,
             "remove",
@@ -2336,7 +2349,12 @@ class ReconcileTransactionSafetyTests(unittest.TestCase):
         ) -> None:
             nonlocal racer_identity
             if source_name == target.name and racer_identity is None:
-                os.unlink(source_name, dir_fd=source_parent_fd)
+                os.rename(
+                    source_name,
+                    displaced.name,
+                    src_dir_fd=source_parent_fd,
+                    dst_dir_fd=source_parent_fd,
+                )
                 os.symlink("old-source", source_name, dir_fd=source_parent_fd)
                 metadata = os.stat(
                     source_name,
@@ -2487,6 +2505,7 @@ class ReconcileTransactionSafetyTests(unittest.TestCase):
         current = sync_root / "current"
         old_target = f"releases/{SHA_A}"
         current.symlink_to(old_target, target_is_directory=True)
+        displaced = sync_root / "current-before-race"
         real_move = MODULE._atomic_move_beneath_home
         racer_identity: tuple[int, int] | None = None
 
@@ -2499,7 +2518,7 @@ class ReconcileTransactionSafetyTests(unittest.TestCase):
         ) -> None:
             nonlocal racer_identity
             if source == current and racer_identity is None:
-                current.unlink()
+                current.rename(displaced)
                 current.symlink_to(old_target, target_is_directory=True)
                 racer_identity = (current.lstat().st_dev, current.lstat().st_ino)
             real_move(
@@ -3240,7 +3259,12 @@ class ManagedStateTransactionSafetyTests(unittest.TestCase):
                 and ".publish." in source_name
                 and racer_identity is None
             ):
-                os.unlink(source_name, dir_fd=source_parent_fd)
+                os.rename(
+                    source_name,
+                    f"{source_name}.before-race",
+                    src_dir_fd=source_parent_fd,
+                    dst_dir_fd=source_parent_fd,
+                )
                 file_fd = os.open(
                     source_name,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL,
@@ -3479,7 +3503,12 @@ class ManagedStateTransactionSafetyTests(unittest.TestCase):
                 and destination_name.startswith("rollback-current-")
                 and racer_identity is None
             ):
-                os.unlink(source_name, dir_fd=source_parent_fd)
+                os.rename(
+                    source_name,
+                    f"{source_name}.before-race",
+                    src_dir_fd=source_parent_fd,
+                    dst_dir_fd=source_parent_fd,
+                )
                 file_fd = os.open(
                     source_name,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL,
