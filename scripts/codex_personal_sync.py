@@ -1400,6 +1400,7 @@ def _verified_archive_snapshot(archive_path: Path, checksum_path: Path) -> Any:
 
 
 def verify_checksum(archive_path: Path, checksum_path: Path) -> None:
+    """Verify one captured snapshot; use verify_and_extract_archive to extract it."""
     snapshot = _verified_archive_snapshot(archive_path, checksum_path)
     snapshot.close()
 
