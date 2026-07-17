@@ -305,6 +305,108 @@ class ManifestSchemaSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.SyncError, "must not exceed 255"):
                 MODULE.load_manifest_data(link_owner_release_root)
 
+    def test_runtime_enforces_active_managed_link_target_byte_limit(self) -> None:
+        owner = "o" * MODULE.MAX_OWNER_COMPONENT_BYTES
+        target = "/".join(["t"] * MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)
+        removed_target = "/".join(
+            ["r"] * MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH
+        )
+        source_at_limit = "/".join(["s" * 181, "s" * 181, "s" * 183])
+        source_over_limit = "/".join(["s" * 181, "s" * 181, "s" * 184])
+        unicode_source_at_limit = "/".join(
+            ["é" * 127, "é" * 127, "é" * 18 + "s"]
+        )
+        unicode_source_over_limit = "/".join(
+            ["é" * 127, "é" * 127, "é" * 18 + "ss"]
+        )
+        self.assertEqual(
+            len(
+                MODULE._relative_managed_link_target(
+                    PurePosixPath(source_at_limit),
+                    PurePosixPath(target),
+                    owner,
+                ).encode("utf-8")
+            ),
+            MODULE.MAX_MANAGED_LINK_TARGET_BYTES,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            release_root = Path(temp_dir) / "release"
+            for source in (
+                source_at_limit,
+                source_over_limit,
+                unicode_source_at_limit,
+                unicode_source_over_limit,
+            ):
+                (release_root / source).mkdir(parents=True)
+            manifest_path = release_root / MODULE.MANIFEST_RELATIVE_PATH
+            manifest_path.parent.mkdir(parents=True)
+            payload = {
+                "version": 1,
+                "owner": owner,
+                "links": [
+                    {
+                        "source": source_at_limit,
+                        "target": target,
+                        "kind": "directory",
+                        "owner": owner,
+                    }
+                ],
+                "removed_links": [
+                    {
+                        "id": "legacy-long-target",
+                        "source": source_over_limit,
+                        "target": removed_target,
+                        "kind": "directory",
+                    }
+                ],
+            }
+            manifest_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+            manifest = MODULE.load_manifest_data(release_root)
+            self.assertEqual(len(manifest.removed_links), 1)
+            self.assertEqual(
+                len(
+                    MODULE._desired_link_target(
+                        Path(temp_dir) / "home",
+                        manifest.entries[0],
+                    ).encode("utf-8")
+                ),
+                MODULE.MAX_MANAGED_LINK_TARGET_BYTES,
+            )
+
+            payload["links"][0]["source"] = source_over_limit
+            manifest_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "managed symlink target exceeds 1023 UTF-8 bytes",
+            ):
+                MODULE.load_manifest_data(release_root)
+
+            payload["links"][0]["source"] = unicode_source_at_limit
+            manifest_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            unicode_manifest = MODULE.load_manifest_data(release_root)
+            unicode_link_target = MODULE._desired_link_target(
+                Path(temp_dir) / "home",
+                unicode_manifest.entries[0],
+            )
+            self.assertLess(
+                len(unicode_link_target),
+                MODULE.MAX_MANAGED_LINK_TARGET_BYTES,
+            )
+            self.assertEqual(
+                len(unicode_link_target.encode("utf-8")),
+                MODULE.MAX_MANAGED_LINK_TARGET_BYTES,
+            )
+
+            payload["links"][0]["source"] = unicode_source_over_limit
+            manifest_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "managed symlink target exceeds 1023 UTF-8 bytes",
+            ):
+                MODULE.load_manifest_data(release_root)
+
     def test_runtime_rejects_explicit_null_manifest_and_link_owners(self) -> None:
         for field in ("manifest", "link"):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temp_dir:
@@ -3307,6 +3409,50 @@ class StatusManagedStateSafetyTests(unittest.TestCase):
         self.assertEqual(set(scanned_releases), {SHA_A, SHA_B})
         self.assertEqual(scanned_releases.count(SHA_A), 2)
         self.assertEqual(scanned_releases.count(SHA_B), 2)
+
+    def test_bootstrap_hashes_each_release_once_per_refresh_operation(self) -> None:
+        historical_source = self.root / "historical-release"
+        write_skill_release(historical_source)
+        historical_release = (
+            MODULE._releases_root(self.home, MODULE.PUBLIC_OWNER) / SHA_B
+        )
+        shutil.copytree(historical_source, historical_release)
+        real_snapshot = MODULE._release_tree_snapshot_from_directory_fd
+        scanned_releases: list[str] = []
+
+        def count_release_snapshot(
+            root_fd: int,
+            display_root: Path,
+            *,
+            require_sanitized_modes: bool,
+        ):
+            scanned_releases.append(display_root.name)
+            return real_snapshot(
+                root_fd,
+                display_root,
+                require_sanitized_modes=require_sanitized_modes,
+            )
+
+        refreshed_states: list[MODULE.ManagedState] = []
+        with mock.patch.object(
+            MODULE,
+            "_release_tree_snapshot_from_directory_fd",
+            side_effect=count_release_snapshot,
+        ):
+            for _ in range(2):
+                refreshed_states.append(
+                    MODULE._refresh_managed_state_from_current(
+                        self.home,
+                        MODULE.ManagedState(owners={}, links={}),
+                        bootstrap_history=True,
+                    )
+                )
+
+        self.assertEqual(set(scanned_releases), {SHA_A, SHA_B})
+        self.assertEqual(scanned_releases.count(SHA_A), 2)
+        self.assertEqual(scanned_releases.count(SHA_B), 2)
+        for state in refreshed_states:
+            self.assertIn(PurePosixPath("skills/example"), state.links)
 
     def test_rejects_managed_link_parent_swap(self) -> None:
         target = self.home / "skills" / "example"

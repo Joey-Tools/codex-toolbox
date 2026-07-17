@@ -12,6 +12,7 @@ from itertools import chain
 import json
 import os
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import selectors
 import stat
@@ -26,6 +27,7 @@ from urllib.request import Request, urlopen
 
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 MAX_OWNER_COMPONENT_BYTES = 255
+MAX_MANAGED_LINK_TARGET_BYTES = 1023
 KINDS = {"file", "directory", "skill"}
 PUBLIC_OWNER = "public"
 REMOVED_LINK_FIELDS = frozenset(
@@ -373,6 +375,35 @@ def _owner_id(raw: object, field: str) -> str:
     return raw
 
 
+def _relative_managed_link_target(
+    source: str,
+    target: str,
+    owner: str,
+) -> str:
+    current = PurePosixPath("personal-sync")
+    if owner != PUBLIC_OWNER:
+        current = current / "overlays" / owner
+    current = current / "current"
+    return posixpath.relpath(
+        (current / PurePosixPath(source)).as_posix(),
+        start=PurePosixPath(target).parent.as_posix(),
+    )
+
+
+def _validate_active_managed_link_target(
+    source: str,
+    target: str,
+    owner: str,
+    field: str,
+) -> None:
+    link_target = _relative_managed_link_target(source, target, owner)
+    if len(link_target.encode("utf-8")) > MAX_MANAGED_LINK_TARGET_BYTES:
+        raise ValidationError(
+            f"{field} managed symlink target exceeds "
+            f"{MAX_MANAGED_LINK_TARGET_BYTES} UTF-8 bytes"
+        )
+
+
 def _removed_link_key(raw: object, field: str) -> str:
     if not isinstance(raw, str):
         raise ValidationError(f"{field} must use owner:id keys")
@@ -607,6 +638,12 @@ def _manifest_model(
             raise ValidationError(
                 "public manifest links must not declare override=true"
             )
+        _validate_active_managed_link_target(
+            source,
+            target,
+            link_owner,
+            f"manifest link {source}",
+        )
         if path_kind is not None:
             source_type = path_kind(source)
             if kind == "file":

@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import plistlib
+import posixpath
 import re
 import stat
 import subprocess
@@ -48,6 +49,7 @@ MAX_MANIFEST_TARGET_PATH_BYTES = 4096
 MAX_MANIFEST_TARGET_COMPONENT_BYTES = 255
 MAX_MANIFEST_TARGET_PATH_DEPTH = 64
 MAX_OWNER_COMPONENT_BYTES = 255
+MAX_MANAGED_LINK_TARGET_BYTES = 1023
 STATE_RELATIVE_PATH = Path("state/managed-links.json")
 MAX_MANAGED_STATE_BYTES = 16 * 1024 * 1024
 QUARANTINE_RELATIVE_PATH = Path("quarantine")
@@ -585,6 +587,35 @@ def _validate_explicit_owner(raw: object, field_name: str = "owner") -> str:
     return _validate_owner(raw, field_name)
 
 
+def _relative_managed_link_target(
+    source: PurePosixPath,
+    target: PurePosixPath,
+    owner: str,
+) -> str:
+    current = PurePosixPath("personal-sync")
+    if owner != PUBLIC_OWNER:
+        current = current / "overlays" / owner
+    current = current / "current"
+    return posixpath.relpath(
+        (current / source).as_posix(),
+        start=target.parent.as_posix(),
+    )
+
+
+def _validate_active_managed_link_target(
+    source: PurePosixPath,
+    target: PurePosixPath,
+    owner: str,
+    field_name: str,
+) -> None:
+    link_target = _relative_managed_link_target(source, target, owner)
+    if len(link_target.encode("utf-8")) > MAX_MANAGED_LINK_TARGET_BYTES:
+        raise SyncError(
+            f"{field_name} managed symlink target exceeds "
+            f"{MAX_MANAGED_LINK_TARGET_BYTES} UTF-8 bytes"
+        )
+
+
 def _validate_release_sha(raw: object, field_name: str = "release SHA") -> str:
     if not isinstance(raw, str) or RELEASE_DIR_RE.fullmatch(raw) is None:
         raise SyncError(
@@ -912,6 +943,12 @@ def _parse_manifest_data(
             raise SyncError(f"manifest link {source} override must be boolean")
         if owner == PUBLIC_OWNER and override:
             raise SyncError("public manifest links must not declare override=true")
+        _validate_active_managed_link_target(
+            source,
+            target,
+            owner,
+            f"manifest link {source}",
+        )
         if target in targets:
             raise SyncError(f"duplicate manifest target: {target}")
         targets.add(target)
@@ -4725,6 +4762,7 @@ def _refresh_managed_state_from_current(
     *,
     bootstrap_history: bool,
 ) -> ManagedState:
+    manifest_cache: dict[tuple[str, str], ManifestData | None] = {}
     refreshed = ManagedState(
         owners=dict(state.owners),
         links=dict(state.links),
@@ -4734,7 +4772,11 @@ def _refresh_managed_state_from_current(
         sha = _current_sha(home, owner)
         if sha is None:
             continue
-        manifest = _current_manifest_data(home, owner)
+        manifest = _current_manifest_data(
+            home,
+            owner,
+            manifest_cache=manifest_cache,
+        )
         refreshed.owners[owner] = sha
         for entry in manifest.entries:
             if (
@@ -4763,9 +4805,18 @@ def _refresh_managed_state_from_current(
                 allow_missing=True,
             ):
                 continue
-            for release_root in _valid_release_dirs(home, owner):
+            for release_root in _valid_release_dirs(
+                home,
+                owner,
+                manifest_cache=manifest_cache,
+            ):
                 sha = release_root.name
-                manifest = _load_installed_manifest_data(home, owner, sha)
+                manifest = _load_installed_manifest_data(
+                    home,
+                    owner,
+                    sha,
+                    manifest_cache=manifest_cache,
+                )
                 if manifest.owner != owner:
                     continue
                 for entry in manifest.entries:
@@ -4979,14 +5030,13 @@ def _entry_target_path(home: Path, entry: LinkEntry) -> Path:
     return home / Path(*entry.target.parts)
 
 
-def _entry_current_source(home: Path, entry: LinkEntry) -> Path:
-    return _current_link(home, entry.owner) / Path(*entry.source.parts)
-
-
 def _desired_link_target(home: Path, entry: LinkEntry) -> str:
-    target_path = _entry_target_path(home, entry)
-    source_path = _entry_current_source(home, entry)
-    return os.path.relpath(source_path, start=target_path.parent)
+    del home
+    return _relative_managed_link_target(
+        entry.source,
+        entry.target,
+        entry.owner,
+    )
 
 
 def _path_exists_or_is_link(path: Path) -> bool:
@@ -14725,7 +14775,12 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> None:
         print("managed link state: ok")
 
 
-def _valid_release_dirs(home: Path, owner: str) -> list[Path]:
+def _valid_release_dirs(
+    home: Path,
+    owner: str,
+    *,
+    manifest_cache: dict[tuple[str, str], ManifestData | None] | None = None,
+) -> list[Path]:
     releases_root = _releases_root(home, owner)
     releases: list[Path] = []
     releases_fd = _open_directory_beneath(home, releases_root)
@@ -14739,7 +14794,12 @@ def _valid_release_dirs(home: Path, owner: str) -> list[Path]:
             if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
                 raise SyncError(f"refusing unsafe release directory: {path}")
             try:
-                _load_installed_manifest_data(home, owner, name)
+                _load_installed_manifest_data(
+                    home,
+                    owner,
+                    name,
+                    manifest_cache=manifest_cache,
+                )
             except SyncError:
                 continue
             releases.append(path)

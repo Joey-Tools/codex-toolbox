@@ -957,6 +957,83 @@ class SyncManifestChangeTests(unittest.TestCase):
             ):
                 MODULE._manifest_model(current)
 
+    def test_manifest_enforces_active_managed_link_target_byte_limit(self) -> None:
+        owner = "o" * MODULE.MAX_OWNER_COMPONENT_BYTES
+        target = "/".join(["t"] * MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)
+        removed_target = "/".join(
+            ["r"] * MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH
+        )
+        source_at_limit = "/".join(["s" * 181, "s" * 181, "s" * 183])
+        source_over_limit = "/".join(["s" * 181, "s" * 181, "s" * 184])
+        unicode_source_at_limit = "/".join(
+            ["é" * 127, "é" * 127, "é" * 18 + "s"]
+        )
+        unicode_source_over_limit = "/".join(
+            ["é" * 127, "é" * 127, "é" * 18 + "ss"]
+        )
+        payload: dict[str, object] = {
+            "version": 1,
+            "owner": owner,
+            "links": [
+                {
+                    "source": source_at_limit,
+                    "target": target,
+                    "kind": "directory",
+                }
+            ],
+            "removed_links": [
+                {
+                    "id": "legacy-long-target",
+                    "source": source_over_limit,
+                    "target": removed_target,
+                    "kind": "directory",
+                }
+            ],
+        }
+
+        self.assertEqual(
+            len(
+                MODULE._relative_managed_link_target(
+                    source_at_limit,
+                    target,
+                    owner,
+                ).encode("utf-8")
+            ),
+            MODULE.MAX_MANAGED_LINK_TARGET_BYTES,
+        )
+        model = MODULE._manifest_model(payload)
+        self.assertIn("legacy-long-target", model["removed"])
+
+        payload["links"][0]["source"] = source_over_limit  # type: ignore[index]
+        with self.assertRaisesRegex(
+            MODULE.ValidationError,
+            "managed symlink target exceeds 1023 UTF-8 bytes",
+        ):
+            MODULE._manifest_model(payload)
+
+        payload["links"][0]["source"] = unicode_source_at_limit  # type: ignore[index]
+        unicode_link_target = MODULE._relative_managed_link_target(
+            unicode_source_at_limit,
+            target,
+            owner,
+        )
+        self.assertLess(
+            len(unicode_link_target),
+            MODULE.MAX_MANAGED_LINK_TARGET_BYTES,
+        )
+        self.assertEqual(
+            len(unicode_link_target.encode("utf-8")),
+            MODULE.MAX_MANAGED_LINK_TARGET_BYTES,
+        )
+        MODULE._manifest_model(payload)
+
+        payload["links"][0]["source"] = unicode_source_over_limit  # type: ignore[index]
+        with self.assertRaisesRegex(
+            MODULE.ValidationError,
+            "managed symlink target exceeds 1023 UTF-8 bytes",
+        ):
+            MODULE._manifest_model(payload)
+
     def test_override_policy_does_not_change_removal_identity(self) -> None:
         previous = manifest("keep")
         previous["owner"] = "private"

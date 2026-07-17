@@ -3,7 +3,7 @@ from __future__ import annotations
 import gzip
 import importlib.util
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 import tarfile
@@ -500,6 +500,88 @@ class PackageBuilderSafetyTests(unittest.TestCase):
             with self.subTest(name=name):
                 with self.assertRaisesRegex(BUILDER.PackageError, message):
                     BUILDER._manifest_sources(payload)
+
+    def test_manifest_enforces_active_managed_link_target_byte_limit(self) -> None:
+        owner = "o" * BUILDER.MAX_OWNER_COMPONENT_BYTES
+        target = "/".join(["t"] * BUILDER.MAX_MANIFEST_TARGET_PATH_DEPTH)
+        removed_target = "/".join(
+            ["r"] * BUILDER.MAX_MANIFEST_TARGET_PATH_DEPTH
+        )
+        source_at_limit = "/".join(["s" * 181, "s" * 181, "s" * 183])
+        source_over_limit = "/".join(["s" * 181, "s" * 181, "s" * 184])
+        unicode_source_at_limit = "/".join(
+            ["é" * 127, "é" * 127, "é" * 18 + "s"]
+        )
+        unicode_source_over_limit = "/".join(
+            ["é" * 127, "é" * 127, "é" * 18 + "ss"]
+        )
+        payload: dict[str, object] = {
+            "version": 1,
+            "owner": owner,
+            "links": [
+                {
+                    "source": source_at_limit,
+                    "target": target,
+                    "kind": "directory",
+                }
+            ],
+            "removed_links": [
+                {
+                    "id": "legacy-long-target",
+                    "source": source_over_limit,
+                    "target": removed_target,
+                    "kind": "directory",
+                }
+            ],
+        }
+
+        self.assertEqual(
+            len(
+                BUILDER._relative_managed_link_target(
+                    PurePosixPath(source_at_limit),
+                    PurePosixPath(target),
+                    owner,
+                ).encode("utf-8")
+            ),
+            BUILDER.MAX_MANAGED_LINK_TARGET_BYTES,
+        )
+        self.assertEqual(
+            BUILDER._manifest_sources(payload),
+            [Path(source_at_limit)],
+        )
+
+        payload["links"][0]["source"] = source_over_limit  # type: ignore[index]
+        with self.assertRaisesRegex(
+            BUILDER.PackageError,
+            "managed symlink target exceeds 1023 UTF-8 bytes",
+        ):
+            BUILDER._manifest_sources(payload)
+
+        payload["links"][0]["source"] = unicode_source_at_limit  # type: ignore[index]
+        unicode_link_target = BUILDER._relative_managed_link_target(
+            PurePosixPath(unicode_source_at_limit),
+            PurePosixPath(target),
+            owner,
+        )
+        self.assertLess(
+            len(unicode_link_target),
+            BUILDER.MAX_MANAGED_LINK_TARGET_BYTES,
+        )
+        self.assertEqual(
+            len(unicode_link_target.encode("utf-8")),
+            BUILDER.MAX_MANAGED_LINK_TARGET_BYTES,
+        )
+        self.assertEqual(
+            BUILDER._manifest_sources(payload),
+            [Path(unicode_source_at_limit)],
+        )
+
+        payload["links"][0]["source"] = unicode_source_over_limit  # type: ignore[index]
+        with self.assertRaisesRegex(
+            BUILDER.PackageError,
+            "managed symlink target exceeds 1023 UTF-8 bytes",
+        ):
+            BUILDER._manifest_sources(payload)
 
     def test_manifest_active_link_limit_reserves_current_transaction_record(
         self,

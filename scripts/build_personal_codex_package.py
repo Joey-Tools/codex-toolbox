@@ -13,6 +13,7 @@ from itertools import chain
 import json
 import os
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import selectors
 import shutil
@@ -46,6 +47,7 @@ MAX_MANIFEST_TARGET_PATH_BYTES = 4096
 MAX_MANIFEST_TARGET_COMPONENT_BYTES = 255
 MAX_MANIFEST_TARGET_PATH_DEPTH = 64
 MAX_OWNER_COMPONENT_BYTES = 255
+MAX_MANAGED_LINK_TARGET_BYTES = 1023
 MAX_PENDING_LINK_RECORDS = 10_000
 MAX_PENDING_LINK_CLAIMS = 20_000
 # A first-install transaction also records and claims the owner's current link.
@@ -410,6 +412,35 @@ def _validate_manifest_owner(raw: object, field: str = "owner") -> str:
     return raw
 
 
+def _relative_managed_link_target(
+    source: PurePosixPath,
+    target: PurePosixPath,
+    owner: str,
+) -> str:
+    current = PurePosixPath("personal-sync")
+    if owner != PUBLIC_OWNER:
+        current = current / "overlays" / owner
+    current = current / "current"
+    return posixpath.relpath(
+        (current / source).as_posix(),
+        start=target.parent.as_posix(),
+    )
+
+
+def _validate_active_managed_link_target(
+    source: PurePosixPath,
+    target: PurePosixPath,
+    owner: str,
+    field: str,
+) -> None:
+    link_target = _relative_managed_link_target(source, target, owner)
+    if len(link_target.encode("utf-8")) > MAX_MANAGED_LINK_TARGET_BYTES:
+        raise PackageError(
+            f"{field} managed symlink target exceeds "
+            f"{MAX_MANAGED_LINK_TARGET_BYTES} UTF-8 bytes"
+        )
+
+
 def _validate_removed_link_key(raw: object, field: str) -> str:
     if not isinstance(raw, str):
         raise PackageError(f"{field} must be an owner:id string")
@@ -563,6 +594,12 @@ def _manifest_sources(manifest: dict[str, Any]) -> list[Path]:
                     raise PackageError(
                         "public manifest links must not declare override=true"
                     )
+                _validate_active_managed_link_target(
+                    source_path,
+                    target,
+                    owner,
+                    f"manifest link {source_path}",
+                )
             sources.append(Path(*source_path.parts))
 
     removed_links = manifest.get("removed_links", [])
