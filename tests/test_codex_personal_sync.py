@@ -328,6 +328,15 @@ class PersonalGuidelinesContentTests(unittest.TestCase):
         self.assertIn("backstops, not execution-time bounds", agents)
         self.assertNotIn("$bounded-command-output", agents)
 
+    def test_agents_guidance_documents_wait_agent_timeout_contract(self) -> None:
+        agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
+
+        self.assertIn("polling with `wait_agent`", agents)
+        self.assertIn("omit `timeout_ms` to use the `30000` millisecond default", agents)
+        self.assertIn("supported `10000`–`3600000` millisecond range", agents)
+        self.assertIn("`30000`–`60000` for ordinary or reviewer polling", agents)
+        self.assertIn("longer single waits are valid", agents)
+
 
 class CodexPersonalSyncTests(unittest.TestCase):
     def setUp(self) -> None:

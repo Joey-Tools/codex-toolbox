@@ -2,3 +2,4 @@
 
 - Prefer `rg` or `rg --files` for text and file searches when available.
 - Before running a command that may produce large or unbounded output, narrow its inputs or results, or capture complete output in a task-scoped file; surface only counts, candidate filenames, decisive key lines, or a short tail. Treat display or output caps as backstops, not execution-time bounds.
+- When polling with `wait_agent`, omit `timeout_ms` to use the `30000` millisecond default or keep it within the supported `10000`–`3600000` millisecond range. Prefer `10000` when a response is imminent and `30000`–`60000` for ordinary or reviewer polling; longer single waits are valid but usually weaken user-facing progress updates.
