@@ -148,6 +148,10 @@ def _bounded_json_integer(raw_value: str) -> int:
     return int(raw_value)
 
 
+def _reject_json_constant(raw_value: str) -> NoReturn:
+    raise ValueError(f"non-standard JSON constant is not allowed: {raw_value}")
+
+
 class _ArchiveEntryExistsError(SyncError):
     pass
 
@@ -166,6 +170,12 @@ class ReleaseAssets:
     checksum_name: str
     checksum_id: int
     checksum_size: int
+
+
+@dataclass(frozen=True)
+class VerifiedReleaseManifest:
+    manifest: dict[str, Any]
+    expanded_bytes: int
 
 
 @dataclass(frozen=True)
@@ -1943,31 +1953,61 @@ class _BoundedDecompressedReader:
             )
         return payload
 
+    @property
+    def bytes_read(self) -> int:
+        return self._bytes_read
+
 
 @contextlib.contextmanager
-def _stream_archive_snapshot(snapshot: Any):
+def _stream_archive_snapshot_with_metrics(
+    snapshot: Any,
+    *,
+    maximum_expanded_bytes: int = MAX_ARCHIVE_EXPANDED_BYTES,
+):
     snapshot.seek(0)
     try:
         with gzip.GzipFile(fileobj=snapshot, mode="rb") as decompressor:
             bounded_reader = _BoundedDecompressedReader(
                 decompressor,
-                MAX_ARCHIVE_EXPANDED_BYTES,
+                maximum_expanded_bytes,
             )
             with tarfile.open(fileobj=bounded_reader, mode="r|") as archive:
-                yield archive
+                yield archive, bounded_reader
             while bounded_reader.read(1024 * 1024):
                 pass
     finally:
         snapshot.seek(0)
 
 
-def _scan_archive_snapshot(
+@contextlib.contextmanager
+def _stream_archive_snapshot(snapshot: Any):
+    with _stream_archive_snapshot_with_metrics(snapshot) as (archive, _reader):
+        yield archive
+
+
+def _scan_archive_snapshot_with_metrics(
     snapshot: Any,
-) -> tuple[list[tarfile.TarInfo], tuple[str, ...], tuple[str, ...]]:
+    *,
+    maximum_expanded_bytes: int = MAX_ARCHIVE_EXPANDED_BYTES,
+) -> tuple[
+    list[tarfile.TarInfo],
+    tuple[str, ...],
+    tuple[str, ...],
+    int,
+]:
     members: list[tarfile.TarInfo] = []
     expanded_bytes = 0
     try:
-        with _stream_archive_snapshot(snapshot) as archive:
+        with _stream_archive_snapshot_with_metrics(
+            snapshot,
+            maximum_expanded_bytes=min(
+                MAX_ARCHIVE_EXPANDED_BYTES,
+                maximum_expanded_bytes,
+            ),
+        ) as (
+            archive,
+            bounded_reader,
+        ):
             for member in archive:
                 if len(members) >= MAX_ARCHIVE_MEMBERS:
                     raise SyncError(
@@ -1987,12 +2027,22 @@ def _scan_archive_snapshot(
                             f"{expanded_bytes} > {MAX_ARCHIVE_EXPANDED_BYTES}"
                         )
                 members.append(member)
+        scanned_bytes = bounded_reader.bytes_read
     except (tarfile.TarError, OSError, EOFError, zlib.error) as error:
         raise SyncError(f"failed to inspect archive snapshot: {error}") from error
     if not members:
         raise SyncError("archive is empty")
     _validate_archive_member_paths(members)
     release_root_parts, manifest_parts = _archive_release_root_parts(members)
+    return members, release_root_parts, manifest_parts, scanned_bytes
+
+
+def _scan_archive_snapshot(
+    snapshot: Any,
+) -> tuple[list[tarfile.TarInfo], tuple[str, ...], tuple[str, ...]]:
+    members, release_root_parts, manifest_parts, _scanned_bytes = (
+        _scan_archive_snapshot_with_metrics(snapshot)
+    )
     return members, release_root_parts, manifest_parts
 
 
@@ -2253,6 +2303,179 @@ def verify_and_extract_archive(
         return _safe_extract_archive_snapshot(snapshot, destination)
     finally:
         snapshot.close()
+
+
+def _read_release_manifest_from_archive_snapshot(
+    snapshot: Any,
+    sha: str,
+    *,
+    maximum_expanded_bytes: int = MAX_ARCHIVE_EXPANDED_BYTES * 2,
+) -> tuple[dict[str, Any], int]:
+    if (
+        isinstance(maximum_expanded_bytes, bool)
+        or not isinstance(maximum_expanded_bytes, int)
+        or maximum_expanded_bytes < 0
+    ):
+        raise SyncError("archive expanded byte budget must be a non-negative integer")
+    (
+        planned_members,
+        release_root_parts,
+        manifest_parts,
+        first_pass_bytes,
+    ) = _scan_archive_snapshot_with_metrics(
+        snapshot,
+        maximum_expanded_bytes=min(
+            MAX_ARCHIVE_EXPANDED_BYTES,
+            maximum_expanded_bytes,
+        ),
+    )
+    expected_root_parts = (f"personal-codex-{sha}",)
+    expected_manifest_parts = (
+        *expected_root_parts,
+        *MANIFEST_RELATIVE_PATH.parts,
+    )
+    expected_manifest_path = "/".join(expected_manifest_parts)
+    if (
+        release_root_parts != expected_root_parts
+        or manifest_parts != expected_manifest_parts
+    ):
+        raise SyncError(
+            "archive must contain exactly one release manifest at "
+            f"{expected_manifest_path}"
+        )
+
+    manifest_payload: bytes | None = None
+    try:
+        remaining_expanded_bytes = maximum_expanded_bytes - first_pass_bytes
+        with _stream_archive_snapshot_with_metrics(
+            snapshot,
+            maximum_expanded_bytes=min(
+                MAX_ARCHIVE_EXPANDED_BYTES,
+                remaining_expanded_bytes,
+            ),
+        ) as (
+            archive,
+            bounded_reader,
+        ):
+            for expected_member in planned_members:
+                member = archive.next()
+                if member is None:
+                    raise SyncError(
+                        "archive snapshot ended before all planned members"
+                    )
+                _validate_tar_member(member)
+                if _archive_member_signature(member) != _archive_member_signature(
+                    expected_member
+                ):
+                    raise SyncError(
+                        "archive snapshot metadata changed between passes"
+                    )
+                member_parts = PurePosixPath(member.name).parts
+                if member_parts != expected_manifest_parts:
+                    continue
+                if manifest_payload is not None:
+                    raise SyncError(
+                        "archive contains duplicate release manifest entries"
+                    )
+                if member.size > MAX_RELEASE_MANIFEST_BYTES:
+                    raise SyncError(
+                        "archive release manifest exceeds byte limit: "
+                        f"{member.size} > {MAX_RELEASE_MANIFEST_BYTES}"
+                    )
+                source = archive.extractfile(member)
+                if source is None:
+                    raise SyncError(
+                        f"failed to read archive member: {member.name}"
+                    )
+                try:
+                    manifest_payload = source.read(member.size + 1)
+                finally:
+                    source.close()
+                if len(manifest_payload) != member.size:
+                    raise SyncError(
+                        f"archive member ended early: {member.name}"
+                    )
+            if archive.next() is not None:
+                raise SyncError("archive snapshot gained members between passes")
+        second_pass_bytes = bounded_reader.bytes_read
+    except (tarfile.TarError, OSError, EOFError, zlib.error) as error:
+        raise SyncError(f"failed to read archive release manifest: {error}") from error
+    if manifest_payload is None:
+        raise SyncError("archive release manifest disappeared between passes")
+    manifest = _decode_manifest_payload(
+        manifest_payload,
+        Path(expected_manifest_path),
+    )
+    return manifest, first_pass_bytes + second_pass_bytes
+
+
+def read_verified_release_manifest(
+    repo: str,
+    assets: ReleaseAssets,
+    *,
+    maximum_expanded_bytes: int = MAX_ARCHIVE_EXPANDED_BYTES * 2,
+) -> VerifiedReleaseManifest:
+    """Download exact assets and read the release manifest without extraction."""
+    if not isinstance(repo, str) or REPOSITORY_RE.fullmatch(repo) is None:
+        raise SyncError("release repository must be an owner/repo string")
+    if not isinstance(assets, ReleaseAssets):
+        raise SyncError("release assets must use the ReleaseAssets record")
+    if (
+        isinstance(maximum_expanded_bytes, bool)
+        or not isinstance(maximum_expanded_bytes, int)
+        or maximum_expanded_bytes < 0
+    ):
+        raise SyncError("archive expanded byte budget must be a non-negative integer")
+    normalized_assets = select_release_assets(
+        {
+            "tagName": assets.tag_name,
+            "targetCommitish": assets.sha,
+            "assets": [
+                {
+                    "id": assets.archive_id,
+                    "name": assets.archive_name,
+                    "size": assets.archive_size,
+                },
+                {
+                    "id": assets.checksum_id,
+                    "name": assets.checksum_name,
+                    "size": assets.checksum_size,
+                },
+            ],
+        }
+    )
+    if normalized_assets != assets:
+        raise SyncError("release asset metadata is internally inconsistent")
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="codex-release-manifest."
+        ) as temp_dir_raw:
+            destination = Path(temp_dir_raw)
+            download_release_assets(repo, assets, destination)
+            archive_path = destination / assets.archive_name
+            checksum_path = destination / assets.checksum_name
+            snapshot = _verified_archive_snapshot(archive_path, checksum_path)
+            try:
+                manifest, expanded_bytes = (
+                    _read_release_manifest_from_archive_snapshot(
+                        snapshot,
+                        assets.sha,
+                        maximum_expanded_bytes=maximum_expanded_bytes,
+                    )
+                )
+            finally:
+                snapshot.close()
+    except SyncError:
+        raise
+    except OSError as error:
+        raise SyncError(
+            f"failed to read verified release manifest: {error}"
+        ) from error
+    return VerifiedReleaseManifest(
+        manifest=manifest,
+        expanded_bytes=expanded_bytes,
+    )
 
 
 def find_release_root(extract_root: Path) -> Path:
@@ -12003,6 +12226,7 @@ def _decode_manifest_payload(
         data = json.loads(
             payload.decode("utf-8"),
             parse_int=_bounded_json_integer,
+            parse_constant=_reject_json_constant,
         )
     except (UnicodeDecodeError, ValueError, RecursionError) as error:
         raise SyncError(f"Invalid JSON in {manifest_path}: {error}") from error

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import importlib.util
 from io import StringIO
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -24,6 +27,18 @@ assert SPEC is not None
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+ORIGINAL_READ_VERIFIED_RELEASE_MANIFEST = MODULE._read_verified_release_manifest
+
+RUNTIME_SCRIPT_PATH = REPO_ROOT / "scripts" / "codex_personal_sync.py"
+RUNTIME_SPEC = importlib.util.spec_from_file_location(
+    "codex_personal_sync_release_manifest_baseline",
+    RUNTIME_SCRIPT_PATH,
+)
+RUNTIME = importlib.util.module_from_spec(RUNTIME_SPEC)
+assert RUNTIME_SPEC is not None
+assert RUNTIME_SPEC.loader is not None
+sys.modules[RUNTIME_SPEC.name] = RUNTIME
+RUNTIME_SPEC.loader.exec_module(RUNTIME)
 
 MANIFEST = Path(
     "personal_codex/private-sync-manifest.json"
@@ -71,7 +86,12 @@ def complete_release(
     prerelease: bool = False,
     asset_state: str = "uploaded",
     published_at: str = "2026-07-15T00:00:00Z",
+    archive_id: int | None = None,
+    checksum_id: int | None = None,
+    archive_size: int = 1,
+    checksum_size: int = 1,
 ) -> dict[str, object]:
+    asset_id_base = int(sha[:12], 16) * 2 + 1
     return {
         "tag_name": tag or f"personal-codex-20260715-000000-{sha[:7]}",
         "target_commitish": sha,
@@ -80,15 +100,231 @@ def complete_release(
         "published_at": published_at,
         "assets": [
             {
+                "id": archive_id if archive_id is not None else asset_id_base,
                 "name": f"personal-codex-{sha}.tar.gz",
+                "size": archive_size,
                 "state": asset_state,
             },
             {
+                "id": checksum_id if checksum_id is not None else asset_id_base + 1,
                 "name": f"personal-codex-{sha}.sha256",
+                "size": checksum_size,
                 "state": asset_state,
             },
         ],
     }
+
+
+class VerifiedReleaseManifestRuntimeTests(unittest.TestCase):
+    SHA = "a" * 40
+
+    @classmethod
+    def manifest_member_path(cls, *, root: str | None = None) -> str:
+        release_root = root or f"personal-codex-{cls.SHA}"
+        return f"{release_root}/personal_codex/sync-manifest.json"
+
+    @staticmethod
+    def archive_payload(entries: list[tuple[str, bytes]]) -> bytes:
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz") as archive:
+            for name, payload in entries:
+                member = tarfile.TarInfo(name)
+                member.mode = 0o644
+                member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
+        return output.getvalue()
+
+    def assets_for_payloads(
+        self,
+        archive_payload: bytes,
+        checksum_payload: bytes,
+    ) -> object:
+        return RUNTIME.ReleaseAssets(
+            tag_name=f"personal-codex-20260715-000000-{self.SHA[:7]}",
+            sha=self.SHA,
+            archive_name=f"personal-codex-{self.SHA}.tar.gz",
+            archive_id=101,
+            archive_size=len(archive_payload),
+            checksum_name=f"personal-codex-{self.SHA}.sha256",
+            checksum_id=102,
+            checksum_size=len(checksum_payload),
+        )
+
+    def checksum_payload(self, archive_payload: bytes) -> bytes:
+        digest = hashlib.sha256(archive_payload).hexdigest()
+        return (
+            f"{digest}  personal-codex-{self.SHA}.tar.gz\n".encode("ascii")
+        )
+
+    def read_with_fake_downloads(
+        self,
+        archive_payload: bytes,
+        checksum_payload: bytes,
+        *,
+        maximum_expanded_bytes: int | None = None,
+    ) -> tuple[object, list[tuple[str, int, int, int]]]:
+        assets = self.assets_for_payloads(archive_payload, checksum_payload)
+        payloads = {
+            assets.archive_name: archive_payload,
+            assets.checksum_name: checksum_payload,
+        }
+        calls: list[tuple[str, int, int, int]] = []
+
+        def fake_download(
+            _repo: str,
+            asset_name: str,
+            asset_id: int,
+            expected_size: int,
+            maximum_bytes: int,
+            destination: Path,
+        ) -> None:
+            calls.append((asset_name, asset_id, expected_size, maximum_bytes))
+            payload = payloads[asset_name]
+            self.assertEqual(len(payload), expected_size)
+            (destination / asset_name).write_bytes(payload)
+
+        with mock.patch.object(
+            RUNTIME,
+            "_download_release_asset",
+            side_effect=fake_download,
+        ):
+            kwargs = (
+                {}
+                if maximum_expanded_bytes is None
+                else {"maximum_expanded_bytes": maximum_expanded_bytes}
+            )
+            result = RUNTIME.read_verified_release_manifest(
+                "owner/repo",
+                assets,
+                **kwargs,
+            )
+        return result, calls
+
+    def test_reads_exact_manifest_with_exact_asset_ids_and_sizes(self) -> None:
+        expected_manifest = {
+            "version": 1,
+            "links": [],
+            "unknown": {"preserved": True},
+        }
+        manifest_payload = json.dumps(expected_manifest).encode("utf-8")
+        archive_payload = self.archive_payload(
+            [(self.manifest_member_path(), manifest_payload)]
+        )
+        checksum_payload = self.checksum_payload(archive_payload)
+
+        result, calls = self.read_with_fake_downloads(
+            archive_payload,
+            checksum_payload,
+        )
+
+        self.assertEqual(result.manifest, expected_manifest)
+        self.assertGreater(result.expanded_bytes, len(manifest_payload) * 2)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    f"personal-codex-{self.SHA}.tar.gz",
+                    101,
+                    len(archive_payload),
+                    RUNTIME.MAX_ARCHIVE_COMPRESSED_BYTES,
+                ),
+                (
+                    f"personal-codex-{self.SHA}.sha256",
+                    102,
+                    len(checksum_payload),
+                    RUNTIME.MAX_ARCHIVE_CHECKSUM_BYTES,
+                ),
+            ],
+        )
+
+    def test_rejects_bad_checksum(self) -> None:
+        manifest_payload = b'{"version":1,"links":[]}'
+        archive_payload = self.archive_payload(
+            [(self.manifest_member_path(), manifest_payload)]
+        )
+        checksum_payload = (
+            f"{'0' * 64}  personal-codex-{self.SHA}.tar.gz\n".encode("ascii")
+        )
+
+        with self.assertRaisesRegex(RUNTIME.SyncError, "checksum mismatch"):
+            self.read_with_fake_downloads(archive_payload, checksum_payload)
+
+    def test_rejects_wrong_duplicate_and_oversized_manifest_entries(self) -> None:
+        valid_payload = b'{"version":1,"links":[]}'
+        cases = (
+            (
+                "wrong-root",
+                [(self.manifest_member_path(root="wrong-root"), valid_payload)],
+                "exactly one release manifest",
+            ),
+            (
+                "duplicate",
+                [
+                    (self.manifest_member_path(), valid_payload),
+                    (self.manifest_member_path(), valid_payload),
+                ],
+                "duplicate archive member path",
+            ),
+            (
+                "oversized",
+                [
+                    (
+                        self.manifest_member_path(),
+                        b"x" * (RUNTIME.MAX_RELEASE_MANIFEST_BYTES + 1),
+                    )
+                ],
+                "release manifest exceeds byte limit",
+            ),
+        )
+        for name, entries, error_pattern in cases:
+            with self.subTest(name=name):
+                archive_payload = self.archive_payload(entries)
+                checksum_payload = self.checksum_payload(archive_payload)
+                with self.assertRaisesRegex(RUNTIME.SyncError, error_pattern):
+                    self.read_with_fake_downloads(
+                        archive_payload,
+                        checksum_payload,
+                    )
+
+    def test_rejects_truncated_archive_after_checksum_verification(self) -> None:
+        archive_payload = self.archive_payload(
+            [(self.manifest_member_path(), b'{"version":1,"links":[]}')]
+        )
+        truncated_payload = archive_payload[: len(archive_payload) // 2]
+        checksum_payload = self.checksum_payload(truncated_payload)
+
+        with self.assertRaisesRegex(
+            RUNTIME.SyncError,
+            "failed to inspect archive snapshot|ended before all planned members",
+        ):
+            self.read_with_fake_downloads(truncated_payload, checksum_payload)
+
+    def test_expanded_budget_is_enforced_across_both_archive_passes(self) -> None:
+        manifest_payload = b'{"version":1,"links":[]}'
+        archive_payload = self.archive_payload(
+            [(self.manifest_member_path(), manifest_payload)]
+        )
+        checksum_payload = self.checksum_payload(archive_payload)
+        initial, _calls = self.read_with_fake_downloads(
+            archive_payload,
+            checksum_payload,
+        )
+
+        exact, _calls = self.read_with_fake_downloads(
+            archive_payload,
+            checksum_payload,
+            maximum_expanded_bytes=initial.expanded_bytes,
+        )
+        self.assertEqual(exact.expanded_bytes, initial.expanded_bytes)
+        with self.assertRaisesRegex(
+            RUNTIME.SyncError,
+            "expanded byte limit",
+        ):
+            self.read_with_fake_downloads(
+                archive_payload,
+                checksum_payload,
+                maximum_expanded_bytes=initial.expanded_bytes - 1,
+            )
 
 
 class ReleaseManifestBaselineTests(unittest.TestCase):
@@ -98,6 +334,25 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
         self.repo = Path(self.temporary_directory.name) / "repo"
         self.repo.mkdir()
         self.git("init", "-q", "-b", "main")
+        archive_reader_patch = mock.patch.object(
+            MODULE,
+            "_read_verified_release_manifest",
+            side_effect=self.read_commit_manifest_as_archive,
+        )
+        self.archive_manifest_reader = archive_reader_patch.start()
+        self.addCleanup(archive_reader_patch.stop)
+
+    def read_commit_manifest_as_archive(
+        self,
+        _repository: str,
+        identity: object,
+        _maximum_expanded_bytes: int,
+    ) -> tuple[dict[str, object], int]:
+        sha = getattr(identity, "sha")
+        payload = MODULE._manifest_at_ref(self.repo, sha, MANIFEST)
+        if payload is None:
+            raise AssertionError(f"missing test manifest at {sha}")
+        return payload, 0
 
     def git(self, *args: str) -> str:
         result = subprocess.run(
@@ -266,12 +521,13 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
         sha = "a" * 40
         draft = complete_release(sha, draft=True)
         prerelease = complete_release(sha, prerelease=True)
-        mismatched_assets = complete_release(sha)
-        mismatched_assets["assets"][1]["name"] = (
-            f"personal-codex-{'c' * 40}.sha256"
-        )
-        pending_assets = complete_release(sha, asset_state="new")
-        first_page = [draft, prerelease, mismatched_assets, pending_assets] + [draft] * 96
+        unrelated = {
+            "tag_name": "v1.0.0",
+            "draft": False,
+            "prerelease": False,
+            "assets": [],
+        }
+        first_page = [draft, prerelease, unrelated] + [draft] * 97
         expected = complete_release(
             sha,
             published_at="2026-07-15T01:00:00Z",
@@ -286,8 +542,12 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
             "_request_json",
             side_effect=[first_page, [older, expected]],
         ) as request_json:
+            identities = MODULE._complete_release_identities(
+                "owner/repo",
+                "token",
+            )
             self.assertEqual(
-                MODULE._complete_release_identities("owner/repo", "token"),
+                [(identity.tag_name, identity.sha) for identity in identities],
                 [
                     (older["tag_name"], older["target_commitish"]),
                     (expected["tag_name"], sha),
@@ -298,16 +558,54 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
         self.assertIn("page=1", request_json.call_args_list[0].args[0])
         self.assertIn("page=2", request_json.call_args_list[1].args[0])
 
+    def test_published_personal_release_requires_complete_uploaded_pair(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        cases = (
+            ("missing-assets", {"assets": []}, "missing.*tarball"),
+            (
+                "pending-assets",
+                {"asset_state": "new"},
+                "missing.*tarball",
+            ),
+            (
+                "mismatched-checksum",
+                {"checksum_sha": "c" * 40},
+                "missing.*matching checksum",
+            ),
+        )
+        for name, mutation, error_pattern in cases:
+            with self.subTest(name=name):
+                release = complete_release(
+                    sha,
+                    asset_state=str(mutation.get("asset_state", "uploaded")),
+                )
+                if "assets" in mutation:
+                    release["assets"] = mutation["assets"]
+                checksum_sha = mutation.get("checksum_sha")
+                if checksum_sha is not None:
+                    release["assets"][1]["name"] = (
+                        f"personal-codex-{checksum_sha}.sha256"
+                    )
+                with self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    error_pattern,
+                ):
+                    MODULE._complete_release_identity(release)
+
     def test_complete_release_identity_uses_asset_sha_and_rejects_conflicts(
         self,
     ) -> None:
         sha = "a" * 40
         release = complete_release(sha)
         release["target_commitish"] = "main"
-        self.assertEqual(
-            MODULE._complete_release_identity(release),
-            (release["published_at"], release["tag_name"], sha),
-        )
+        identity = MODULE._complete_release_identity(release)
+        self.assertIsNotNone(identity)
+        assert identity is not None
+        self.assertEqual(identity.published_at, release["published_at"])
+        self.assertEqual(identity.tag_name, release["tag_name"])
+        self.assertEqual(identity.sha, sha)
 
         mismatched_target = complete_release(sha)
         mismatched_target["target_commitish"] = "b" * 40
@@ -331,6 +629,68 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ValidationError, "multiple.*tarball"):
             MODULE._complete_release_identity(duplicate_archive)
 
+    def test_complete_release_identity_requires_exact_asset_metadata(self) -> None:
+        sha = "a" * 40
+        cases = (
+            ("missing-id", None, 1, "asset id"),
+            ("boolean-id", True, 1, "asset id"),
+            ("zero-id", 0, 1, "asset id"),
+            ("missing-size", 101, None, "asset size"),
+            ("boolean-size", 101, False, "asset size"),
+            ("negative-size", 101, -1, "asset size"),
+        )
+        for name, asset_id, asset_size, error_pattern in cases:
+            with self.subTest(name=name):
+                release = complete_release(sha)
+                archive = release["assets"][0]
+                if asset_id is None:
+                    archive.pop("id")
+                else:
+                    archive["id"] = asset_id
+                if asset_size is None:
+                    archive.pop("size")
+                else:
+                    archive["size"] = asset_size
+                with self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    error_pattern,
+                ):
+                    MODULE._complete_release_identity(release)
+
+    def test_release_metadata_preflight_fails_before_archive_download(self) -> None:
+        sha = "a" * 40
+        release = complete_release(sha, archive_size=2)
+        cases = (
+            ("count", [release, release], "MAX_COMPLETE_RELEASES", 1, "count"),
+            (
+                "archive-total",
+                [release],
+                "MAX_RELEASE_ARCHIVE_TOTAL_BYTES",
+                1,
+                "compressed byte total",
+            ),
+            (
+                "checksum-total",
+                [complete_release(sha, checksum_size=2)],
+                "MAX_RELEASE_CHECKSUM_TOTAL_BYTES",
+                1,
+                "checksums exceed byte total",
+            ),
+        )
+        for name, releases, limit_name, limit, error_pattern in cases:
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    MODULE,
+                    "_iter_github_releases",
+                    side_effect=lambda *_args, values=releases: iter(values),
+                ),
+                mock.patch.object(MODULE, limit_name, limit),
+                self.assertRaisesRegex(MODULE.ValidationError, error_pattern),
+            ):
+                MODULE._complete_release_identities("owner/repo", "token")
+            self.archive_manifest_reader.assert_not_called()
+
     def test_release_baseline_accepts_verified_release_history(self) -> None:
         self.write_manifest(manifest("keep"))
         baseline_sha = self.commit("Add manifest")
@@ -351,6 +711,172 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
 
         self.assertEqual(base_ref, baseline_sha)
         self.assertEqual(previous, manifest("keep"))
+        self.archive_manifest_reader.assert_called_once()
+        identity = self.archive_manifest_reader.call_args.args[1]
+        self.assertEqual(identity.archive_id, release["assets"][0]["id"])
+        self.assertEqual(identity.archive_size, release["assets"][0]["size"])
+        self.assertEqual(identity.checksum_id, release["assets"][1]["id"])
+        self.assertEqual(identity.checksum_size, release["assets"][1]["size"])
+
+    def test_release_baseline_rejects_archive_manifest_mismatch(self) -> None:
+        self.write_manifest(manifest("keep"))
+        baseline_sha = self.commit("Add manifest")
+        tag = f"personal-codex-20260715-000000-{baseline_sha[:7]}"
+        self.git("tag", tag, baseline_sha)
+        release = complete_release(baseline_sha, tag=tag)
+        self.archive_manifest_reader.side_effect = None
+        self.archive_manifest_reader.return_value = (manifest("different"), 1)
+
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": "token"}),
+            self.release_patch(release),
+            self.assertRaisesRegex(
+                MODULE.ValidationError,
+                "archive manifest does not match Git commit manifest",
+            ),
+        ):
+            MODULE._release_baseline(self.repo, "owner/repo", MANIFEST)
+
+    def test_release_archive_manifest_comparison_is_json_type_sensitive(self) -> None:
+        sha = "a" * 40
+        identity = MODULE._complete_release_identity(complete_release(sha))
+        self.assertIsNotNone(identity)
+        assert identity is not None
+        cases = (
+            ("bool-int", True, 1),
+            ("false-zero", False, 0),
+            ("int-float", 1, 1.0),
+        )
+        for name, commit_value, archive_value in cases:
+            with self.subTest(name=name):
+                self.archive_manifest_reader.reset_mock()
+                self.archive_manifest_reader.side_effect = None
+                self.archive_manifest_reader.return_value = (
+                    {"value": archive_value},
+                    0,
+                )
+                with self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    "archive manifest does not match Git commit manifest",
+                ):
+                    MODULE._verify_release_archive_manifests(
+                        "owner/repo",
+                        [identity],
+                        {sha: {"value": commit_value}},
+                    )
+
+    def test_release_archive_verification_caches_only_identical_asset_pairs(
+        self,
+    ) -> None:
+        self.write_manifest(manifest("keep"))
+        baseline_sha = self.commit("Add manifest")
+        tag = f"personal-codex-20260715-000000-{baseline_sha[:7]}"
+        self.git("tag", tag, baseline_sha)
+        first = complete_release(
+            baseline_sha,
+            tag=tag,
+            archive_id=101,
+            checksum_id=102,
+        )
+        repeated = complete_release(
+            baseline_sha,
+            tag=tag,
+            archive_id=101,
+            checksum_id=102,
+        )
+        distinct = complete_release(
+            baseline_sha,
+            tag=tag,
+            archive_id=201,
+            checksum_id=202,
+        )
+        releases = [first, repeated, distinct]
+
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": "token"}),
+            mock.patch.object(
+                MODULE,
+                "_iter_github_releases",
+                side_effect=lambda *_args: iter(releases),
+            ),
+        ):
+            MODULE._release_baseline(self.repo, "owner/repo", MANIFEST)
+
+        self.assertEqual(self.archive_manifest_reader.call_count, 2)
+        verified_pairs = {
+            (
+                call.args[1].archive_id,
+                call.args[1].checksum_id,
+            )
+            for call in self.archive_manifest_reader.call_args_list
+        }
+        self.assertEqual(verified_pairs, {(101, 102), (201, 202)})
+
+    def test_release_archive_expanded_total_is_enforced(self) -> None:
+        self.write_manifest(manifest("keep"))
+        baseline_sha = self.commit("Add manifest")
+        tag = f"personal-codex-20260715-000000-{baseline_sha[:7]}"
+        self.git("tag", tag, baseline_sha)
+        releases = [
+            complete_release(
+                baseline_sha,
+                tag=tag,
+                archive_id=101,
+                checksum_id=102,
+            ),
+            complete_release(
+                baseline_sha,
+                tag=tag,
+                archive_id=201,
+                checksum_id=202,
+            ),
+        ]
+        self.archive_manifest_reader.side_effect = None
+        self.archive_manifest_reader.return_value = (manifest("keep"), 1)
+
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": "token"}),
+            mock.patch.object(
+                MODULE,
+                "_iter_github_releases",
+                side_effect=lambda *_args: iter(releases),
+            ),
+            mock.patch.object(MODULE, "MAX_RELEASE_EXPANDED_SCAN_TOTAL_BYTES", 1),
+            self.assertRaisesRegex(
+                MODULE.ValidationError,
+                "exceeded its expanded byte budget",
+            ),
+        ):
+            MODULE._release_baseline(self.repo, "owner/repo", MANIFEST)
+
+        self.assertEqual(self.archive_manifest_reader.call_count, 2)
+        self.assertEqual(
+            [call.args[2] for call in self.archive_manifest_reader.call_args_list],
+            [1, 0],
+        )
+
+    def test_runtime_sync_error_is_normalized(self) -> None:
+        sha = "a" * 40
+        identity = MODULE._complete_release_identity(complete_release(sha))
+        self.assertIsNotNone(identity)
+        assert identity is not None
+        runtime = MODULE._sync_runtime_module()
+        with (
+            mock.patch.object(
+                runtime,
+                "read_verified_release_manifest",
+                side_effect=runtime.SyncError("checksum mismatch"),
+            ),
+            self.assertRaisesRegex(
+                MODULE.ValidationError,
+                "failed to verify release archive.*checksum mismatch",
+            ),
+        ):
+            ORIGINAL_READ_VERIFIED_RELEASE_MANIFEST(
+                "owner/repo",
+                identity,
+                MODULE.MAX_RELEASE_EXPANDED_SCAN_TOTAL_BYTES,
+            )
 
     def test_release_baseline_uses_newer_branch_target_release(self) -> None:
         self.write_manifest(manifest("keep", "retired"))

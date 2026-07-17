@@ -74,6 +74,12 @@ GIT_ERROR_TAIL_BYTES = 64 * 1024
 MAX_GIT_METADATA_BYTES = 64 * 1024
 MAX_GIT_RELEASE_HISTORY_BYTES = 1024 * 1024
 MAX_RELEASE_MANIFEST_HISTORY_BYTES = 64 * 1024 * 1024
+MAX_COMPLETE_RELEASES = 256
+MAX_RELEASE_ARCHIVE_BYTES = 64 * 1024 * 1024
+MAX_RELEASE_CHECKSUM_BYTES = 64 * 1024
+MAX_RELEASE_ARCHIVE_TOTAL_BYTES = 256 * 1024 * 1024
+MAX_RELEASE_CHECKSUM_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_RELEASE_EXPANDED_SCAN_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 MAX_GIT_CHANGE_SUMMARY_BYTES = 1024 * 1024
 MAX_GIT_TREE_LISTING_BYTES = 16 * 1024 * 1024
 MAX_MANIFEST_PATH_BYTES = 4096
@@ -93,6 +99,30 @@ GIT_OBJECT_ID_RE = re.compile(rb"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 class ValidationError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class _CompleteRelease:
+    published_at: str
+    tag_name: str
+    sha: str
+    archive_name: str
+    archive_id: int
+    archive_size: int
+    checksum_name: str
+    checksum_id: int
+    checksum_size: int
+
+    @property
+    def asset_pair_key(self) -> tuple[str | int, ...]:
+        return (
+            self.archive_name,
+            self.archive_id,
+            self.archive_size,
+            self.checksum_name,
+            self.checksum_id,
+            self.checksum_size,
+        )
 
 
 _SYNC_RUNTIME_MODULE: Any | None = None
@@ -140,6 +170,39 @@ def _bounded_json_integer(raw_value: str) -> int:
             f"JSON integer exceeds {MAX_JSON_INTEGER_DIGITS} digits"
         )
     return int(raw_value)
+
+
+def _reject_json_constant(raw_value: str) -> Any:
+    raise ValueError(f"non-standard JSON constant is not allowed: {raw_value}")
+
+
+def _strict_json_equal(left: object, right: object) -> bool:
+    pending = [(left, right)]
+    while pending:
+        left_value, right_value = pending.pop()
+        if type(left_value) is not type(right_value):
+            return False
+        if isinstance(left_value, dict):
+            if not all(type(key) is str for key in left_value):
+                return False
+            if not all(type(key) is str for key in right_value):
+                return False
+            if left_value.keys() != right_value.keys():
+                return False
+            pending.extend(
+                (left_value[key], right_value[key]) for key in left_value
+            )
+            continue
+        if isinstance(left_value, list):
+            if len(left_value) != len(right_value):
+                return False
+            pending.extend(zip(left_value, right_value))
+            continue
+        if type(left_value) not in {str, int, float, bool, type(None)}:
+            return False
+        if left_value != right_value:
+            return False
+    return True
 
 
 ManifestPathKind = Callable[[str], Optional[str]]
@@ -1098,7 +1161,12 @@ def _release_manifest_payload(manifest: dict[str, Any]) -> bytes:
     _validate_manifest_json_string_tokens(manifest)
     output = io.BytesIO()
     try:
-        encoder = json.JSONEncoder(indent=2, sort_keys=False, ensure_ascii=True)
+        encoder = json.JSONEncoder(
+            indent=2,
+            sort_keys=False,
+            ensure_ascii=True,
+            allow_nan=False,
+        )
         for chunk in encoder.iterencode(manifest):
             remaining = MAX_RELEASE_MANIFEST_BYTES - output.tell()
             if len(chunk) > remaining:
@@ -1126,7 +1194,11 @@ def _parse_manifest_bytes(payload: bytes, description: str) -> dict[str, Any]:
     except UnicodeDecodeError as error:
         raise ValidationError(f"{description} is not valid UTF-8: {error}") from error
     try:
-        data = json.loads(text, parse_int=_bounded_json_integer)
+        data = json.loads(
+            text,
+            parse_int=_bounded_json_integer,
+            parse_constant=_reject_json_constant,
+        )
     except (ValueError, RecursionError) as error:
         raise ValidationError(f"{description} is invalid JSON: {error}") from error
     if not isinstance(data, dict):
@@ -2009,6 +2081,7 @@ def _request_json(url: str, token: str) -> Any:
         return json.loads(
             body.decode("utf-8"),
             parse_int=_bounded_json_integer,
+            parse_constant=_reject_json_constant,
         )
     except (UnicodeDecodeError, ValueError, RecursionError) as error:
         raise ValidationError(
@@ -2049,17 +2122,60 @@ def _iter_github_releases(repository: str, token: str):
     )
 
 
+def _complete_release_asset_metadata(
+    asset: dict[str, Any],
+    asset_name: str,
+    *,
+    maximum_bytes: int,
+) -> tuple[int, int]:
+    asset_id = asset.get("id")
+    if isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id <= 0:
+        raise ValidationError(
+            f"complete release asset {asset_name} has an invalid GitHub asset id"
+        )
+    asset_size = asset.get("size")
+    if (
+        isinstance(asset_size, bool)
+        or not isinstance(asset_size, int)
+        or asset_size < 0
+    ):
+        raise ValidationError(
+            f"complete release asset {asset_name} has an invalid GitHub asset size"
+        )
+    if asset_size > maximum_bytes:
+        raise ValidationError(
+            f"complete release asset {asset_name} exceeds {maximum_bytes} byte limit"
+        )
+    return asset_id, asset_size
+
+
 def _complete_release_identity(
     release: dict[str, Any],
-) -> tuple[str, str, str] | None:
-    if release.get("draft") or release.get("prerelease"):
+) -> _CompleteRelease | None:
+    tag_name = release.get("tag_name")
+    if not isinstance(tag_name, str) or not tag_name.startswith("personal-codex-"):
         return None
+    draft = release.get("draft")
+    prerelease = release.get("prerelease")
+    if not isinstance(draft, bool) or not isinstance(prerelease, bool):
+        raise ValidationError(
+            f"personal-codex release {tag_name} has invalid publication flags"
+        )
+    if draft or prerelease:
+        return None
+    tag_match = RELEASE_TAG_RE.fullmatch(tag_name)
+    if tag_match is None:
+        raise ValidationError(
+            f"complete published release has invalid tag name: {tag_name}"
+        )
     assets = release.get("assets")
     if not isinstance(assets, list):
-        return None
+        raise ValidationError(
+            f"published personal-codex release {tag_name} has no asset array"
+        )
 
-    archive_shas: list[str] = []
-    checksum_sha_counts: dict[str, int] = {}
+    archive_matches: list[tuple[str, dict[str, Any]]] = []
+    checksum_matches: dict[str, list[dict[str, Any]]] = {}
     for asset in assets:
         if not isinstance(asset, dict) or asset.get("state") != "uploaded":
             continue
@@ -2068,36 +2184,50 @@ def _complete_release_identity(
             continue
         archive_match = RELEASE_ARCHIVE_ASSET_RE.fullmatch(name)
         if archive_match is not None:
-            archive_shas.append(archive_match.group(1))
+            archive_matches.append((archive_match.group(1), asset))
             continue
         checksum_match = RELEASE_CHECKSUM_ASSET_RE.fullmatch(name)
         if checksum_match is not None:
             checksum_sha = checksum_match.group(1)
-            checksum_sha_counts[checksum_sha] = (
-                checksum_sha_counts.get(checksum_sha, 0) + 1
-            )
+            checksum_matches.setdefault(checksum_sha, []).append(asset)
 
-    complete_shas = {sha for sha in archive_shas if sha in checksum_sha_counts}
-    if not complete_shas:
-        return None
-    if len(archive_shas) != 1:
+    if not archive_matches:
+        raise ValidationError(
+            f"published personal-codex release {tag_name} is missing its tarball asset"
+        )
+    if len(archive_matches) != 1:
         raise ValidationError(
             "complete published release has multiple personal-codex tarball assets"
         )
-    sha = archive_shas[0]
-    if checksum_sha_counts[sha] != 1:
+    sha, archive_asset = archive_matches[0]
+    matching_checksums = checksum_matches.get(sha, [])
+    if not matching_checksums:
+        raise ValidationError(
+            f"published personal-codex release {tag_name} is missing its matching "
+            "checksum asset"
+        )
+    if len(matching_checksums) != 1:
         raise ValidationError(
             "complete published release has multiple matching checksum assets"
         )
-
-    tag_name = release.get("tag_name")
-    if not isinstance(tag_name, str):
-        raise ValidationError("complete published release has no valid tag name")
-    tag_match = RELEASE_TAG_RE.fullmatch(tag_name)
-    if tag_match is None:
+    checksum_asset = matching_checksums[0]
+    archive_name = archive_asset["name"]
+    checksum_name = checksum_asset["name"]
+    archive_id, archive_size = _complete_release_asset_metadata(
+        archive_asset,
+        archive_name,
+        maximum_bytes=MAX_RELEASE_ARCHIVE_BYTES,
+    )
+    checksum_id, checksum_size = _complete_release_asset_metadata(
+        checksum_asset,
+        checksum_name,
+        maximum_bytes=MAX_RELEASE_CHECKSUM_BYTES,
+    )
+    if archive_id == checksum_id:
         raise ValidationError(
-            f"complete published release has invalid tag name: {tag_name}"
+            "complete release archive and checksum must have distinct GitHub asset ids"
         )
+
     if not sha.startswith(tag_match.group(1)):
         raise ValidationError(
             f"release asset SHA {sha} does not match tag suffix {tag_match.group(1)}"
@@ -2118,21 +2248,72 @@ def _complete_release_identity(
         raise ValidationError(
             "complete published release has an invalid published_at timestamp"
         )
-    return published_at, tag_name, sha
+    return _CompleteRelease(
+        published_at=published_at,
+        tag_name=tag_name,
+        sha=sha,
+        archive_name=archive_name,
+        archive_id=archive_id,
+        archive_size=archive_size,
+        checksum_name=checksum_name,
+        checksum_id=checksum_id,
+        checksum_size=checksum_size,
+    )
 
 
 def _complete_release_identities(
     repository: str,
     token: str,
-) -> list[tuple[str, str]]:
-    identities: list[tuple[str, str]] = []
+) -> list[_CompleteRelease]:
+    identities: list[_CompleteRelease] = []
     for release in _iter_github_releases(repository, token):
         identity = _complete_release_identity(release)
         if identity is not None:
-            _published_at, tag_name, sha = identity
-            identities.append((tag_name, sha))
+            identities.append(identity)
     if not identities:
         raise ValidationError(f"no complete published release found for {repository}")
+    if len(identities) > MAX_COMPLETE_RELEASES:
+        raise ValidationError(
+            "complete published release count exceeds limit: "
+            f"{len(identities)} > {MAX_COMPLETE_RELEASES}"
+        )
+
+    assets_by_id: dict[int, tuple[str, int]] = {}
+    unique_archives: set[tuple[int, str, int]] = set()
+    unique_checksums: set[tuple[int, str, int]] = set()
+    for identity in identities:
+        archive = (
+            identity.archive_id,
+            identity.archive_name,
+            identity.archive_size,
+        )
+        checksum = (
+            identity.checksum_id,
+            identity.checksum_name,
+            identity.checksum_size,
+        )
+        for asset_id, asset_name, asset_size in (archive, checksum):
+            previous = assets_by_id.setdefault(asset_id, (asset_name, asset_size))
+            if previous != (asset_name, asset_size):
+                raise ValidationError(
+                    "GitHub asset id has conflicting release metadata: "
+                    f"{asset_id}"
+                )
+        unique_archives.add(archive)
+        unique_checksums.add(checksum)
+
+    total_archive_bytes = sum(size for _id, _name, size in unique_archives)
+    if total_archive_bytes > MAX_RELEASE_ARCHIVE_TOTAL_BYTES:
+        raise ValidationError(
+            "complete release archives exceed compressed byte total: "
+            f"{total_archive_bytes} > {MAX_RELEASE_ARCHIVE_TOTAL_BYTES}"
+        )
+    total_checksum_bytes = sum(size for _id, _name, size in unique_checksums)
+    if total_checksum_bytes > MAX_RELEASE_CHECKSUM_TOTAL_BYTES:
+        raise ValidationError(
+            "complete release checksums exceed byte total: "
+            f"{total_checksum_bytes} > {MAX_RELEASE_CHECKSUM_TOTAL_BYTES}"
+        )
     return identities
 
 
@@ -2155,9 +2336,11 @@ def _is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
 
 def _verified_release_shas(
     repo_root: Path,
-    identities: list[tuple[str, str]],
+    identities: list[_CompleteRelease],
 ) -> list[str]:
-    tag_queries = [f"refs/tags/{tag_name}^{{commit}}" for tag_name, _sha in identities]
+    tag_queries = [
+        f"refs/tags/{identity.tag_name}^{{commit}}" for identity in identities
+    ]
     result = _bounded_git_output(
         repo_root,
         ["git", "cat-file", "--batch-check=%(objectname) %(objecttype)"],
@@ -2175,7 +2358,9 @@ def _verified_release_shas(
 
     release_shas: list[str] = []
     seen_shas: set[str] = set()
-    for (tag_name, expected_sha), line in zip(identities, lines):
+    for identity, line in zip(identities, lines):
+        tag_name = identity.tag_name
+        expected_sha = identity.sha
         fields = line.split()
         if len(fields) == 2 and fields[1] == b"missing":
             raise ValidationError(f"release tag is unavailable locally: {tag_name}")
@@ -2237,6 +2422,93 @@ def _select_release_baseline_sha(repo_root: Path, release_shas: list[str]) -> st
     return selected
 
 
+def _read_verified_release_manifest(
+    repository: str,
+    identity: _CompleteRelease,
+    maximum_expanded_bytes: int,
+) -> tuple[dict[str, Any], int]:
+    runtime = _sync_runtime_module()
+    assets = runtime.ReleaseAssets(
+        tag_name=identity.tag_name,
+        sha=identity.sha,
+        archive_name=identity.archive_name,
+        archive_id=identity.archive_id,
+        archive_size=identity.archive_size,
+        checksum_name=identity.checksum_name,
+        checksum_id=identity.checksum_id,
+        checksum_size=identity.checksum_size,
+    )
+    try:
+        verified = runtime.read_verified_release_manifest(
+            repository,
+            assets,
+            maximum_expanded_bytes=maximum_expanded_bytes,
+        )
+    except runtime.SyncError as error:
+        raise ValidationError(
+            f"failed to verify release archive {identity.tag_name}: {error}"
+        ) from error
+    manifest = getattr(verified, "manifest", None)
+    expanded_bytes = getattr(verified, "expanded_bytes", None)
+    if not isinstance(manifest, dict):
+        raise ValidationError(
+            f"release archive {identity.tag_name} returned an invalid manifest"
+        )
+    if (
+        isinstance(expanded_bytes, bool)
+        or not isinstance(expanded_bytes, int)
+        or expanded_bytes < 0
+    ):
+        raise ValidationError(
+            f"release archive {identity.tag_name} returned invalid scan accounting"
+        )
+    return manifest, expanded_bytes
+
+
+def _verify_release_archive_manifests(
+    repository: str,
+    identities: list[_CompleteRelease],
+    manifests_by_sha: dict[str, dict[str, Any]],
+) -> None:
+    manifests_by_asset_pair: dict[tuple[str | int, ...], dict[str, Any]] = {}
+    total_expanded_bytes = 0
+    for identity in identities:
+        archive_manifest = manifests_by_asset_pair.get(identity.asset_pair_key)
+        if archive_manifest is None:
+            remaining_expanded_bytes = (
+                MAX_RELEASE_EXPANDED_SCAN_TOTAL_BYTES - total_expanded_bytes
+            )
+            archive_manifest, expanded_bytes = _read_verified_release_manifest(
+                repository,
+                identity,
+                remaining_expanded_bytes,
+            )
+            if expanded_bytes > remaining_expanded_bytes:
+                raise ValidationError(
+                    f"release archive {identity.tag_name} exceeded its expanded "
+                    "byte budget"
+                )
+            total_expanded_bytes += expanded_bytes
+            if total_expanded_bytes > MAX_RELEASE_EXPANDED_SCAN_TOTAL_BYTES:
+                raise ValidationError(
+                    "release archive scans exceed expanded byte total: "
+                    f"{total_expanded_bytes} > "
+                    f"{MAX_RELEASE_EXPANDED_SCAN_TOTAL_BYTES}"
+                )
+            manifests_by_asset_pair[identity.asset_pair_key] = archive_manifest
+        commit_manifest = manifests_by_sha.get(identity.sha)
+        if commit_manifest is None:
+            raise ValidationError(
+                f"release archive {identity.tag_name} has no matching Git manifest"
+            )
+        if not _strict_json_equal(archive_manifest, commit_manifest):
+            raise ValidationError(
+                "release archive manifest does not match Git commit manifest: "
+                f"{identity.tag_name} ({identity.sha}; archive asset "
+                f"{identity.archive_id}, checksum asset {identity.checksum_id})"
+            )
+
+
 def _release_history_baseline(
     repo_root: Path,
     repository: str,
@@ -2251,6 +2523,11 @@ def _release_history_baseline(
         repo_root,
         release_shas,
         manifest,
+    )
+    _verify_release_archive_manifests(
+        repository,
+        identities,
+        dict(release_manifests),
     )
     return sha, release_manifests
 

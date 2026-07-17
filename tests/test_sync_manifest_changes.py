@@ -2350,6 +2350,36 @@ class ManifestSerializationSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ValidationError, "invalid JSON"):
             MODULE._parse_manifest_bytes(payload, "manifest")
 
+    def test_rejects_nonstandard_constants_in_raw_manifests(self) -> None:
+        for constant in (b"NaN", b"Infinity", b"-Infinity"):
+            with self.subTest(constant=constant.decode("ascii")):
+                payload = (
+                    b'{"version":1,"unknown":'
+                    + constant
+                    + b',"links":[]}'
+                )
+
+                with self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    "invalid JSON: non-standard JSON constant",
+                ):
+                    MODULE._parse_manifest_bytes(
+                        payload,
+                        "release manifest object deadbeef",
+                    )
+
+    def test_rejects_non_finite_programmatic_manifest_values(self) -> None:
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                payload = manifest("keep")
+                payload["unknown"] = value
+
+                with self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    "failed to serialize release manifest",
+                ):
+                    MODULE._release_manifest_payload(payload)
+
 
 class ManifestDescriptorSafetyTests(unittest.TestCase):
     @staticmethod
