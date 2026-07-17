@@ -645,6 +645,25 @@ def _portable_target_key(path: PurePosixPath) -> tuple[str, ...]:
     )
 
 
+def _portable_owner_key(owner: str) -> str:
+    return unicodedata.normalize("NFC", owner).casefold()
+
+
+def _validate_portable_owner_spellings(owners: list[str]) -> None:
+    spellings: dict[str, str] = {}
+    for owner in sorted(
+        {owner for owner in owners if owner != PUBLIC_OWNER},
+        key=lambda value: (_portable_owner_key(value), value),
+    ):
+        key = _portable_owner_key(owner)
+        previous = spellings.get(key)
+        if previous is not None and previous != owner:
+            raise SyncError(
+                f"portable owner spellings conflict: {previous} and {owner}"
+            )
+        spellings[key] = owner
+
+
 def _validate_portable_target_spellings(targets: list[PurePosixPath]) -> None:
     spellings: dict[tuple[str, ...], PurePosixPath] = {}
     for target in targets:
@@ -814,6 +833,9 @@ def _validate_same_owner_active_removed_target_hierarchy(
 
 
 def _validate_manifest_target_portability(manifests: list[ManifestData]) -> None:
+    _validate_portable_owner_spellings(
+        [manifest.owner for manifest in manifests]
+    )
     active_targets: list[PurePosixPath] = []
     all_targets: list[PurePosixPath] = []
     for manifest in manifests:
@@ -3814,6 +3836,7 @@ def _managed_state_from_payload(
         if not isinstance(raw_sha, str) or RELEASE_DIR_RE.fullmatch(raw_sha) is None:
             raise SyncError(f"managed link owner {owner} has invalid release SHA")
         owners[owner] = raw_sha
+    _validate_portable_owner_spellings(list(owners))
 
     raw_links = data.get("links", [])
     if not isinstance(raw_links, list):
@@ -5106,6 +5129,7 @@ def _known_owners(home: Path, extra_owners: set[str] | None = None) -> set[str]:
         create=False,
         allow_missing=True,
     ):
+        _validate_portable_owner_spellings(list(owners))
         return owners
     for path in overlays_root.iterdir():
         if not _owner_is_valid(path.name):
@@ -5114,6 +5138,7 @@ def _known_owners(home: Path, extra_owners: set[str] | None = None) -> set[str]:
         if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
             raise SyncError(f"refusing unsafe overlay directory: {path}")
         owners.add(path.name)
+    _validate_portable_owner_spellings(list(owners))
     return owners
 
 
@@ -13492,6 +13517,12 @@ def _install_release_set_unlocked(
                 "would recover pending personal sync transaction under the install lock"
             )
         return
+    install_owners = set(loaded_state.owners)
+    install_owners.update(
+        manifest.owner
+        for _source_root, _sha, manifest, _source_expectation in releases
+    )
+    _known_owners(home, install_owners)
     if not dry_run and not preflight_only:
         _try_cleanup_ready_pending_batches(home)
     _verify_managed_state_current_claims(home, loaded_state)

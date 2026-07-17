@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path, PurePosixPath
+import stat
 import subprocess
 import sys
 import tarfile
@@ -1648,6 +1651,27 @@ class PackageBuilderSafetyTests(unittest.TestCase):
 
         self.assertFalse(archive.exists())
 
+    def test_create_archive_preserves_preexisting_read_only_output(self) -> None:
+        staging = self.root / "existing-archive-staging"
+        staging.mkdir()
+        (staging / "payload.txt").write_text("payload\n", encoding="utf-8")
+        archive = self.root / "existing.tar.gz"
+        archive.write_bytes(b"existing archive\n")
+        archive.chmod(0o444)
+        original_identity = (archive.stat().st_dev, archive.stat().st_ino)
+
+        with self.assertRaisesRegex(
+            BUILDER.PackageError,
+            "refusing to overwrite package output",
+        ):
+            BUILDER.create_archive(staging, archive, "personal-codex-test")
+
+        self.assertEqual(archive.read_bytes(), b"existing archive\n")
+        self.assertEqual(
+            (archive.stat().st_dev, archive.stat().st_ino),
+            original_identity,
+        )
+
     def test_checksum_failure_removes_archive_and_partial_sidecar(self) -> None:
         repo, manifest, _source, head = self.init_tracked_repo(
             "repo-checksum-failure"
@@ -1656,15 +1680,19 @@ class PackageBuilderSafetyTests(unittest.TestCase):
         archive = output_dir / f"personal-codex-{head}.tar.gz"
         checksum = BUILDER._checksum_path(archive)
 
-        def fail_checksum(archive_path: Path) -> Path:
-            self.assertEqual(archive_path, archive)
-            checksum.write_text("partial\n", encoding="utf-8")
+        def fail_checksum(
+            _archive_fd: int,
+            checksum_fd: int,
+            archive_name: str,
+        ) -> None:
+            self.assertEqual(archive_name, archive.name)
+            os.write(checksum_fd, b"partial\n")
             raise OSError("injected checksum failure")
 
         with (
             mock.patch.object(
                 BUILDER,
-                "write_checksum",
+                "_write_checksum_to_fd",
                 side_effect=fail_checksum,
             ),
             self.assertRaisesRegex(OSError, "injected checksum failure"),
@@ -1678,6 +1706,369 @@ class PackageBuilderSafetyTests(unittest.TestCase):
 
         self.assertFalse(archive.exists())
         self.assertFalse(checksum.exists())
+        self.assertEqual(list(output_dir.iterdir()), [])
+
+    def test_checksum_publish_collision_rolls_back_only_current_archive(self) -> None:
+        repo, manifest, _source, head = self.init_tracked_repo(
+            "repo-checksum-publish-collision"
+        )
+        output_dir = self.root / "checksum-publish-collision-dist"
+        archive = output_dir / f"personal-codex-{head}.tar.gz"
+        checksum = BUILDER._checksum_path(archive)
+        real_rename_noreplace = BUILDER._rename_noreplace_at
+        injected = False
+
+        def collide_with_checksum(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal injected
+            if destination_name == checksum.name and not injected:
+                injected = True
+                foreign_fd = os.open(
+                    destination_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=destination_parent_fd,
+                )
+                try:
+                    os.write(foreign_fd, b"existing checksum\n")
+                finally:
+                    os.close(foreign_fd)
+            real_rename_noreplace(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.object(
+                BUILDER,
+                "_rename_noreplace_at",
+                side_effect=collide_with_checksum,
+            ),
+            self.assertRaisesRegex(
+                BUILDER.PackageError,
+                "differs from generated content",
+            ),
+        ):
+            BUILDER.build_package(repo, manifest, output_dir, head)
+
+        self.assertFalse(archive.exists())
+        self.assertEqual(checksum.read_bytes(), b"existing checksum\n")
+        self.assertEqual(list(output_dir.iterdir()), [checksum])
+
+    def test_cleanup_preserves_raced_archive_replacement(self) -> None:
+        repo, manifest, _source, head = self.init_tracked_repo(
+            "repo-raced-archive-cleanup"
+        )
+        output_dir = self.root / "raced-archive-cleanup-dist"
+        archive = output_dir / f"personal-codex-{head}.tar.gz"
+        checksum = BUILDER._checksum_path(archive)
+        real_rename_noreplace = BUILDER._rename_noreplace_at
+        archive_replaced = False
+        checksum_created = False
+
+        def replace_archive_before_cleanup(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal archive_replaced, checksum_created
+            if destination_name == checksum.name and not archive_replaced:
+                os.unlink(archive.name, dir_fd=destination_parent_fd)
+                foreign_fd = os.open(
+                    archive.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=destination_parent_fd,
+                )
+                try:
+                    os.write(foreign_fd, b"foreign archive\n")
+                finally:
+                    os.close(foreign_fd)
+                archive_replaced = True
+            if destination_name == checksum.name and not checksum_created:
+                foreign_fd = os.open(
+                    destination_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=destination_parent_fd,
+                )
+                try:
+                    os.write(foreign_fd, b"foreign checksum\n")
+                finally:
+                    os.close(foreign_fd)
+                checksum_created = True
+            real_rename_noreplace(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.object(
+                BUILDER,
+                "_rename_noreplace_at",
+                side_effect=replace_archive_before_cleanup,
+            ),
+            self.assertRaisesRegex(
+                BUILDER.PackageError,
+                "package output cleanup was incomplete",
+            ),
+        ):
+            BUILDER.build_package(repo, manifest, output_dir, head)
+
+        self.assertEqual(archive.read_bytes(), b"foreign archive\n")
+        self.assertEqual(checksum.read_bytes(), b"foreign checksum\n")
+        self.assertEqual(set(output_dir.iterdir()), {archive, checksum})
+
+    def test_cleanup_restores_replacement_raced_at_isolation(self) -> None:
+        repo, manifest, _source, head = self.init_tracked_repo(
+            "repo-raced-isolation-cleanup"
+        )
+        output_dir = self.root / "raced-isolation-cleanup-dist"
+        archive = output_dir / f"personal-codex-{head}.tar.gz"
+        checksum = BUILDER._checksum_path(archive)
+        real_rename_noreplace = BUILDER._rename_noreplace_at
+        archive_replaced = False
+        checksum_created = False
+
+        def replace_archive_at_isolation(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal archive_replaced, checksum_created
+            if destination_name == checksum.name and not checksum_created:
+                foreign_fd = os.open(
+                    destination_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=destination_parent_fd,
+                )
+                try:
+                    os.write(foreign_fd, b"foreign checksum\n")
+                finally:
+                    os.close(foreign_fd)
+                checksum_created = True
+            if (
+                source_name == archive.name
+                and destination_name.startswith(".personal-codex-retained-")
+                and not archive_replaced
+            ):
+                os.unlink(source_name, dir_fd=source_parent_fd)
+                foreign_fd = os.open(
+                    source_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=source_parent_fd,
+                )
+                try:
+                    os.write(foreign_fd, b"foreign archive\n")
+                finally:
+                    os.close(foreign_fd)
+                archive_replaced = True
+            real_rename_noreplace(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.object(
+                BUILDER,
+                "_rename_noreplace_at",
+                side_effect=replace_archive_at_isolation,
+            ),
+            self.assertRaisesRegex(
+                BUILDER.PackageError,
+                "package output cleanup was incomplete",
+            ),
+        ):
+            BUILDER.build_package(repo, manifest, output_dir, head)
+
+        self.assertEqual(archive.read_bytes(), b"foreign archive\n")
+        self.assertEqual(checksum.read_bytes(), b"foreign checksum\n")
+        self.assertEqual(set(output_dir.iterdir()), {archive, checksum})
+
+    def test_build_resumes_after_archive_only_publication(self) -> None:
+        repo, manifest, _source, head = self.init_tracked_repo(
+            "repo-resume-archive-only"
+        )
+        reference_dir = self.root / "resume-reference-dist"
+        reference_archive, _reference_checksum = BUILDER.build_package(
+            repo,
+            manifest,
+            reference_dir,
+            head,
+        )
+        output_dir = self.root / "resume-archive-only-dist"
+        output_dir.mkdir()
+        archive = output_dir / reference_archive.name
+        archive.write_bytes(reference_archive.read_bytes())
+        archive_identity = (archive.stat().st_dev, archive.stat().st_ino)
+
+        resumed_archive, resumed_checksum = BUILDER.build_package(
+            repo,
+            manifest,
+            output_dir,
+            head,
+        )
+
+        self.assertEqual(resumed_archive, archive)
+        self.assertEqual(
+            (archive.stat().st_dev, archive.stat().st_ino),
+            archive_identity,
+        )
+        expected_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        self.assertEqual(
+            resumed_checksum.read_text(encoding="utf-8"),
+            f"{expected_digest}  {archive.name}\n",
+        )
+        checksum_identity = (
+            resumed_checksum.stat().st_dev,
+            resumed_checksum.stat().st_ino,
+        )
+
+        BUILDER.build_package(repo, manifest, output_dir, head)
+
+        self.assertEqual(
+            (archive.stat().st_dev, archive.stat().st_ino),
+            archive_identity,
+        )
+        self.assertEqual(
+            (resumed_checksum.stat().st_dev, resumed_checksum.stat().st_ino),
+            checksum_identity,
+        )
+        self.assertEqual(set(output_dir.iterdir()), {archive, resumed_checksum})
+
+    def test_build_rejects_and_preserves_different_archive_residue(self) -> None:
+        repo, manifest, _source, head = self.init_tracked_repo(
+            "repo-different-archive-residue"
+        )
+        output_dir = self.root / "different-archive-residue-dist"
+        output_dir.mkdir()
+        archive = output_dir / f"personal-codex-{head}.tar.gz"
+        checksum = BUILDER._checksum_path(archive)
+        archive.write_bytes(b"different archive\n")
+        archive_identity = (archive.stat().st_dev, archive.stat().st_ino)
+
+        with self.assertRaisesRegex(
+            BUILDER.PackageError,
+            "differs from generated content",
+        ):
+            BUILDER.build_package(repo, manifest, output_dir, head)
+
+        self.assertEqual(archive.read_bytes(), b"different archive\n")
+        self.assertEqual(
+            (archive.stat().st_dev, archive.stat().st_ino),
+            archive_identity,
+        )
+        self.assertFalse(checksum.exists())
+        self.assertEqual(list(output_dir.iterdir()), [archive])
+
+    def test_build_rejects_hardlinked_matching_archive_residue(self) -> None:
+        repo, manifest, _source, head = self.init_tracked_repo(
+            "repo-hardlinked-archive-residue"
+        )
+        reference_dir = self.root / "hardlinked-archive-reference-dist"
+        reference_archive, _reference_checksum = BUILDER.build_package(
+            repo,
+            manifest,
+            reference_dir,
+            head,
+        )
+        output_dir = self.root / "hardlinked-archive-residue-dist"
+        output_dir.mkdir()
+        archive = output_dir / reference_archive.name
+        archive.write_bytes(reference_archive.read_bytes())
+        archive_alias = output_dir / "archive-alias.tar.gz"
+        os.link(archive, archive_alias)
+        checksum = BUILDER._checksum_path(archive)
+        archive_identity = (archive.stat().st_dev, archive.stat().st_ino)
+
+        with self.assertRaisesRegex(
+            BUILDER.PackageError,
+            "unsafe link count",
+        ):
+            BUILDER.build_package(repo, manifest, output_dir, head)
+
+        self.assertEqual(
+            (archive.stat().st_dev, archive.stat().st_ino),
+            archive_identity,
+        )
+        self.assertEqual(archive.read_bytes(), reference_archive.read_bytes())
+        self.assertTrue(archive_alias.samefile(archive))
+        self.assertFalse(checksum.exists())
+        self.assertEqual(set(output_dir.iterdir()), {archive, archive_alias})
+
+    def test_build_rejects_world_writable_matching_checksum_residue(self) -> None:
+        repo, manifest, _source, head = self.init_tracked_repo(
+            "repo-writable-checksum-residue"
+        )
+        reference_dir = self.root / "writable-checksum-reference-dist"
+        reference_archive, reference_checksum = BUILDER.build_package(
+            repo,
+            manifest,
+            reference_dir,
+            head,
+        )
+        output_dir = self.root / "writable-checksum-residue-dist"
+        output_dir.mkdir()
+        archive = output_dir / reference_archive.name
+        checksum = output_dir / reference_checksum.name
+        archive.write_bytes(reference_archive.read_bytes())
+        checksum.write_bytes(reference_checksum.read_bytes())
+        checksum.chmod(0o666)
+        archive_identity = (archive.stat().st_dev, archive.stat().st_ino)
+        checksum_identity = (checksum.stat().st_dev, checksum.stat().st_ino)
+
+        with self.assertRaisesRegex(
+            BUILDER.PackageError,
+            "unsafe permissions",
+        ):
+            BUILDER.build_package(repo, manifest, output_dir, head)
+
+        self.assertEqual(
+            (archive.stat().st_dev, archive.stat().st_ino),
+            archive_identity,
+        )
+        self.assertEqual(
+            (checksum.stat().st_dev, checksum.stat().st_ino),
+            checksum_identity,
+        )
+        self.assertEqual(archive.read_bytes(), reference_archive.read_bytes())
+        self.assertEqual(checksum.read_bytes(), reference_checksum.read_bytes())
+        self.assertEqual(stat.S_IMODE(checksum.stat().st_mode), 0o666)
+        self.assertEqual(set(output_dir.iterdir()), {archive, checksum})
+
+    def test_successful_build_publishes_only_final_output_pair(self) -> None:
+        repo, manifest, _source, head = self.init_tracked_repo(
+            "repo-final-output-pair"
+        )
+        output_dir = self.root / "final-output-pair-dist"
+
+        archive, checksum = BUILDER.build_package(
+            repo,
+            manifest,
+            output_dir,
+            head,
+        )
+
+        self.assertEqual(set(output_dir.iterdir()), {archive, checksum})
+        expected_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        self.assertEqual(
+            checksum.read_text(encoding="utf-8"),
+            f"{expected_digest}  {archive.name}\n",
+        )
 
     def test_strict_blob_copy_bounds_output_before_creating_destination(self) -> None:
         destination = self.root / "staged" / "payload.bin"

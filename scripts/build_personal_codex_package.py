@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_right
 from collections.abc import Callable, Iterable
+import ctypes
 from dataclasses import dataclass, field
 from graphlib import CycleError, TopologicalSorter
 import gzip
@@ -19,6 +20,7 @@ import selectors
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 from typing import Any
@@ -2178,49 +2180,708 @@ class _BoundedArchiveWriter:
         return getattr(self._writer, name)
 
 
-def create_archive(staging_root: Path, archive_path: Path, package_name: str) -> None:
-    _validate_staged_release_compatibility(staging_root, package_name)
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
+@dataclass(frozen=True)
+class _PackageOutputSpec:
+    final_name: str
+    label: str
+    writer: Callable[[int, dict[str, int]], None]
+
+
+@dataclass
+class _PendingPackageOutput:
+    spec: _PackageOutputSpec
+    temporary_name: str | None
+    file_descriptor: int
+    published: bool = False
+    reused: bool = False
+    final_file_descriptor: int | None = None
+
+
+def _package_output_path_matches_fd(path: Path, file_descriptor: int) -> bool:
     try:
-        with archive_path.open("wb") as raw_file:
-            compressed_writer = _BoundedArchiveWriter(
-                raw_file,
-                MAX_ARCHIVE_COMPRESSED_BYTES,
-                overflow_description="release archive exceeds compressed size limit",
-                defer_overflow=True,
+        bound_metadata = os.fstat(file_descriptor)
+        current_metadata = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        bound_metadata.st_dev,
+        bound_metadata.st_ino,
+    ) == (
+        current_metadata.st_dev,
+        current_metadata.st_ino,
+    )
+
+
+def _package_output_entry_matches_fd(
+    directory_fd: int,
+    name: str,
+    file_descriptor: int,
+) -> bool:
+    try:
+        bound_metadata = os.fstat(file_descriptor)
+        current_metadata = os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except OSError:
+        return False
+    return (
+        bound_metadata.st_dev,
+        bound_metadata.st_ino,
+    ) == (
+        current_metadata.st_dev,
+        current_metadata.st_ino,
+    )
+
+
+def _temporary_package_output_names(kind: str) -> Iterable[str]:
+    for _attempt in range(128):
+        yield f".personal-codex-{kind}-{os.getpid()}-{os.urandom(8).hex()}"
+    raise PackageError(f"failed to allocate a temporary {kind} output")
+
+
+def _package_output_directory_open_flags() -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    return flags
+
+
+def _rename_noreplace_at(
+    source_parent_fd: int,
+    source_name: str,
+    destination_parent_fd: int,
+    destination_name: str,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source_name)
+    destination_bytes = os.fsencode(destination_name)
+    if sys.platform == "darwin":
+        try:
+            rename_function = libc.renameatx_np
+        except AttributeError as error:
+            raise PackageError(
+                "renameatx_np is required for safe package publication"
+            ) from error
+        rename_function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_function.restype = ctypes.c_int
+        result = rename_function(
+            source_parent_fd,
+            source_bytes,
+            destination_parent_fd,
+            destination_bytes,
+            0x00000004,
+        )
+    elif sys.platform.startswith("linux"):
+        try:
+            rename_function = libc.renameat2
+        except AttributeError as error:
+            raise PackageError(
+                "renameat2 is required for safe package publication"
+            ) from error
+        rename_function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_function.restype = ctypes.c_int
+        result = rename_function(
+            source_parent_fd,
+            source_bytes,
+            destination_parent_fd,
+            destination_bytes,
+            0x00000001,
+        )
+    else:
+        raise PackageError(
+            f"safe no-replace publication is unsupported on platform {sys.platform}"
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            f"{source_name} -> {destination_name}",
+        )
+
+
+def _open_package_output_directory(output_dir: Path) -> int:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        directory_fd = os.open(
+            output_dir,
+            _package_output_directory_open_flags(),
+        )
+    except OSError as error:
+        raise PackageError(
+            f"refusing unsafe package output directory: {output_dir}"
+        ) from error
+    if not _package_output_path_matches_fd(output_dir, directory_fd):
+        os.close(directory_fd)
+        raise PackageError(f"package output directory changed while opening: {output_dir}")
+    return directory_fd
+
+
+def _require_package_output_absent(
+    directory_fd: int,
+    output_dir: Path,
+    name: str,
+) -> None:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise PackageError(
+            f"failed to inspect package output: {output_dir / name}"
+        ) from error
+    raise PackageError(f"refusing to overwrite package output: {output_dir / name}")
+
+
+def _create_pending_package_output(
+    directory_fd: int,
+    spec: _PackageOutputSpec,
+) -> _PendingPackageOutput:
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    for candidate in _temporary_package_output_names(spec.label):
+        try:
+            file_descriptor = os.open(
+                candidate,
+                flags,
+                0o600,
+                dir_fd=directory_fd,
             )
-            with gzip.GzipFile(
-                fileobj=compressed_writer,
-                mode="wb",
-                mtime=0,
-            ) as gzip_file:
-                bounded_writer = _BoundedArchiveWriter(
-                    gzip_file,
-                    MAX_ARCHIVE_EXPANDED_BYTES,
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise PackageError(
+                f"failed to create temporary {spec.label} output"
+            ) from error
+        metadata = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or not _package_output_entry_matches_fd(
+                directory_fd,
+                candidate,
+                file_descriptor,
+            )
+        ):
+            os.close(file_descriptor)
+            raise PackageError(
+                f"temporary {spec.label} output changed during creation; "
+                f"preserved as {candidate}"
+            )
+        return _PendingPackageOutput(spec, candidate, file_descriptor)
+    raise PackageError(f"failed to create temporary {spec.label} output")
+
+
+def _isolate_package_output_for_cleanup(
+    directory_fd: int,
+    name: str,
+    file_descriptor: int,
+    *,
+    label: str,
+) -> None:
+    try:
+        current_metadata = os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise PackageError(f"failed to inspect {label} during cleanup") from error
+    bound_metadata = os.fstat(file_descriptor)
+    if (
+        current_metadata.st_dev,
+        current_metadata.st_ino,
+    ) != (
+        bound_metadata.st_dev,
+        bound_metadata.st_ino,
+    ):
+        raise PackageError(f"{label} changed during cleanup; preserved as {name}")
+
+    retained_name: str | None = None
+    for candidate in _temporary_package_output_names("retained"):
+        try:
+            _rename_noreplace_at(
+                directory_fd,
+                name,
+                directory_fd,
+                candidate,
+            )
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise PackageError(f"failed to isolate {label} during cleanup") from error
+        retained_name = candidate
+        break
+    if retained_name is None:
+        raise PackageError(f"failed to isolate {label} during cleanup")
+    try:
+        os.fsync(directory_fd)
+    except OSError as error:
+        raise PackageError(
+            f"failed to persist isolated {label}; preserved as {retained_name}"
+        ) from error
+    if not _package_output_entry_matches_fd(
+        directory_fd,
+        retained_name,
+        file_descriptor,
+    ):
+        try:
+            _rename_noreplace_at(
+                directory_fd,
+                retained_name,
+                directory_fd,
+                name,
+            )
+        except FileExistsError as error:
+            raise PackageError(
+                f"{label} changed during cleanup; original name {name} is occupied "
+                f"and the replacement is preserved as {retained_name}"
+            ) from error
+        except FileNotFoundError as error:
+            raise PackageError(
+                f"{label} changed during cleanup; retained replacement "
+                f"{retained_name} disappeared before it could be restored"
+            ) from error
+        except (OSError, PackageError) as error:
+            raise PackageError(
+                f"{label} changed during cleanup; failed to restore it to {name} "
+                f"and preserved it as {retained_name}"
+            ) from error
+        try:
+            os.fsync(directory_fd)
+        except OSError as error:
+            raise PackageError(
+                f"{label} changed during cleanup; restored it to {name} but failed "
+                "to persist the restoration"
+            ) from error
+        raise PackageError(
+            f"{label} changed during cleanup; restored the replacement to {name}"
+        )
+    try:
+        os.unlink(retained_name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except OSError as error:
+        raise PackageError(
+            f"failed to remove {label}; preserved as {retained_name}"
+        ) from error
+
+
+def _close_pending_package_outputs(
+    pending_outputs: Iterable[_PendingPackageOutput],
+) -> None:
+    for pending in pending_outputs:
+        file_descriptors = {pending.file_descriptor}
+        if pending.final_file_descriptor is not None:
+            file_descriptors.add(pending.final_file_descriptor)
+        for file_descriptor in file_descriptors:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+
+
+def _package_output_fd_snapshot(file_descriptor: int, *, label: str) -> tuple[int, ...]:
+    try:
+        metadata = os.fstat(file_descriptor)
+    except OSError as error:
+        raise PackageError(f"failed to inspect {label}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise PackageError(f"{label} is not a regular file")
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _package_output_fds_match(
+    expected_fd: int,
+    existing_fd: int,
+    *,
+    label: str,
+) -> bool:
+    expected_before = _package_output_fd_snapshot(expected_fd, label=f"generated {label}")
+    existing_before = _package_output_fd_snapshot(existing_fd, label=f"existing {label}")
+    expected_size = expected_before[4]
+    if existing_before[4] != expected_size:
+        return False
+    offset = 0
+    while offset < expected_size:
+        read_size = min(1024 * 1024, expected_size - offset)
+        expected_chunk = os.pread(expected_fd, read_size, offset)
+        existing_chunk = os.pread(existing_fd, read_size, offset)
+        if not expected_chunk or expected_chunk != existing_chunk:
+            return False
+        offset += len(expected_chunk)
+    return (
+        _package_output_fd_snapshot(expected_fd, label=f"generated {label}")
+        == expected_before
+        and _package_output_fd_snapshot(existing_fd, label=f"existing {label}")
+        == existing_before
+    )
+
+
+def _validate_reusable_package_output_metadata(
+    file_descriptor: int,
+    output_path: Path,
+    *,
+    label: str,
+) -> None:
+    try:
+        metadata = os.fstat(file_descriptor)
+    except OSError as error:
+        raise PackageError(f"failed to inspect existing {label}: {output_path}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise PackageError(f"existing {label} is not a regular file: {output_path}")
+    if metadata.st_uid != os.geteuid():
+        raise PackageError(
+            f"existing {label} has unsafe ownership: {output_path}"
+        )
+    if metadata.st_nlink != 1:
+        raise PackageError(
+            f"existing {label} has unsafe link count: {output_path}"
+        )
+    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PackageError(
+            f"existing {label} has unsafe permissions: {output_path}"
+        )
+
+
+def _open_matching_package_output(
+    directory_fd: int,
+    output_dir: Path,
+    pending: _PendingPackageOutput,
+) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    output_path = output_dir / pending.spec.final_name
+    try:
+        existing_fd = os.open(
+            pending.spec.final_name,
+            flags,
+            dir_fd=directory_fd,
+        )
+    except OSError as error:
+        raise PackageError(
+            f"failed to bind existing {pending.spec.label} output: {output_path}"
+        ) from error
+    try:
+        _validate_reusable_package_output_metadata(
+            existing_fd,
+            output_path,
+            label=f"{pending.spec.label} output",
+        )
+        if not _package_output_entry_matches_fd(
+            directory_fd,
+            pending.spec.final_name,
+            existing_fd,
+        ):
+            raise PackageError(
+                f"existing {pending.spec.label} output changed while opening: "
+                f"{output_path}"
+            )
+        if not _package_output_fds_match(
+            pending.file_descriptor,
+            existing_fd,
+            label=f"{pending.spec.label} output",
+        ):
+            raise PackageError(
+                f"existing {pending.spec.label} output differs from generated "
+                f"content: {output_path}"
+            )
+        if not _package_output_entry_matches_fd(
+            directory_fd,
+            pending.spec.final_name,
+            existing_fd,
+        ):
+            raise PackageError(
+                f"existing {pending.spec.label} output changed during validation: "
+                f"{output_path}"
+            )
+        result = existing_fd
+        existing_fd = -1
+        return result
+    finally:
+        if existing_fd >= 0:
+            os.close(existing_fd)
+
+
+def _publish_package_outputs(
+    output_dir: Path,
+    specs: tuple[_PackageOutputSpec, ...],
+    *,
+    validate_after_publish: Callable[[], None] | None = None,
+    reuse_matching_existing: bool = False,
+) -> None:
+    if not specs:
+        raise PackageError("package output transaction must not be empty")
+    final_names = [spec.final_name for spec in specs]
+    if len(set(final_names)) != len(final_names):
+        raise PackageError("package output names must be unique")
+    for final_name in final_names:
+        if Path(final_name).name != final_name or final_name in {"", ".", ".."}:
+            raise PackageError(f"unsafe package output name: {final_name}")
+
+    directory_fd = -1
+    pending_outputs: list[_PendingPackageOutput] = []
+    outputs_complete = False
+    try:
+        directory_fd = _open_package_output_directory(output_dir)
+        if not reuse_matching_existing:
+            for final_name in final_names:
+                _require_package_output_absent(directory_fd, output_dir, final_name)
+
+        output_fds: dict[str, int] = {}
+        for spec in specs:
+            pending = _create_pending_package_output(directory_fd, spec)
+            pending_outputs.append(pending)
+            output_fds[spec.final_name] = pending.file_descriptor
+            spec.writer(pending.file_descriptor, output_fds)
+            os.fchmod(pending.file_descriptor, 0o644)
+            os.fsync(pending.file_descriptor)
+
+        for pending in pending_outputs:
+            temporary_name = pending.temporary_name
+            if temporary_name is None:
+                raise PackageError(f"temporary {pending.spec.label} output is missing")
+            try:
+                _rename_noreplace_at(
+                    directory_fd,
+                    temporary_name,
+                    directory_fd,
+                    pending.spec.final_name,
                 )
-                with tarfile.open(
-                    fileobj=bounded_writer,
-                    mode="w",
-                    format=tarfile.PAX_FORMAT,
-                ) as archive:
+            except FileExistsError as error:
+                if not reuse_matching_existing:
+                    raise PackageError(
+                        f"refusing to overwrite package output: "
+                        f"{output_dir / pending.spec.final_name}"
+                    ) from error
+                pending.final_file_descriptor = _open_matching_package_output(
+                    directory_fd,
+                    output_dir,
+                    pending,
+                )
+                pending.reused = True
+            except OSError as error:
+                raise PackageError(
+                    f"failed to publish {pending.spec.label} output"
+                ) from error
+            else:
+                pending.temporary_name = None
+                pending.published = True
+                pending.final_file_descriptor = pending.file_descriptor
+                os.fsync(directory_fd)
+            if pending.final_file_descriptor is None:
+                raise PackageError(
+                    f"published {pending.spec.label} output is not bound"
+                )
+            if not _package_output_entry_matches_fd(
+                directory_fd,
+                pending.spec.final_name,
+                pending.final_file_descriptor,
+            ):
+                raise PackageError(
+                    f"published {pending.spec.label} output changed"
+                )
+
+        if not _package_output_path_matches_fd(output_dir, directory_fd):
+            raise PackageError(f"package output directory changed: {output_dir}")
+        for pending in pending_outputs:
+            final_file_descriptor = pending.final_file_descriptor
+            if final_file_descriptor is None:
+                raise PackageError(
+                    f"published {pending.spec.label} output is not bound"
+                )
+            if not _package_output_entry_matches_fd(
+                directory_fd,
+                pending.spec.final_name,
+                final_file_descriptor,
+            ):
+                raise PackageError(
+                    f"published {pending.spec.label} output changed"
+                )
+            if pending.reused:
+                _validate_reusable_package_output_metadata(
+                    final_file_descriptor,
+                    output_dir / pending.spec.final_name,
+                    label=f"{pending.spec.label} output",
+                )
+                if not _package_output_fds_match(
+                    pending.file_descriptor,
+                    final_file_descriptor,
+                    label=f"{pending.spec.label} output",
+                ):
+                    raise PackageError(
+                        f"reused {pending.spec.label} output changed after validation"
+                    )
+            if not _package_output_entry_matches_fd(
+                directory_fd,
+                pending.spec.final_name,
+                final_file_descriptor,
+            ):
+                raise PackageError(
+                    f"published {pending.spec.label} output changed"
+                )
+        if validate_after_publish is not None:
+            validate_after_publish()
+        outputs_complete = True
+        for pending in pending_outputs:
+            temporary_name = pending.temporary_name
+            if temporary_name is None:
+                continue
+            _isolate_package_output_for_cleanup(
+                directory_fd,
+                temporary_name,
+                pending.file_descriptor,
+                label=f"temporary {pending.spec.label} output",
+            )
+            pending.temporary_name = None
+    except BaseException as error:
+        cleanup_errors: list[str] = []
+        if directory_fd >= 0:
+            for pending in reversed(pending_outputs):
+                if outputs_complete or pending.reused:
+                    cleanup_name = pending.temporary_name
+                else:
+                    cleanup_name = (
+                        pending.spec.final_name
+                        if pending.published
+                        else pending.temporary_name
+                    )
+                if cleanup_name is None:
+                    continue
+                cleanup_fd = (
+                    pending.file_descriptor
+                    if cleanup_name == pending.temporary_name
+                    else pending.final_file_descriptor
+                )
+                if cleanup_fd is None:
+                    cleanup_errors.append(
+                        f"{pending.spec.label} output cleanup is not bound"
+                    )
+                    continue
+                try:
+                    _isolate_package_output_for_cleanup(
+                        directory_fd,
+                        cleanup_name,
+                        cleanup_fd,
+                        label=f"{pending.spec.label} output",
+                    )
+                except (OSError, PackageError) as cleanup_error:
+                    cleanup_errors.append(str(cleanup_error))
+        _close_pending_package_outputs(pending_outputs)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        if cleanup_errors:
+            raise PackageError(
+                "package output cleanup was incomplete: " + "; ".join(cleanup_errors)
+            ) from error
+        raise
+    else:
+        _close_pending_package_outputs(pending_outputs)
+        os.close(directory_fd)
+
+
+def _write_archive_to_fd(
+    staging_root: Path,
+    archive_fd: int,
+    package_name: str,
+) -> None:
+    with os.fdopen(os.dup(archive_fd), "wb") as raw_file:
+        compressed_writer = _BoundedArchiveWriter(
+            raw_file,
+            MAX_ARCHIVE_COMPRESSED_BYTES,
+            overflow_description="release archive exceeds compressed size limit",
+            defer_overflow=True,
+        )
+        with gzip.GzipFile(
+            fileobj=compressed_writer,
+            mode="wb",
+            mtime=0,
+        ) as gzip_file:
+            bounded_writer = _BoundedArchiveWriter(
+                gzip_file,
+                MAX_ARCHIVE_EXPANDED_BYTES,
+            )
+            with tarfile.open(
+                fileobj=bounded_writer,
+                mode="w",
+                format=tarfile.PAX_FORMAT,
+            ) as archive:
+                archive.add(
+                    staging_root,
+                    arcname=package_name,
+                    recursive=False,
+                    filter=_tar_filter,
+                )
+                for path in _iter_tar_paths(staging_root):
+                    relative_path = path.relative_to(staging_root).as_posix()
                     archive.add(
-                        staging_root,
-                        arcname=package_name,
+                        path,
+                        arcname=f"{package_name}/{relative_path}",
                         recursive=False,
                         filter=_tar_filter,
                     )
-                    for path in _iter_tar_paths(staging_root):
-                        relative_path = path.relative_to(staging_root).as_posix()
-                        archive.add(
-                            path,
-                            arcname=f"{package_name}/{relative_path}",
-                            recursive=False,
-                            filter=_tar_filter,
-                        )
-            compressed_writer.raise_if_overflow()
-    except BaseException:
-        archive_path.unlink(missing_ok=True)
-        raise
+        compressed_writer.raise_if_overflow()
+
+
+def _archive_digest_from_fd(archive_fd: int) -> str:
+    digest = hashlib.sha256()
+    with os.fdopen(os.dup(archive_fd), "rb") as archive_file:
+        archive_file.seek(0)
+        for chunk in iter(lambda: archive_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_checksum_to_fd(
+    archive_fd: int,
+    checksum_fd: int,
+    archive_name: str,
+) -> None:
+    payload = f"{_archive_digest_from_fd(archive_fd)}  {archive_name}\n".encode()
+    with os.fdopen(os.dup(checksum_fd), "wb") as checksum_file:
+        written = checksum_file.write(payload)
+        if written != len(payload):
+            raise PackageError("failed to write the complete release checksum")
+
+
+def create_archive(staging_root: Path, archive_path: Path, package_name: str) -> None:
+    _validate_staged_release_compatibility(staging_root, package_name)
+
+    def write_archive(archive_fd: int, _output_fds: dict[str, int]) -> None:
+        _write_archive_to_fd(staging_root, archive_fd, package_name)
+
+    _publish_package_outputs(
+        archive_path.parent,
+        (_PackageOutputSpec(archive_path.name, "archive", write_archive),),
+    )
 
 
 def _checksum_path(archive_path: Path) -> Path:
@@ -2229,15 +2890,45 @@ def _checksum_path(archive_path: Path) -> Path:
 
 
 def write_checksum(archive_path: Path) -> Path:
-    digest = hashlib.sha256()
-    with archive_path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
     checksum_path = _checksum_path(archive_path)
-    checksum_path.write_text(
-        f"{digest.hexdigest()}  {archive_path.name}\n",
-        encoding="utf-8",
-    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        archive_fd = os.open(archive_path, flags)
+    except OSError as error:
+        raise PackageError(f"failed to open release archive: {archive_path}") from error
+    try:
+        archive_metadata = os.fstat(archive_fd)
+        if not stat.S_ISREG(archive_metadata.st_mode):
+            raise PackageError(f"release archive is not a regular file: {archive_path}")
+        if not _package_output_path_matches_fd(archive_path, archive_fd):
+            raise PackageError(f"release archive changed while opening: {archive_path}")
+
+        def write_checksum_output(
+            checksum_fd: int,
+            _output_fds: dict[str, int],
+        ) -> None:
+            _write_checksum_to_fd(archive_fd, checksum_fd, archive_path.name)
+
+        def validate_archive() -> None:
+            if not _package_output_path_matches_fd(archive_path, archive_fd):
+                raise PackageError(
+                    f"release archive changed during checksum creation: {archive_path}"
+                )
+
+        _publish_package_outputs(
+            checksum_path.parent,
+            (
+                _PackageOutputSpec(
+                    checksum_path.name,
+                    "checksum",
+                    write_checksum_output,
+                ),
+            ),
+            validate_after_publish=validate_archive,
+        )
+    finally:
+        os.close(archive_fd)
     return checksum_path
 
 
@@ -2260,6 +2951,7 @@ def build_package(
         )
     package_name = f"personal-codex-{sha}"
     archive_path = output_dir / f"{package_name}.tar.gz"
+    checksum_path = _checksum_path(archive_path)
     with tempfile.TemporaryDirectory(prefix="personal-codex-package.") as temp_dir_raw:
         staging_root = Path(temp_dir_raw) / package_name
         staging_root.mkdir(parents=True)
@@ -2267,13 +2959,40 @@ def build_package(
             stage_release(repo_root, manifest_path, staging_root)
         else:
             stage_strict_release(repo_root, strict_snapshot, staging_root)
-        create_archive(staging_root, archive_path, package_name)
-    try:
-        checksum_path = write_checksum(archive_path)
-    except BaseException:
-        archive_path.unlink(missing_ok=True)
-        _checksum_path(archive_path).unlink(missing_ok=True)
-        raise
+        _validate_staged_release_compatibility(staging_root, package_name)
+
+        def write_archive_output(
+            archive_fd: int,
+            _output_fds: dict[str, int],
+        ) -> None:
+            _write_archive_to_fd(staging_root, archive_fd, package_name)
+
+        def write_checksum_output(
+            checksum_fd: int,
+            output_fds: dict[str, int],
+        ) -> None:
+            _write_checksum_to_fd(
+                output_fds[archive_path.name],
+                checksum_fd,
+                archive_path.name,
+            )
+
+        _publish_package_outputs(
+            output_dir,
+            (
+                _PackageOutputSpec(
+                    archive_path.name,
+                    "archive",
+                    write_archive_output,
+                ),
+                _PackageOutputSpec(
+                    checksum_path.name,
+                    "checksum",
+                    write_checksum_output,
+                ),
+            ),
+            reuse_matching_existing=True,
+        )
     return archive_path, checksum_path
 
 

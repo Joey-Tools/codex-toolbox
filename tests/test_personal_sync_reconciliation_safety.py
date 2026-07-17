@@ -600,6 +600,26 @@ class TargetPortabilityTests(unittest.TestCase):
                 ):
                     MODULE._validate_manifest_target_portability([manifest])
 
+    def test_rejects_owner_spellings_with_same_portable_key(self) -> None:
+        manifests = [
+            self._target_manifest("private"),
+            self._target_manifest("Private"),
+        ]
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "portable owner spellings conflict",
+        ):
+            MODULE._validate_manifest_target_portability(manifests)
+
+    def test_allows_special_public_root_and_case_variant_overlay_owner(self) -> None:
+        MODULE._validate_manifest_target_portability(
+            [
+                self._target_manifest(MODULE.PUBLIC_OWNER),
+                self._target_manifest("Public"),
+            ]
+        )
+
     def test_allows_exact_active_and_removed_tombstone_target(self) -> None:
         target = PurePosixPath("skills/example")
         manifest = MODULE.ManifestData(
@@ -922,6 +942,71 @@ class TargetPortabilityTests(unittest.TestCase):
                                 allow_cross_owner=False,
                             )
                     stage_release.assert_not_called()
+
+    def test_install_rejects_stale_overlay_owner_case_alias_before_staging(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            home = root / "home"
+            (home / "personal-sync" / "overlays" / "private").mkdir(
+                parents=True
+            )
+            manifest = self._target_manifest(
+                "Private",
+                active="skills/private",
+            )
+
+            with mock.patch.object(
+                MODULE,
+                "_stage_release_tree_for_install",
+            ) as stage_release:
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "portable owner spellings conflict",
+                ):
+                    MODULE._install_release_set_unlocked(
+                        home,
+                        [(root / "release", SHA_B, manifest)],
+                        dry_run=False,
+                        allow_cross_owner=True,
+                    )
+
+            stage_release.assert_not_called()
+
+    def test_installs_case_variant_public_overlay_into_distinct_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            home = root / "home"
+            public_release = root / "public-release"
+            overlay_release = root / "overlay-release"
+            write_skill_release(
+                public_release,
+                source_name="public-root",
+                target_name="public-root",
+            )
+            write_skill_release(
+                overlay_release,
+                source_name="public-overlay",
+                target_name="public-overlay",
+                owner="Public",
+            )
+
+            install_quietly(public_release, home, SHA_A)
+            install_quietly(overlay_release, home, SHA_B)
+
+            self.assertEqual(
+                MODULE._known_owners(home),
+                {MODULE.PUBLIC_OWNER, "Public"},
+            )
+            self.assertTrue(MODULE._current_link(home).is_symlink())
+            self.assertTrue(MODULE._current_link(home, "Public").is_symlink())
+            self.assertEqual(
+                MODULE._load_managed_state(home).owners,
+                {MODULE.PUBLIC_OWNER: SHA_A, "Public": SHA_B},
+            )
 
 
 class ArchiveErrorNormalizationSafetyTests(unittest.TestCase):
@@ -3346,6 +3431,66 @@ class ManagedStateReadSafetyTests(unittest.TestCase):
                 MODULE._load_managed_state(self.home)
 
         read_file.assert_not_called()
+
+    def test_rejects_case_alias_owners_before_release_lookup(self) -> None:
+        payload = {
+            "version": 1,
+            "owners": {
+                "private": SHA_A,
+                "Private": SHA_B,
+            },
+            "links": [],
+        }
+
+        with mock.patch.object(
+            MODULE,
+            "_ensure_safe_release_directory",
+        ) as ensure_release:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "portable owner spellings conflict",
+            ):
+                MODULE._managed_state_from_payload(self.home, payload)
+
+        ensure_release.assert_not_called()
+
+    def test_allows_public_root_and_case_variant_overlay_ledger_owners(
+        self,
+    ) -> None:
+        payload = {
+            "version": 1,
+            "owners": {
+                MODULE.PUBLIC_OWNER: SHA_A,
+                "Public": SHA_B,
+            },
+            "links": [],
+        }
+
+        def manifest_for_owner(
+            _home: Path,
+            owner: str,
+            _sha: str,
+            *,
+            manifest_cache: object = None,
+        ) -> MODULE.ManifestData:
+            del manifest_cache
+            return MODULE.ManifestData(
+                owner=owner,
+                entries=[],
+                removed_links=[],
+            )
+
+        with (
+            mock.patch.object(MODULE, "_ensure_safe_release_directory"),
+            mock.patch.object(
+                MODULE,
+                "_load_installed_manifest_data",
+                side_effect=manifest_for_owner,
+            ),
+        ):
+            state = MODULE._managed_state_from_payload(self.home, payload)
+
+        self.assertEqual(state.owners, payload["owners"])
 
 
 class StatusManagedStateSafetyTests(unittest.TestCase):
