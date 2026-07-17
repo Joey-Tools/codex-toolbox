@@ -217,7 +217,7 @@ jobs:
           ]
           release_tag_prefix = "personal-codex-"
           release_tag_pattern = re.compile(
-              r"^personal-codex-[0-9]{8}-[0-9]{6}-(?P<sha_prefix>[0-9a-f]{7})$"
+              r"^personal-codex-[0-9]{8}-[0-9]{6}-(?P<sha_prefix>[0-9a-f]{7,40})$"
           )
           personal_asset_pattern = re.compile(
               r"^personal-codex-[0-9a-f]{40}(?:\.tar\.gz|\.sha256)$"
@@ -257,7 +257,7 @@ jobs:
               tag_match = release_tag_pattern.fullmatch(tag_name)
               if tag_match is None:
                   raise SystemExit(f"{context} has invalid release tag: {tag_name}")
-              if tag_match.group("sha_prefix") != sha[:7]:
+              if not sha.startswith(tag_match.group("sha_prefix")):
                   raise SystemExit(
                       f"{context} tag suffix does not match target SHA: {tag_name}"
                   )
@@ -309,17 +309,6 @@ jobs:
               matching_assets = matching_personal_assets(
                   draft_release.get("assets", [])
               )
-              matching_names = [asset["name"] for asset in matching_assets]
-              if (
-                  len(matching_assets) == len(expected_asset_names)
-                  and set(matching_names) == expected_asset_names
-                  and all(
-                      asset.get("state") == "uploaded"
-                      for asset in matching_assets
-                  )
-              ):
-                  return set(matching_names)
-
               asset_ids = []
               for repair_asset in matching_assets:
                   asset_id = repair_asset.get("id")

@@ -289,7 +289,7 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
         self.assertIsNone(exit_error)
         self.assert_full_replacement(calls, deleted_asset_ids=[101, 102, 104])
 
-    def test_complete_uploaded_draft_pair_is_not_retransmitted(self) -> None:
+    def test_complete_uploaded_draft_pair_is_replaced_in_full(self) -> None:
         initial_release = self.release(draft=True)
         final_release = self.release(draft=True)
 
@@ -299,13 +299,48 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
         )
 
         self.assertIsNone(exit_error)
-        self.assertFalse(
-            any(
-                method == "DELETE" or url.startswith("https://uploads.github.com/")
-                for method, url in calls
-            )
-        )
-        self.assertEqual(sum(method == "PATCH" for method, _url in calls), 1)
+        self.assert_full_replacement(calls, deleted_asset_ids=[101, 102])
+
+    def test_long_valid_draft_tag_prefixes_are_repaired_in_full(self) -> None:
+        for prefix_length in (8, 40):
+            with self.subTest(prefix_length=prefix_length):
+                tag = (
+                    "personal-codex-20260715-000000-"
+                    f"{self.SHA[:prefix_length]}"
+                )
+                initial_release = self.release(draft=True)
+                initial_release["tag_name"] = tag
+                final_release = self.release(draft=True)
+                final_release["tag_name"] = tag
+
+                calls, exit_error = self.run_publish_script(
+                    initial_release,
+                    final_release=final_release,
+                )
+
+                self.assertIsNone(exit_error)
+                self.assert_full_replacement(calls, deleted_asset_ids=[101, 102])
+
+    def test_long_valid_published_tag_prefixes_are_reused_read_only(self) -> None:
+        for prefix_length in (8, 40):
+            with self.subTest(prefix_length=prefix_length):
+                initial_release = self.release(draft=False)
+                initial_release["tag_name"] = (
+                    "personal-codex-20260715-000000-"
+                    f"{self.SHA[:prefix_length]}"
+                )
+
+                calls, exit_error = self.run_publish_script(initial_release)
+
+                self.assertIsNotNone(exit_error)
+                assert exit_error is not None
+                self.assertEqual(exit_error.code, 0)
+                self.assertFalse(
+                    any(
+                        method in {"DELETE", "PATCH", "POST"}
+                        for method, _url in calls
+                    )
+                )
 
     def test_invalid_draft_tag_or_suffix_fails_before_asset_mutation(self) -> None:
         cases = (
@@ -317,6 +352,11 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
             (
                 "wrong-sha-suffix",
                 f"personal-codex-20260715-000000-{'b' * 7}",
+                "tag suffix does not match target SHA",
+            ),
+            (
+                "wrong-long-sha-prefix",
+                f"personal-codex-20260715-000000-{self.SHA[:7]}b",
                 "tag suffix does not match target SHA",
             ),
         )
@@ -395,7 +435,6 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
             with self.subTest(name=name):
                 initial_release = self.release(draft=True)
                 repair_asset = initial_release["assets"][0]
-                repair_asset["state"] = "new"
                 if invalid_id is None:
                     repair_asset.pop("id")
                 else:
@@ -415,7 +454,6 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
 
     def test_retry_fails_before_mutation_when_matching_asset_ids_repeat(self) -> None:
         initial_release = self.release(draft=True)
-        initial_release["assets"][0]["state"] = "new"
         initial_release["assets"][1]["id"] = 101
 
         calls, exit_error = self.run_publish_script(initial_release)
