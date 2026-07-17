@@ -42,6 +42,19 @@ REMOVED_LINK_FIELDS = frozenset(
     }
 )
 BASE_RELEASE_FIELDS = frozenset({"repo", "sha"})
+MANIFEST_FIELDS = frozenset(
+    {
+        "version",
+        "owner",
+        "links",
+        "reference_only",
+        "removed_links",
+        "base_release",
+    }
+)
+MANIFEST_LINK_FIELDS = frozenset(
+    {"source", "target", "kind", "owner", "override"}
+)
 SYNC_INTERNAL_TARGET = PurePosixPath("personal-sync")
 PENDING_LINK_POINTER_TARGET = PurePosixPath(
     ".personal-sync-pending-transaction.json"
@@ -672,6 +685,12 @@ def _manifest_model(
     enforce_history_constraints: bool = True,
 ) -> dict[str, Any]:
     _validate_manifest_unicode_scalars(data)
+    unknown_fields = sorted(set(data) - MANIFEST_FIELDS)
+    if unknown_fields:
+        raise ValidationError(
+            "sync manifest has unsupported field(s): "
+            + ", ".join(unknown_fields)
+        )
     version = data.get("version")
     if type(version) is not int or version != 1:
         raise ValidationError("sync manifest version must be 1")
@@ -690,9 +709,15 @@ def _manifest_model(
             "manifest active links exceed runtime transaction limit: "
             f"{len(raw_links)} > {MAX_MANIFEST_ACTIVE_LINKS}"
         )
-    for raw_link in raw_links:
+    for index, raw_link in enumerate(raw_links):
         if not isinstance(raw_link, dict):
             raise ValidationError("manifest link entries must be objects")
+        unknown_fields = sorted(set(raw_link) - MANIFEST_LINK_FIELDS)
+        if unknown_fields:
+            raise ValidationError(
+                f"manifest link #{index + 1} has unsupported field(s): "
+                + ", ".join(unknown_fields)
+            )
         source = _relative_path(raw_link.get("source"), "link source")
         target = _target_path(raw_link.get("target"), "link target")
         kind = raw_link.get("kind")

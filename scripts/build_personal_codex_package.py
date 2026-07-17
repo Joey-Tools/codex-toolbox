@@ -75,6 +75,19 @@ REMOVED_LINK_FIELDS = frozenset(
     }
 )
 BASE_RELEASE_FIELDS = frozenset({"repo", "sha"})
+MANIFEST_FIELDS = frozenset(
+    {
+        "version",
+        "owner",
+        "links",
+        "reference_only",
+        "removed_links",
+        "base_release",
+    }
+)
+MANIFEST_LINK_FIELDS = frozenset(
+    {"source", "target", "kind", "owner", "override"}
+)
 REGULAR_GIT_MODES = frozenset({b"100644", b"100755"})
 PUBLIC_OWNER = "public"
 RESERVED_TARGET_ROOTS = (
@@ -553,6 +566,12 @@ def _validate_replacement_retirement_graph(
 
 
 def _manifest_sources(manifest: dict[str, Any]) -> list[Path]:
+    unknown_fields = sorted(set(manifest) - MANIFEST_FIELDS)
+    if unknown_fields:
+        raise PackageError(
+            "sync manifest has unsupported field(s): "
+            + ", ".join(unknown_fields)
+        )
     version = manifest.get("version")
     if type(version) is not int or version != 1:
         raise PackageError("sync manifest version must be 1")
@@ -575,10 +594,16 @@ def _manifest_sources(manifest: dict[str, Any]) -> list[Path]:
                 "sync manifest active links exceed runtime transaction limit: "
                 f"{len(items)} > {MAX_MANIFEST_ACTIVE_LINKS}"
             )
-        for item in items:
+        for index, item in enumerate(items):
             if section == "links":
                 if not isinstance(item, dict):
                     raise PackageError("manifest link entries must be objects")
+                unknown_fields = sorted(set(item) - MANIFEST_LINK_FIELDS)
+                if unknown_fields:
+                    raise PackageError(
+                        f"manifest link #{index + 1} has unsupported field(s): "
+                        + ", ".join(unknown_fields)
+                    )
                 source = item.get("source")
             else:
                 source = item

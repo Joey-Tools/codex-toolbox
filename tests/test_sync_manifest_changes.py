@@ -1091,6 +1091,31 @@ class SyncManifestChangeTests(unittest.TestCase):
             ):
                 MODULE._manifest_model(current)
 
+    def test_manifest_rejects_unknown_top_level_and_link_fields(self) -> None:
+        valid = manifest("keep")
+        valid["owner"] = "private"
+        valid["links"][0]["owner"] = "private"
+        valid["links"][0]["override"] = True
+        MODULE._manifest_model(valid)
+
+        for location, field in (
+            ("top-level", "reference_onyl"),
+            ("link", "overide"),
+        ):
+            current = json.loads(json.dumps(valid))
+            if location == "top-level":
+                current[field] = []
+            else:
+                current["links"][0][field] = True
+            with (
+                self.subTest(location=location),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    rf"unsupported field\(s\): {field}",
+                ),
+            ):
+                MODULE._manifest_model(current)
+
     def test_manifest_enforces_active_managed_link_target_byte_limit(self) -> None:
         owner = "o" * MODULE.MAX_OWNER_COMPONENT_BYTES
         target = "/".join(["t"] * MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)

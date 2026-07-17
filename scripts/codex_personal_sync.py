@@ -151,6 +151,19 @@ REMOVED_LINK_FIELDS = frozenset(
     }
 )
 BASE_RELEASE_FIELDS = frozenset({"repo", "sha"})
+MANIFEST_FIELDS = frozenset(
+    {
+        "version",
+        "owner",
+        "links",
+        "reference_only",
+        "removed_links",
+        "base_release",
+    }
+)
+MANIFEST_LINK_FIELDS = frozenset(
+    {"source", "target", "kind", "owner", "override"}
+)
 LAUNCHD_LABEL = "io.github.joey-tools.codex-personal-sync"
 LEGACY_LAUNCHD_LABELS = ("com.joeyteng.codex-personal-sync",)
 SYSTEMD_UNIT = "codex-personal-sync"
@@ -979,6 +992,12 @@ def _parse_manifest_data(
     path_kind: Callable[[PurePosixPath], str | None],
 ) -> ManifestData:
     _validate_manifest_unicode_scalars(data)
+    unknown_fields = sorted(set(data) - MANIFEST_FIELDS)
+    if unknown_fields:
+        raise SyncError(
+            "sync manifest has unsupported field(s): "
+            + ", ".join(unknown_fields)
+        )
     version = data.get("version")
     if type(version) is not int or version != 1:
         raise SyncError("sync manifest version must be 1")
@@ -999,6 +1018,12 @@ def _parse_manifest_data(
     for index, raw_entry in enumerate(raw_links):
         if not isinstance(raw_entry, dict):
             raise SyncError(f"manifest link #{index + 1} must be an object")
+        unknown_fields = sorted(set(raw_entry) - MANIFEST_LINK_FIELDS)
+        if unknown_fields:
+            raise SyncError(
+                f"manifest link #{index + 1} has unsupported field(s): "
+                + ", ".join(unknown_fields)
+            )
         source = _validate_relative_path(raw_entry.get("source"), "source")
         target = _validate_target_path(raw_entry.get("target"), "target")
         kind = raw_entry.get("kind")
@@ -6329,6 +6354,7 @@ def _plan_reconciliation(
     state: ManagedState,
     *,
     allow_cross_owner: bool,
+    allow_unledgered_removed_links: bool = False,
 ) -> list[ReconcileAction]:
     desired_by_target = _entries_by_target(desired_entries)
     previous_targets: dict[PurePosixPath, set[str]] = {}
@@ -6341,7 +6367,8 @@ def _plan_reconciliation(
     candidate_targets = set(desired_by_target)
     candidate_targets.update(state.links)
     candidate_targets.update(previous_targets)
-    candidate_targets.update(removed_by_target)
+    if allow_unledgered_removed_links:
+        candidate_targets.update(removed_by_target)
     actions: list[ReconcileAction] = []
 
     for relative_target in sorted(candidate_targets, key=PurePosixPath.as_posix):
@@ -6358,7 +6385,11 @@ def _plan_reconciliation(
             else None
         )
         record = state.links.get(relative_target)
-        removed_candidates = removed_by_target.get(relative_target, [])
+        removed_candidates = (
+            removed_by_target.get(relative_target, [])
+            if allow_unledgered_removed_links
+            else []
+        )
         if (
             record is not None
             and planned_snapshot is not None
@@ -14962,6 +14993,7 @@ def _install_release_set_unlocked(
         removed_links,
         state,
         allow_cross_owner=allow_cross_owner,
+        allow_unledgered_removed_links=bootstrap_history,
     )
     _verify_managed_state_link_claims(home, state, actions)
     link_actions = [
@@ -16524,10 +16556,11 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
         # Uncommitted recovery returns the exact restored before-state snapshot.
         # If that state was absent, plan this uninstall like a clean legacy retry
         # so the restored links are claimed before their owner is retired.
+        bootstrap_history = not initial_state_snapshot.exists
         state = _refresh_managed_state_from_current(
             home,
             loaded_state,
-            bootstrap_history=not initial_state_snapshot.exists,
+            bootstrap_history=bootstrap_history,
         )
         baseline_link_snapshots = _capture_managed_state_link_snapshots(home, state)
         current_manifests = _installed_manifests(home)
@@ -16589,6 +16622,7 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
             historical_removed_links,
             state,
             allow_cross_owner=True,
+            allow_unledgered_removed_links=bootstrap_history,
         )
         _verify_managed_state_link_claims(home, state, actions)
         link_actions = [

@@ -504,6 +504,41 @@ class PackageBuilderSafetyTests(unittest.TestCase):
                 with self.assertRaisesRegex(BUILDER.PackageError, message):
                     BUILDER._manifest_sources(payload)
 
+    def test_manifest_rejects_unknown_top_level_and_link_fields(self) -> None:
+        valid: dict[str, object] = {
+            "version": 1,
+            "owner": "private",
+            "links": [
+                {
+                    "source": "payload",
+                    "target": "skills/example",
+                    "kind": "skill",
+                    "owner": "private",
+                    "override": True,
+                }
+            ],
+            "reference_only": [],
+        }
+        self.assertEqual(BUILDER._manifest_sources(valid), [Path("payload")])
+
+        for location, field in (
+            ("top-level", "reference_onyl"),
+            ("link", "overide"),
+        ):
+            payload = json.loads(json.dumps(valid))
+            if location == "top-level":
+                payload[field] = []
+            else:
+                payload["links"][0][field] = True
+            with (
+                self.subTest(location=location),
+                self.assertRaisesRegex(
+                    BUILDER.PackageError,
+                    rf"unsupported field\(s\): {field}",
+                ),
+            ):
+                BUILDER._manifest_sources(payload)
+
     def test_manifest_enforces_active_managed_link_target_byte_limit(self) -> None:
         owner = "o" * BUILDER.MAX_OWNER_COMPONENT_BYTES
         target = "/".join(["t"] * BUILDER.MAX_MANIFEST_TARGET_PATH_DEPTH)

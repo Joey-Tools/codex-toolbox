@@ -1442,7 +1442,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         self.assertTrue((home / "skills" / "public-base").is_symlink())
 
-    def test_install_private_reconciles_matching_legacy_private_symlink(self) -> None:
+    def test_install_private_rejects_unclaimed_legacy_tombstone_replacement(
+        self,
+    ) -> None:
         home = self.root / "home" / ".codex"
         old_public = self.root / "old-public"
         old_private = self.root / "old-private"
@@ -1485,38 +1487,57 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 }
             ],
         )
+        state_path = home / "personal-sync" / "state" / "managed-links.json"
+        legacy_metadata = legacy_link.lstat()
+        before = (
+            legacy_metadata.st_dev,
+            legacy_metadata.st_ino,
+            legacy_link.readlink().as_posix(),
+            current_target(home),
+            (
+                home / "personal-sync" / "overlays" / "private" / "current"
+            ).readlink().as_posix(),
+            state_path.read_bytes(),
+        )
 
         with self.capture_reconcile_backups() as backup_events:
-            self.install_private_pair(
-                home,
-                new_public,
-                new_private,
-                public_sha=SHA3,
-                private_sha=SHA4,
-            )
-
-        self.assertEqual(
-            legacy_link.readlink().as_posix(),
-            "../personal-sync/current/personal_codex/skills/legacy-skill",
-        )
-        self.assertEqual(
-            list(
-                (home / "personal-sync" / "quarantine").glob(
-                    "*/links/skills/legacy-skill"
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "refusing to replace unproven symlink target",
+            ):
+                self.install_private_pair(
+                    home,
+                    new_public,
+                    new_private,
+                    public_sha=SHA3,
+                    private_sha=SHA4,
                 )
-            ),
-            [],
-        )
-        self.assertIn(
+
+        legacy_metadata = legacy_link.lstat()
+        self.assertEqual(
             (
-                "quarantine-replace",
-                "skills/legacy-skill",
-                "../personal-sync/overlays/private/current/"
-                "personal_codex/skills/legacy-skill",
-                "private:retire-legacy-private-link",
+                legacy_metadata.st_dev,
+                legacy_metadata.st_ino,
+                legacy_link.readlink().as_posix(),
+                current_target(home),
+                (
+                    home
+                    / "personal-sync"
+                    / "overlays"
+                    / "private"
+                    / "current"
+                ).readlink().as_posix(),
+                state_path.read_bytes(),
             ),
-            backup_events,
+            before,
         )
+        self.assertNotIn(
+            "skills/legacy-skill",
+            {event[1] for event in backup_events},
+        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(home)))
+        self.assertFalse((MODULE._releases_root(home) / SHA3).exists())
+        self.assertFalse((MODULE._releases_root(home, "private") / SHA4).exists())
 
     def test_install_private_preserves_local_directory_at_removed_target(self) -> None:
         home = self.root / "home" / ".codex"
@@ -1655,7 +1676,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertFalse((home / "personal-sync" / "current").exists())
         self.assertFalse((home / "skills").exists())
 
-    def test_install_private_quarantine_remove_reapplies_if_legacy_link_returns(self) -> None:
+    def test_install_private_does_not_reapply_tombstone_cleanup_with_existing_ledger(
+        self,
+    ) -> None:
         home = self.root / "home" / ".codex"
         old_public = self.root / "old-public"
         old_private = self.root / "old-private"
@@ -1698,28 +1721,37 @@ class CodexPersonalSyncTests(unittest.TestCase):
             removed_links=removed_links,
             extra_skill_dirs=("legacy-skill",),
         )
+        legacy_metadata = legacy_link.lstat()
+        legacy_before = (
+            legacy_metadata.st_dev,
+            legacy_metadata.st_ino,
+            legacy_link.readlink().as_posix(),
+        )
+        state_path = home / "personal-sync" / "state" / "managed-links.json"
+        state_before = state_path.read_bytes()
 
         with self.capture_reconcile_backups() as first_backup_events:
-            self.install_private_pair(
-                home,
-                new_public,
-                new_private,
-                public_sha=SHA3,
-                private_sha=SHA4,
-            )
-        self.assertFalse(os.path.lexists(legacy_link))
-        legacy_link.symlink_to(legacy_target, target_is_directory=True)
-
-        with self.capture_reconcile_backups() as second_backup_events:
-            self.install_private_pair(
-                home,
-                new_public,
-                new_private,
-                public_sha=SHA3,
-                private_sha=SHA4,
-            )
-
-        self.assertFalse(os.path.lexists(legacy_link))
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "overlay verification failed with 1 issue",
+            ):
+                self.install_private_pair(
+                    home,
+                    new_public,
+                    new_private,
+                    public_sha=SHA3,
+                    private_sha=SHA4,
+                )
+        legacy_metadata = legacy_link.lstat()
+        self.assertEqual(
+            (
+                legacy_metadata.st_dev,
+                legacy_metadata.st_ino,
+                legacy_link.readlink().as_posix(),
+            ),
+            legacy_before,
+        )
+        self.assertEqual(state_path.read_bytes(), state_before)
         self.assertEqual(
             list(
                 (home / "personal-sync" / "quarantine").glob(
@@ -1728,16 +1760,22 @@ class CodexPersonalSyncTests(unittest.TestCase):
             ),
             [],
         )
-        expected_backup = (
-            "quarantine-remove",
+        self.assertNotIn(
             "skills/legacy-skill",
-            legacy_target,
-            "private:retire-legacy-private-link",
+            {event[1] for event in first_backup_events},
         )
-        self.assertIn(expected_backup, first_backup_events)
-        self.assertIn(expected_backup, second_backup_events)
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+        self.assertEqual(
+            (home / "personal-sync" / "overlays" / "private" / "current")
+            .readlink()
+            .as_posix(),
+            f"releases/{SHA2}",
+        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(home)))
 
-    def test_install_private_legacy_quarantine_dry_run_has_no_side_effects(self) -> None:
+    def test_install_private_legacy_tombstone_dry_run_rejects_without_side_effects(
+        self,
+    ) -> None:
         home = self.root / "home" / ".codex"
         old_public = self.root / "old-public"
         old_private = self.root / "old-private"
@@ -1786,14 +1824,18 @@ class CodexPersonalSyncTests(unittest.TestCase):
         quarantine_root = home / "personal-sync" / "quarantine"
         quarantine_before = snapshot_tree(quarantine_root)
 
-        self.install_private_pair(
-            home,
-            new_public,
-            new_private,
-            public_sha=SHA3,
-            private_sha=SHA4,
-            dry_run=True,
-        )
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "refusing to replace unproven symlink target",
+        ):
+            self.install_private_pair(
+                home,
+                new_public,
+                new_private,
+                public_sha=SHA3,
+                private_sha=SHA4,
+                dry_run=True,
+            )
 
         self.assertEqual(legacy_link.readlink().as_posix(), legacy_target)
         self.assertEqual(current_target(home), f"releases/{SHA1}")

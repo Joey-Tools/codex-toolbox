@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import hashlib
 from io import StringIO
 import json
 import os
@@ -12,6 +13,15 @@ from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+ARCHIVE_PAYLOAD = b"archive"
+CHECKSUM_PAYLOAD = b"checksum"
+
+
+def asset_content(payload: bytes) -> dict[str, object]:
+    return {
+        "size": len(payload),
+        "digest": f"sha256:{hashlib.sha256(payload).hexdigest()}",
+    }
 
 
 def complete_release(
@@ -28,18 +38,19 @@ def complete_release(
         "target_commitish": sha,
         "draft": draft,
         "prerelease": False,
+        "immutable": not draft,
         "assets": [
             {
                 "id": archive_id,
                 "name": f"personal-codex-{sha}.tar.gz",
-                "size": 1,
                 "state": asset_state,
+                **asset_content(ARCHIVE_PAYLOAD),
             },
             {
                 "id": checksum_id,
                 "name": f"personal-codex-{sha}.sha256",
-                "size": 1,
                 "state": asset_state,
+                **asset_content(CHECKSUM_PAYLOAD),
             },
         ],
     }
@@ -109,13 +120,17 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
             url = request.full_url
             calls.append((method, url))
             if method == "GET" and "/releases?per_page=" in url:
-                return FakeResponse(
-                    initial_releases if url.endswith("&page=1") else []
-                )
+                return FakeResponse(initial_releases if url.endswith("&page=1") else [])
             if method == "DELETE" and "/releases/assets/" in url:
                 return FakeResponse(None)
             if method == "POST" and url.startswith("https://uploads.github.com/"):
                 asset_name = url.rsplit("?name=", 1)[1]
+                expected_payload = (
+                    CHECKSUM_PAYLOAD
+                    if asset_name.endswith(".sha256")
+                    else ARCHIVE_PAYLOAD
+                )
+                self.assertEqual(request.data, expected_payload)
                 return FakeResponse(
                     {
                         "id": 999,
@@ -136,6 +151,7 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
                         raise AssertionError("unexpected published release lookup")
                     default_published_release = dict(final_release)
                     default_published_release["draft"] = False
+                    default_published_release["immutable"] = True
                     return FakeResponse(default_published_release)
                 raise AssertionError("unexpected extra release lookup")
             if method == "PATCH" and url.endswith(f"/releases/{self.RELEASE_ID}"):
@@ -148,8 +164,8 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
             temp_root = Path(temp_dir)
             dist = temp_root / "dist"
             dist.mkdir()
-            (dist / f"personal-codex-{self.SHA}.tar.gz").write_bytes(b"archive")
-            (dist / f"personal-codex-{self.SHA}.sha256").write_bytes(b"checksum")
+            (dist / f"personal-codex-{self.SHA}.tar.gz").write_bytes(ARCHIVE_PAYLOAD)
+            (dist / f"personal-codex-{self.SHA}.sha256").write_bytes(CHECKSUM_PAYLOAD)
             try:
                 os.chdir(temp_root)
                 with (
@@ -220,6 +236,17 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
             ],
         )
         self.assertEqual(sum(method == "PATCH" for method, _url in calls), 1)
+
+    def assert_no_mutations(self, calls: list[tuple[str, str]]) -> None:
+        self.assertFalse(
+            any(method in {"DELETE", "PATCH", "POST"} for method, _url in calls)
+        )
+
+    def assert_failed(self, exit_error: SystemExit | None) -> SystemExit:
+        self.assertIsNotNone(exit_error)
+        assert exit_error is not None
+        self.assertNotEqual(exit_error.code, 0)
+        return exit_error
 
     def test_retry_replaces_pending_pair_in_full(self) -> None:
         initial_release = self.release(draft=True)
@@ -324,10 +351,7 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
     def test_long_valid_draft_tag_prefixes_are_repaired_in_full(self) -> None:
         for prefix_length in (8, 40):
             with self.subTest(prefix_length=prefix_length):
-                tag = (
-                    "personal-codex-20260715-000000-"
-                    f"{self.SHA[:prefix_length]}"
-                )
+                tag = f"personal-codex-20260715-000000-{self.SHA[:prefix_length]}"
                 initial_release = self.release(draft=True)
                 initial_release["tag_name"] = tag
                 final_release = self.release(draft=True)
@@ -346,8 +370,7 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
             with self.subTest(prefix_length=prefix_length):
                 initial_release = self.release(draft=False)
                 initial_release["tag_name"] = (
-                    "personal-codex-20260715-000000-"
-                    f"{self.SHA[:prefix_length]}"
+                    f"personal-codex-20260715-000000-{self.SHA[:prefix_length]}"
                 )
 
                 calls, exit_error = self.run_publish_script(initial_release)
@@ -356,20 +379,201 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
                 assert exit_error is not None
                 self.assertEqual(exit_error.code, 0)
                 self.assertFalse(
-                    any(
-                        method in {"DELETE", "PATCH", "POST"}
-                        for method, _url in calls
-                    )
+                    any(method in {"DELETE", "PATCH", "POST"} for method, _url in calls)
                 )
+
+    def test_published_release_with_exact_content_is_reused_read_only(self) -> None:
+        initial_release = self.release(draft=False)
+        initial_release["assets"].append(
+            {
+                "id": True,
+                "name": "release-notes.txt",
+                "size": False,
+                "state": "new",
+            }
+        )
+
+        calls, exit_error = self.run_publish_script(initial_release)
+
+        self.assertIsNotNone(exit_error)
+        assert exit_error is not None
+        self.assertEqual(exit_error.code, 0)
+        self.assert_no_mutations(calls)
+
+    def test_published_release_requires_valid_release_id_without_mutation(
+        self,
+    ) -> None:
+        cases = (
+            ("missing", None),
+            ("zero", 0),
+            ("boolean", True),
+        )
+        for name, invalid_id in cases:
+            with self.subTest(name=name):
+                initial_release = self.release(draft=False)
+                if invalid_id is None:
+                    initial_release.pop("id")
+                else:
+                    initial_release["id"] = invalid_id
+
+                calls, exit_error = self.run_publish_script(initial_release)
+
+                error = self.assert_failed(exit_error)
+                self.assertIn("invalid release id", str(error))
+                self.assert_no_mutations(calls)
+
+    def test_published_release_requires_immutable_true_without_mutation(
+        self,
+    ) -> None:
+        cases = (
+            ("missing", None),
+            ("false", False),
+            ("integer-one", 1),
+        )
+        for name, invalid_immutable in cases:
+            with self.subTest(name=name):
+                initial_release = self.release(draft=False)
+                if invalid_immutable is None:
+                    initial_release.pop("immutable")
+                else:
+                    initial_release["immutable"] = invalid_immutable
+
+                calls, exit_error = self.run_publish_script(initial_release)
+
+                error = self.assert_failed(exit_error)
+                self.assertIn("must be immutable", str(error))
+                self.assert_no_mutations(calls)
+
+    def test_published_release_requires_valid_unique_asset_ids_without_mutation(
+        self,
+    ) -> None:
+        cases = (
+            ("missing", None),
+            ("zero", 0),
+            ("boolean", True),
+            ("string", "101"),
+            ("duplicate", 102),
+        )
+        for name, invalid_id in cases:
+            with self.subTest(name=name):
+                initial_release = self.release(draft=False)
+                archive_asset = initial_release["assets"][0]
+                if invalid_id is None:
+                    archive_asset.pop("id")
+                else:
+                    archive_asset["id"] = invalid_id
+
+                calls, exit_error = self.run_publish_script(initial_release)
+
+                error = self.assert_failed(exit_error)
+                if name == "duplicate":
+                    self.assertIn("duplicate matching asset ids", str(error))
+                else:
+                    self.assertIn("positive integer id", str(error))
+                self.assert_no_mutations(calls)
+
+    def test_published_release_requires_exact_asset_content_without_mutation(
+        self,
+    ) -> None:
+        cases = (
+            ("archive-size-missing", 0, "size", None, True, "invalid size"),
+            ("archive-size-string", 0, "size", "7", False, "invalid size"),
+            ("archive-size-boolean", 0, "size", True, False, "invalid size"),
+            ("archive-size-negative", 0, "size", -1, False, "invalid size"),
+            (
+                "checksum-size-mismatch",
+                1,
+                "size",
+                len(CHECKSUM_PAYLOAD) + 1,
+                False,
+                "size mismatch",
+            ),
+            ("archive-digest-missing", 0, "digest", None, True, "invalid digest"),
+            (
+                "archive-digest-non-string",
+                0,
+                "digest",
+                123,
+                False,
+                "invalid digest",
+            ),
+            (
+                "checksum-digest-malformed",
+                1,
+                "digest",
+                "sha256:not-a-digest",
+                False,
+                "invalid digest",
+            ),
+            (
+                "checksum-digest-wrong-algorithm",
+                1,
+                "digest",
+                f"sha512:{'0' * 64}",
+                False,
+                "invalid digest",
+            ),
+            (
+                "checksum-digest-mismatch",
+                1,
+                "digest",
+                f"sha256:{'0' * 64}",
+                False,
+                "digest mismatch",
+            ),
+        )
+        for name, asset_index, field, value, remove, error_text in cases:
+            with self.subTest(name=name):
+                initial_release = self.release(draft=False)
+                release_asset = initial_release["assets"][asset_index]
+                if remove:
+                    release_asset.pop(field)
+                else:
+                    release_asset[field] = value
+
+                calls, exit_error = self.run_publish_script(initial_release)
+
+                error = self.assert_failed(exit_error)
+                self.assertIn(error_text, str(error))
+                self.assert_no_mutations(calls)
+
+    def test_published_release_rejects_nonexact_matching_name_set_without_mutation(
+        self,
+    ) -> None:
+        for name in ("missing", "other-sha", "duplicate"):
+            with self.subTest(name=name):
+                initial_release = self.release(draft=False)
+                if name == "missing":
+                    initial_release["assets"].pop()
+                    error_text = "matching asset name mismatch"
+                elif name == "other-sha":
+                    initial_release["assets"].append(
+                        {
+                            "id": 103,
+                            "name": f"personal-codex-{'b' * 40}.tar.gz",
+                            "state": "uploaded",
+                            **asset_content(ARCHIVE_PAYLOAD),
+                        }
+                    )
+                    error_text = "unexpected uploaded assets"
+                else:
+                    duplicate_asset = dict(initial_release["assets"][0])
+                    duplicate_asset["id"] = 103
+                    initial_release["assets"].append(duplicate_asset)
+                    error_text = "duplicate uploaded assets"
+
+                calls, exit_error = self.run_publish_script(initial_release)
+
+                error = self.assert_failed(exit_error)
+                self.assertIn(error_text, str(error))
+                self.assert_no_mutations(calls)
 
     def test_published_prerelease_does_not_anchor_formal_release(self) -> None:
         prerelease = self.release(draft=False)
         prerelease["prerelease"] = True
         formal_release = self.release(draft=False)
 
-        calls, exit_error = self.run_publish_script(
-            [prerelease, formal_release]
-        )
+        calls, exit_error = self.run_publish_script([prerelease, formal_release])
 
         self.assertIsNotNone(exit_error)
         assert exit_error is not None
@@ -412,10 +616,7 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
                 assert exit_error is not None
                 self.assertIn(f"invalid {field} flag", str(exit_error))
                 self.assertFalse(
-                    any(
-                        method in {"DELETE", "PATCH", "POST"}
-                        for method, _url in calls
-                    )
+                    any(method in {"DELETE", "PATCH", "POST"} for method, _url in calls)
                 )
 
     def test_invalid_draft_tag_or_suffix_fails_before_asset_mutation(self) -> None:
@@ -481,6 +682,125 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
                 assert exit_error is not None
                 self.assertIn("final release identity drift", str(exit_error))
                 self.assertFalse(any(method == "PATCH" for method, _url in calls))
+
+    def test_pre_publish_content_drift_fails_before_patch(self) -> None:
+        cases = (
+            ("size-missing", "invalid size"),
+            ("size-mismatch", "size mismatch"),
+            ("digest-missing", "invalid digest"),
+            ("digest-mismatch", "digest mismatch"),
+            ("duplicate-id", "duplicate matching asset ids"),
+            ("pending", "matching assets not uploaded"),
+        )
+        for name, error_text in cases:
+            with self.subTest(name=name):
+                initial_release = self.release(draft=True)
+                final_release = self.release(draft=True)
+                archive_asset = final_release["assets"][0]
+                if name == "size-missing":
+                    archive_asset.pop("size")
+                elif name == "size-mismatch":
+                    archive_asset["size"] = len(ARCHIVE_PAYLOAD) + 1
+                elif name == "digest-missing":
+                    archive_asset.pop("digest")
+                elif name == "digest-mismatch":
+                    archive_asset["digest"] = f"sha256:{'0' * 64}"
+                elif name == "duplicate-id":
+                    archive_asset["id"] = 102
+                else:
+                    archive_asset["state"] = "new"
+
+                calls, exit_error = self.run_publish_script(
+                    initial_release,
+                    final_release=final_release,
+                )
+
+                error = self.assert_failed(exit_error)
+                self.assertIn(error_text, str(error))
+                self.assertFalse(any(method == "PATCH" for method, _url in calls))
+
+    def test_pre_publish_draft_does_not_require_immutable(self) -> None:
+        initial_release = self.release(draft=True)
+        final_release = self.release(draft=True)
+        final_release.pop("immutable")
+
+        calls, exit_error = self.run_publish_script(
+            initial_release,
+            final_release=final_release,
+        )
+
+        self.assertIsNone(exit_error)
+        self.assertEqual(sum(method == "PATCH" for method, _url in calls), 1)
+
+    def test_post_publish_content_drift_is_detected_after_patch(self) -> None:
+        cases = (
+            ("size-missing", "invalid size"),
+            ("size-mismatch", "size mismatch"),
+            ("digest-missing", "invalid digest"),
+            ("digest-mismatch", "digest mismatch"),
+            ("duplicate-id", "duplicate matching asset ids"),
+            ("pending", "matching assets not uploaded"),
+        )
+        for name, error_text in cases:
+            with self.subTest(name=name):
+                initial_release = self.release(draft=True)
+                final_release = self.release(draft=True)
+                published_release = self.release(draft=False)
+                archive_asset = published_release["assets"][0]
+                if name == "size-missing":
+                    archive_asset.pop("size")
+                elif name == "size-mismatch":
+                    archive_asset["size"] = len(ARCHIVE_PAYLOAD) + 1
+                elif name == "digest-missing":
+                    archive_asset.pop("digest")
+                elif name == "digest-mismatch":
+                    archive_asset["digest"] = f"sha256:{'0' * 64}"
+                elif name == "duplicate-id":
+                    archive_asset["id"] = 102
+                else:
+                    archive_asset["state"] = "new"
+
+                calls, exit_error = self.run_publish_script(
+                    initial_release,
+                    final_release=final_release,
+                    published_release=published_release,
+                )
+
+                error = self.assert_failed(exit_error)
+                self.assertIn(error_text, str(error))
+                self.assertEqual(
+                    sum(method == "PATCH" for method, _url in calls),
+                    1,
+                )
+
+    def test_post_publish_immutable_drift_is_detected_after_patch(self) -> None:
+        cases = (
+            ("missing", None),
+            ("false", False),
+            ("integer-one", 1),
+        )
+        for name, invalid_immutable in cases:
+            with self.subTest(name=name):
+                initial_release = self.release(draft=True)
+                final_release = self.release(draft=True)
+                published_release = self.release(draft=False)
+                if invalid_immutable is None:
+                    published_release.pop("immutable")
+                else:
+                    published_release["immutable"] = invalid_immutable
+
+                calls, exit_error = self.run_publish_script(
+                    initial_release,
+                    final_release=final_release,
+                    published_release=published_release,
+                )
+
+                error = self.assert_failed(exit_error)
+                self.assertIn("must be immutable", str(error))
+                self.assertEqual(
+                    sum(method == "PATCH" for method, _url in calls),
+                    1,
+                )
 
     def test_published_prerelease_drift_is_detected_after_patch(self) -> None:
         initial_release = self.release(draft=True)
@@ -575,10 +895,7 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
                 assert exit_error is not None
                 self.assertIn("invalid release id", str(exit_error))
                 self.assertFalse(
-                    any(
-                        method in {"DELETE", "PATCH", "POST"}
-                        for method, _url in calls
-                    )
+                    any(method in {"DELETE", "PATCH", "POST"} for method, _url in calls)
                 )
 
     def test_published_release_does_not_accept_pending_assets_by_name(self) -> None:
@@ -589,7 +906,7 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
         self.assertIsNotNone(exit_error)
         assert exit_error is not None
         self.assertIn("matching assets not uploaded", str(exit_error))
-        self.assertFalse(any(method == "PATCH" for method, _url in calls))
+        self.assert_no_mutations(calls)
 
     def test_published_release_rejects_uploaded_pair_with_pending_match(self) -> None:
         initial_release = self.release(draft=False)
@@ -607,10 +924,21 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
         self.assertIsNotNone(exit_error)
         assert exit_error is not None
         self.assertIn("matching assets not uploaded", str(exit_error))
-        self.assertFalse(any(method == "PATCH" for method, _url in calls))
+        self.assert_no_mutations(calls)
 
 
 class PublicReleaseWorkflowContractTests(unittest.TestCase):
+    def test_publish_step_hashes_and_uploads_one_cached_asset_snapshot(self) -> None:
+        publish_script = ReleaseWorkflowAssetRetryTests.publish_script()
+
+        self.assertIn("asset_file.read(1024 * 1024)", publish_script)
+        self.assertIn('"data": bytes(content)', publish_script)
+        self.assertIn(
+            'data=expected_asset_content[asset.name]["data"]',
+            publish_script,
+        )
+        self.assertNotIn("data=asset.read_bytes()", publish_script)
+
     def test_release_workflow_extracts_the_verified_archive_snapshot(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"

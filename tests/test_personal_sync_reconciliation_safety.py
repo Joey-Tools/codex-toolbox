@@ -101,6 +101,17 @@ def write_agent_skill_release(
     return MODULE.load_manifest_data(release_root)
 
 
+def write_removed_links(
+    release_root: Path,
+    removed_links: list[dict[str, object]],
+) -> MODULE.ManifestData:
+    manifest_path = release_root / MODULE.MANIFEST_RELATIVE_PATH
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["removed_links"] = removed_links
+    manifest_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    return MODULE.load_manifest_data(release_root)
+
+
 def foreign_leaf_snapshot(path: Path) -> tuple[object, ...]:
     metadata = path.lstat()
     identity = (metadata.st_dev, metadata.st_ino)
@@ -510,6 +521,46 @@ class ManifestSchemaSafetyTests(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(MODULE.SyncError, "owner id"):
+                    MODULE.load_manifest_data(release_root)
+
+    def test_runtime_manifest_field_allowlists_match_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            release_root = Path(temp_dir) / "release"
+            write_skill_release(release_root, owner="private")
+            manifest_path = release_root / MODULE.MANIFEST_RELATIVE_PATH
+            valid_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            valid_payload["links"][0]["override"] = True
+            manifest_path.write_text(
+                json.dumps(valid_payload) + "\n",
+                encoding="utf-8",
+            )
+
+            valid_manifest = MODULE.load_manifest_data(release_root)
+            self.assertEqual(valid_manifest.owner, "private")
+            self.assertEqual(valid_manifest.entries[0].owner, "private")
+            self.assertTrue(valid_manifest.entries[0].override)
+
+            for location, field in (
+                ("top-level", "reference_onyl"),
+                ("link", "overide"),
+            ):
+                payload = json.loads(json.dumps(valid_payload))
+                if location == "top-level":
+                    payload[field] = []
+                else:
+                    payload["links"][0][field] = True
+                manifest_path.write_text(
+                    json.dumps(payload) + "\n",
+                    encoding="utf-8",
+                )
+
+                with (
+                    self.subTest(location=location),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        rf"unsupported field\(s\): {field}",
+                    ),
+                ):
                     MODULE.load_manifest_data(release_root)
 
     def test_runtime_rejects_unknown_removed_link_fields(self) -> None:
@@ -6110,6 +6161,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             state: MODULE.ManagedState,
             *,
             allow_cross_owner: bool,
+            allow_unledgered_removed_links: bool = False,
         ) -> list[MODULE.ReconcileAction]:
             nonlocal injected, plan_calls, raced_snapshot
             actions = real_plan(
@@ -6119,6 +6171,9 @@ class InstallTransactionSafetyTests(unittest.TestCase):
                 removed_links,
                 state,
                 allow_cross_owner=allow_cross_owner,
+                allow_unledgered_removed_links=(
+                    allow_unledgered_removed_links
+                ),
             )
             plan_calls += 1
             if not injected and plan_calls == 2:
@@ -8734,6 +8789,106 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
         final_state = MODULE._load_managed_state(self.home)
         self.assertNotIn(private_key, final_state.links)
 
+    def test_existing_ledger_tombstone_does_not_authorize_update_replacement(
+        self,
+    ) -> None:
+        next_release = self.root / "next-public-with-tombstone"
+        write_skill_release(
+            next_release,
+            source_name="public-next",
+            target_name="public-base",
+        )
+        next_manifest = write_removed_links(
+            next_release,
+            [
+                {
+                    "id": "legacy-public-base",
+                    "source": "personal_codex/skills/legacy-public-base",
+                    "target": "skills/public-base",
+                    "kind": "skill",
+                    "legacy": True,
+                }
+            ],
+        )
+        target_key = PurePosixPath("skills/public-base")
+        target = self.home / Path(*target_key.parts)
+        state_payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        state_payload["links"] = [
+            link
+            for link in state_payload["links"]
+            if link["target"] != target_key.as_posix()
+        ]
+        self.state_path.write_text(json.dumps(state_payload) + "\n", encoding="utf-8")
+        state_before = self.state_path.read_bytes()
+        current_before = MODULE._read_symlink_snapshot_beneath(
+            self.home,
+            MODULE._current_link(self.home),
+        )
+        target.unlink()
+        target.symlink_to(
+            MODULE._removed_link_target(self.home, next_manifest.removed_links[0]),
+            target_is_directory=True,
+        )
+        foreign_before = foreign_leaf_snapshot(target)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "refusing to replace unproven symlink target",
+        ):
+            install_quietly(next_release, self.home, SHA_B)
+
+        self.assertEqual(foreign_leaf_snapshot(target), foreign_before)
+        self.assertEqual(
+            MODULE._read_symlink_snapshot_beneath(
+                self.home,
+                MODULE._current_link(self.home),
+            ),
+            current_before,
+        )
+        self.assertEqual(self.state_path.read_bytes(), state_before)
+        self.assertFalse(
+            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
+        )
+        self.assertFalse((MODULE._releases_root(self.home) / SHA_B).exists())
+
+    def test_first_bootstrap_tombstone_still_removes_legacy_link(self) -> None:
+        next_release = self.root / "next-public-bootstrap-tombstone"
+        write_skill_release(
+            next_release,
+            source_name="public-next",
+            target_name="public-base",
+        )
+        next_manifest = write_removed_links(
+            next_release,
+            [
+                {
+                    "id": "legacy-only",
+                    "source": "personal_codex/skills/legacy-only",
+                    "target": "skills/legacy-only",
+                    "kind": "skill",
+                    "legacy": True,
+                }
+            ],
+        )
+        removed = next_manifest.removed_links[0]
+        legacy_target = self.home / Path(*removed.target.parts)
+        legacy_target.symlink_to(
+            MODULE._removed_link_target(self.home, removed),
+            target_is_directory=True,
+        )
+        self.state_path.unlink()
+
+        install_quietly(next_release, self.home, SHA_B)
+
+        self.assertFalse(os.path.lexists(legacy_target))
+        self.assertEqual(MODULE._current_sha(self.home), SHA_B)
+        final_state = MODULE._load_managed_state(self.home)
+        self.assertEqual(final_state.owners, {MODULE.PUBLIC_OWNER: SHA_B})
+        self.assertEqual(set(final_state.links), {PurePosixPath("skills/public-base")})
+        self.assertFalse(
+            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
+        )
+
     def test_install_does_not_adopt_preexisting_exact_desired_link(self) -> None:
         private_release = self.root / "preexisting-link-private-release"
         private_manifest = write_skill_release(
@@ -9262,6 +9417,61 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
             ),
         ):
             MODULE._load_pending_link_batch(self.home)
+
+    def test_existing_ledger_uninstall_preserves_unclaimed_tombstone_link(
+        self,
+    ) -> None:
+        private_release = self.root / "private-with-agents-tombstone"
+        write_skill_release(
+            private_release,
+            source_name="private",
+            target_name="private",
+            owner="private",
+        )
+        private_manifest = write_removed_links(
+            private_release,
+            [
+                {
+                    "id": "legacy-agents",
+                    "source": "personal_codex/legacy/AGENTS.md",
+                    "target": "AGENTS.md",
+                    "kind": "file",
+                    "legacy": True,
+                }
+            ],
+        )
+        install_quietly(private_release, self.home, SHA_B)
+        agents_key = PurePosixPath("AGENTS.md")
+        installed_state = MODULE._load_managed_state(self.home)
+        self.assertNotIn(agents_key, installed_state.links)
+        public_manifest = MODULE._current_manifest_data(
+            self.home,
+            MODULE.PUBLIC_OWNER,
+        )
+        self.assertIn(agents_key, {entry.target for entry in public_manifest.entries})
+        self.assertEqual(private_manifest.removed_links[0].target, agents_key)
+
+        self.agents.unlink()
+        self.agents.symlink_to(
+            MODULE._removed_link_target(
+                self.home,
+                private_manifest.removed_links[0],
+            )
+        )
+        foreign_before = foreign_leaf_snapshot(self.agents)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            MODULE.uninstall_overlay(self.home, "private", dry_run=False)
+
+        self.assertEqual(foreign_leaf_snapshot(self.agents), foreign_before)
+        final_state = MODULE._load_managed_state(self.home)
+        self.assertEqual(final_state.owners, {MODULE.PUBLIC_OWNER: SHA_A})
+        self.assertNotIn(agents_key, final_state.links)
+        self.assertFalse(os.path.lexists(self.home / "skills" / "private"))
+        self.assertFalse(
+            os.path.lexists(MODULE._current_link(self.home, "private"))
+        )
+        self.assertFalse(os.path.lexists(self.pointer_path))
 
 
 class PendingLinkTransactionSafetyTests(unittest.TestCase):
