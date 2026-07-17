@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-17
 updated: 2026-07-17
 branch: codex/daily-skill-friction-20260717-codex-toolbox-wait-agent-min-timeout
-pr:
+pr: https://github.com/Joey-Tools/codex-toolbox/pull/16
 supersedes: []
 superseded_by:
 ---
@@ -30,3 +30,4 @@ superseded_by:
 
 - `personal_codex/AGENTS.md`
 - `tests/test_codex_personal_sync.py`
+- https://github.com/Joey-Tools/codex-toolbox/pull/16
