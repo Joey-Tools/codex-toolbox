@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_right
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 import contextlib
 from contextvars import ContextVar
 import ctypes
@@ -46,6 +46,10 @@ MAX_ARCHIVE_EXPANDED_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_PATH_BYTES = 4096
 MAX_ARCHIVE_MEMBER_COMPONENT_BYTES = 255
 MAX_ARCHIVE_MEMBER_PATH_DEPTH = 64
+MAX_TEMP_ARCHIVE_CLEANUP_DEPTH = MAX_ARCHIVE_MEMBER_PATH_DEPTH + 4
+MAX_TEMP_ARCHIVE_CLEANUP_ENTRIES = (
+    MAX_ARCHIVE_MEMBERS * (MAX_ARCHIVE_MEMBER_PATH_DEPTH + 2) + 128
+)
 MAX_MANIFEST_TARGET_PATH_BYTES = 4096
 MAX_MANIFEST_TARGET_COMPONENT_BYTES = 255
 MAX_MANIFEST_TARGET_PATH_DEPTH = 64
@@ -156,8 +160,22 @@ class _ArchiveEntryExistsError(SyncError):
     pass
 
 
+class _UseArchiveWorkspace:
+    pass
+
+
+_USE_ARCHIVE_WORKSPACE = _UseArchiveWorkspace()
+
+
 class _SafeReconcileApplyError(SyncError):
     """Reconciliation failed before an existing managed link was changed."""
+
+
+@dataclass(frozen=True)
+class BoundArchiveWorkspace:
+    path: Path
+    fd: int
+    identity: tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -1301,11 +1319,15 @@ def _open_bounded_regular_file(
     *,
     maximum_bytes: int,
     description: str,
+    workspace: BoundArchiveWorkspace | None = None,
 ) -> tuple[int, int, os.stat_result]:
     if path.name in {"", ".", ".."}:
         raise SyncError(f"refusing unsafe {description} path: {path}")
     try:
-        parent_fd = os.open(path.parent, _archive_directory_open_flags())
+        if workspace is None:
+            parent_fd = os.open(path.parent, _archive_directory_open_flags())
+        else:
+            parent_fd = _open_archive_directory_beneath(workspace, path.parent)
     except OSError as error:
         raise SyncError(f"refusing unsafe {description} parent: {path.parent}") from error
     file_descriptor = -1
@@ -1346,6 +1368,7 @@ def _require_bounded_regular_file_unchanged(
     file_descriptor: int,
     initial_metadata: os.stat_result,
     description: str,
+    workspace: BoundArchiveWorkspace | None = None,
 ) -> None:
     current_metadata = os.fstat(file_descriptor)
     if (
@@ -1357,6 +1380,9 @@ def _require_bounded_regular_file_unchanged(
         or not _archive_path_matches_fd(path, file_descriptor)
     ):
         raise SyncError(f"{description} changed while reading: {path}")
+    if workspace is not None:
+        workspace_check_fd = _duplicate_bound_archive_workspace(workspace)
+        os.close(workspace_check_fd)
 
 
 def _read_bounded_regular_file(
@@ -1364,11 +1390,13 @@ def _read_bounded_regular_file(
     *,
     maximum_bytes: int,
     description: str,
+    workspace: BoundArchiveWorkspace | None = None,
 ) -> bytes:
     parent_fd, file_descriptor, metadata = _open_bounded_regular_file(
         path,
         maximum_bytes=maximum_bytes,
         description=description,
+        workspace=workspace,
     )
     try:
         payload = bytearray()
@@ -1387,6 +1415,7 @@ def _read_bounded_regular_file(
             file_descriptor,
             metadata,
             description,
+            workspace,
         )
         return bytes(payload)
     finally:
@@ -1396,11 +1425,14 @@ def _read_bounded_regular_file(
 
 def _copy_archive_to_immutable_snapshot(
     archive_path: Path,
+    *,
+    workspace: BoundArchiveWorkspace | None = None,
 ) -> tuple[Any, str]:
     parent_fd, archive_fd, metadata = _open_bounded_regular_file(
         archive_path,
         maximum_bytes=MAX_ARCHIVE_COMPRESSED_BYTES,
         description="compressed archive",
+        workspace=workspace,
     )
     snapshot: Any | None = None
     digest = hashlib.sha256()
@@ -1427,6 +1459,7 @@ def _copy_archive_to_immutable_snapshot(
             archive_fd,
             metadata,
             "compressed archive",
+            workspace,
         )
         snapshot.flush()
         os.fsync(snapshot.fileno())
@@ -1441,11 +1474,17 @@ def _copy_archive_to_immutable_snapshot(
         os.close(parent_fd)
 
 
-def _expected_archive_checksum(archive_path: Path, checksum_path: Path) -> str:
+def _expected_archive_checksum(
+    archive_path: Path,
+    checksum_path: Path,
+    *,
+    workspace: BoundArchiveWorkspace | None = None,
+) -> str:
     checksum_payload = _read_bounded_regular_file(
         checksum_path,
         maximum_bytes=MAX_ARCHIVE_CHECKSUM_BYTES,
         description="checksum file",
+        workspace=workspace,
     )
     try:
         checksum_text = checksum_payload.decode("utf-8")
@@ -1468,9 +1507,21 @@ def _expected_archive_checksum(archive_path: Path, checksum_path: Path) -> str:
     return expected
 
 
-def _verified_archive_snapshot(archive_path: Path, checksum_path: Path) -> Any:
-    expected = _expected_archive_checksum(archive_path, checksum_path)
-    snapshot, actual = _copy_archive_to_immutable_snapshot(archive_path)
+def _verified_archive_snapshot(
+    archive_path: Path,
+    checksum_path: Path,
+    *,
+    workspace: BoundArchiveWorkspace | None = None,
+) -> Any:
+    expected = _expected_archive_checksum(
+        archive_path,
+        checksum_path,
+        workspace=workspace,
+    )
+    snapshot, actual = _copy_archive_to_immutable_snapshot(
+        archive_path,
+        workspace=workspace,
+    )
     if actual != expected:
         snapshot.close()
         raise SyncError(
@@ -1654,82 +1705,545 @@ def _archive_directory_open_flags() -> int:
     return flags
 
 
-def _archive_extraction_anchor(archive_path: Path, destination: Path) -> Path:
-    """Return the caller-owned workspace containing the archive and destination."""
-    archive_parent = Path(os.path.abspath(archive_path.parent))
-    destination_parent = Path(os.path.abspath(destination.parent))
-    if ".." in archive_path.parts or ".." in destination.parts:
-        raise SyncError("refusing archive extraction path with parent traversal")
+@contextlib.contextmanager
+def bind_archive_workspace(path: Path) -> Iterator[BoundArchiveWorkspace]:
+    workspace_path = Path(os.path.abspath(path))
+    workspace_fd = -1
     try:
-        return Path(os.path.commonpath((archive_parent, destination_parent)))
-    except ValueError as error:
+        workspace_fd = os.open(workspace_path, _archive_directory_open_flags())
+        opened_metadata = os.fstat(workspace_fd)
+        path_metadata = os.lstat(workspace_path)
+    except OSError as error:
+        if workspace_fd >= 0:
+            os.close(workspace_fd)
         raise SyncError(
-            f"archive and destination do not share a trusted anchor: {destination}"
+            f"failed to bind archive workspace {workspace_path}: {error}"
+        ) from error
+    identity = (opened_metadata.st_dev, opened_metadata.st_ino)
+    if (
+        not stat.S_ISDIR(opened_metadata.st_mode)
+        or not stat.S_ISDIR(path_metadata.st_mode)
+        or (path_metadata.st_dev, path_metadata.st_ino) != identity
+    ):
+        os.close(workspace_fd)
+        raise SyncError(f"archive workspace changed while binding: {workspace_path}")
+    try:
+        yield BoundArchiveWorkspace(
+            path=workspace_path,
+            fd=workspace_fd,
+            identity=identity,
+        )
+    finally:
+        active_error = sys.exc_info()[0] is not None
+        try:
+            os.close(workspace_fd)
+        except OSError as error:
+            close_error = SyncError(
+                f"failed to close archive workspace {workspace_path}: {error}"
+            )
+            if active_error:
+                print(f"warning: {close_error}", file=sys.stderr)
+            else:
+                raise close_error from error
+
+
+def _duplicate_bound_archive_workspace(workspace: BoundArchiveWorkspace) -> int:
+    if not isinstance(workspace, BoundArchiveWorkspace):
+        raise SyncError("archive workspace capability is required")
+    workspace_path = Path(os.path.abspath(workspace.path))
+    workspace_fd = -1
+    try:
+        workspace_fd = os.dup(workspace.fd)
+        opened_metadata = os.fstat(workspace_fd)
+        path_metadata = os.lstat(workspace_path)
+    except (OSError, TypeError, ValueError) as error:
+        if workspace_fd >= 0:
+            os.close(workspace_fd)
+        raise SyncError(
+            f"archive workspace is no longer bound: {workspace_path}"
+        ) from error
+    identity = (opened_metadata.st_dev, opened_metadata.st_ino)
+    if (
+        not stat.S_ISDIR(opened_metadata.st_mode)
+        or not stat.S_ISDIR(path_metadata.st_mode)
+        or identity != workspace.identity
+        or (path_metadata.st_dev, path_metadata.st_ino) != workspace.identity
+    ):
+        os.close(workspace_fd)
+        raise SyncError(f"archive workspace binding changed: {workspace_path}")
+    return workspace_fd
+
+
+def _temporary_archive_workspace_names(prefix: str) -> Iterator[str]:
+    if (
+        not isinstance(prefix, str)
+        or not prefix
+        or "\0" in prefix
+        or "/" in prefix
+        or len(prefix.encode("utf-8")) > 128
+    ):
+        raise SyncError("temporary archive workspace prefix is unsafe")
+    for _attempt in range(128):
+        yield f"{prefix}{os.getpid()}-{os.urandom(16).hex()}"
+    raise SyncError("failed to allocate a temporary archive workspace")
+
+
+def _temporary_archive_cleanup_names() -> Iterator[str]:
+    for _attempt in range(128):
+        yield (
+            f".codex-archive-cleanup-{os.getpid()}-"
+            f"{os.urandom(16).hex()}"
+        )
+    raise SyncError("failed to allocate a temporary archive cleanup name")
+
+
+def _isolate_temporary_archive_entry(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+) -> str:
+    # POSIX has no portable unlink-by-open-fd primitive. Random no-replace
+    # isolation plus identity checks protects against path replacement that is
+    # observable before deletion, but a malicious same-uid process that keeps
+    # racing newly isolated random names is outside this helper's threat model.
+    isolated_name: str | None = None
+    for candidate in _temporary_archive_cleanup_names():
+        try:
+            _rename_noreplace_at(
+                parent_fd,
+                name,
+                parent_fd,
+                candidate,
+            )
+        except FileExistsError:
+            continue
+        isolated_name = candidate
+        break
+    assert isolated_name is not None
+    current = os.stat(
+        isolated_name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    if (
+        (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
+        or stat.S_IFMT(current.st_mode) != stat.S_IFMT(expected.st_mode)
+    ):
+        raise SyncError(
+            "temporary archive workspace entry changed during cleanup isolation; "
+            f"preserved as {isolated_name}"
+        )
+    return isolated_name
+
+
+def _remove_temporary_archive_entry(
+    parent_fd: int,
+    name: str,
+    budget: list[int],
+    *,
+    depth: int,
+) -> None:
+    if depth > MAX_TEMP_ARCHIVE_CLEANUP_DEPTH:
+        raise SyncError("temporary archive workspace cleanup exceeds depth limit")
+    if budget[0] <= 0:
+        raise SyncError("temporary archive workspace cleanup exceeds entry limit")
+    budget[0] -= 1
+    metadata = os.stat(
+        name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    isolated_name = _isolate_temporary_archive_entry(
+        parent_fd,
+        name,
+        metadata,
+    )
+    if stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        os.unlink(isolated_name, dir_fd=parent_fd)
+        return
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SyncError(
+            "temporary archive workspace contains an unsupported entry; "
+            f"preserved as {isolated_name}"
+        )
+    child_fd = os.open(
+        isolated_name,
+        _archive_directory_open_flags(),
+        dir_fd=parent_fd,
+    )
+    try:
+        expected_identity = (metadata.st_dev, metadata.st_ino)
+        if _directory_identity(child_fd) != expected_identity:
+            raise SyncError(
+                "temporary archive workspace entry changed after isolation; "
+                f"preserved as {isolated_name}"
+            )
+        for child_name in os.listdir(child_fd):
+            _remove_temporary_archive_entry(
+                child_fd,
+                child_name,
+                budget,
+                depth=depth + 1,
+            )
+        if os.listdir(child_fd):
+            raise SyncError(
+                "temporary archive workspace directory gained an entry; "
+                f"preserved as {isolated_name}"
+            )
+        current = os.stat(
+            isolated_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != expected_identity
+        ):
+            raise SyncError(
+                "temporary archive workspace entry changed before deletion; "
+                f"preserved as {isolated_name}"
+            )
+        os.rmdir(isolated_name, dir_fd=parent_fd)
+    finally:
+        active_error = sys.exc_info()[0] is not None
+        try:
+            os.close(child_fd)
+        except OSError as error:
+            close_error = SyncError(
+                "failed to close temporary archive workspace entry: "
+                f"{error}"
+            )
+            if active_error:
+                print(f"warning: {close_error}", file=sys.stderr)
+            else:
+                raise close_error from error
+
+
+def _cleanup_bound_temporary_archive_workspace(
+    parent_fd: int,
+    name: str,
+    workspace_fd: int,
+    expected_identity: tuple[int, int],
+) -> None:
+    try:
+        opened_metadata = os.fstat(workspace_fd)
+        path_metadata = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise SyncError(
+            f"failed to inspect temporary archive workspace {name}: {error}"
+        ) from error
+    if (
+        not stat.S_ISDIR(opened_metadata.st_mode)
+        or (opened_metadata.st_dev, opened_metadata.st_ino) != expected_identity
+        or not stat.S_ISDIR(path_metadata.st_mode)
+        or (path_metadata.st_dev, path_metadata.st_ino) != expected_identity
+    ):
+        raise SyncError(
+            "temporary archive workspace changed; refusing cleanup: "
+            f"{name}"
+        )
+    try:
+        isolated_name = _isolate_temporary_archive_entry(
+            parent_fd,
+            name,
+            path_metadata,
+        )
+        budget = [MAX_TEMP_ARCHIVE_CLEANUP_ENTRIES]
+        for child_name in os.listdir(workspace_fd):
+            _remove_temporary_archive_entry(
+                workspace_fd,
+                child_name,
+                budget,
+                depth=0,
+            )
+        if os.listdir(workspace_fd):
+            raise SyncError(
+                "temporary archive workspace gained an entry; "
+                f"preserved as {isolated_name}"
+            )
+        opened_metadata = os.fstat(workspace_fd)
+        path_metadata = os.stat(
+            isolated_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(opened_metadata.st_mode)
+            or (opened_metadata.st_dev, opened_metadata.st_ino)
+            != expected_identity
+            or not stat.S_ISDIR(path_metadata.st_mode)
+            or (path_metadata.st_dev, path_metadata.st_ino)
+            != expected_identity
+        ):
+            raise SyncError(
+                "temporary archive workspace changed before deletion; "
+                f"preserved as {isolated_name}"
+            )
+        os.rmdir(isolated_name, dir_fd=parent_fd)
+    except OSError as error:
+        raise SyncError(
+            f"failed to clean temporary archive workspace {name}: {error}"
         ) from error
 
 
-def _open_archive_directory_beneath(anchor: Path, directory: Path) -> int:
-    anchor = Path(os.path.abspath(anchor))
-    directory = Path(os.path.abspath(directory))
+def _cleanup_created_temporary_archive_workspace(
+    parent_fd: int,
+    name: str,
+    created_metadata: os.stat_result,
+) -> None:
     try:
-        parts = directory.relative_to(anchor).parts
+        isolated_name = _isolate_temporary_archive_entry(
+            parent_fd,
+            name,
+            created_metadata,
+        )
+        isolated_metadata = os.stat(
+            isolated_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(isolated_metadata.st_mode)
+            or (isolated_metadata.st_dev, isolated_metadata.st_ino)
+            != (created_metadata.st_dev, created_metadata.st_ino)
+        ):
+            raise SyncError(
+                "temporary archive workspace changed before creation cleanup; "
+                f"preserved as {isolated_name}"
+            )
+        os.rmdir(isolated_name, dir_fd=parent_fd)
+    except OSError as error:
+        raise SyncError(
+            f"failed to clean created temporary archive workspace {name}: {error}"
+        ) from error
+
+
+@contextlib.contextmanager
+def create_bound_temporary_archive_workspace(
+    parent_workspace: BoundArchiveWorkspace,
+    *,
+    prefix: str,
+) -> Iterator[BoundArchiveWorkspace]:
+    parent_fd = _duplicate_bound_archive_workspace(parent_workspace)
+    workspace_fd = -1
+    workspace_name: str | None = None
+    workspace_identity: tuple[int, int] | None = None
+    created_metadata: os.stat_result | None = None
+    cleanup_attempted = False
+    try:
+        for candidate in _temporary_archive_workspace_names(prefix):
+            try:
+                os.mkdir(candidate, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            workspace_name = candidate
+            break
+        assert workspace_name is not None
+        created_metadata = os.stat(
+            workspace_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(created_metadata.st_mode):
+            raise SyncError("created temporary archive workspace is not a directory")
+        workspace_identity = (created_metadata.st_dev, created_metadata.st_ino)
+        workspace_fd = os.open(
+            workspace_name,
+            _archive_directory_open_flags(),
+            dir_fd=parent_fd,
+        )
+        opened_metadata = os.fstat(workspace_fd)
+        current_metadata = os.stat(
+            workspace_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(opened_metadata.st_mode)
+            or (opened_metadata.st_dev, opened_metadata.st_ino)
+            != workspace_identity
+            or not stat.S_ISDIR(current_metadata.st_mode)
+            or (current_metadata.st_dev, current_metadata.st_ino)
+            != workspace_identity
+        ):
+            raise SyncError(
+                "temporary archive workspace changed while binding"
+            )
+        workspace_path = parent_workspace.path / workspace_name
+        workspace = BoundArchiveWorkspace(
+            path=workspace_path,
+            fd=workspace_fd,
+            identity=workspace_identity,
+        )
+        check_fd = _duplicate_bound_archive_workspace(workspace)
+        os.close(check_fd)
+        try:
+            yield workspace
+        finally:
+            cleanup_attempted = True
+            active_error = sys.exc_info()[0] is not None
+            cleanup_error: BaseException | None = None
+            try:
+                _cleanup_bound_temporary_archive_workspace(
+                    parent_fd,
+                    workspace_name,
+                    workspace_fd,
+                    workspace_identity,
+                )
+            except BaseException as error:
+                cleanup_error = error
+            if cleanup_error is not None:
+                if active_error:
+                    print(f"warning: {cleanup_error}", file=sys.stderr)
+                else:
+                    raise cleanup_error
+    finally:
+        active_error = sys.exc_info()[0] is not None
+        if (
+            not cleanup_attempted
+            and workspace_name is not None
+            and workspace_identity is not None
+        ):
+            try:
+                if workspace_fd >= 0:
+                    _cleanup_bound_temporary_archive_workspace(
+                        parent_fd,
+                        workspace_name,
+                        workspace_fd,
+                        workspace_identity,
+                    )
+                elif created_metadata is not None:
+                    _cleanup_created_temporary_archive_workspace(
+                        parent_fd,
+                        workspace_name,
+                        created_metadata,
+                    )
+            except BaseException as cleanup_error:
+                if active_error:
+                    print(f"warning: {cleanup_error}", file=sys.stderr)
+                else:
+                    raise
+        close_error: OSError | None = None
+        for descriptor in (workspace_fd, parent_fd):
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if close_error is None:
+                    close_error = error
+        if close_error is not None:
+            workspace_close_error = SyncError(
+                f"failed to close temporary archive workspace: {close_error}"
+            )
+            if active_error:
+                print(f"warning: {workspace_close_error}", file=sys.stderr)
+            else:
+                raise workspace_close_error from close_error
+
+
+@contextlib.contextmanager
+def temporary_archive_workspace(
+    *,
+    prefix: str,
+    parent: Path | None = None,
+) -> Iterator[BoundArchiveWorkspace]:
+    parent_path = Path(tempfile.gettempdir()) if parent is None else parent
+    with bind_archive_workspace(parent_path) as parent_workspace:
+        with create_bound_temporary_archive_workspace(
+            parent_workspace,
+            prefix=prefix,
+        ) as workspace:
+            yield workspace
+
+
+def _archive_workspace_relative_parts(
+    workspace: BoundArchiveWorkspace,
+    path: Path,
+) -> tuple[Path, tuple[str, ...]]:
+    workspace_path = Path(os.path.abspath(workspace.path))
+    if ".." in path.parts:
+        raise SyncError(f"refusing archive workspace parent traversal: {path}")
+    normalized_path = Path(os.path.abspath(path))
+    try:
+        parts = normalized_path.relative_to(workspace_path).parts
     except ValueError as error:
         raise SyncError(
-            f"archive destination parent escapes its trusted anchor: {directory}"
+            f"archive path escapes its bound workspace: {normalized_path}"
         ) from error
     if any(part in {"", ".", ".."} for part in parts):
-        raise SyncError(f"refusing unsafe archive destination parent: {directory}")
+        raise SyncError(f"refusing unsafe archive workspace path: {normalized_path}")
+    return normalized_path, parts
 
-    anchor_fd = -1
-    directory_fd = -1
-    flags = _archive_directory_open_flags()
+
+def _open_archive_directory_beneath(
+    workspace: BoundArchiveWorkspace,
+    directory: Path,
+    *,
+    create: bool = False,
+) -> int:
+    directory, parts = _archive_workspace_relative_parts(workspace, directory)
+    directory_fd = _duplicate_bound_archive_workspace(workspace)
     try:
-        anchor_fd = os.open(anchor, flags)
-        directory_fd = os.dup(anchor_fd)
         for part in parts:
-            entry_metadata = os.stat(
-                part,
-                dir_fd=directory_fd,
-                follow_symlinks=False,
-            )
-            if not stat.S_ISDIR(entry_metadata.st_mode):
-                raise SyncError(
-                    f"refusing unsafe archive destination parent: {directory}"
-                )
-            next_fd = os.open(part, flags, dir_fd=directory_fd)
+            next_fd = -1
             try:
+                try:
+                    entry_metadata = os.stat(
+                        part,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    next_fd = _create_archive_directory_at(directory_fd, part)
+                    entry_metadata = os.fstat(next_fd)
+                else:
+                    if not stat.S_ISDIR(entry_metadata.st_mode):
+                        raise SyncError(
+                            f"refusing unsafe archive directory: {directory}"
+                        )
+                    next_fd = os.open(
+                        part,
+                        _archive_directory_open_flags(),
+                        dir_fd=directory_fd,
+                    )
                 bound_metadata = os.fstat(next_fd)
                 if (
-                    (entry_metadata.st_dev, entry_metadata.st_ino)
+                    not stat.S_ISDIR(bound_metadata.st_mode)
+                    or (entry_metadata.st_dev, entry_metadata.st_ino)
                     != (bound_metadata.st_dev, bound_metadata.st_ino)
                     or not _archive_entry_matches_fd(directory_fd, part, next_fd)
                 ):
                     raise SyncError(
-                        f"archive destination ancestor changed: {directory}"
+                        f"archive directory ancestor changed: {directory}"
                     )
             except BaseException:
-                os.close(next_fd)
+                if next_fd >= 0:
+                    os.close(next_fd)
                 raise
             previous_fd = directory_fd
             directory_fd = next_fd
             os.close(previous_fd)
-        if (
-            not _archive_path_matches_fd(anchor, anchor_fd)
-            or not _archive_path_matches_fd(directory, directory_fd)
-        ):
-            raise SyncError(f"archive destination ancestor changed: {directory}")
+        if not _archive_path_matches_fd(directory, directory_fd):
+            raise SyncError(f"archive directory ancestor changed: {directory}")
+        workspace_check_fd = _duplicate_bound_archive_workspace(workspace)
+        os.close(workspace_check_fd)
         result = directory_fd
         directory_fd = -1
         return result
+    except SyncError:
+        raise
     except OSError as error:
-        raise SyncError(
-            f"refusing unsafe archive destination parent: {directory}"
-        ) from error
+        raise SyncError(f"refusing unsafe archive directory: {directory}") from error
     finally:
         if directory_fd >= 0:
             os.close(directory_fd)
-        if anchor_fd >= 0:
-            os.close(anchor_fd)
 
 
 def _create_archive_directory_at(parent_fd: int, name: str) -> int:
@@ -1786,12 +2300,12 @@ def _create_archive_directory_at(parent_fd: int, name: str) -> int:
 
 def _create_archive_destination(
     destination: Path,
-    destination_anchor: Path,
+    workspace: BoundArchiveWorkspace,
 ) -> tuple[int, int]:
     if destination.name in {"", ".", ".."}:
         raise SyncError(f"refusing unsafe archive destination: {destination}")
     parent_fd = _open_archive_directory_beneath(
-        destination_anchor,
+        workspace,
         destination.parent,
     )
     destination_fd: int | None = None
@@ -1810,6 +2324,8 @@ def _create_archive_destination(
             destination_fd,
         ) or not _archive_path_matches_fd(destination, destination_fd):
             raise SyncError(f"archive destination changed after creation: {destination}")
+        workspace_check_fd = _duplicate_bound_archive_workspace(workspace)
+        os.close(workspace_check_fd)
         return parent_fd, destination_fd
     except BaseException:
         if destination_fd is not None:
@@ -2287,14 +2803,15 @@ def _validate_archive_tree_evidence(
 def _safe_extract_archive_snapshot(
     snapshot: Any,
     destination: Path,
-    destination_anchor: Path,
+    *,
+    workspace: BoundArchiveWorkspace,
 ) -> tuple[Path, ReleaseTreeExpectation]:
     planned_members, release_root_parts, manifest_parts = _scan_archive_snapshot(
         snapshot
     )
     parent_fd, destination_fd = _create_archive_destination(
         destination,
-        destination_anchor,
+        workspace,
     )
     directory_identities = {(): _directory_identity(destination_fd)}
     release_fd: int | None = None
@@ -2353,6 +2870,8 @@ def _safe_extract_archive_snapshot(
             or not _archive_path_matches_fd(destination, destination_fd)
         ):
             raise SyncError(f"archive destination changed during extraction: {destination}")
+        workspace_check_fd = _duplicate_bound_archive_workspace(workspace)
+        os.close(workspace_check_fd)
         return release_root, (
             final_release_identity,
             release_directory_identity,
@@ -2364,13 +2883,23 @@ def _safe_extract_archive_snapshot(
         os.close(parent_fd)
 
 
-def safe_extract_archive(archive_path: Path, destination: Path) -> Path:
-    snapshot, _digest = _copy_archive_to_immutable_snapshot(archive_path)
+def safe_extract_archive(
+    archive_path: Path,
+    destination: Path,
+    *,
+    workspace: BoundArchiveWorkspace,
+) -> Path:
+    workspace_check_fd = _duplicate_bound_archive_workspace(workspace)
+    os.close(workspace_check_fd)
+    snapshot, _digest = _copy_archive_to_immutable_snapshot(
+        archive_path,
+        workspace=workspace,
+    )
     try:
         release_root, _release_expectation = _safe_extract_archive_snapshot(
             snapshot,
             destination,
-            _archive_extraction_anchor(archive_path, destination),
+            workspace=workspace,
         )
         return release_root
     finally:
@@ -2381,13 +2910,29 @@ def verify_and_extract_archive(
     archive_path: Path,
     checksum_path: Path,
     destination: Path,
+    *,
+    workspace: BoundArchiveWorkspace,
+    read_workspace: (
+        BoundArchiveWorkspace | None | _UseArchiveWorkspace
+    ) = _USE_ARCHIVE_WORKSPACE,
 ) -> tuple[Path, ReleaseTreeExpectation]:
-    snapshot = _verified_archive_snapshot(archive_path, checksum_path)
+    workspace_check_fd = _duplicate_bound_archive_workspace(workspace)
+    os.close(workspace_check_fd)
+    effective_read_workspace = (
+        workspace
+        if isinstance(read_workspace, _UseArchiveWorkspace)
+        else read_workspace
+    )
+    snapshot = _verified_archive_snapshot(
+        archive_path,
+        checksum_path,
+        workspace=effective_read_workspace,
+    )
     try:
         return _safe_extract_archive_snapshot(
             snapshot,
             destination,
-            _archive_extraction_anchor(archive_path, destination),
+            workspace=workspace,
         )
     finally:
         snapshot.close()
@@ -2536,14 +3081,23 @@ def read_verified_release_manifest(
         raise SyncError("release asset metadata is internally inconsistent")
 
     try:
-        with tempfile.TemporaryDirectory(
+        with temporary_archive_workspace(
             prefix="codex-release-manifest."
-        ) as temp_dir_raw:
-            destination = Path(temp_dir_raw)
-            download_release_assets(repo, assets, destination)
+        ) as workspace:
+            destination = workspace.path
+            download_release_assets(
+                repo,
+                assets,
+                destination,
+                workspace=workspace,
+            )
             archive_path = destination / assets.archive_name
             checksum_path = destination / assets.checksum_name
-            snapshot = _verified_archive_snapshot(archive_path, checksum_path)
+            snapshot = _verified_archive_snapshot(
+                archive_path,
+                checksum_path,
+                workspace=workspace,
+            )
             try:
                 manifest, expanded_bytes = (
                     _read_release_manifest_from_archive_snapshot(
@@ -3976,6 +4530,7 @@ def _decode_managed_state_json(payload: bytes, path: Path) -> dict[str, Any]:
         data = json.loads(
             payload.decode("utf-8"),
             parse_int=_bounded_json_integer,
+            parse_constant=_reject_json_constant,
         )
     except (UnicodeDecodeError, ValueError, RecursionError) as error:
         raise SyncError(f"Invalid JSON in {path}: {error}") from error
@@ -12156,11 +12711,6 @@ def _hash_exact_regular_file(
     *,
     capture_payload: bool,
 ) -> tuple[bytes, bytes | None]:
-    if capture_payload and snapshot.size > MAX_RELEASE_MANIFEST_BYTES:
-        raise SyncError(
-            f"release manifest exceeds {MAX_RELEASE_MANIFEST_BYTES} bytes: "
-            f"{display_path}"
-        )
     content_digest = hashlib.sha256()
     chunks: list[bytes] | None = [] if capture_payload else None
     remaining = snapshot.size
@@ -12353,22 +12903,25 @@ def _open_installed_release_directory_fd(
     return release_fd
 
 
-def _release_tree_identity_from_directory_fd(
+def _release_tree_identity_and_captured_files_from_directory_fd(
     root_fd: int,
     display_root: Path,
     *,
     require_sanitized_modes: bool = False,
-) -> tuple[dict[str, Any], ManifestData, str]:
+    capture_limits: dict[PurePosixPath, int],
+) -> tuple[ReleaseTreeIdentity, dict[PurePosixPath, bytes]]:
     (
         manifest_payload,
         tree_digest,
         path_kinds,
         source_snapshots,
         source_members,
+        captured_files,
     ) = _release_tree_snapshot_from_directory_fd(
         root_fd,
         display_root,
         require_sanitized_modes=require_sanitized_modes,
+        capture_limits=capture_limits,
     )
     data = _decode_manifest_payload(
         manifest_payload,
@@ -12382,7 +12935,24 @@ def _release_tree_identity_from_directory_fd(
         source_members,
         operation="identity validation",
     )
-    return data, manifest, tree_digest
+    return (data, manifest, tree_digest), captured_files
+
+
+def _release_tree_identity_from_directory_fd(
+    root_fd: int,
+    display_root: Path,
+    *,
+    require_sanitized_modes: bool = False,
+) -> ReleaseTreeIdentity:
+    identity, _captured_files = (
+        _release_tree_identity_and_captured_files_from_directory_fd(
+            root_fd,
+            display_root,
+            require_sanitized_modes=require_sanitized_modes,
+            capture_limits={},
+        )
+    )
+    return identity
 
 
 def _installed_release_identity_and_directory_identity(
@@ -12511,12 +13081,14 @@ def _release_tree_snapshot_from_directory_fd(
     display_root: Path,
     *,
     require_sanitized_modes: bool,
+    capture_limits: dict[PurePosixPath, int],
 ) -> tuple[
     bytes,
     str,
     dict[PurePosixPath, str],
     dict[PurePosixPath, _ReleaseSourceSnapshot],
     dict[PurePosixPath, tuple[str, ...]],
+    dict[PurePosixPath, bytes],
 ]:
     """Capture one normalized release-tree identity without following symlinks."""
     digest = hashlib.sha256(b"codex-personal-sync-release-tree-v1\0")
@@ -12525,6 +13097,7 @@ def _release_tree_snapshot_from_directory_fd(
     path_kinds: dict[PurePosixPath, str] = {}
     source_snapshots: dict[PurePosixPath, _ReleaseSourceSnapshot] = {}
     source_members: dict[PurePosixPath, tuple[str, ...]] = {}
+    captured_files: dict[PurePosixPath, bytes] = {}
 
     def normalized_mode(metadata: os.stat_result, display_path: Path) -> int:
         actual_mode = stat.S_IMODE(metadata.st_mode)
@@ -12636,14 +13209,39 @@ def _release_tree_snapshot_from_directory_fd(
                     snapshot,
                     display_path,
                 )
+                capture_limit = (
+                    MAX_RELEASE_MANIFEST_BYTES
+                    if relative_path == manifest_relative
+                    else None
+                )
+                requested_limit = capture_limits.get(relative_path)
+                if requested_limit is not None:
+                    capture_limit = (
+                        requested_limit
+                        if capture_limit is None
+                        else min(capture_limit, requested_limit)
+                    )
+                if capture_limit is not None and opened_snapshot.size > capture_limit:
+                    description = (
+                        "release manifest"
+                        if relative_path == manifest_relative
+                        else "release file"
+                    )
+                    raise SyncError(
+                        f"{description} exceeds {capture_limit} bytes: {display_path}"
+                    )
                 file_identity, captured_payload = _hash_exact_regular_file(
                     file_fd,
                     opened_snapshot,
                     display_path,
-                    capture_payload=relative_path == manifest_relative,
+                    capture_payload=capture_limit is not None,
                 )
-                if captured_payload is not None:
+                if relative_path == manifest_relative:
+                    assert captured_payload is not None
                     manifest_payload = captured_payload
+                if relative_path in capture_limits:
+                    assert captured_payload is not None
+                    captured_files[relative_path] = captured_payload
                 _require_release_source_unchanged(
                     opened_snapshot,
                     os.fstat(file_fd),
@@ -12691,6 +13289,7 @@ def _release_tree_snapshot_from_directory_fd(
         path_kinds,
         source_snapshots,
         source_members,
+        captured_files,
     )
 
 
@@ -13010,6 +13609,69 @@ def _source_release_identity(
         raise SyncError(f"release source changed during validation: {source_root}") from error
     finally:
         _close_fd_quietly(source_fd)
+        _close_fd_quietly(parent_fd)
+
+
+def read_expected_release_file(
+    release_root: Path,
+    relative_path: PurePosixPath,
+    release_expectation: ReleaseTreeExpectation,
+    *,
+    maximum_bytes: int = MAX_ARCHIVE_MEMBER_BYTES,
+) -> bytes:
+    if isinstance(maximum_bytes, bool) or not isinstance(maximum_bytes, int):
+        raise SyncError("release file byte limit must be an integer")
+    if maximum_bytes < 0:
+        raise SyncError("release file byte limit must be non-negative")
+    if not isinstance(relative_path, PurePosixPath):
+        raise SyncError("release file path must be a relative POSIX path")
+    relative_path = _validate_relative_path(
+        relative_path.as_posix(),
+        "release file path",
+    )
+    parent_fd, release_fd, release_root_snapshot = _open_release_source_root(
+        release_root
+    )
+    try:
+        identity, captured_files = (
+            _release_tree_identity_and_captured_files_from_directory_fd(
+                release_fd,
+                release_root,
+                require_sanitized_modes=True,
+                capture_limits={relative_path: maximum_bytes},
+            )
+        )
+        observed_expectation = (identity, _directory_identity(release_fd))
+        if observed_expectation != release_expectation:
+            raise SyncError("release source changed after its captured identity")
+        payload = captured_files.get(relative_path)
+        if payload is None:
+            raise SyncError(
+                f"expected release file is missing: "
+                f"{release_root / Path(*relative_path.parts)}"
+            )
+        _require_release_source_unchanged(
+            release_root_snapshot,
+            os.fstat(release_fd),
+            release_root,
+        )
+        current_release_root = os.stat(
+            release_root.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        _require_release_source_unchanged(
+            release_root_snapshot,
+            current_release_root,
+            release_root,
+        )
+        return payload
+    except OSError as error:
+        raise SyncError(
+            f"release source changed while reading expected file: {release_root}"
+        ) from error
+    finally:
+        _close_fd_quietly(release_fd)
         _close_fd_quietly(parent_fd)
 
 
@@ -14387,6 +15049,7 @@ def _run_gh_json(args: list[str]) -> Any:
         return json.loads(
             completed.stdout,
             parse_int=_bounded_json_integer,
+            parse_constant=_reject_json_constant,
         )
     except (ValueError, RecursionError) as error:
         raise SyncError(f"gh returned invalid JSON: {error}") from error
@@ -14396,7 +15059,10 @@ def _run_gh_json_stream(args: list[str]) -> list[Any]:
     completed = _run_gh_process(args)
     if completed.returncode != 0:
         raise SyncError(completed.stderr.strip() or "gh command failed")
-    decoder = json.JSONDecoder(parse_int=_bounded_json_integer)
+    decoder = json.JSONDecoder(
+        parse_int=_bounded_json_integer,
+        parse_constant=_reject_json_constant,
+    )
     values: list[Any] = []
     text = completed.stdout
     index = 0
@@ -14562,6 +15228,8 @@ def _download_release_asset(
     expected_size: int,
     maximum_bytes: int,
     destination: Path,
+    *,
+    bound_destination_fd: int,
 ) -> None:
     _validated_release_asset_metadata(
         {"id": asset_id, "size": expected_size},
@@ -14577,10 +15245,10 @@ def _download_release_asset(
     destination_linked = False
     completed = False
     try:
-        destination_fd = os.open(destination, _archive_directory_open_flags())
+        destination_fd = os.dup(bound_destination_fd)
     except OSError as error:
         raise SyncError(
-            f"failed to open release download directory {destination}: {error}"
+            f"release download directory is no longer bound {destination}: {error}"
         ) from error
     process: subprocess.Popen[bytes] | None = None
     stdout: Any | None = None
@@ -14784,7 +15452,13 @@ def _download_release_asset(
             raise cleanup_errors[0]
 
 
-def download_release_assets(repo: str, assets: ReleaseAssets, destination: Path) -> None:
+def download_release_assets(
+    repo: str,
+    assets: ReleaseAssets,
+    destination: Path,
+    *,
+    workspace: BoundArchiveWorkspace,
+) -> None:
     downloads = (
         (
             assets.archive_name,
@@ -14809,53 +15483,88 @@ def download_release_assets(repo: str, assets: ReleaseAssets, destination: Path)
         if asset_id in asset_ids:
             raise SyncError("release archive and checksum must have distinct GitHub asset ids")
         asset_ids.add(asset_id)
+    destination_fd = _open_archive_directory_beneath(
+        workspace,
+        destination,
+        create=True,
+    )
     try:
-        destination.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise SyncError(f"failed to create release download directory: {destination}") from error
-    for asset_name, asset_id, asset_size, maximum_bytes in downloads:
-        _download_release_asset(
-            repo,
-            asset_name,
-            asset_id,
-            asset_size,
-            maximum_bytes,
-            destination,
-        )
+        for asset_name, asset_id, asset_size, maximum_bytes in downloads:
+            _download_release_asset(
+                repo,
+                asset_name,
+                asset_id,
+                asset_size,
+                maximum_bytes,
+                destination,
+                bound_destination_fd=destination_fd,
+            )
+        if not _archive_path_matches_fd(destination, destination_fd):
+            raise SyncError(f"release download directory changed: {destination}")
+        workspace_check_fd = _duplicate_bound_archive_workspace(workspace)
+        os.close(workspace_check_fd)
+    finally:
+        os.close(destination_fd)
 
 
 def download_and_extract_release(
     repo: str,
     destination: Path,
     *,
+    workspace: BoundArchiveWorkspace,
     sha: str | None = None,
 ) -> DownloadedRelease:
     release = find_release_by_asset_sha(repo, sha) if sha is not None else find_latest_release(repo)
     assets = select_release_assets(release)
-    destination.mkdir(parents=True, exist_ok=True)
-    download_release_assets(repo, assets, destination)
-    archive_path = destination / assets.archive_name
-    checksum_path = destination / assets.checksum_name
-    extract_root = destination / "extract"
-    release_root, release_expectation = verify_and_extract_archive(
-        archive_path,
-        checksum_path,
-        extract_root,
+    destination_fd = _open_archive_directory_beneath(
+        workspace,
+        destination,
+        create=True,
     )
-    return DownloadedRelease(
-        repo=repo,
-        assets=assets,
-        release_root=release_root,
-        release_expectation=release_expectation,
+    destination_workspace = BoundArchiveWorkspace(
+        path=Path(os.path.abspath(destination)),
+        fd=destination_fd,
+        identity=_directory_identity(destination_fd),
     )
+    try:
+        download_release_assets(
+            repo,
+            assets,
+            destination,
+            workspace=destination_workspace,
+        )
+        archive_path = destination / assets.archive_name
+        checksum_path = destination / assets.checksum_name
+        extract_root = destination / "extract"
+        release_root, release_expectation = verify_and_extract_archive(
+            archive_path,
+            checksum_path,
+            extract_root,
+            workspace=destination_workspace,
+        )
+        return DownloadedRelease(
+            repo=repo,
+            assets=assets,
+            release_root=release_root,
+            release_expectation=release_expectation,
+        )
+    finally:
+        os.close(destination_fd)
 
 
 def install_from_github(repo: str, home: Path, *, dry_run: bool) -> None:
     home = home.expanduser()
     if _preflight_pending_recovery(home, dry_run=dry_run) and dry_run:
         return
-    with tempfile.TemporaryDirectory(prefix="codex-personal-sync.") as temp_dir_raw:
-        release = download_and_extract_release(repo, Path(temp_dir_raw))
+    with temporary_archive_workspace(
+        prefix="codex-personal-sync."
+    ) as workspace:
+        temp_dir = workspace.path
+        release = download_and_extract_release(
+            repo,
+            temp_dir,
+            workspace=workspace,
+        )
         install_release_tree(
             release.release_root,
             home,
@@ -14906,9 +15615,15 @@ def install_private_from_github(
     if owner == PUBLIC_OWNER:
         raise SyncError("install-private owner must not be public")
 
-    with tempfile.TemporaryDirectory(prefix="codex-personal-sync-private.") as temp_dir_raw:
-        temp_dir = Path(temp_dir_raw)
-        overlay_release = download_and_extract_release(repo, temp_dir / "overlay")
+    with temporary_archive_workspace(
+        prefix="codex-personal-sync-private."
+    ) as workspace:
+        temp_dir = workspace.path
+        overlay_release = download_and_extract_release(
+            repo,
+            temp_dir / "overlay",
+            workspace=workspace,
+        )
         overlay_manifest = _validate_release_manifest_owner(
             overlay_release.release_root,
             owner,
@@ -14918,6 +15633,7 @@ def install_private_from_github(
         base_release = download_and_extract_release(
             base_spec.repo,
             temp_dir / "base",
+            workspace=workspace,
             sha=base_spec.sha,
         )
         base_manifest = _validate_release_manifest_owner(

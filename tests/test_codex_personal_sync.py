@@ -342,13 +342,63 @@ class CodexPersonalSyncTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory(prefix="codex-personal-sync.")
         self.root = Path(self.tmpdir.name)
+        self.archive_workspace_context = MODULE.bind_archive_workspace(self.root)
+        self.archive_workspace = self.archive_workspace_context.__enter__()
         self.user_home = self.root / "home"
         self.path_home_patch = mock.patch.object(MODULE.Path, "home", return_value=self.user_home)
         self.path_home_patch.start()
 
     def tearDown(self) -> None:
         self.path_home_patch.stop()
+        self.archive_workspace_context.__exit__(None, None, None)
         self.tmpdir.cleanup()
+
+    def safe_extract_archive(self, archive_path: Path, destination: Path) -> Path:
+        return MODULE.safe_extract_archive(
+            archive_path,
+            destination,
+            workspace=self.archive_workspace,
+        )
+
+    def verify_and_extract_archive(
+        self,
+        archive_path: Path,
+        checksum_path: Path,
+        destination: Path,
+    ):
+        return MODULE.verify_and_extract_archive(
+            archive_path,
+            checksum_path,
+            destination,
+            workspace=self.archive_workspace,
+        )
+
+    def download_release_assets(
+        self,
+        repo: str,
+        assets: MODULE.ReleaseAssets,
+        destination: Path,
+    ) -> None:
+        MODULE.download_release_assets(
+            repo,
+            assets,
+            destination,
+            workspace=self.archive_workspace,
+        )
+
+    def download_and_extract_release(
+        self,
+        repo: str,
+        destination: Path,
+        *,
+        sha: str | None = None,
+    ) -> MODULE.DownloadedRelease:
+        return MODULE.download_and_extract_release(
+            repo,
+            destination,
+            workspace=self.archive_workspace,
+            sha=sha,
+        )
 
     def run_quietly(self, callback, *args, **kwargs):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -400,7 +450,13 @@ class CodexPersonalSyncTests(unittest.TestCase):
         private_sha: str,
         dry_run: bool = False,
     ) -> None:
-        def fake_download(repo: str, destination: Path, *, sha: str | None = None):
+        def fake_download(
+            repo: str,
+            destination: Path,
+            *,
+            workspace,
+            sha: str | None = None,
+        ):
             if repo == "Joey-Tools/codex-private-workflows":
                 return MODULE.DownloadedRelease(
                     repo=repo,
@@ -542,11 +598,15 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
             archive_path = dist_dir / f"personal-codex-{SHA1}.tar.gz"
             checksum_path = dist_dir / f"personal-codex-{SHA1}.sha256"
-            release_root, _release_expectation = MODULE.verify_and_extract_archive(
-                archive_path,
-                checksum_path,
-                temp_dir / "extract",
-            )
+            with MODULE.bind_archive_workspace(temp_dir) as workspace:
+                release_root, _release_expectation = (
+                    MODULE.verify_and_extract_archive(
+                        archive_path,
+                        checksum_path,
+                        temp_dir / "extract",
+                        workspace=workspace,
+                    )
+                )
             with tarfile.open(archive_path, "r:gz") as archive:
                 member_names = archive.getnames()
 
@@ -835,7 +895,13 @@ class CodexPersonalSyncTests(unittest.TestCase):
         write_private_skill_only_release(private_release)
         downloads: list[tuple[str, str | None]] = []
 
-        def fake_download(repo: str, destination: Path, *, sha: str | None = None):
+        def fake_download(
+            repo: str,
+            destination: Path,
+            *,
+            workspace,
+            sha: str | None = None,
+        ):
             downloads.append((repo, sha))
             if repo == "Joey-Tools/codex-private-workflows":
                 return MODULE.DownloadedRelease(
@@ -923,7 +989,13 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 overlay_validated = True
             return manifest
 
-        def fake_download(repo: str, destination: Path, *, sha: str | None = None):
+        def fake_download(
+            repo: str,
+            destination: Path,
+            *,
+            workspace,
+            sha: str | None = None,
+        ):
             downloads.append((repo, sha))
             if repo == "Joey-Tools/codex-private-workflows":
                 return MODULE.DownloadedRelease(
@@ -2246,7 +2318,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         destination = self.root / "downloads"
         with mock.patch.object(MODULE.subprocess, "Popen", side_effect=fake_popen):
-            MODULE.download_release_assets("owner/repo", assets, destination)
+            self.download_release_assets("owner/repo", assets, destination)
 
         self.assertEqual(len(calls), 2)
         self.assertEqual(
@@ -2307,7 +2379,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 "changed during publication",
             ),
         ):
-            MODULE.download_release_assets("owner/repo", assets, destination)
+            self.download_release_assets("owner/repo", assets, destination)
 
         self.assertTrue(replaced)
         self.assertFalse((destination / assets.archive_name).exists())
@@ -2367,7 +2439,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 "changed during publication",
             ),
         ):
-            MODULE.download_release_assets("owner/repo", assets, destination)
+            self.download_release_assets("owner/repo", assets, destination)
 
         self.assertTrue(replaced)
         self.assertFalse((destination / assets.archive_name).exists())
@@ -2439,7 +2511,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 "partial release asset changed during cleanup",
             ),
         ):
-            MODULE.download_release_assets("owner/repo", assets, destination)
+            self.download_release_assets("owner/repo", assets, destination)
 
         self.assertTrue(replaced)
         self.assertFalse((destination / assets.archive_name).exists())
@@ -2485,7 +2557,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             ) as close_fd,
             self.assertRaisesRegex(MODULE.SyncError, "size mismatch"),
         ):
-            MODULE.download_release_assets("owner/repo", assets, destination)
+            self.download_release_assets("owner/repo", assets, destination)
 
         self.assertGreaterEqual(close_fd.call_count, 2)
         for call in close_fd.call_args_list[-2:]:
@@ -2517,7 +2589,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         with mock.patch.object(MODULE.subprocess, "Popen", return_value=process):
             with self.assertRaisesRegex(MODULE.SyncError, "exceeds its advertised"):
-                MODULE.download_release_assets("owner/repo", assets, destination)
+                self.download_release_assets("owner/repo", assets, destination)
 
         self.assertTrue(process.terminated)
         self.assertFalse((destination / assets.archive_name).exists())
@@ -2541,7 +2613,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         with mock.patch.object(MODULE.subprocess, "Popen", return_value=process):
             with self.assertRaisesRegex(MODULE.SyncError, "size mismatch"):
-                MODULE.download_release_assets("owner/repo", assets, destination)
+                self.download_release_assets("owner/repo", assets, destination)
 
         self.assertFalse((destination / assets.archive_name).exists())
         self.assertEqual(list(destination.glob(".*.partial.*")), [])
@@ -2561,7 +2633,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         with mock.patch.object(MODULE.subprocess, "Popen") as popen:
             with self.assertRaisesRegex(MODULE.SyncError, "exceeds"):
-                MODULE.download_release_assets("owner/repo", assets, destination)
+                self.download_release_assets("owner/repo", assets, destination)
 
         popen.assert_not_called()
         self.assertFalse(destination.exists())
@@ -2728,10 +2800,14 @@ class CodexPersonalSyncTests(unittest.TestCase):
         retained_archive = self.root / "verified.tar.gz"
         real_extract = MODULE._safe_extract_archive_snapshot
 
-        def replace_archive_path(snapshot, extract_root, destination_anchor):
+        def replace_archive_path(snapshot, extract_root, *, workspace):
             archive_path.rename(retained_archive)
             malicious_archive.rename(archive_path)
-            return real_extract(snapshot, extract_root, destination_anchor)
+            return real_extract(
+                snapshot,
+                extract_root,
+                workspace=workspace,
+            )
 
         with (
             mock.patch.object(MODULE, "find_latest_release", return_value={}),
@@ -2743,7 +2819,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 side_effect=replace_archive_path,
             ),
         ):
-            release = MODULE.download_and_extract_release("owner/repo", destination)
+            release = self.download_and_extract_release("owner/repo", destination)
 
         self.assertEqual(
             (release.release_root / "personal_codex" / "AGENTS.md").read_text(
@@ -2761,6 +2837,753 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertEqual(archive_path.read_bytes(), b"replacement")
         self.assertTrue(retained_archive.is_file())
 
+    def test_expected_release_file_rejects_release_root_name_replacement(
+        self,
+    ) -> None:
+        release_root = self.root / "expected-release"
+        retained_release = self.root / "retained-expected-release"
+        runner_path = MODULE.PurePosixPath("scripts/codex_personal_sync.py")
+        write_minimal_release(release_root)
+        original_runner = (release_root / Path(*runner_path.parts)).read_bytes()
+        release_expectation = MODULE._source_release_identity(release_root, None)
+
+        self.assertEqual(
+            MODULE.read_expected_release_file(
+                release_root,
+                runner_path,
+                release_expectation,
+            ),
+            original_runner,
+        )
+
+        release_root.rename(retained_release)
+        write_minimal_release(release_root, agent_text="substitute\n")
+        (release_root / Path(*runner_path.parts)).write_text(
+            "#!/usr/bin/env python3\n# substitute\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "release source changed after its captured identity",
+        ):
+            MODULE.read_expected_release_file(
+                release_root,
+                runner_path,
+                release_expectation,
+            )
+
+    def test_expected_release_file_rejects_descendant_replace_restore(
+        self,
+    ) -> None:
+        release_root = self.root / "expected-descendant-release"
+        substitute_root = self.root / "substitute-descendant-release"
+        retained_scripts = self.root / "retained-expected-scripts"
+        runner_path = MODULE.PurePosixPath("scripts/codex_personal_sync.py")
+        write_minimal_release(release_root)
+        write_minimal_release(substitute_root)
+        (substitute_root / Path(*runner_path.parts)).write_text(
+            "#!/usr/bin/env python3\n# install-private substitute\n",
+            encoding="utf-8",
+        )
+        release_expectation = MODULE._source_release_identity(release_root, None)
+        original_runner = (release_root / Path(*runner_path.parts)).read_bytes()
+        real_capture = (
+            MODULE._release_tree_identity_and_captured_files_from_directory_fd
+        )
+
+        def capture_substitute_then_restore(*args, **kwargs):
+            original_scripts = release_root / "scripts"
+            substitute_scripts = substitute_root / "scripts"
+            original_scripts.rename(retained_scripts)
+            substitute_scripts.rename(original_scripts)
+            try:
+                return real_capture(*args, **kwargs)
+            finally:
+                original_scripts.rename(substitute_scripts)
+                retained_scripts.rename(original_scripts)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_release_tree_identity_and_captured_files_from_directory_fd",
+                side_effect=capture_substitute_then_restore,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "release source changed after its captured identity",
+            ),
+        ):
+            MODULE.read_expected_release_file(
+                release_root,
+                runner_path,
+                release_expectation,
+            )
+
+        self.assertEqual(
+            (release_root / Path(*runner_path.parts)).read_bytes(),
+            original_runner,
+        )
+
+    def test_download_extract_rejects_destination_replacement_after_download(
+        self,
+    ) -> None:
+        destination = self.root / "replaceable-download"
+        retained_destination = self.root / "retained-download"
+        source_root = self.root / "download-replacement-source"
+        source_archive = self.root / "download-replacement.tar.gz"
+        source_checksum = self.root / "download-replacement.sha256"
+        write_minimal_release(source_root)
+        with tarfile.open(source_archive, "w:gz") as archive:
+            archive.add(source_root, arcname=f"personal-codex-{SHA1}")
+        digest = hashlib.sha256(source_archive.read_bytes()).hexdigest()
+        source_checksum.write_text(
+            f"{digest}  personal-codex-{SHA1}.tar.gz\n",
+            encoding="utf-8",
+        )
+        assets = MODULE.ReleaseAssets(
+            tag_name="personal-codex-20260520-120000-1111111",
+            sha=SHA1,
+            archive_name=f"personal-codex-{SHA1}.tar.gz",
+            checksum_name=f"personal-codex-{SHA1}.sha256",
+            archive_id=1,
+            archive_size=source_archive.stat().st_size,
+            checksum_id=2,
+            checksum_size=source_checksum.stat().st_size,
+        )
+
+        def download_then_replace(repo, selected_assets, path, *, workspace):
+            self.assertEqual(repo, "owner/repo")
+            self.assertEqual(selected_assets, assets)
+            self.assertEqual(workspace.path, path)
+            shutil.copy2(source_archive, path / assets.archive_name)
+            shutil.copy2(source_checksum, path / assets.checksum_name)
+            path.rename(retained_destination)
+            path.mkdir()
+            (path / "replacement.txt").write_text(
+                "replacement\n",
+                encoding="utf-8",
+            )
+
+        with (
+            mock.patch.object(MODULE, "find_latest_release", return_value={}),
+            mock.patch.object(MODULE, "select_release_assets", return_value=assets),
+            mock.patch.object(
+                MODULE,
+                "download_release_assets",
+                side_effect=download_then_replace,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "archive workspace binding changed",
+            ),
+        ):
+            self.download_and_extract_release("owner/repo", destination)
+
+        self.assertFalse((retained_destination / "extract").exists())
+        self.assertEqual(
+            (destination / "replacement.txt").read_text(encoding="utf-8"),
+            "replacement\n",
+        )
+
+    def test_verify_extract_rejects_symlinked_workspace_descendant_without_writes(
+        self,
+    ) -> None:
+        trusted_root = self.root / "trusted-workspace"
+        outside = self.root / "outside"
+        source_root = self.root / "symlink-source"
+        trusted_root.mkdir()
+        outside.mkdir()
+        write_minimal_release(source_root)
+        link = trusted_root / "link"
+        link.symlink_to(outside, target_is_directory=True)
+        archive_path = link / f"personal-codex-{SHA1}.tar.gz"
+        checksum_path = link / f"personal-codex-{SHA1}.sha256"
+        with tarfile.open(outside / archive_path.name, "w:gz") as archive:
+            archive.add(source_root, arcname=f"personal-codex-{SHA1}")
+        digest = hashlib.sha256((outside / archive_path.name).read_bytes()).hexdigest()
+        (outside / checksum_path.name).write_text(
+            f"{digest}  {archive_path.name}\n",
+            encoding="utf-8",
+        )
+
+        def outside_snapshot() -> dict[str, tuple[int, bytes | None]]:
+            snapshot: dict[str, tuple[int, bytes | None]] = {}
+            for path in sorted(outside.rglob("*")):
+                metadata = path.lstat()
+                snapshot[path.relative_to(outside).as_posix()] = (
+                    stat.S_IFMT(metadata.st_mode),
+                    path.read_bytes() if path.is_file() else None,
+                )
+            return snapshot
+
+        before = outside_snapshot()
+        with MODULE.bind_archive_workspace(trusted_root) as workspace:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "unsafe (?:checksum file parent|archive directory)",
+            ):
+                MODULE.verify_and_extract_archive(
+                    archive_path,
+                    checksum_path,
+                    link / "extract",
+                    workspace=workspace,
+                )
+
+        self.assertEqual(outside_snapshot(), before)
+
+    def test_temporary_archive_workspace_binds_and_cleans_random_leaf(self) -> None:
+        parent = self.root / "temporary-workspace-parent"
+        parent.mkdir()
+        workspace_path: Path | None = None
+        workspace_fd = -1
+
+        with MODULE.temporary_archive_workspace(
+            prefix="temporary-workspace.",
+            parent=parent,
+        ) as workspace:
+            workspace_path = workspace.path
+            workspace_fd = workspace.fd
+            metadata = workspace_path.stat()
+            self.assertEqual(
+                (metadata.st_dev, metadata.st_ino),
+                workspace.identity,
+            )
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o700)
+            (workspace_path / "nested").mkdir()
+            (workspace_path / "nested" / "payload.txt").write_text(
+                "payload\n",
+                encoding="utf-8",
+            )
+
+        assert workspace_path is not None
+        self.assertFalse(workspace_path.exists())
+        with self.assertRaises(OSError):
+            os.fstat(workspace_fd)
+
+    def test_temporary_archive_workspace_accepts_symlinked_parent_ancestor(
+        self,
+    ) -> None:
+        real_root = self.root / "real-temporary-root"
+        real_parent = real_root / "tmp"
+        alias_root = self.root / "alias-temporary-root"
+        real_parent.mkdir(parents=True)
+        alias_root.symlink_to(real_root, target_is_directory=True)
+        lexical_parent = alias_root / "tmp"
+
+        with MODULE.temporary_archive_workspace(
+            prefix="ancestor-symlink.",
+            parent=lexical_parent,
+        ) as workspace:
+            self.assertEqual(
+                workspace.path.parent,
+                Path(os.path.abspath(lexical_parent)),
+            )
+            self.assertNotEqual(workspace.path.parent, real_parent)
+            self.assertTrue(workspace.path.is_dir())
+
+    def test_temporary_archive_workspace_rejects_leaf_replacement_before_open(
+        self,
+    ) -> None:
+        parent = self.root / "replace-before-open-parent"
+        moved_workspace = self.root / "moved-before-open-workspace"
+        parent.mkdir()
+        real_open = MODULE.os.open
+        replaced_path: Path | None = None
+
+        def replace_before_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal replaced_path
+            if (
+                replaced_path is None
+                and dir_fd is not None
+                and isinstance(path, str)
+                and path.startswith("replace-before-open.")
+            ):
+                replaced_path = parent / path
+                replaced_path.rename(moved_workspace)
+                replaced_path.mkdir()
+                (replaced_path / "sentinel.txt").write_text(
+                    "replacement\n",
+                    encoding="utf-8",
+                )
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with MODULE.bind_archive_workspace(parent) as parent_workspace:
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "open",
+                    side_effect=replace_before_open,
+                ),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "temporary archive workspace changed while binding",
+                ),
+            ):
+                with MODULE.create_bound_temporary_archive_workspace(
+                    parent_workspace,
+                    prefix="replace-before-open.",
+                ):
+                    self.fail("replacement workspace must not be yielded")
+
+        assert replaced_path is not None
+        self.assertTrue(moved_workspace.is_dir())
+        self.assertEqual(
+            (replaced_path / "sentinel.txt").read_text(encoding="utf-8"),
+            "replacement\n",
+        )
+
+    def test_temporary_archive_workspace_open_failure_preserves_replacement(
+        self,
+    ) -> None:
+        parent = self.root / "open-failure-cleanup-parent"
+        moved_workspace = self.root / "moved-open-failure-workspace"
+        parent.mkdir()
+        real_open = MODULE.os.open
+        real_rename = MODULE._rename_noreplace_at
+        raced = False
+
+        def fail_workspace_open(path, flags, mode=0o777, *, dir_fd=None):
+            if (
+                dir_fd is not None
+                and isinstance(path, str)
+                and path.startswith("open-failure-cleanup.")
+            ):
+                raise OSError("simulated workspace open failure")
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        def replace_before_isolation(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+        ):
+            nonlocal raced
+            if not raced:
+                raced = True
+                workspace_path = parent / source_name
+                workspace_path.rename(moved_workspace)
+                workspace_path.mkdir()
+                (workspace_path / "sentinel.txt").write_text(
+                    "replacement\n",
+                    encoding="utf-8",
+                )
+            return real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        stderr = io.StringIO()
+        with MODULE.bind_archive_workspace(parent) as parent_workspace:
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "open",
+                    side_effect=fail_workspace_open,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_rename_noreplace_at",
+                    side_effect=replace_before_isolation,
+                ),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaisesRegex(
+                    OSError,
+                    "simulated workspace open failure",
+                ),
+            ):
+                with MODULE.create_bound_temporary_archive_workspace(
+                    parent_workspace,
+                    prefix="open-failure-cleanup.",
+                ):
+                    self.fail("workspace open failure must not yield")
+
+        self.assertTrue(raced)
+        self.assertTrue(moved_workspace.is_dir())
+        isolated = list(parent.glob(".codex-archive-cleanup-*"))
+        self.assertEqual(len(isolated), 1)
+        self.assertEqual(
+            (isolated[0] / "sentinel.txt").read_text(encoding="utf-8"),
+            "replacement\n",
+        )
+        self.assertIn("changed during cleanup isolation", stderr.getvalue())
+
+    def test_bind_archive_workspace_close_failure_preserves_primary(self) -> None:
+        parent = self.root / "bind-close-primary"
+        parent.mkdir()
+        real_close = MODULE.os.close
+        workspace_fd = -1
+        close_failed = False
+        stderr = io.StringIO()
+
+        def fail_workspace_close(file_descriptor: int) -> None:
+            nonlocal close_failed
+            if file_descriptor == workspace_fd and not close_failed:
+                close_failed = True
+                raise OSError("simulated workspace close failure")
+            real_close(file_descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "close",
+                    side_effect=fail_workspace_close,
+                ),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaisesRegex(RuntimeError, "primary failure"),
+            ):
+                with MODULE.bind_archive_workspace(parent) as workspace:
+                    workspace_fd = workspace.fd
+                    raise RuntimeError("primary failure")
+        finally:
+            if workspace_fd >= 0:
+                real_close(workspace_fd)
+
+        self.assertTrue(close_failed)
+        self.assertIn(
+            "warning: failed to close archive workspace",
+            stderr.getvalue(),
+        )
+
+    def test_temporary_archive_child_close_failure_is_reported(self) -> None:
+        parent = self.root / "child-close-report-parent"
+        parent.mkdir()
+        real_close = MODULE.os.close
+        child_identity: tuple[int, int] | None = None
+        failed_fd = -1
+
+        def fail_child_close(file_descriptor: int) -> None:
+            nonlocal failed_fd
+            try:
+                metadata = os.fstat(file_descriptor)
+            except OSError:
+                real_close(file_descriptor)
+                return
+            if (
+                child_identity is not None
+                and (metadata.st_dev, metadata.st_ino) == child_identity
+                and failed_fd < 0
+            ):
+                failed_fd = file_descriptor
+                raise OSError("simulated child close failure")
+            real_close(file_descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "close",
+                    side_effect=fail_child_close,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "failed to close temporary archive workspace entry",
+                ),
+            ):
+                with MODULE.temporary_archive_workspace(
+                    prefix="child-close-report.",
+                    parent=parent,
+                ) as workspace:
+                    child = workspace.path / "child"
+                    child.mkdir()
+                    metadata = child.stat()
+                    child_identity = (metadata.st_dev, metadata.st_ino)
+        finally:
+            if failed_fd >= 0:
+                real_close(failed_fd)
+
+        self.assertGreaterEqual(failed_fd, 0)
+
+    def test_temporary_archive_child_close_failure_preserves_primary(
+        self,
+    ) -> None:
+        parent = self.root / "child-close-primary-parent"
+        parent.mkdir()
+        real_close = MODULE.os.close
+        child_identity: tuple[int, int] | None = None
+        failed_fd = -1
+        stderr = io.StringIO()
+
+        def fail_child_close(file_descriptor: int) -> None:
+            nonlocal failed_fd
+            try:
+                metadata = os.fstat(file_descriptor)
+            except OSError:
+                real_close(file_descriptor)
+                return
+            if (
+                child_identity is not None
+                and (metadata.st_dev, metadata.st_ino) == child_identity
+                and failed_fd < 0
+            ):
+                failed_fd = file_descriptor
+                raise OSError("simulated child close failure")
+            real_close(file_descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "close",
+                    side_effect=fail_child_close,
+                ),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaisesRegex(RuntimeError, "primary failure"),
+            ):
+                with MODULE.temporary_archive_workspace(
+                    prefix="child-close-primary.",
+                    parent=parent,
+                ) as workspace:
+                    child = workspace.path / "child"
+                    child.mkdir()
+                    metadata = child.stat()
+                    child_identity = (metadata.st_dev, metadata.st_ino)
+                    raise RuntimeError("primary failure")
+        finally:
+            if failed_fd >= 0:
+                real_close(failed_fd)
+
+        self.assertGreaterEqual(failed_fd, 0)
+        self.assertIn(
+            "warning: failed to close temporary archive workspace entry",
+            stderr.getvalue(),
+        )
+
+    def test_temporary_archive_cleanup_preserves_root_replacement(self) -> None:
+        parent = self.root / "cleanup-root-parent"
+        moved_workspace = self.root / "moved-cleanup-root"
+        replacement = self.root / "replacement-cleanup-root"
+        parent.mkdir()
+        replacement.mkdir()
+        (replacement / "sentinel.txt").write_text("keep\n", encoding="utf-8")
+        real_rename = MODULE._rename_noreplace_at
+        replaced = False
+
+        def replace_root(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+        ):
+            nonlocal replaced
+            if source_name.startswith("cleanup-root.") and not replaced:
+                replaced = True
+                (parent / source_name).rename(moved_workspace)
+                replacement.rename(parent / source_name)
+            return real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=replace_root,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "changed during cleanup isolation",
+            ),
+        ):
+            with MODULE.temporary_archive_workspace(
+                prefix="cleanup-root.",
+                parent=parent,
+            ) as workspace:
+                (workspace.path / "owned.txt").write_text(
+                    "owned\n",
+                    encoding="utf-8",
+                )
+
+        self.assertTrue(replaced)
+        self.assertEqual(
+            (moved_workspace / "owned.txt").read_text(encoding="utf-8"),
+            "owned\n",
+        )
+        retained_replacements = list(parent.glob(".codex-archive-cleanup-*"))
+        self.assertEqual(len(retained_replacements), 1)
+        self.assertEqual(
+            (retained_replacements[0] / "sentinel.txt").read_text(
+                encoding="utf-8"
+            ),
+            "keep\n",
+        )
+
+    def test_temporary_archive_cleanup_preserves_leaf_replacement_and_primary(
+        self,
+    ) -> None:
+        parent = self.root / "cleanup-leaf-parent"
+        parent.mkdir()
+        real_rename = MODULE._rename_noreplace_at
+        replaced = False
+        stderr = io.StringIO()
+
+        def replace_leaf(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+        ):
+            nonlocal replaced
+            if source_name == "owned.txt" and not replaced:
+                replaced = True
+                os.rename(
+                    source_name,
+                    "moved-owned.txt",
+                    src_dir_fd=source_parent_fd,
+                    dst_dir_fd=source_parent_fd,
+                )
+                replacement_fd = os.open(
+                    source_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=source_parent_fd,
+                )
+                try:
+                    os.write(replacement_fd, b"replacement\n")
+                finally:
+                    os.close(replacement_fd)
+            return real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=replace_leaf,
+            ),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaisesRegex(RuntimeError, "primary failure"),
+        ):
+            with MODULE.temporary_archive_workspace(
+                prefix="cleanup-leaf.",
+                parent=parent,
+            ) as workspace:
+                (workspace.path / "owned.txt").write_text(
+                    "owned\n",
+                    encoding="utf-8",
+                )
+                raise RuntimeError("primary failure")
+
+        self.assertTrue(replaced)
+        self.assertIn("warning:", stderr.getvalue())
+        retained_roots = list(parent.glob(".codex-archive-cleanup-*"))
+        self.assertEqual(len(retained_roots), 1)
+        retained_root = retained_roots[0]
+        self.assertEqual(
+            (retained_root / "moved-owned.txt").read_text(encoding="utf-8"),
+            "owned\n",
+        )
+        retained_replacements = [
+            path
+            for path in retained_root.glob(".codex-archive-cleanup-*")
+            if path.is_file()
+        ]
+        self.assertEqual(len(retained_replacements), 1)
+        self.assertEqual(
+            retained_replacements[0].read_text(encoding="utf-8"),
+            "replacement\n",
+        )
+
+    def test_safe_extract_accepts_unresolved_temporary_workspace_path(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="archive-workspace-no-resolve."
+        ) as temp_dir_raw:
+            workspace_path = Path(temp_dir_raw)
+            source_root = workspace_path / "source"
+            archive_path = workspace_path / "release.tar.gz"
+            write_minimal_release(source_root)
+            with tarfile.open(archive_path, "w:gz") as archive:
+                archive.add(source_root, arcname=f"personal-codex-{SHA1}")
+
+            with MODULE.bind_archive_workspace(workspace_path) as workspace:
+                release_root = MODULE.safe_extract_archive(
+                    archive_path,
+                    workspace_path / "extract",
+                    workspace=workspace,
+                )
+
+            self.assertTrue(
+                (release_root / "personal_codex" / "sync-manifest.json").is_file()
+            )
+
+    def test_safe_extract_rejects_replaced_workspace_path(self) -> None:
+        workspace_path = self.root / "replaceable-workspace"
+        retained_workspace = self.root / "retained-workspace"
+        replacement_marker = workspace_path / "replacement.txt"
+        source_root = self.root / "workspace-replacement-source"
+        archive_path = self.root / "workspace-replacement.tar.gz"
+        workspace_path.mkdir()
+        write_minimal_release(source_root)
+        with tarfile.open(archive_path, "w:gz") as archive:
+            archive.add(source_root, arcname=f"personal-codex-{SHA1}")
+
+        with MODULE.bind_archive_workspace(workspace_path) as workspace:
+            workspace_path.rename(retained_workspace)
+            workspace_path.mkdir()
+            replacement_marker.write_text("replacement\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "archive workspace binding changed",
+            ):
+                MODULE.safe_extract_archive(
+                    archive_path,
+                    workspace_path / "extract",
+                    workspace=workspace,
+                )
+
+        self.assertEqual(replacement_marker.read_text(encoding="utf-8"), "replacement\n")
+        self.assertEqual(list(retained_workspace.iterdir()), [])
+
+    def test_safe_extract_rejects_closed_or_mismatched_workspace_fd(self) -> None:
+        source_root = self.root / "closed-workspace-source"
+        archive_path = self.root / "closed-workspace.tar.gz"
+        first = self.root / "first-workspace"
+        second = self.root / "second-workspace"
+        first.mkdir()
+        second.mkdir()
+        write_minimal_release(source_root)
+        with tarfile.open(archive_path, "w:gz") as archive:
+            archive.add(source_root, arcname=f"personal-codex-{SHA1}")
+
+        with MODULE.bind_archive_workspace(first) as closed_workspace:
+            pass
+        with self.assertRaisesRegex(MODULE.SyncError, "no longer bound"):
+            MODULE.safe_extract_archive(
+                archive_path,
+                first / "extract",
+                workspace=closed_workspace,
+            )
+
+        with (
+            MODULE.bind_archive_workspace(first) as first_workspace,
+            MODULE.bind_archive_workspace(second) as second_workspace,
+        ):
+            mismatched_workspace = MODULE.BoundArchiveWorkspace(
+                path=first_workspace.path,
+                fd=second_workspace.fd,
+                identity=first_workspace.identity,
+            )
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "archive workspace binding changed",
+            ):
+                MODULE.safe_extract_archive(
+                    archive_path,
+                    first / "extract",
+                    workspace=mismatched_workspace,
+                )
+
     def test_safe_extract_rejects_parent_traversal(self) -> None:
         archive_path = self.root / "unsafe.tar.gz"
         with tarfile.open(archive_path, "w:gz") as archive:
@@ -2770,7 +3593,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             archive.addfile(member, io.BytesIO(data))
 
         with self.assertRaisesRegex(MODULE.SyncError, "unsafe archive member path"):
-            MODULE.safe_extract_archive(archive_path, self.root / "extract")
+            self.safe_extract_archive(archive_path, self.root / "extract")
         self.assertFalse((self.root / "evil.txt").exists())
 
     def test_safe_extract_enforces_member_resource_limits_before_writing(self) -> None:
@@ -2807,7 +3630,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     for patcher in patches:
                         stack.enter_context(patcher)
                     with self.assertRaisesRegex(MODULE.SyncError, expected):
-                        MODULE.safe_extract_archive(archive_path, destination)
+                        self.safe_extract_archive(archive_path, destination)
                 self.assertFalse(destination.exists())
 
     def test_safe_extract_counts_pax_metadata_against_expanded_limit(self) -> None:
@@ -2829,7 +3652,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 MODULE.SyncError,
                 "total expanded byte limit",
             ):
-                MODULE.safe_extract_archive(archive_path, destination)
+                self.safe_extract_archive(archive_path, destination)
 
         self.assertFalse(destination.exists())
 
@@ -2857,7 +3680,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 MODULE.SyncError,
                 "total expanded byte limit",
             ):
-                MODULE.safe_extract_archive(archive_path, destination)
+                self.safe_extract_archive(archive_path, destination)
 
         self.assertFalse(destination.exists())
 
@@ -2906,7 +3729,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             side_effect=rewrite_after_identity,
         ):
             with self.assertRaisesRegex(MODULE.SyncError, "file changed during validation"):
-                MODULE.safe_extract_archive(archive_path, destination)
+                self.safe_extract_archive(archive_path, destination)
 
         self.assertEqual(identity_calls, 1)
         self.assertIsNotNone(raced_path)
@@ -2930,7 +3753,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     MODULE.SyncError,
                     "unsafe archive member path",
                 ):
-                    MODULE.safe_extract_archive(archive_path, destination)
+                    self.safe_extract_archive(archive_path, destination)
                 self.assertFalse(destination.exists())
 
     def test_safe_extract_rejects_pax_path_with_embedded_nul_before_writing(
@@ -2953,7 +3776,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             MODULE.SyncError,
             "unsafe archive member path: embedded NUL",
         ):
-            MODULE.safe_extract_archive(archive_path, destination)
+            self.safe_extract_archive(archive_path, destination)
 
         self.assertFalse(destination.exists())
 
@@ -3001,7 +3824,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                             )
                         )
                     with self.assertRaisesRegex(MODULE.SyncError, expected):
-                        MODULE.safe_extract_archive(archive_path, destination)
+                        self.safe_extract_archive(archive_path, destination)
                 self.assertFalse(destination.exists())
 
     def test_archive_member_path_limits_accept_boundaries_and_shared_prefixes(
@@ -3078,7 +3901,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             ) as create_destination,
             self.assertRaisesRegex(MODULE.SyncError, "path entry limit"),
         ):
-            MODULE.safe_extract_archive(archive_path, destination)
+            self.safe_extract_archive(archive_path, destination)
 
         create_destination.assert_not_called()
         self.assertFalse(destination.exists())
@@ -3103,7 +3926,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         destination = self.root / "duplicate-extract"
         with self.assertRaisesRegex(MODULE.SyncError, "duplicate archive member path"):
-            MODULE.safe_extract_archive(archive_path, destination)
+            self.safe_extract_archive(archive_path, destination)
 
         self.assertFalse(destination.exists())
 
@@ -3147,7 +3970,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     MODULE.SyncError,
                     "portable archive member path conflict",
                 ):
-                    MODULE.safe_extract_archive(archive_path, destination)
+                    self.safe_extract_archive(archive_path, destination)
 
                 self.assertFalse(destination.exists())
 
@@ -3160,7 +3983,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             archive.addfile(member)
 
         with self.assertRaisesRegex(MODULE.SyncError, "archive link member"):
-            MODULE.safe_extract_archive(archive_path, self.root / "extract")
+            self.safe_extract_archive(archive_path, self.root / "extract")
 
     def test_safe_extract_rejects_preexisting_symlink_destination(self) -> None:
         source_root = self.root / "preexisting-source"
@@ -3177,7 +4000,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             MODULE.SyncError,
             "pre-existing archive destination",
         ):
-            MODULE.safe_extract_archive(archive_path, destination)
+            self.safe_extract_archive(archive_path, destination)
 
         self.assertTrue(destination.is_symlink())
         self.assertEqual(list(outside.iterdir()), [])
@@ -3199,9 +4022,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "unsafe archive destination parent",
+            "unsafe archive directory",
         ):
-            MODULE.safe_extract_archive(archive_path, destination)
+            self.safe_extract_archive(archive_path, destination)
 
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
         self.assertEqual(list(nested_outside.iterdir()), [])
@@ -3232,7 +4055,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             swap_destination,
         ):
             with self.assertRaisesRegex(MODULE.SyncError, "destination changed"):
-                MODULE.safe_extract_archive(archive_path, destination)
+                self.safe_extract_archive(archive_path, destination)
 
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
         self.assertEqual(list(redirected.iterdir()), [sentinel])
@@ -3276,7 +4099,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             swap_parent,
         ):
             with self.assertRaisesRegex(MODULE.SyncError, "parent changed"):
-                MODULE.safe_extract_archive(archive_path, destination)
+                self.safe_extract_archive(archive_path, destination)
 
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
         self.assertEqual(list(redirected.iterdir()), [sentinel])
@@ -3338,7 +4161,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     insert_expected_leaf,
                 ):
                     with self.assertRaisesRegex(MODULE.SyncError, "entry already exists"):
-                        MODULE.safe_extract_archive(archive_path, destination)
+                        self.safe_extract_archive(archive_path, destination)
 
                 existing = (
                     destination
@@ -3368,7 +4191,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             archive.add(source_root, arcname=f"personal-codex-{SHA1}")
 
         destination = self.root / "success-extract"
-        release_root = MODULE.safe_extract_archive(archive_path, destination)
+        release_root = self.safe_extract_archive(archive_path, destination)
 
         self.assertEqual(release_root, destination / f"personal-codex-{SHA1}")
         self.assertTrue(
@@ -3417,7 +4240,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             "_create_archive_directory_at",
             side_effect=tracked_create,
         ):
-            release_root = MODULE.safe_extract_archive(
+            release_root = self.safe_extract_archive(
                 archive_path,
                 self.root / "many-directories-extract",
             )
@@ -3462,7 +4285,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 MODULE.SyncError,
                 "archive directory changed",
             ):
-                MODULE.safe_extract_archive(archive_path, destination)
+                self.safe_extract_archive(archive_path, destination)
 
         self.assertTrue(swapped)
         self.assertEqual(
@@ -3487,7 +4310,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             "extractall",
             side_effect=AssertionError("extractall must not be used"),
         ) as extractall:
-            release_root = MODULE.safe_extract_archive(archive_path, self.root / "extract")
+            release_root = self.safe_extract_archive(archive_path, self.root / "extract")
 
         extractall.assert_not_called()
         mode = (release_root / "personal_codex" / "bin" / "example-tool").stat().st_mode
@@ -4322,7 +5145,13 @@ class CodexPersonalSyncTests(unittest.TestCase):
         write_agent_only_release(public_release, agent_text="public\n")
         write_private_agent_release(private_release, agent_text="private\n")
 
-        def fake_download(repo: str, destination: Path, *, sha: str | None = None):
+        def fake_download(
+            repo: str,
+            destination: Path,
+            *,
+            workspace,
+            sha: str | None = None,
+        ):
             if repo == "Joey-Tools/codex-private-workflows":
                 return MODULE.DownloadedRelease(
                     repo=repo,
@@ -4745,7 +5574,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             ],
         }
 
-        def fake_download(repo, assets, destination):
+        def fake_download(repo, assets, destination, *, workspace):
             self.assertEqual(repo, "owner/repo")
             self.assertEqual(assets.archive_name, archive_name)
             shutil.copy2(archive_path, destination / archive_name)
@@ -4759,6 +5588,57 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertTrue((home / "AGENTS.md").is_symlink())
+
+    def test_install_from_github_rejects_replaced_extracted_release_root(
+        self,
+    ) -> None:
+        release_root = self.root / "downloaded-release"
+        retained_release = self.root / "retained-downloaded-release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(release_root, agent_text="verified\n")
+        release_expectation = MODULE._source_release_identity(release_root, None)
+        release_root.rename(retained_release)
+        write_minimal_release(release_root, agent_text="substitute\n")
+        assets = MODULE.ReleaseAssets(
+            tag_name="personal-codex-20260511-120000-1111111",
+            sha=SHA1,
+            archive_name=f"personal-codex-{SHA1}.tar.gz",
+            checksum_name=f"personal-codex-{SHA1}.sha256",
+            archive_id=101,
+            archive_size=1,
+            checksum_id=102,
+            checksum_size=1,
+        )
+
+        def fake_download(repo, destination, *, workspace, sha=None):
+            self.assertEqual(repo, "owner/repo")
+            self.assertIsNone(sha)
+            return MODULE.DownloadedRelease(
+                repo=repo,
+                assets=assets,
+                release_root=release_root,
+                release_expectation=release_expectation,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "download_and_extract_release",
+                side_effect=fake_download,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "release source changed after its captured identity",
+            ),
+        ):
+            self.run_quietly(
+                MODULE.install_from_github,
+                "owner/repo",
+                home,
+                dry_run=False,
+            )
+
+        self.assertFalse((home / "personal-sync" / "current").exists())
 
     def test_install_from_github_rejects_downloaded_checksum_mismatch(self) -> None:
         source_root = self.root / "source"
@@ -4780,7 +5660,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             ],
         }
 
-        def fake_download(repo, assets, destination):
+        def fake_download(repo, assets, destination, *, workspace):
             shutil.copy2(archive_path, destination / archive_name)
             shutil.copy2(checksum_path, destination / checksum_name)
 

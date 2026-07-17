@@ -1043,6 +1043,23 @@ class GitHubJsonErrorNormalizationSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.SyncError, "gh returned invalid JSON"):
                 MODULE._run_gh_json(["api", "repos/owner/repo/releases"])
 
+    def test_run_gh_json_rejects_nonstandard_constants(self) -> None:
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            completed = self._completed(f'{{"value":{constant}}}')
+            with (
+                self.subTest(constant=constant),
+                mock.patch.object(
+                    MODULE,
+                    "_run_gh_process",
+                    return_value=completed,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "gh returned invalid JSON: non-standard JSON constant",
+                ),
+            ):
+                MODULE._run_gh_json(["api", "repos/owner/repo/releases"])
+
     def test_run_gh_json_normalizes_deep_nesting(self) -> None:
         completed = self._completed("[]")
 
@@ -1064,6 +1081,18 @@ class GitHubJsonErrorNormalizationSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 MODULE.SyncError,
                 "gh returned invalid paginated JSON",
+            ):
+                MODULE._run_gh_json_stream(["api", "repos/owner/repo/releases"])
+
+    def test_run_gh_json_stream_rejects_nonstandard_constant_on_second_page(
+        self,
+    ) -> None:
+        completed = self._completed('[{"id":1}]\n[{"id":NaN}]\n')
+
+        with mock.patch.object(MODULE, "_run_gh_process", return_value=completed):
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "gh returned invalid paginated JSON: non-standard JSON constant",
             ):
                 MODULE._run_gh_json_stream(["api", "repos/owner/repo/releases"])
 
@@ -3432,6 +3461,17 @@ class ManagedStateReadSafetyTests(unittest.TestCase):
 
         read_file.assert_not_called()
 
+    def test_rejects_nonstandard_constant_in_unknown_state_field(self) -> None:
+        self.state_path.write_bytes(
+            b'{"version":1,"owners":{},"links":[],"unknown":NaN}\n'
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "Invalid JSON.*non-standard JSON constant",
+        ):
+            MODULE._load_managed_state(self.home)
+
     def test_rejects_case_alias_owners_before_release_lookup(self) -> None:
         payload = {
             "version": 1,
@@ -3517,12 +3557,14 @@ class StatusManagedStateSafetyTests(unittest.TestCase):
             display_root: Path,
             *,
             require_sanitized_modes: bool,
+            capture_limits,
         ):
             scanned_releases.append(display_root.name)
             return real_snapshot(
                 root_fd,
                 display_root,
                 require_sanitized_modes=require_sanitized_modes,
+                capture_limits=capture_limits,
             )
 
         with (
@@ -3556,12 +3598,14 @@ class StatusManagedStateSafetyTests(unittest.TestCase):
             display_root: Path,
             *,
             require_sanitized_modes: bool,
+            capture_limits,
         ):
             scanned_releases.append(display_root.name)
             return real_snapshot(
                 root_fd,
                 display_root,
                 require_sanitized_modes=require_sanitized_modes,
+                capture_limits=capture_limits,
             )
 
         with (
@@ -3597,12 +3641,14 @@ class StatusManagedStateSafetyTests(unittest.TestCase):
             display_root: Path,
             *,
             require_sanitized_modes: bool,
+            capture_limits,
         ):
             scanned_releases.append(display_root.name)
             return real_snapshot(
                 root_fd,
                 display_root,
                 require_sanitized_modes=require_sanitized_modes,
+                capture_limits=capture_limits,
             )
 
         with (
@@ -3635,12 +3681,14 @@ class StatusManagedStateSafetyTests(unittest.TestCase):
             display_root: Path,
             *,
             require_sanitized_modes: bool,
+            capture_limits,
         ):
             scanned_releases.append(display_root.name)
             return real_snapshot(
                 root_fd,
                 display_root,
                 require_sanitized_modes=require_sanitized_modes,
+                capture_limits=capture_limits,
             )
 
         refreshed_states: list[MODULE.ManagedState] = []
@@ -11030,6 +11078,25 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         MODULE._publish_pending_link_pointer(self.home, batch)
 
         with self.assertRaisesRegex(MODULE.SyncError, "pending stage"):
+            MODULE._load_pending_link_batch(self.home)
+
+    def test_pending_wal_pointer_rejects_nonstandard_json_constant(self) -> None:
+        batch, _actions, _state, _state_snapshot = self._stage_crash_batch()
+        MODULE._clear_pending_link_pointer(self.home, batch)
+        metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        raw_payload = metadata_path.read_text(encoding="utf-8")
+        self.assertTrue(raw_payload.endswith("}\n"))
+        metadata_path.write_text(
+            raw_payload[:-2] + ',"unknown":NaN}\n',
+            encoding="utf-8",
+        )
+        batch.pointer_snapshot = None
+        MODULE._publish_pending_link_pointer(self.home, batch)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "Invalid JSON.*non-standard JSON constant",
+        ):
             MODULE._load_pending_link_batch(self.home)
 
     def test_pending_metadata_requires_exact_after_claim_set(self) -> None:

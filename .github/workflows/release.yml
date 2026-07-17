@@ -97,23 +97,30 @@ jobs:
           spec.loader.exec_module(module)
 
           sha = __import__("os").environ["GITHUB_SHA"]
-          archive_path = repo_root / "dist" / f"personal-codex-{sha}.tar.gz"
-          checksum_path = repo_root / "dist" / f"personal-codex-{sha}.sha256"
-          release_root, _release_expectation = module.verify_and_extract_archive(
-              archive_path,
-              checksum_path,
-              repo_root / "dist" / "extract",
-          )
-          entries = module.validate_release_tree(release_root)
-          targets = {entry.target.as_posix() for entry in entries}
-          runner = release_root / "scripts" / "codex_personal_sync.py"
+          dist = repo_root / "dist"
+          archive_path = dist / f"personal-codex-{sha}.tar.gz"
+          checksum_path = dist / f"personal-codex-{sha}.sha256"
+          with module.bind_archive_workspace(dist) as workspace:
+              release_root, release_expectation = module.verify_and_extract_archive(
+                  archive_path,
+                  checksum_path,
+                  dist / "extract",
+                  workspace=workspace,
+              )
+              entries = release_expectation[0][1].entries
+              targets = {entry.target.as_posix() for entry in entries}
+              runner_payload = module.read_expected_release_file(
+                  release_root,
+                  module.PurePosixPath("scripts/codex_personal_sync.py"),
+                  release_expectation,
+              )
 
-          if not entries or any(entry.owner != "public" for entry in entries):
-              raise SystemExit("release manifest must contain only public-owned entries")
-          if "bin/codex-personal-sync" not in targets:
-              raise SystemExit("public toolbox release must publish the sync runner")
-          if "install-private" not in runner.read_text(encoding="utf-8"):
-              raise SystemExit("sync runner must include the private overlay entrypoint")
+              if not entries or any(entry.owner != "public" for entry in entries):
+                  raise SystemExit("release manifest must contain only public-owned entries")
+              if "bin/codex-personal-sync" not in targets:
+                  raise SystemExit("public toolbox release must publish the sync runner")
+              if b"install-private" not in runner_payload:
+                  raise SystemExit("sync runner must include the private overlay entrypoint")
           PY
 
   publish:
@@ -158,23 +165,30 @@ jobs:
           spec.loader.exec_module(module)
 
           sha = __import__("os").environ["GITHUB_SHA"]
-          archive_path = repo_root / "dist" / f"personal-codex-{sha}.tar.gz"
-          checksum_path = repo_root / "dist" / f"personal-codex-{sha}.sha256"
-          release_root, _release_expectation = module.verify_and_extract_archive(
-              archive_path,
-              checksum_path,
-              repo_root / "dist" / "extract",
-          )
-          entries = module.validate_release_tree(release_root)
-          targets = {entry.target.as_posix() for entry in entries}
-          runner = release_root / "scripts" / "codex_personal_sync.py"
+          dist = repo_root / "dist"
+          archive_path = dist / f"personal-codex-{sha}.tar.gz"
+          checksum_path = dist / f"personal-codex-{sha}.sha256"
+          with module.bind_archive_workspace(dist) as workspace:
+              release_root, release_expectation = module.verify_and_extract_archive(
+                  archive_path,
+                  checksum_path,
+                  dist / "extract",
+                  workspace=workspace,
+              )
+              entries = release_expectation[0][1].entries
+              targets = {entry.target.as_posix() for entry in entries}
+              runner_payload = module.read_expected_release_file(
+                  release_root,
+                  module.PurePosixPath("scripts/codex_personal_sync.py"),
+                  release_expectation,
+              )
 
-          if not entries or any(entry.owner != "public" for entry in entries):
-              raise SystemExit("release manifest must contain only public-owned entries")
-          if "bin/codex-personal-sync" not in targets:
-              raise SystemExit("public toolbox release must publish the sync runner")
-          if "install-private" not in runner.read_text(encoding="utf-8"):
-              raise SystemExit("sync runner must include the private overlay entrypoint")
+              if not entries or any(entry.owner != "public" for entry in entries):
+                  raise SystemExit("release manifest must contain only public-owned entries")
+              if "bin/codex-personal-sync" not in targets:
+                  raise SystemExit("public toolbox release must publish the sync runner")
+              if b"install-private" not in runner_payload:
+                  raise SystemExit("sync runner must include the private overlay entrypoint")
           PY
 
       - name: Publish GitHub release

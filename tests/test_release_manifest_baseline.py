@@ -177,10 +177,18 @@ class VerifiedReleaseManifestRuntimeTests(unittest.TestCase):
             expected_size: int,
             maximum_bytes: int,
             destination: Path,
+            *,
+            bound_destination_fd: int,
         ) -> None:
             calls.append((asset_name, asset_id, expected_size, maximum_bytes))
             payload = payloads[asset_name]
             self.assertEqual(len(payload), expected_size)
+            opened_metadata = os.fstat(bound_destination_fd)
+            path_metadata = destination.stat()
+            self.assertEqual(
+                (opened_metadata.st_dev, opened_metadata.st_ino),
+                (path_metadata.st_dev, path_metadata.st_ino),
+            )
             (destination / asset_name).write_bytes(payload)
 
         with mock.patch.object(
@@ -1611,8 +1619,14 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
         )
 
         self.assertEqual(workflow.count("module.verify_and_extract_archive("), 2)
+        self.assertEqual(workflow.count("module.bind_archive_workspace(dist)"), 2)
+        self.assertEqual(workflow.count("workspace=workspace"), 2)
+        self.assertEqual(workflow.count("module.read_expected_release_file("), 2)
+        self.assertEqual(workflow.count("release_expectation[0][1].entries"), 2)
         self.assertNotIn("module.verify_checksum(", workflow)
         self.assertNotIn("module.safe_extract_archive(", workflow)
+        self.assertNotIn("module.validate_release_tree(", workflow)
+        self.assertNotIn("runner.read_text(", workflow)
 
 
 if __name__ == "__main__":
