@@ -2177,19 +2177,26 @@ def _complete_release_identity(
     archive_matches: list[tuple[str, dict[str, Any]]] = []
     checksum_matches: dict[str, list[dict[str, Any]]] = {}
     for asset in assets:
-        if not isinstance(asset, dict) or asset.get("state") != "uploaded":
+        if not isinstance(asset, dict):
             continue
         name = asset.get("name")
         if not isinstance(name, str):
             continue
         archive_match = RELEASE_ARCHIVE_ASSET_RE.fullmatch(name)
+        checksum_match = RELEASE_CHECKSUM_ASSET_RE.fullmatch(name)
+        if archive_match is None and checksum_match is None:
+            continue
+        if asset.get("state") != "uploaded":
+            raise ValidationError(
+                f"published personal-codex release {tag_name} has release asset "
+                f"{name} that is not uploaded"
+            )
         if archive_match is not None:
             archive_matches.append((archive_match.group(1), asset))
             continue
-        checksum_match = RELEASE_CHECKSUM_ASSET_RE.fullmatch(name)
-        if checksum_match is not None:
-            checksum_sha = checksum_match.group(1)
-            checksum_matches.setdefault(checksum_sha, []).append(asset)
+        assert checksum_match is not None
+        checksum_sha = checksum_match.group(1)
+        checksum_matches.setdefault(checksum_sha, []).append(asset)
 
     if not archive_matches:
         raise ValidationError(

@@ -14929,9 +14929,10 @@ def _install_release_set_unlocked(
     previous_entries = [
         entry for manifest in current_manifests.values() for entry in manifest.entries
     ]
-    bootstrap_history = (
-        not initial_state_snapshot.exists and not recovered_pending_transaction
-    )
+    # Recovery returns the exact restored or committed state snapshot. If that
+    # snapshot is absent, this remains a first bootstrap even when the pending
+    # transaction appeared after the unlocked preflight.
+    bootstrap_history = not initial_state_snapshot.exists
     state = _refresh_managed_state_from_current(
         home,
         loaded_state,

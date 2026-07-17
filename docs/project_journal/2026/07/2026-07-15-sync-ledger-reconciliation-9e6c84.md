@@ -33,6 +33,7 @@ superseded_by:
 - Managed-state publication remains precommit until an inode-bound, fsynced commit marker is published after all release, link, and state checks. Recovery rolls back an unmarked exact after-state, while a marked transaction never infers rollback from a missing canonical ledger.
 - An uncommitted first-bootstrap overlay uninstall that restores an absent managed-state file re-enters legacy ownership planning from the exact recovered before-state, so a retry cannot remove only the overlay `current` pointer while stranding its links.
 - Before a recovered precommit pointer is cleared, every planned create revalidates its descriptor-bound before-state absence. A foreign node keeps the pointer and evidence in place and cannot be adopted by the subsequent legacy bootstrap.
+- First-bootstrap ownership reconstruction is decided from the exact state snapshot returned after locked pending-WAL recovery. A transaction that appears after unlocked preflight can no longer suppress bootstrap history and leave an already-correct legacy link outside the new ledger.
 - State publication uses exclusive creation and descriptor-bound verification; concurrent or unexpected content is preserved in quarantine instead of overwritten.
 - State loads, transaction snapshots, and match checks bind parent and file descriptors, reject non-regular or oversized ledgers, and verify identities around bounded reads.
 - Release staging copies from descriptor-bound sources, validates the complete staged manifest, sanitizes modes, and retains raced objects without publishing an unverified SHA.
@@ -73,6 +74,7 @@ superseded_by:
 - Active, removed, and replacement targets are rejected before portable-key construction when they exceed 4,096 UTF-8 bytes, 64 components, or 255 UTF-8 bytes in any single component. Target overlap and cross-version hierarchy checks compute each portable identity once and use sorted adjacent comparisons, bounding validation to `O(n log n)`.
 - Runtime, builder, and manifest-change validation reject invalid UTF-8 scalars throughout manifest JSON plus NUL or invalid encoding in path fields, and builders enforce the 4 MiB limit on the final serialized release manifest.
 - GitHub release assets are selected by validated REST asset ID and advertised size, then streamed through bounded `gh api` stdout into no-overwrite partial files. Publication keeps the verified partial descriptor open, links within a bound destination directory, and checks that the published inode still matches before accepting it. Cleanup isolates named entries under unpredictable no-replace names and deletes only the inode bound to that descriptor, preserving concurrent replacements. Overflow terminates and reaps the child process, and manifest parse/canonicalization failures are normalized to domain errors.
+- Published Release validation rejects any matching personal-Codex archive or checksum whose GitHub asset state is not `uploaded`, including duplicate and other-SHA assets, so validation and runtime selection cannot disagree on a partially uploaded Release.
 - Reconciliation plans bind the nearest existing ancestor plus the exact parent and leaf inode/target; missing parents are published exclusively and reused only through transaction-owned identities.
 - Install, uninstall, and `current` mutations fail closed on same-target inode or parent replacement, while failed destructive transactions restore the original quarantined inode without overwriting concurrent content.
 - Manifest-change validation applies the same 4 MiB raw and formatted payload limits to current and historical manifests, resolving exact Git commits and blobs before bounded reads.
@@ -115,13 +117,13 @@ superseded_by:
 - Changed Python files — `ruff check`, Python compilation, and `git diff --check` passed.
 - Focused read-only security review of the optional-claim diff — no findings.
 - Repository test command — 655 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
-- Reconciliation safety module — 286 tests passed.
+- Reconciliation safety module — 299 tests passed, including locked recovery of a pending transaction that appears after first-bootstrap preflight.
 - Runtime module — 168 tests passed after workspace-capability and cleanup-lifecycle hardening.
 - Workspace creation, replacement isolation, descriptor-close, and primary-error regression selection — 7 focused tests passed.
 - Strict JSON regression selection — 4 focused managed-state, WAL-pointer, single-page, and second-page tests passed in both the public and private runtime mirrors.
 - Package builder safety module — 70 tests passed as part of the repository suite.
 - Manifest change validation module — 81 tests passed as part of the repository suite.
-- Release baseline validation module — 43 tests passed.
+- Release baseline validation module — 44 tests passed, including mixed uploaded/pending archive and checksum assets.
 - Authenticated historical Release validation — all 13 published archive/checksum pairs matched their corresponding Git manifests, with baseline `fdd4baaab300cd362d79a742bf75070b3b83f2d0`.
 - Python 3.9 Release-history and manifest-serialization selection — 49 tests passed.
 - Changed-file `ruff`, repository-wide `ruff`, `actionlint`, manifest change validation, project journal validation, Python compilation, and `git diff --check` passed.

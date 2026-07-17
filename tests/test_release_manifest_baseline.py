@@ -575,7 +575,7 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
             (
                 "pending-assets",
                 {"asset_state": "new"},
-                "missing.*tarball",
+                "not uploaded",
             ),
             (
                 "mismatched-checksum",
@@ -599,6 +599,32 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     MODULE.ValidationError,
                     error_pattern,
+                ):
+                    MODULE._complete_release_identity(release)
+
+    def test_published_personal_release_rejects_mixed_asset_states(self) -> None:
+        sha = "a" * 40
+        other_sha = "b" * 40
+        cases = (
+            ("duplicate-archive", f"personal-codex-{sha}.tar.gz"),
+            ("other-archive", f"personal-codex-{other_sha}.tar.gz"),
+            ("duplicate-checksum", f"personal-codex-{sha}.sha256"),
+            ("other-checksum", f"personal-codex-{other_sha}.sha256"),
+        )
+        for name, asset_name in cases:
+            with self.subTest(name=name):
+                release = complete_release(sha)
+                release["assets"].append(
+                    {
+                        "id": 999,
+                        "name": asset_name,
+                        "size": 1,
+                        "state": "new",
+                    }
+                )
+                with self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    "not uploaded",
                 ):
                     MODULE._complete_release_identity(release)
 
