@@ -422,6 +422,13 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                 ["--base-ref", "HEAD", "--release-repo", "owner/repo"]
             )
 
+    def test_repair_incomplete_head_release_requires_release_repo(self) -> None:
+        with self.assertRaisesRegex(
+            MODULE.ValidationError,
+            "requires --release-repo",
+        ):
+            MODULE.main(["--repair-incomplete-head-release"])
+
     def test_github_response_body_limit_accepts_boundary_and_rejects_overflow(
         self,
     ) -> None:
@@ -601,6 +608,258 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                     error_pattern,
                 ):
                     MODULE._complete_release_identity(release)
+
+    def test_repair_skips_only_nonexact_matching_assets_for_exact_sha(
+        self,
+    ) -> None:
+        current_sha = "a" * 40
+        historical_sha = "b" * 40
+        historical_release = complete_release(historical_sha)
+        repairable_releases = [complete_release(current_sha) for _ in range(4)]
+        for release_id, release in enumerate(repairable_releases, start=123):
+            release["id"] = release_id
+        repairable_releases[0]["assets"] = []
+        repairable_releases[1]["assets"][1]["state"] = "starter"
+        repairable_releases[2]["assets"].append(
+            {
+                "id": 999,
+                "name": f"personal-codex-{'c' * 40}.sha256",
+                "size": 1,
+                "state": "starter",
+            }
+        )
+        repairable_releases[3]["assets"].append(
+            {
+                "id": 999,
+                "name": f"personal-codex-{'c' * 40}.tar.gz",
+                "size": 1,
+                "state": "uploaded",
+            }
+        )
+
+        for current_release in repairable_releases:
+            with (
+                self.subTest(assets=current_release["assets"]),
+                mock.patch.object(
+                    MODULE,
+                    "_iter_github_releases",
+                    side_effect=lambda *_args, release=current_release: iter(
+                        [release, historical_release]
+                    ),
+                ),
+            ):
+                identities = MODULE._complete_release_identities(
+                    "owner/repo",
+                    "token",
+                    repair_incomplete_release_sha=current_sha,
+                )
+
+            self.assertEqual(
+                [(identity.tag_name, identity.sha) for identity in identities],
+                [(historical_release["tag_name"], historical_sha)],
+            )
+
+        complete_current = complete_release(current_sha)
+        with mock.patch.object(
+            MODULE,
+            "_iter_github_releases",
+            side_effect=lambda *_args: iter(
+                [complete_current, historical_release]
+            ),
+        ):
+            identities = MODULE._complete_release_identities(
+                "owner/repo",
+                "token",
+                repair_incomplete_release_sha=current_sha,
+            )
+        self.assertEqual(
+            [identity.sha for identity in identities],
+            [current_sha, historical_sha],
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_iter_github_releases",
+                side_effect=lambda *_args: iter(
+                    [repairable_releases[0], historical_release]
+                ),
+            ),
+            self.assertRaises(MODULE.ValidationError),
+        ):
+            MODULE._complete_release_identities(
+                "owner/repo",
+                "token",
+                repair_incomplete_release_sha="c" * 40,
+            )
+
+    def test_repair_requires_valid_unique_matching_asset_ids(self) -> None:
+        current_sha = "a" * 40
+        historical_release = complete_release("b" * 40)
+        cases = (
+            ("missing", None),
+            ("boolean", True),
+            ("zero", 0),
+            ("negative", -1),
+            ("duplicate", complete_release(current_sha)["assets"][0]["id"]),
+        )
+        for name, asset_id in cases:
+            current_release = complete_release(current_sha)
+            current_release["id"] = 123
+            extra_asset = {
+                "name": f"personal-codex-{'c' * 40}.sha256",
+                "size": 1,
+                "state": "starter",
+            }
+            if asset_id is not None:
+                extra_asset["id"] = asset_id
+            current_release["assets"].append(extra_asset)
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    MODULE,
+                    "_iter_github_releases",
+                    side_effect=lambda *_args, release=current_release: iter(
+                        [release, historical_release]
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    "valid GitHub asset id|reuses GitHub asset id",
+                ),
+            ):
+                MODULE._complete_release_identities(
+                    "owner/repo",
+                    "token",
+                    repair_incomplete_release_sha=current_sha,
+                )
+
+    def test_repair_preserves_immutable_metadata_and_history_validation(
+        self,
+    ) -> None:
+        current_sha = "a" * 40
+        historical_release = complete_release("b" * 40)
+        invalid_releases = []
+
+        invalid_tag = complete_release(current_sha)
+        invalid_tag["id"] = 123
+        invalid_tag["tag_name"] = "personal-codex-invalid"
+        invalid_tag["assets"] = []
+        invalid_releases.append((invalid_tag, "invalid tag name"))
+
+        mismatched_tag = complete_release(current_sha)
+        mismatched_tag["id"] = 123
+        mismatched_tag["tag_name"] = (
+            f"personal-codex-20260715-000000-{'c' * 7}"
+        )
+        mismatched_tag["assets"] = []
+        invalid_releases.append((mismatched_tag, "does not match tag suffix"))
+
+        invalid_timestamp = complete_release(current_sha)
+        invalid_timestamp["id"] = 123
+        invalid_timestamp["published_at"] = "invalid"
+        invalid_timestamp["assets"] = []
+        invalid_releases.append((invalid_timestamp, "published_at"))
+
+        invalid_assets = complete_release(current_sha)
+        invalid_assets["id"] = 123
+        invalid_assets["assets"] = None
+        invalid_releases.append((invalid_assets, "no asset array"))
+
+        invalid_release_id = complete_release(current_sha)
+        invalid_release_id["id"] = True
+        invalid_release_id["assets"] = []
+        invalid_releases.append((invalid_release_id, "GitHub release id"))
+
+        for current_release, error_pattern in invalid_releases:
+            with (
+                self.subTest(error_pattern=error_pattern),
+                mock.patch.object(
+                    MODULE,
+                    "_iter_github_releases",
+                    side_effect=lambda *_args, release=current_release: iter(
+                        [release, historical_release]
+                    ),
+                ),
+                self.assertRaisesRegex(MODULE.ValidationError, error_pattern),
+            ):
+                MODULE._complete_release_identities(
+                    "owner/repo",
+                    "token",
+                    repair_incomplete_release_sha=current_sha,
+                )
+
+        repairable_current = complete_release(current_sha)
+        repairable_current["id"] = 123
+        repairable_current["assets"] = []
+        historical_release["assets"] = []
+        with (
+            mock.patch.object(
+                MODULE,
+                "_iter_github_releases",
+                side_effect=lambda *_args: iter(
+                    [repairable_current, historical_release]
+                ),
+            ),
+            self.assertRaisesRegex(MODULE.ValidationError, "missing.*tarball"),
+        ):
+            MODULE._complete_release_identities(
+                "owner/repo",
+                "token",
+                repair_incomplete_release_sha=current_sha,
+            )
+
+    def test_repair_rejects_multiple_matching_head_releases(self) -> None:
+        current_sha = "a" * 40
+        historical_release = complete_release("b" * 40)
+        incomplete_releases = [complete_release(current_sha) for _ in range(2)]
+        for release_id, release in enumerate(incomplete_releases, start=123):
+            release["id"] = release_id
+            release["assets"] = []
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_iter_github_releases",
+                side_effect=lambda *_args: iter(
+                    [*incomplete_releases, historical_release]
+                ),
+            ),
+            self.assertRaisesRegex(
+                MODULE.ValidationError,
+                "multiple repairable incomplete published releases",
+            ),
+        ):
+            MODULE._complete_release_identities(
+                "owner/repo",
+                "token",
+                repair_incomplete_release_sha=current_sha,
+            )
+
+    def test_release_history_repair_resolves_head_internally(self) -> None:
+        head_sha = "a" * 40
+        with (
+            mock.patch.object(MODULE, "_resolve_commit", return_value=head_sha) as resolve,
+            mock.patch.object(MODULE, "_github_token", return_value="token"),
+            mock.patch.object(
+                MODULE,
+                "_complete_release_identities",
+                side_effect=MODULE.ValidationError("stop after identity lookup"),
+            ) as identities,
+            self.assertRaisesRegex(MODULE.ValidationError, "stop after identity lookup"),
+        ):
+            MODULE._release_history_baseline(
+                self.repo,
+                "owner/repo",
+                MANIFEST,
+                repair_incomplete_head_release=True,
+            )
+        resolve.assert_called_once_with(self.repo, "HEAD")
+        identities.assert_called_once_with(
+            "owner/repo",
+            "token",
+            repair_incomplete_release_sha=head_sha,
+        )
 
     def test_published_personal_release_rejects_mixed_asset_states(self) -> None:
         sha = "a" * 40
@@ -1638,22 +1897,6 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                 self.assertIn("GITHUB_TOKEN: ${{ github.token }}", text)
                 self.assertNotIn("github.event.before", text)
                 self.assertNotIn("--base-ref HEAD^", text)
-
-    def test_release_workflow_extracts_the_verified_archive_snapshot(self) -> None:
-        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertEqual(workflow.count("module.verify_and_extract_archive("), 2)
-        self.assertEqual(workflow.count("module.bind_archive_workspace(dist)"), 2)
-        self.assertEqual(workflow.count("workspace=workspace"), 2)
-        self.assertEqual(workflow.count("module.read_expected_release_file("), 2)
-        self.assertEqual(workflow.count("release_expectation[0][1].entries"), 2)
-        self.assertNotIn("module.verify_checksum(", workflow)
-        self.assertNotIn("module.safe_extract_archive(", workflow)
-        self.assertNotIn("module.validate_release_tree(", workflow)
-        self.assertNotIn("runner.read_text(", workflow)
-
 
 if __name__ == "__main__":
     unittest.main()

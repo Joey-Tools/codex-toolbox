@@ -2149,9 +2149,20 @@ def _complete_release_asset_metadata(
     return asset_id, asset_size
 
 
-def _complete_release_identity(
+def _personal_codex_release_asset_matches(
+    name: object,
+) -> tuple[re.Match[str] | None, re.Match[str] | None]:
+    if not isinstance(name, str):
+        return None, None
+    return (
+        RELEASE_ARCHIVE_ASSET_RE.fullmatch(name),
+        RELEASE_CHECKSUM_ASSET_RE.fullmatch(name),
+    )
+
+
+def _published_personal_release_metadata(
     release: dict[str, Any],
-) -> _CompleteRelease | None:
+) -> tuple[str, re.Match[str], list[Any], str] | None:
     tag_name = release.get("tag_name")
     if not isinstance(tag_name, str) or not tag_name.startswith("personal-codex-"):
         return None
@@ -2173,6 +2184,21 @@ def _complete_release_identity(
         raise ValidationError(
             f"published personal-codex release {tag_name} has no asset array"
         )
+    published_at = release.get("published_at")
+    if not isinstance(published_at, str) or PUBLISHED_AT_RE.fullmatch(published_at) is None:
+        raise ValidationError(
+            "complete published release has an invalid published_at timestamp"
+        )
+    return tag_name, tag_match, assets, published_at
+
+
+def _complete_release_identity(
+    release: dict[str, Any],
+) -> _CompleteRelease | None:
+    metadata = _published_personal_release_metadata(release)
+    if metadata is None:
+        return None
+    tag_name, tag_match, assets, published_at = metadata
 
     archive_matches: list[tuple[str, dict[str, Any]]] = []
     checksum_matches: dict[str, list[dict[str, Any]]] = {}
@@ -2180,12 +2206,10 @@ def _complete_release_identity(
         if not isinstance(asset, dict):
             continue
         name = asset.get("name")
-        if not isinstance(name, str):
-            continue
-        archive_match = RELEASE_ARCHIVE_ASSET_RE.fullmatch(name)
-        checksum_match = RELEASE_CHECKSUM_ASSET_RE.fullmatch(name)
+        archive_match, checksum_match = _personal_codex_release_asset_matches(name)
         if archive_match is None and checksum_match is None:
             continue
+        assert isinstance(name, str)
         if asset.get("state") != "uploaded":
             raise ValidationError(
                 f"published personal-codex release {tag_name} has release asset "
@@ -2250,11 +2274,6 @@ def _complete_release_identity(
             f"release asset SHA {sha} does not match target commit {target_commitish}"
         )
 
-    published_at = release.get("published_at")
-    if not isinstance(published_at, str) or PUBLISHED_AT_RE.fullmatch(published_at) is None:
-        raise ValidationError(
-            "complete published release has an invalid published_at timestamp"
-        )
     return _CompleteRelease(
         published_at=published_at,
         tag_name=tag_name,
@@ -2268,12 +2287,107 @@ def _complete_release_identity(
     )
 
 
+def _repairable_incomplete_release_for_sha(
+    release: dict[str, Any],
+    sha: str,
+) -> bool:
+    metadata = _published_personal_release_metadata(release)
+    if metadata is None:
+        return False
+    tag_name, tag_match, assets, _published_at = metadata
+    if release.get("target_commitish") != sha:
+        return False
+    if not sha.startswith(tag_match.group(1)):
+        raise ValidationError(
+            f"release target SHA {sha} does not match tag suffix "
+            f"{tag_match.group(1)}"
+        )
+
+    expected_asset_names = {
+        f"personal-codex-{sha}.tar.gz",
+        f"personal-codex-{sha}.sha256",
+    }
+    matching_assets: list[dict[str, Any]] = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = asset.get("name")
+        archive_match, checksum_match = _personal_codex_release_asset_matches(name)
+        if archive_match is None and checksum_match is None:
+            continue
+        matching_assets.append(asset)
+
+    has_exact_uploaded_pair = len(matching_assets) == 2 and all(
+        sum(
+            asset.get("name") == expected_name
+            and asset.get("state") == "uploaded"
+            for asset in matching_assets
+        )
+        == 1
+        for expected_name in expected_asset_names
+    )
+    if has_exact_uploaded_pair:
+        return False
+
+    release_id = release.get("id")
+    if (
+        isinstance(release_id, bool)
+        or not isinstance(release_id, int)
+        or release_id <= 0
+    ):
+        raise ValidationError(
+            f"repairable published release {tag_name} has no valid GitHub release id"
+        )
+
+    matching_asset_ids: set[int] = set()
+    for asset in matching_assets:
+        asset_id = asset.get("id")
+        if (
+            isinstance(asset_id, bool)
+            or not isinstance(asset_id, int)
+            or asset_id <= 0
+        ):
+            raise ValidationError(
+                f"repairable published release {tag_name} has matching asset "
+                f"{asset.get('name')} without a valid GitHub asset id"
+            )
+        if asset_id in matching_asset_ids:
+            raise ValidationError(
+                f"repairable published release {tag_name} reuses GitHub asset id "
+                f"{asset_id}"
+            )
+        matching_asset_ids.add(asset_id)
+    return True
+
+
 def _complete_release_identities(
     repository: str,
     token: str,
+    *,
+    repair_incomplete_release_sha: str | None = None,
 ) -> list[_CompleteRelease]:
+    if (
+        repair_incomplete_release_sha is not None
+        and FULL_SHA_RE.fullmatch(repair_incomplete_release_sha) is None
+    ):
+        raise ValidationError("repair release SHA must be 40 lowercase hex")
     identities: list[_CompleteRelease] = []
+    repairable_incomplete_release_count = 0
     for release in _iter_github_releases(repository, token):
+        if (
+            repair_incomplete_release_sha is not None
+            and _repairable_incomplete_release_for_sha(
+                release,
+                repair_incomplete_release_sha,
+            )
+        ):
+            repairable_incomplete_release_count += 1
+            if repairable_incomplete_release_count > 1:
+                raise ValidationError(
+                    "multiple repairable incomplete published releases match HEAD "
+                    f"{repair_incomplete_release_sha}"
+                )
+            continue
         identity = _complete_release_identity(release)
         if identity is not None:
             identities.append(identity)
@@ -2520,8 +2634,17 @@ def _release_history_baseline(
     repo_root: Path,
     repository: str,
     manifest: Path,
+    *,
+    repair_incomplete_head_release: bool = False,
 ) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
-    identities = _complete_release_identities(repository, _github_token())
+    repair_incomplete_release_sha = (
+        _resolve_commit(repo_root, "HEAD") if repair_incomplete_head_release else None
+    )
+    identities = _complete_release_identities(
+        repository,
+        _github_token(),
+        repair_incomplete_release_sha=repair_incomplete_release_sha,
+    )
     release_shas = _verified_release_shas(repo_root, identities)
     sha = _select_release_baseline_sha(repo_root, release_shas)
     if not _is_ancestor(repo_root, sha, "HEAD"):
@@ -2595,6 +2718,7 @@ def build_parser() -> argparse.ArgumentParser:
     baseline = parser.add_mutually_exclusive_group()
     baseline.add_argument("--base-ref")
     baseline.add_argument("--release-repo")
+    parser.add_argument("--repair-incomplete-head-release", action="store_true")
     return parser
 
 
@@ -2610,6 +2734,10 @@ def _path_argument(raw: str, field: str) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.repair_incomplete_head_release and args.release_repo is None:
+        raise ValidationError(
+            "--repair-incomplete-head-release requires --release-repo"
+        )
     manifest = _path_argument(args.manifest, "--manifest")
     _manifest_git_path(manifest)
     try:
@@ -2646,6 +2774,7 @@ def main(argv: list[str] | None = None) -> int:
             repo_root,
             args.release_repo,
             manifest,
+            repair_incomplete_head_release=args.repair_incomplete_head_release,
         )
         manifests_by_sha = dict(release_manifests)
         previous = manifests_by_sha.get(base_ref)

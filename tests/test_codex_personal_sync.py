@@ -37,6 +37,16 @@ SHA5 = "5" * 40
 SHA6 = "6" * 40
 
 
+def github_release_asset(
+    asset_id: object,
+    name: str,
+    *,
+    size: object = 1,
+    state: object = "uploaded",
+) -> dict[str, object]:
+    return {"id": asset_id, "name": name, "size": size, "state": state}
+
+
 class FakeDownloadProcess:
     def __init__(self, payload: bytes, *, returncode: int = 0) -> None:
         self.stdout = io.BytesIO(payload)
@@ -2245,8 +2255,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             "tagName": "personal-codex-20260511-120000-1111111",
             "targetCommitish": SHA1,
             "assets": [
-                {"id": 101, "name": f"personal-codex-{SHA1}.tar.gz", "size": 1},
-                {"id": 102, "name": f"personal-codex-{SHA1}.sha256", "size": 1},
+                github_release_asset(101, f"personal-codex-{SHA1}.tar.gz"),
+                github_release_asset(102, f"personal-codex-{SHA1}.sha256"),
             ],
         }
 
@@ -2258,35 +2268,117 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertEqual(assets.checksum_name, f"personal-codex-{SHA1}.sha256")
         self.assertEqual((assets.checksum_id, assets.checksum_size), (102, 1))
 
+    def test_select_release_assets_rejects_unique_pending_pair(self) -> None:
+        release = {
+            "tagName": "personal-codex-20260511-120000-1111111",
+            "targetCommitish": SHA1,
+            "assets": [
+                github_release_asset(
+                    101,
+                    f"personal-codex-{SHA1}.tar.gz",
+                    state="new",
+                ),
+                github_release_asset(
+                    102,
+                    f"personal-codex-{SHA1}.sha256",
+                    state="new",
+                ),
+            ],
+        }
+
+        with self.assertRaisesRegex(MODULE.SyncError, "not uploaded"):
+            MODULE.select_release_assets(release)
+
+    def test_select_release_assets_rejects_missing_asset_state(self) -> None:
+        archive = github_release_asset(101, f"personal-codex-{SHA1}.tar.gz")
+        archive.pop("state")
+        release = {
+            "tagName": "personal-codex-20260511-120000-1111111",
+            "targetCommitish": SHA1,
+            "assets": [
+                archive,
+                github_release_asset(102, f"personal-codex-{SHA1}.sha256"),
+            ],
+        }
+
+        with self.assertRaisesRegex(MODULE.SyncError, "not uploaded"):
+            MODULE.select_release_assets(release)
+
+    def test_select_release_assets_rejects_extra_pending_matching_assets(
+        self,
+    ) -> None:
+        cases = (
+            ("duplicate-archive", f"personal-codex-{SHA1}.tar.gz"),
+            ("other-archive", f"personal-codex-{SHA2}.tar.gz"),
+            ("duplicate-checksum", f"personal-codex-{SHA1}.sha256"),
+            ("other-checksum", f"personal-codex-{SHA2}.sha256"),
+        )
+        for name, pending_name in cases:
+            with self.subTest(name=name):
+                release = {
+                    "tagName": "personal-codex-20260511-120000-1111111",
+                    "targetCommitish": SHA1,
+                    "assets": [
+                        github_release_asset(
+                            101,
+                            f"personal-codex-{SHA1}.tar.gz",
+                        ),
+                        github_release_asset(
+                            102,
+                            f"personal-codex-{SHA1}.sha256",
+                        ),
+                        github_release_asset(999, pending_name, state="new"),
+                    ],
+                }
+
+                with self.assertRaisesRegex(MODULE.SyncError, "not uploaded"):
+                    MODULE.select_release_assets(release)
+
     def test_select_release_assets_rejects_invalid_api_metadata(self) -> None:
         archive_name = f"personal-codex-{SHA1}.tar.gz"
         checksum_name = f"personal-codex-{SHA1}.sha256"
         cases = (
-            ("missing-id", {"name": archive_name, "size": 1}, "asset id"),
-            ("boolean-id", {"id": True, "name": archive_name, "size": 1}, "asset id"),
-            ("zero-id", {"id": 0, "name": archive_name, "size": 1}, "asset id"),
-            ("missing-size", {"id": 101, "name": archive_name}, "asset size"),
+            (
+                "missing-id",
+                {"name": archive_name, "size": 1, "state": "uploaded"},
+                "asset id",
+            ),
+            (
+                "boolean-id",
+                github_release_asset(True, archive_name),
+                "asset id",
+            ),
+            (
+                "zero-id",
+                github_release_asset(0, archive_name),
+                "asset id",
+            ),
+            (
+                "missing-size",
+                {"id": 101, "name": archive_name, "state": "uploaded"},
+                "asset size",
+            ),
             (
                 "boolean-size",
-                {"id": 101, "name": archive_name, "size": False},
+                github_release_asset(101, archive_name, size=False),
                 "asset size",
             ),
             (
                 "negative-size",
-                {"id": 101, "name": archive_name, "size": -1},
+                github_release_asset(101, archive_name, size=-1),
                 "asset size",
             ),
             (
                 "oversized",
-                {
-                    "id": 101,
-                    "name": archive_name,
-                    "size": MODULE.MAX_ARCHIVE_COMPRESSED_BYTES + 1,
-                },
+                github_release_asset(
+                    101,
+                    archive_name,
+                    size=MODULE.MAX_ARCHIVE_COMPRESSED_BYTES + 1,
+                ),
                 "exceeds",
             ),
         )
-        checksum = {"id": 102, "name": checksum_name, "size": 1}
+        checksum = github_release_asset(102, checksum_name)
 
         for name, archive, error_pattern in cases:
             with self.subTest(name=name):
@@ -2302,7 +2394,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         release = {
             "tagName": "personal-codex-20260511-120000-1111111",
             "assets": [
-                {"id": 101, "name": f"personal-codex-{SHA1}.tar.gz", "size": 1}
+                github_release_asset(101, f"personal-codex-{SHA1}.tar.gz")
             ],
         }
 
@@ -2313,10 +2405,10 @@ class CodexPersonalSyncTests(unittest.TestCase):
         release = {
             "tagName": "personal-codex-20260511-120000-1111111",
             "assets": [
-                {"id": 101, "name": f"personal-codex-{SHA1}.tar.gz", "size": 1},
-                {"id": 201, "name": f"personal-codex-{SHA2}.tar.gz", "size": 1},
-                {"id": 102, "name": f"personal-codex-{SHA1}.sha256", "size": 1},
-                {"id": 202, "name": f"personal-codex-{SHA2}.sha256", "size": 1},
+                github_release_asset(101, f"personal-codex-{SHA1}.tar.gz"),
+                github_release_asset(201, f"personal-codex-{SHA2}.tar.gz"),
+                github_release_asset(102, f"personal-codex-{SHA1}.sha256"),
+                github_release_asset(202, f"personal-codex-{SHA2}.sha256"),
             ],
         }
 
@@ -2329,8 +2421,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             "assets": [
                 {"name": f"personal-codex-{SHA1}.tar.gz.sig"},
                 {"name": f"personal-codex-{SHA1}.sha256.bak"},
-                {"id": 101, "name": f"personal-codex-{SHA1}.tar.gz", "size": 1},
-                {"id": 102, "name": f"personal-codex-{SHA1}.sha256", "size": 1},
+                github_release_asset(101, f"personal-codex-{SHA1}.tar.gz"),
+                github_release_asset(102, f"personal-codex-{SHA1}.sha256"),
             ],
         }
 
@@ -2343,8 +2435,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
         release = {
             "tagName": "personal-codex-20260511-120000-2222222",
             "assets": [
-                {"id": 101, "name": f"personal-codex-{SHA1}.tar.gz", "size": 1},
-                {"id": 102, "name": f"personal-codex-{SHA1}.sha256", "size": 1},
+                github_release_asset(101, f"personal-codex-{SHA1}.tar.gz"),
+                github_release_asset(102, f"personal-codex-{SHA1}.sha256"),
             ],
         }
 
@@ -2356,8 +2448,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             "tagName": "personal-codex-20260511-120000-1111111",
             "targetCommitish": SHA2,
             "assets": [
-                {"id": 101, "name": f"personal-codex-{SHA1}.tar.gz", "size": 1},
-                {"id": 102, "name": f"personal-codex-{SHA1}.sha256", "size": 1},
+                github_release_asset(101, f"personal-codex-{SHA1}.tar.gz"),
+                github_release_asset(102, f"personal-codex-{SHA1}.sha256"),
             ],
         }
 
@@ -2369,8 +2461,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             "tag_name": "personal-codex-20260511-120000-1111111",
             "target_commitish": SHA1,
             "assets": [
-                {"id": 101, "name": f"personal-codex-{SHA1}.tar.gz", "size": 1},
-                {"id": 102, "name": f"personal-codex-{SHA1}.sha256", "size": 1},
+                github_release_asset(101, f"personal-codex-{SHA1}.tar.gz"),
+                github_release_asset(102, f"personal-codex-{SHA1}.sha256"),
             ],
         }
 
@@ -5760,16 +5852,14 @@ class CodexPersonalSyncTests(unittest.TestCase):
                         "tag_name": "personal-codex-20260511-120000-1111111",
                         "target_commitish": SHA1,
                         "assets": [
-                            {
-                                "id": 101,
-                                "name": f"personal-codex-{SHA1}.tar.gz",
-                                "size": 1,
-                            },
-                            {
-                                "id": 102,
-                                "name": f"personal-codex-{SHA1}.sha256",
-                                "size": 1,
-                            },
+                            github_release_asset(
+                                101,
+                                f"personal-codex-{SHA1}.tar.gz",
+                            ),
+                            github_release_asset(
+                                102,
+                                f"personal-codex-{SHA1}.sha256",
+                            ),
                         ],
                     }
                 ]
@@ -5817,8 +5907,16 @@ class CodexPersonalSyncTests(unittest.TestCase):
             "tagName": "personal-codex-20260511-120000-1111111",
             "targetCommitish": SHA1,
             "assets": [
-                {"id": 101, "name": archive_name, "size": archive_path.stat().st_size},
-                {"id": 102, "name": checksum_name, "size": checksum_path.stat().st_size},
+                github_release_asset(
+                    101,
+                    archive_name,
+                    size=archive_path.stat().st_size,
+                ),
+                github_release_asset(
+                    102,
+                    checksum_name,
+                    size=checksum_path.stat().st_size,
+                ),
             ],
         }
 
@@ -5903,8 +6001,16 @@ class CodexPersonalSyncTests(unittest.TestCase):
             "tagName": "personal-codex-20260511-120000-1111111",
             "targetCommitish": SHA1,
             "assets": [
-                {"id": 101, "name": archive_name, "size": archive_path.stat().st_size},
-                {"id": 102, "name": checksum_name, "size": checksum_path.stat().st_size},
+                github_release_asset(
+                    101,
+                    archive_name,
+                    size=archive_path.stat().st_size,
+                ),
+                github_release_asset(
+                    102,
+                    checksum_name,
+                    size=checksum_path.stat().st_size,
+                ),
             ],
         }
 

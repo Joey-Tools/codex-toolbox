@@ -1244,12 +1244,18 @@ def select_release_assets(release: dict[str, Any]) -> ReleaseAssets:
         if not isinstance(name, str):
             continue
         archive_match = ASSET_RE.fullmatch(name)
-        if archive_match:
+        checksum_match = SHA256_RE.fullmatch(name)
+        if archive_match is None and checksum_match is None:
+            continue
+        if asset.get("state") != "uploaded":
+            raise SyncError(
+                f"release {tag_name} has release asset {name} that is not uploaded"
+            )
+        if archive_match is not None:
             archive_matches.append((archive_match.group(1), asset))
             continue
-        checksum_match = SHA256_RE.fullmatch(name)
-        if checksum_match:
-            checksum_matches.setdefault(checksum_match.group(1), []).append(asset)
+        assert checksum_match is not None
+        checksum_matches.setdefault(checksum_match.group(1), []).append(asset)
 
     if not archive_matches:
         raise SyncError(f"release {tag_name} has no personal-codex tarball asset")
@@ -3089,11 +3095,13 @@ def read_verified_release_manifest(
                     "id": assets.archive_id,
                     "name": assets.archive_name,
                     "size": assets.archive_size,
+                    "state": "uploaded",
                 },
                 {
                     "id": assets.checksum_id,
                     "name": assets.checksum_name,
                     "size": assets.checksum_size,
+                    "state": "uploaded",
                 },
             ],
         }

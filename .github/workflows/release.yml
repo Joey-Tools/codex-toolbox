@@ -50,6 +50,7 @@ jobs:
             tests/test_codex_personal_sync.py \
             tests/test_package_builder_safety.py \
             tests/test_personal_sync_reconciliation_safety.py \
+            tests/test_public_release_workflow.py \
             tests/test_release_manifest_baseline.py \
             tests/test_sync_manifest_changes.py \
             tests/test_submodule_worktree_sync.py
@@ -62,6 +63,7 @@ jobs:
             tests.test_codex_git_helpers \
             tests.test_package_builder_safety \
             tests.test_personal_sync_reconciliation_safety \
+            tests.test_public_release_workflow \
             tests.test_release_manifest_baseline \
             tests.test_sync_manifest_changes \
             tests.test_submodule_worktree_sync
@@ -198,6 +200,7 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import re
           from pathlib import Path
           from urllib.parse import quote
           from urllib.request import Request, urlopen
@@ -213,6 +216,12 @@ jobs:
               dist / f"personal-codex-{sha}.sha256",
           ]
           release_tag_prefix = "personal-codex-"
+          release_tag_pattern = re.compile(
+              r"^personal-codex-[0-9]{8}-[0-9]{6}-(?P<sha_prefix>[0-9a-f]{7})$"
+          )
+          personal_asset_pattern = re.compile(
+              r"^personal-codex-[0-9a-f]{40}(?:\.tar\.gz|\.sha256)$"
+          )
 
           def request_json(url, *, method="GET", payload=None):
               data = None
@@ -226,7 +235,10 @@ jobs:
                   headers["Content-Type"] = "application/json"
               request = Request(url, data=data, headers=headers, method=method)
               with urlopen(request, timeout=30) as response:
-                  return json.loads(response.read().decode("utf-8"))
+                  response_body = response.read()
+              if not response_body:
+                  return None
+              return json.loads(response_body.decode("utf-8"))
 
           def iter_releases():
               page = 1
@@ -240,36 +252,133 @@ jobs:
                   page += 1
 
           expected_asset_names = {asset.name for asset in assets}
+
+          def validate_release_tag(tag_name, *, context):
+              tag_match = release_tag_pattern.fullmatch(tag_name)
+              if tag_match is None:
+                  raise SystemExit(f"{context} has invalid release tag: {tag_name}")
+              if tag_match.group("sha_prefix") != sha[:7]:
+                  raise SystemExit(
+                      f"{context} tag suffix does not match target SHA: {tag_name}"
+                  )
+
+          def matching_personal_assets(release_assets):
+              matching_assets = []
+              for release_asset in release_assets:
+                  name = release_asset.get("name")
+                  if (
+                      isinstance(name, str)
+                      and personal_asset_pattern.fullmatch(name) is not None
+                  ):
+                      matching_assets.append(release_asset)
+              return matching_assets
+
+          def uploaded_expected_asset_names(release_assets, *, context):
+              matching_assets = matching_personal_assets(release_assets)
+              non_uploaded = [
+                  asset
+                  for asset in matching_assets
+                  if asset.get("state") != "uploaded"
+              ]
+              if non_uploaded:
+                  descriptions = sorted(
+                      f"{asset.get('name')} ({asset.get('state')})"
+                      for asset in non_uploaded
+                  )
+                  raise SystemExit(
+                      f"{context} has matching assets not uploaded: {descriptions}"
+                  )
+              uploaded_asset_names = [
+                  asset["name"] for asset in matching_assets
+              ]
+              unexpected_names = sorted(
+                  name
+                  for name in uploaded_asset_names
+                  if name not in expected_asset_names
+              )
+              if unexpected_names:
+                  raise SystemExit(
+                      f"{context} has unexpected uploaded assets: {unexpected_names}"
+                  )
+              uploaded_names = set(uploaded_asset_names)
+              if len(uploaded_names) != len(uploaded_asset_names):
+                  raise SystemExit(f"{context} has duplicate uploaded assets")
+              return uploaded_names
+
+          def prepare_draft_assets(draft_release):
+              matching_assets = matching_personal_assets(
+                  draft_release.get("assets", [])
+              )
+              matching_names = [asset["name"] for asset in matching_assets]
+              if (
+                  len(matching_assets) == len(expected_asset_names)
+                  and set(matching_names) == expected_asset_names
+                  and all(
+                      asset.get("state") == "uploaded"
+                      for asset in matching_assets
+                  )
+              ):
+                  return set(matching_names)
+
+              asset_ids = []
+              for repair_asset in matching_assets:
+                  asset_id = repair_asset.get("id")
+                  if not isinstance(asset_id, int) or isinstance(asset_id, bool):
+                      raise SystemExit(
+                          f"draft release {draft_release['tag_name']} has "
+                          "matching asset without a valid id: "
+                          f"{repair_asset.get('name')}"
+                      )
+                  if asset_id <= 0:
+                      raise SystemExit(
+                          f"draft release {draft_release['tag_name']} has "
+                          "matching asset without a positive id: "
+                          f"{repair_asset.get('name')}"
+                      )
+                  asset_ids.append(asset_id)
+              if len(set(asset_ids)) != len(asset_ids):
+                  raise SystemExit(
+                      f"draft release {draft_release['tag_name']} has duplicate "
+                      "matching asset ids"
+                  )
+
+              for repair_asset, asset_id in zip(matching_assets, asset_ids):
+                  request_json(
+                      f"{api_root}/repos/{repo}/releases/assets/{asset_id}",
+                      method="DELETE",
+                  )
+                  print(
+                      "Deleted matching asset before full retry: "
+                      f"{repair_asset.get('name')} "
+                      f"(state={repair_asset.get('state')})"
+                  )
+              return set()
+
           release = None
-          uploaded_asset_names = set()
           for candidate in iter_releases():
               tag_name = candidate.get("tag_name", "")
-              asset_names = {asset["name"] for asset in candidate.get("assets", [])}
               if (
                   candidate.get("target_commitish") != sha
+                  or not isinstance(tag_name, str)
                   or not tag_name.startswith(release_tag_prefix)
               ):
                   continue
+              validate_release_tag(tag_name, context="release candidate")
               release = candidate
-              if expected_asset_names <= asset_names:
-                  if release.get("draft", False):
-                      request_json(
-                          f"{api_root}/repos/{repo}/releases/{release['id']}",
-                          method="PATCH",
-                          payload={"draft": False},
-                      )
-                      print(f"Published existing draft release: {release['tag_name']}")
-                      raise SystemExit(0)
+              if release.get("draft", False):
+                  break
+              uploaded_asset_names = uploaded_expected_asset_names(
+                  release.get("assets", []),
+                  context=f"published release {release['tag_name']}",
+              )
+              if expected_asset_names <= uploaded_asset_names:
                   print(f"Release already exists: {release['tag_name']}")
                   raise SystemExit(0)
-              if release.get("draft", False):
-                  uploaded_asset_names = set(asset_names)
-                  break
               raise SystemExit(
                   f"published release {release['tag_name']} is missing expected assets"
               )
 
-          if release is None or release.get("target_commitish") != sha:
+          if release is None:
               timestamp = __import__("datetime").datetime.now(
                   __import__("datetime").timezone.utc
               ).strftime("%Y%m%d-%H%M%S")
@@ -286,9 +395,15 @@ jobs:
                       "prerelease": False,
                   },
               )
-              uploaded_asset_names = set()
-          else:
-              tag = release["tag_name"]
+          tag = release["tag_name"]
+          validate_release_tag(tag, context="active release")
+          if release.get("target_commitish") != sha:
+              raise SystemExit(
+                  f"active release {tag} target does not match expected SHA"
+              )
+          if release.get("draft") is not True:
+              raise SystemExit(f"release {tag} must remain a draft during asset upload")
+          uploaded_asset_names = prepare_draft_assets(release)
 
           content_types = {
               ".gz": "application/gzip",
@@ -316,11 +431,42 @@ jobs:
               )
               with urlopen(request, timeout=30) as response:
                   uploaded = json.loads(response.read().decode("utf-8"))
+              if (
+                  uploaded.get("name") != asset.name
+                  or uploaded.get("state") != "uploaded"
+              ):
+                  raise SystemExit(
+                      f"asset upload did not complete as uploaded: {asset.name}"
+                  )
               print(f"Uploaded {uploaded['name']}")
               uploaded_asset_names.add(uploaded["name"])
 
           if not expected_asset_names <= uploaded_asset_names:
               raise SystemExit(f"uploaded asset mismatch: {sorted(uploaded_asset_names)}")
+          final_release = request_json(
+              f"{api_root}/repos/{repo}/releases/{release['id']}"
+          )
+          if not isinstance(final_release, dict):
+              raise SystemExit(f"final release lookup failed for draft release {tag}")
+          identity_fields = ("id", "tag_name", "target_commitish", "draft")
+          identity_drift = {
+              field: (release.get(field), final_release.get(field))
+              for field in identity_fields
+              if final_release.get(field) != release.get(field)
+          }
+          if identity_drift:
+              raise SystemExit(
+                  f"final release identity drift for {tag}: {identity_drift}"
+              )
+          final_uploaded_asset_names = uploaded_expected_asset_names(
+              final_release.get("assets", []),
+              context=f"draft release {tag} final check",
+          )
+          if expected_asset_names != final_uploaded_asset_names:
+              raise SystemExit(
+                  "final uploaded asset mismatch: "
+                  f"{sorted(final_uploaded_asset_names)}"
+              )
           request_json(
               f"{api_root}/repos/{repo}/releases/{release['id']}",
               method="PATCH",
