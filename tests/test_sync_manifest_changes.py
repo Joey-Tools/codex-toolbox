@@ -1319,7 +1319,7 @@ class SyncManifestChangeTests(unittest.TestCase):
 
     def test_manifest_history_rejects_active_target_hierarchy_changes(self) -> None:
         for historical_targets, active_target in (
-            (("skills", "skills/a"), "skills/b"),
+            (("skills", "docs/old"), "skills/b"),
             (("skills/a",), "skills"),
         ):
             with self.subTest(
@@ -1351,6 +1351,44 @@ class SyncManifestChangeTests(unittest.TestCase):
         allowed["links"][0]["target"] = "skills/a"
         allowed["removed_links"][0]["target"] = "skills/a"
         allowed["removed_links"][1]["target"] = "skills/b"
+
+        MODULE._manifest_model(allowed)
+
+    def test_manifest_history_rejects_internal_target_hierarchy(self) -> None:
+        for historical_targets in (
+            ("skills/example", "skills/example/child"),
+            ("skills/example/child", "skills/example"),
+            (
+                "Skills/Cafe\N{COMBINING ACUTE ACCENT}",
+                "skills/caf\N{LATIN SMALL LETTER E WITH ACUTE}/child",
+            ),
+        ):
+            removals = []
+            for index, target in enumerate(historical_targets):
+                entry = removed(f"old-{index}", f"remove-old-{index}", legacy=True)
+                entry["target"] = target
+                removals.append(entry)
+            current = manifest("active", removed_links=removals)
+
+            with self.subTest(
+                historical_targets=historical_targets
+            ), self.assertRaisesRegex(
+                MODULE.ValidationError,
+                "historical manifest targets must not overlap",
+            ):
+                MODULE._manifest_model(current)
+
+        allowed = manifest(
+            "active",
+            removed_links=[
+                removed("first", "remove-first", legacy=True),
+                removed("second", "remove-second", legacy=True),
+                removed("sibling", "remove-sibling", legacy=True),
+            ],
+        )
+        allowed["removed_links"][0]["target"] = "skills/example"
+        allowed["removed_links"][1]["target"] = "skills/example"
+        allowed["removed_links"][2]["target"] = "skills/sibling"
 
         MODULE._manifest_model(allowed)
 

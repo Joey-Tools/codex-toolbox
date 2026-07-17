@@ -778,6 +778,9 @@ def _validate_same_owner_active_removed_target_hierarchy(
             removed.target for removed in manifest.removed_links
         )
 
+    for historical_targets in historical_by_owner.values():
+        _validate_non_overlapping_targets(historical_targets)
+
     for owner, active_targets in active_by_owner.items():
         historical_targets = historical_by_owner.get(owner, [])
         historical_by_key = {

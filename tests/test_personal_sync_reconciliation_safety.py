@@ -721,6 +721,25 @@ class TargetPortabilityTests(unittest.TestCase):
 
         MODULE._validate_manifest_target_portability(manifests)
 
+    def test_rejects_same_owner_removed_history_hierarchy_in_any_order(self) -> None:
+        for targets in (
+            ("skills/example", "skills/example/child"),
+            (
+                "Skills/Cafe\N{COMBINING ACUTE ACCENT}",
+                "skills/caf\N{LATIN SMALL LETTER E WITH ACUTE}/child",
+            ),
+        ):
+            for ordered_targets in (targets, tuple(reversed(targets))):
+                manifests = [
+                    self._target_manifest("private", removed=target)
+                    for target in ordered_targets
+                ]
+                with self.subTest(targets=ordered_targets), self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "manifest targets must not overlap",
+                ):
+                    MODULE._validate_manifest_target_portability(manifests)
+
     def test_rejects_same_owner_active_removed_hierarchy_migration(self) -> None:
         for active_target, removed_target in (
             ("skills/example", "skills/example/child"),

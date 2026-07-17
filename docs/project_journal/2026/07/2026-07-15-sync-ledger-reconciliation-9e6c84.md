@@ -89,7 +89,7 @@ superseded_by:
 - Same-content link and ledger inode racers moved during quarantine are restored exactly with no-replace renames; an occupied original name is preserved and reported instead of overwritten.
 - Overlay uninstall applies managed-link changes first, removes the outgoing `current` pointer second, and publishes the owner-free managed state last; precommit rollback and recovery reverse those mutations.
 - Overlay uninstall keeps the outgoing release descriptor-bound through state publication and rollback, retaining pending evidence whenever release identity drift makes rollback unsafe. An already-missing outgoing `current` pointer is represented by a durable `current/retire-absent` record, including bounded metadata, exact before-state transition validation, claim omission, and foreign-target-preserving recovery.
-- Combined manifest validation rejects portable-key strict ancestor conflicts between active targets and historical `removed.target` entries for every owner, while continuing to allow exact migrations, removed-vs-removed history, and replacement-target-only hierarchy.
+- Combined manifest validation rejects portable-key strict ancestor conflicts between active targets and historical `removed.target` entries for every owner. Runtime, package, and manifest-change admission also reject strict ancestor conflicts within one owner's removal history, while continuing to allow exact migrations, exact or sibling historical targets, cross-owner removed history, and replacement-target-only hierarchy.
 - Runtime, package, and manifest-change validation cap owner path components at 255 UTF-8 bytes, including owners embedded in replacement-retirement keys.
 - Runtime, package, and manifest-change validation reject active links whose final relative symlink payload exceeds the macOS 1,023-byte limit, including combined owner, source, and target-depth growth; historical removal records remain loadable for negative cleanup and migration.
 - Public release verification now passes the exact checksum-verified archive snapshot directly into extraction in both publication jobs.
@@ -104,11 +104,11 @@ superseded_by:
 - Add a combined public/private manifest capacity gate when the private release job has both exact manifests; the installer already performs this aggregate preflight and fails safely, while repository CI currently proves capacity one owner at a time.
 
 ## Evidence
-- Repository test command — 612 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
-- Reconciliation safety module — 274 tests passed as part of the repository suite.
+- Repository test command — 615 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
+- Reconciliation safety module — 275 tests passed as part of the repository suite.
 - Runtime module — 153 tests passed.
-- Package builder safety module — 58 tests passed as part of the repository suite.
-- Manifest change validation module — 78 tests passed as part of the repository suite.
+- Package builder safety module — 59 tests passed as part of the repository suite.
+- Manifest change validation module — 79 tests passed as part of the repository suite.
 - Release baseline validation module — 25 tests passed.
 - Dedicated Python 3.9 compatibility selection — 9 tests passed.
 - Changed-file `ruff`, repository-wide `ruff`, `actionlint`, manifest change validation, project journal validation, Python compilation, and `git diff --check` passed.

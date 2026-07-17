@@ -927,6 +927,52 @@ class PackageBuilderSafetyTests(unittest.TestCase):
             [Path("payload")],
         )
 
+    def test_manifest_rejects_historical_target_hierarchy(self) -> None:
+        def manifest(*historical_targets: str) -> dict[str, object]:
+            return {
+                "version": 1,
+                "owner": "private",
+                "links": [
+                    {
+                        "source": "payload",
+                        "target": "skills/current",
+                        "kind": "skill",
+                    }
+                ],
+                "removed_links": [
+                    {
+                        "id": f"retired-{index}",
+                        "source": f"retired/source-{index}",
+                        "target": target,
+                        "kind": "skill",
+                    }
+                    for index, target in enumerate(historical_targets)
+                ],
+            }
+
+        for historical_targets in (
+            ("skills/example", "skills/example/child"),
+            ("skills/example/child", "skills/example"),
+            (
+                "Skills/Cafe\N{COMBINING ACUTE ACCENT}",
+                "skills/caf\N{LATIN SMALL LETTER E WITH ACUTE}/child",
+            ),
+        ):
+            with self.subTest(
+                historical_targets=historical_targets
+            ), self.assertRaisesRegex(
+                BUILDER.PackageError,
+                "historical manifest targets must not overlap",
+            ):
+                BUILDER._manifest_sources(manifest(*historical_targets))
+
+        self.assertEqual(
+            BUILDER._manifest_sources(
+                manifest("skills/example", "skills/example", "skills/sibling")
+            ),
+            [Path("payload")],
+        )
+
     def test_public_active_replacement_obligation_matches_runtime_semantics(
         self,
     ) -> None:

@@ -511,6 +511,19 @@ def _validate_historical_target_hierarchy(
         for target in historical_targets
     }
     ordered_historical_keys = sorted(historical_by_key)
+    for parent_key, child_key in zip(
+        ordered_historical_keys, ordered_historical_keys[1:]
+    ):
+        if (
+            len(parent_key) < len(child_key)
+            and child_key[: len(parent_key)] == parent_key
+        ):
+            parent = historical_by_key[parent_key]
+            child = historical_by_key[child_key]
+            raise ValidationError(
+                "historical manifest targets must not overlap: "
+                f"{parent} is an ancestor of {child}"
+            )
     for active_target in active_targets:
         active_key = _portable_target_key(active_target)
         for prefix_length in range(1, len(active_key)):
