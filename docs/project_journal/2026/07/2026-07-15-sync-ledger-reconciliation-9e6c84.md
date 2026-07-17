@@ -53,7 +53,7 @@ superseded_by:
 - The exact ledger snapshot loaded for planning remains the transaction baseline, and established ledgers only retain targets already owned or created/replaced by the current transaction.
 - Ledger planning now binds the canonical state parent and file inode, while rollback quarantines only the exact inode published by the transaction and preserves same-content racers.
 - The install lock keeps descriptor-bound parent and lock files for the whole critical section and revalidates both canonical identities after acquisition and immediately before the transaction begins.
-- The sync-home root itself is opened from a bound parent descriptor with `O_NOFOLLOW`; lock, pending-pointer, reconciliation, and internal-directory operations reject preexisting or concurrent home-root symlink replacement.
+- The sync-home root itself is opened from a bound parent descriptor with `O_NOFOLLOW`. While the install lock is held, beneath-home and create-or-bind operations automatically reuse its descriptor in the current execution context, so renaming and recreating the canonical home cannot redirect transaction writes before the final lock check. Lock, pending-pointer, reconciliation, and internal-directory operations reject preexisting or concurrent home-root replacement.
 - Published state, managed-link parent/inode/target snapshots, owner-to-release bindings, `current`, and canonical release directories are revalidated after full release scans; concurrent same-target replacements are preserved rather than reclaimed during rollback.
 - Strict package Git inventories enforce streaming stdout/stderr limits with terminate/kill/reap cleanup, committed manifests are size-checked before bounded reads, and redundant live worktree traversal is removed from strict snapshots.
 - Strict package inventory filtering uses component-prefix tries instead of comparing every Git entry with every manifest source or copying every possible path prefix. Git pathspecs collapse to unique top-level roots under a 32 KiB argument budget and fall back to bounded full inventories when necessary; directory descendants are assigned during one tree scan, so duplicate, nested, exact-file, and deeply nested sources remain bounded by inventory size and path depth without approaching `ARG_MAX`.
@@ -104,8 +104,8 @@ superseded_by:
 - Add a combined public/private manifest capacity gate when the private release job has both exact manifests; the installer already performs this aggregate preflight and fails safely, while repository CI currently proves capacity one owner at a time.
 
 ## Evidence
-- Repository test command — 621 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
-- Reconciliation safety module — 275 tests passed as part of the repository suite.
+- Repository test command — 622 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
+- Reconciliation safety module — 276 tests passed as part of the repository suite.
 - Runtime module — 153 tests passed.
 - Package builder safety module — 59 tests passed as part of the repository suite.
 - Manifest change validation module — 79 tests passed as part of the repository suite.

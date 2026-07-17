@@ -274,6 +274,52 @@ class InstallLockBindingSafetyTests(unittest.TestCase):
             self.assertTrue(home.is_symlink())
             self.assertFalse((displaced_home / "personal-sync").exists())
 
+    def test_home_replacement_cannot_redirect_transaction_operations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            home = root / "home"
+            home.mkdir()
+            displaced_home = root / "home-displaced"
+            redirected_directory = home / "redirected"
+            transaction_directory = home / "personal-sync" / "transaction-write"
+
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "install lock stable home changed during transaction",
+            ):
+                with MODULE.installation_lock(home):
+                    home.rename(displaced_home)
+                    home.mkdir()
+                    with self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "sync home changed before reopening it",
+                    ):
+                        MODULE._open_or_create_directory_beneath(
+                            home,
+                            redirected_directory,
+                        )
+                    with self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "sync home changed before reopening it",
+                    ):
+                        MODULE._ensure_safe_internal_directory(
+                            home,
+                            transaction_directory,
+                            create=True,
+                        )
+
+            self.assertFalse(redirected_directory.exists())
+            self.assertFalse(transaction_directory.exists())
+            self.assertFalse(
+                (displaced_home / "personal-sync" / "transaction-write").exists()
+            )
+            directory_fd = MODULE._open_or_create_directory_beneath(
+                home,
+                redirected_directory,
+            )
+            MODULE._close_fd_quietly(directory_fd)
+            self.assertTrue(redirected_directory.is_dir())
+
 
 class ManifestSchemaSafetyTests(unittest.TestCase):
     def test_runtime_owner_component_byte_limit_matches_owner_sync_root(self) -> None:

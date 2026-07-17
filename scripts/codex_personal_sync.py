@@ -5,6 +5,7 @@ import argparse
 from bisect import bisect_right
 from collections.abc import Callable
 import contextlib
+from contextvars import ContextVar
 import ctypes
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -2301,7 +2302,7 @@ def _ensure_safe_internal_directory(
     """Validate every personal-sync directory component without following symlinks."""
     parts = _internal_path_parts(home, path)
     if create:
-        home_fd = _open_or_create_sync_home(home)
+        home_fd = _open_or_create_bound_sync_home(home)
         try:
             directory_fd = _open_or_create_directory_beneath(
                 home,
@@ -2425,6 +2426,24 @@ def _sync_home_matches_fd(
             _close_fd_quietly(parent_fd)
 
 
+_LOCKED_SYNC_HOME_BINDINGS: ContextVar[tuple[tuple[str, int], ...]] = ContextVar(
+    "locked_sync_home_bindings",
+    default=(),
+)
+
+
+def _sync_home_binding_key(home: Path) -> str:
+    return os.path.abspath(os.fspath(home.expanduser()))
+
+
+def _locked_sync_home_fd(home: Path) -> int | None:
+    binding_key = _sync_home_binding_key(home)
+    for candidate_key, candidate_fd in reversed(_LOCKED_SYNC_HOME_BINDINGS.get()):
+        if candidate_key == binding_key:
+            return candidate_fd
+    return None
+
+
 def _open_sync_home(home: Path) -> int:
     if os.fspath(home) in {"", ".", ".."}:
         raise SyncError(f"refusing unsafe sync home: {home}")
@@ -2494,7 +2513,9 @@ def _open_or_create_sync_home(home: Path, *, mode: int = 0o755) -> int:
 
 def _bound_sync_home_anchor(home: Path, home_fd: int | None) -> int:
     if home_fd is None:
-        return _open_sync_home(home)
+        home_fd = _locked_sync_home_fd(home)
+        if home_fd is None:
+            return _open_sync_home(home)
     if not _sync_home_matches_fd(home, home_fd):
         raise SyncError(f"sync home changed before reopening it: {home}")
     anchor_fd = os.dup(home_fd)
@@ -2502,6 +2523,13 @@ def _bound_sync_home_anchor(home: Path, home_fd: int | None) -> int:
         _close_fd_quietly(anchor_fd)
         raise SyncError(f"sync home changed while reopening it: {home}")
     return anchor_fd
+
+
+def _open_or_create_bound_sync_home(home: Path, *, mode: int = 0o755) -> int:
+    locked_home_fd = _locked_sync_home_fd(home)
+    if locked_home_fd is not None:
+        return _bound_sync_home_anchor(home, locked_home_fd)
+    return _open_or_create_sync_home(home, mode=mode)
 
 
 def _open_directory_beneath(
@@ -4929,6 +4957,7 @@ def installation_lock(home: Path):
     lock_fd = -1
     home_lock_acquired = False
     lock_acquired = False
+    binding_token = None
     lock_flags = os.O_RDWR | os.O_CREAT
     lock_flags |= getattr(os, "O_CLOEXEC", 0)
     lock_flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -4990,6 +5019,10 @@ def installation_lock(home: Path):
             raise SyncError(
                 f"install lock binding changed before transaction: {lock_path}"
             )
+        binding_token = _LOCKED_SYNC_HOME_BINDINGS.set(
+            _LOCKED_SYNC_HOME_BINDINGS.get()
+            + ((_sync_home_binding_key(home), home_fd),)
+        )
         try:
             yield
         finally:
@@ -5012,6 +5045,8 @@ def installation_lock(home: Path):
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_acquired = False
     finally:
+        if binding_token is not None:
+            _LOCKED_SYNC_HOME_BINDINGS.reset(binding_token)
         if lock_acquired:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -8392,7 +8427,7 @@ def _load_pending_link_batch(home: Path) -> PendingLinkBatch | None:
 def _publish_pending_link_pointer(home: Path, batch: PendingLinkBatch) -> None:
     pointer_path = _pending_link_pointer_path(home)
     metadata_path = batch.batch_root / PENDING_LINK_METADATA_NAME
-    home_fd = _open_or_create_sync_home(home)
+    home_fd = _open_or_create_bound_sync_home(home)
     source_parent_fd = -1
     target_parent_fd = -1
     published = False
