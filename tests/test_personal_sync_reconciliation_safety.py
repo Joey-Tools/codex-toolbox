@@ -71,6 +71,46 @@ def write_skill_release(
     return MODULE.load_manifest_data(release_root)
 
 
+def write_agent_skill_release(
+    release_root: Path,
+    *,
+    agent_text: str,
+    declares_agents: bool = True,
+) -> MODULE.ManifestData:
+    write_skill_release(
+        release_root,
+        source_name="public-base",
+        target_name="public-base",
+    )
+    personal_root = release_root / "personal_codex"
+    (personal_root / "AGENTS.md").write_text(agent_text, encoding="utf-8")
+    manifest_path = release_root / MODULE.MANIFEST_RELATIVE_PATH
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if declares_agents:
+        payload["links"].append(
+            {
+                "source": "personal_codex/AGENTS.md",
+                "target": "AGENTS.md",
+                "kind": "file",
+                "owner": MODULE.PUBLIC_OWNER,
+            }
+        )
+    else:
+        payload["reference_only"] = ["personal_codex/AGENTS.md"]
+    manifest_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    return MODULE.load_manifest_data(release_root)
+
+
+def foreign_leaf_snapshot(path: Path) -> tuple[object, ...]:
+    metadata = path.lstat()
+    identity = (metadata.st_dev, metadata.st_ino)
+    if stat.S_ISLNK(metadata.st_mode):
+        return ("symlink", identity, path.readlink().as_posix())
+    if stat.S_ISREG(metadata.st_mode):
+        return ("file", identity, path.read_bytes())
+    return ("other", identity, stat.S_IFMT(metadata.st_mode))
+
+
 def install_quietly(source_root: Path, home: Path, sha: str) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         MODULE.install_release_tree(source_root, home, sha, dry_run=False)
@@ -8846,6 +8886,384 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
         self.assertIn(PurePosixPath("skills/public-base"), refreshed.links)
 
 
+class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.home = self.root / "home"
+        self.release_a = self.root / "release-a"
+        self.release_b = self.root / "release-b"
+        write_agent_skill_release(
+            self.release_a,
+            agent_text="agent-a\n",
+        )
+        self.manifest_b = write_agent_skill_release(
+            self.release_b,
+            agent_text="agent-b\n",
+        )
+        install_quietly(self.release_a, self.home, SHA_A)
+        self.agents = self.home / "AGENTS.md"
+        self.agents.unlink()
+        self.local_agents = self.root / "local-agents.md"
+        self.local_agents.write_text("local\n", encoding="utf-8")
+        self.agents.symlink_to(self.local_agents)
+        self.foreign_before = foreign_leaf_snapshot(self.agents)
+        self.pointer_path = MODULE._pending_link_pointer_path(self.home)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _stage_batch(
+        self,
+    ) -> tuple[
+        MODULE.PendingLinkBatch,
+        MODULE.ManagedState,
+        MODULE.ManagedStateFileSnapshot,
+    ]:
+        binding = MODULE._stage_release_tree_for_install(
+            self.release_b,
+            self.home,
+            SHA_B,
+            self.manifest_b,
+        )
+        MODULE._close_install_release_bindings([binding])
+        state, state_snapshot = MODULE._load_managed_state_with_snapshot(self.home)
+        current_manifest = MODULE._current_manifest_data(
+            self.home,
+            MODULE.PUBLIC_OWNER,
+        )
+        actions = MODULE._plan_reconciliation(
+            self.home,
+            self.manifest_b.entries,
+            current_manifest.entries,
+            [],
+            state,
+            allow_cross_owner=False,
+        )
+        self.assertEqual(
+            [action.action for action in actions],
+            [MODULE.PENDING_RELINQUISH_FOREIGN_ACTION],
+        )
+        MODULE._verify_managed_state_link_claims(self.home, state, actions)
+        current_action = MODULE._plan_current_switch_action(
+            self.home,
+            SHA_B,
+            MODULE.PUBLIC_OWNER,
+        )
+        self.assertIsNotNone(current_action)
+        assert current_action is not None
+        managed_targets = MODULE._managed_targets_after_reconciliation(
+            self.home,
+            state,
+            actions,
+        )
+        next_state = MODULE._planned_committed_state(
+            self.home,
+            self.manifest_b.entries,
+            {MODULE.PUBLIC_OWNER: SHA_B},
+            managed_targets,
+        )
+        batch = MODULE._stage_pending_link_batch(
+            self.home,
+            [("current", [current_action]), ("managed", actions)],
+            self.manifest_b.entries,
+            {MODULE.PUBLIC_OWNER: SHA_B},
+            state_snapshot,
+            state,
+            next_state,
+        )
+        MODULE._publish_pending_link_pointer(self.home, batch)
+        return batch, state, state_snapshot
+
+    def _rewrite_metadata_and_republish(
+        self,
+        batch: MODULE.PendingLinkBatch,
+        mutate,
+    ) -> None:
+        MODULE._clear_pending_link_pointer(self.home, batch, phase="before")
+        metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        mutate(payload)
+        metadata_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        batch.pointer_snapshot = None
+        MODULE._publish_pending_link_pointer(self.home, batch)
+
+    def test_relinquishment_batch_is_record_only_and_round_trips(self) -> None:
+        batch, _state, _state_snapshot = self._stage_batch()
+        parsed = MODULE._load_pending_link_batch(self.home)
+        metadata = json.loads(
+            (batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(metadata["version"], 5)
+        self.assertIn(
+            MODULE.PENDING_RELINQUISH_FOREIGN_ACTION,
+            MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION[5],
+        )
+        with mock.patch.object(MODULE, "PENDING_LINK_METADATA_VERSION", 6):
+            self.assertIsNotNone(MODULE._load_pending_link_batch(self.home))
+        record = next(
+            record
+            for record in parsed.records
+            if record.action == MODULE.PENDING_RELINQUISH_FOREIGN_ACTION
+        )
+        self.assertEqual(record.target, PurePosixPath("AGENTS.md"))
+        self.assertIn(record.target, parsed.state_before_value.links)
+        self.assertNotIn(record.target, parsed.state_after_value.links)
+        self.assertNotIn(
+            (record.scope, record.target),
+            {(claim.scope, claim.target) for claim in parsed.claims_before},
+        )
+        self.assertNotIn(
+            (record.scope, record.target),
+            {(claim.scope, claim.target) for claim in parsed.claims_after},
+        )
+        self.assertTrue(
+            all(
+                value is None
+                for value in (
+                    record.source,
+                    record.owner,
+                    record.link_target,
+                    record.release_sha,
+                    record.before_evidence,
+                    record.before_evidence_identity,
+                    record.backup,
+                    record.stage,
+                    record.stage_identity,
+                    record.evidence,
+                    record.evidence_identity,
+                )
+            )
+        )
+        self.assertFalse(
+            os.path.lexists(batch.batch_root / "links" / "AGENTS.md")
+        )
+        self.assertEqual(foreign_leaf_snapshot(self.agents), self.foreign_before)
+
+    def test_uncommitted_recovery_requires_exact_foreign_snapshot(self) -> None:
+        _batch, state, state_snapshot = self._stage_batch()
+        self.agents.unlink()
+        self.agents.write_text("raced\n", encoding="utf-8")
+        raced = foreign_leaf_snapshot(self.agents)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "foreign relinquishment changed",
+        ):
+            MODULE._recover_pending_link_transaction(
+                self.home,
+                state,
+                state_snapshot,
+                dry_run=False,
+            )
+
+        self.assertTrue(self.pointer_path.is_file())
+        self.assertEqual(foreign_leaf_snapshot(self.agents), raced)
+
+    def test_uncommitted_recovery_preserves_exact_foreign_snapshot(self) -> None:
+        _batch, state, state_snapshot = self._stage_batch()
+
+        recovered, _snapshot, did_recover = (
+            MODULE._recover_pending_link_transaction(
+                self.home,
+                state,
+                state_snapshot,
+                dry_run=False,
+            )
+        )
+
+        self.assertTrue(did_recover)
+        self.assertEqual(recovered, state)
+        self.assertFalse(os.path.lexists(self.pointer_path))
+        self.assertEqual(foreign_leaf_snapshot(self.agents), self.foreign_before)
+
+    def test_precommit_foreign_snapshot_race_retains_pointer(self) -> None:
+        real_publish_marker = MODULE._publish_pending_commit_marker
+
+        def replace_foreign_then_publish(
+            home: Path,
+            batch: MODULE.PendingLinkBatch,
+        ) -> None:
+            self.agents.unlink()
+            self.agents.write_text("raced\n", encoding="utf-8")
+            real_publish_marker(home, batch)
+
+        with mock.patch.object(
+            MODULE,
+            "_publish_pending_commit_marker",
+            side_effect=replace_foreign_then_publish,
+        ):
+            with self.assertRaisesRegex(MODULE.SyncError, "rollback was incomplete"):
+                install_quietly(self.release_b, self.home, SHA_B)
+
+        self.assertTrue(self.pointer_path.is_file())
+        self.assertEqual(self.agents.read_text(encoding="utf-8"), "raced\n")
+
+    def test_committed_recovery_ignores_later_foreign_change(self) -> None:
+        real_clear_pointer = MODULE._clear_pending_link_pointer
+
+        def retain_after_commit(
+            home: Path,
+            batch: MODULE.PendingLinkBatch,
+            phase: str | None = None,
+        ) -> None:
+            if phase == "after":
+                raise MODULE.SyncError("injected post-commit pointer retention")
+            real_clear_pointer(home, batch, phase=phase)
+
+        with mock.patch.object(
+            MODULE,
+            "_clear_pending_link_pointer",
+            side_effect=retain_after_commit,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed managed state but finalization failed",
+            ):
+                install_quietly(self.release_b, self.home, SHA_B)
+
+        self.assertTrue(self.pointer_path.is_file())
+        self.agents.unlink()
+        self.agents.write_text("post-commit\n", encoding="utf-8")
+        changed = foreign_leaf_snapshot(self.agents)
+
+        install_quietly(self.release_b, self.home, SHA_B)
+
+        self.assertFalse(os.path.lexists(self.pointer_path))
+        self.assertEqual(foreign_leaf_snapshot(self.agents), changed)
+        state = MODULE._load_managed_state(self.home)
+        self.assertNotIn(PurePosixPath("AGENTS.md"), state.links)
+
+    def test_v4_rejects_foreign_relinquishment_action(self) -> None:
+        batch, _state, _state_snapshot = self._stage_batch()
+        self.assertNotIn(
+            MODULE.PENDING_RELINQUISH_FOREIGN_ACTION,
+            MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION[4],
+        )
+        self._rewrite_metadata_and_republish(
+            batch,
+            lambda payload: payload.__setitem__("version", 4),
+        )
+
+        with self.assertRaisesRegex(MODULE.SyncError, "invalid role"):
+            MODULE._load_pending_link_batch(self.home)
+
+    def test_unknown_pending_metadata_version_is_rejected(self) -> None:
+        batch, _state, _state_snapshot = self._stage_batch()
+        self.assertEqual(
+            frozenset(MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION),
+            MODULE.SUPPORTED_PENDING_LINK_METADATA_VERSIONS,
+        )
+        self._rewrite_metadata_and_republish(
+            batch,
+            lambda payload: payload.__setitem__("version", 6),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "unsupported fields or version",
+        ):
+            MODULE._load_pending_link_batch(self.home)
+
+    def test_parser_rejects_relinquishment_bound_to_old_managed_target(
+        self,
+    ) -> None:
+        batch, _state, _state_snapshot = self._stage_batch()
+        old_target = batch.state_before_value.links[
+            PurePosixPath("AGENTS.md")
+        ].link_target
+
+        def mutate(payload: dict[str, object]) -> None:
+            record = next(
+                candidate
+                for candidate in payload["records"]
+                if candidate["action"]
+                == MODULE.PENDING_RELINQUISH_FOREIGN_ACTION
+            )
+            record["planned_before"]["link_target"] = old_target
+
+        self._rewrite_metadata_and_republish(batch, mutate)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "not an exact optional state transition",
+        ):
+            MODULE._load_pending_link_batch(self.home)
+
+    def test_parser_rejects_relinquishment_with_ownership_evidence(self) -> None:
+        batch, _state, _state_snapshot = self._stage_batch()
+
+        def mutate(payload: dict[str, object]) -> None:
+            record = next(
+                candidate
+                for candidate in payload["records"]
+                if candidate["action"]
+                == MODULE.PENDING_RELINQUISH_FOREIGN_ACTION
+            )
+            record["source"] = "personal_codex/AGENTS.md"
+
+        self._rewrite_metadata_and_republish(batch, mutate)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "not an exact optional state transition",
+        ):
+            MODULE._load_pending_link_batch(self.home)
+
+    def test_parser_rejects_relinquishment_without_before_claim(self) -> None:
+        _batch, state, _state_snapshot = self._stage_batch()
+        forged_before = MODULE.ManagedState(
+            owners=dict(state.owners),
+            links={
+                target: record
+                for target, record in state.links.items()
+                if target != PurePosixPath("AGENTS.md")
+            },
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_managed_state_value_from_snapshot",
+                return_value=forged_before,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "not an exact optional state transition",
+            ),
+        ):
+            MODULE._load_pending_link_batch(self.home)
+
+    def test_parser_rejects_relinquishment_when_private_desired_remains(
+        self,
+    ) -> None:
+        self._stage_batch()
+        private_entry = MODULE.LinkEntry(
+            source=PurePosixPath("personal_codex/AGENTS.md"),
+            target=PurePosixPath("AGENTS.md"),
+            kind="file",
+            owner="private",
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_combine_entries",
+                return_value=[private_entry],
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "not an exact optional state transition",
+            ),
+        ):
+            MODULE._load_pending_link_batch(self.home)
+
+
 class PendingLinkTransactionSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -11079,6 +11497,37 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
         with self.assertRaisesRegex(MODULE.SyncError, "pending stage"):
             MODULE._load_pending_link_batch(self.home)
+
+    def test_legacy_v4_pending_batch_still_parses_and_recovers(self) -> None:
+        batch, _actions, state, state_snapshot = self._stage_crash_batch()
+        MODULE._clear_pending_link_pointer(self.home, batch, phase="before")
+        metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        payload["version"] = 4
+        metadata_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        batch.pointer_snapshot = None
+        MODULE._publish_pending_link_pointer(self.home, batch)
+
+        parsed = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertTrue(
+            {record.action for record in parsed.records}.issubset(
+                MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION[4]
+            )
+        )
+        recovered, _snapshot, did_recover = (
+            MODULE._recover_pending_link_transaction(
+                self.home,
+                state,
+                state_snapshot,
+                dry_run=False,
+            )
+        )
+
+        self.assertTrue(did_recover)
+        self.assertEqual(recovered, state)
+        self.assertFalse(os.path.lexists(self.pointer_path))
 
     def test_pending_wal_pointer_rejects_nonstandard_json_constant(self) -> None:
         batch, _actions, _state, _state_snapshot = self._stage_crash_batch()

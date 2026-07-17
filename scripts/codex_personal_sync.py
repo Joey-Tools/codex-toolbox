@@ -55,11 +55,31 @@ MAX_MANIFEST_TARGET_COMPONENT_BYTES = 255
 MAX_MANIFEST_TARGET_PATH_DEPTH = 64
 MAX_OWNER_COMPONENT_BYTES = 255
 MAX_MANAGED_LINK_TARGET_BYTES = 1023
+MAX_RECONCILE_LINK_TARGET_BYTES = 4096
 STATE_RELATIVE_PATH = Path("state/managed-links.json")
 MAX_MANAGED_STATE_BYTES = 16 * 1024 * 1024
 QUARANTINE_RELATIVE_PATH = Path("quarantine")
 PENDING_LINK_POINTER_NAME = ".personal-sync-pending-transaction.json"
 PENDING_LINK_METADATA_NAME = "pending-transaction.json"
+PENDING_LINK_METADATA_VERSION = 5
+PENDING_RELINQUISH_FOREIGN_ACTION = "relinquish-foreign"
+PENDING_LINK_V4_ACTIONS = frozenset(
+    {
+        "create",
+        "replace",
+        "quarantine-replace",
+        "remove",
+        "quarantine-remove",
+        "retire-absent",
+    }
+)
+PENDING_LINK_ACTIONS_BY_METADATA_VERSION = {
+    4: PENDING_LINK_V4_ACTIONS,
+    5: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
+}
+SUPPORTED_PENDING_LINK_METADATA_VERSIONS = frozenset(
+    PENDING_LINK_ACTIONS_BY_METADATA_VERSION
+)
 PENDING_STATE_BEFORE_EVIDENCE = PurePosixPath("pending", "state", "before")
 PENDING_STATE_AFTER_EVIDENCE = PurePosixPath("pending", "state", "after")
 PENDING_STATE_COMMIT_EVIDENCE = PurePosixPath(
@@ -98,7 +118,7 @@ MAX_PENDING_CLEANUP_ENTRIES = (
 )
 _MAX_PENDING_IDENTITY = (2**64 - 1, 2**64 - 1)
 _MAX_PENDING_DIGEST = "f" * 64
-_MAX_PENDING_LINK_TARGET = "\udcff" * MAX_ARCHIVE_MEMBER_PATH_BYTES
+_MAX_PENDING_LINK_TARGET = "\udcff" * MAX_RECONCILE_LINK_TARGET_BYTES
 _MAX_PENDING_BATCH_NAME = (
     "00000000T000000Z-0-"
     + "0" * (MAX_PENDING_LINK_BATCH_NAME_BYTES - len("00000000T000000Z-0-"))
@@ -420,6 +440,7 @@ class ManifestTransitionCapacityProfile:
     create_record_sizes: dict[PurePosixPath, int]
     remove_record_sizes: dict[PurePosixPath, int]
     retired_absence_record_sizes: dict[PurePosixPath, int]
+    relinquish_foreign_record_sizes: dict[PurePosixPath, int]
     historical_record_sizes: dict[PurePosixPath, int]
 
 
@@ -3785,6 +3806,18 @@ def _symlink_snapshot_at(
     return identity, link_target
 
 
+def _validate_reconcile_link_target(link_target: str, label: str) -> str:
+    try:
+        encoded = os.fsencode(link_target)
+    except (TypeError, UnicodeEncodeError) as error:
+        raise SyncError(f"{label} is not filesystem-encodable") from error
+    if not encoded or len(encoded) > MAX_RECONCILE_LINK_TARGET_BYTES:
+        raise SyncError(
+            f"{label} exceeds {MAX_RECONCILE_LINK_TARGET_BYTES} filesystem bytes"
+        )
+    return link_target
+
+
 def _capture_reconcile_target_snapshot(
     home: Path,
     target: Path,
@@ -3834,6 +3867,10 @@ def _capture_reconcile_target_snapshot(
                 ancestor_identity=parent_identity,
             )
         link_identity, link_target = _symlink_snapshot_at(parent_fd, target.name)
+        _validate_reconcile_link_target(
+            link_target,
+            f"managed target symlink value for {target}",
+        )
         if not _bound_directory_matches(home, target.parent, parent_fd):
             raise SyncError(f"managed target parent changed: {target.parent}")
         return ReconcileTargetSnapshot(
@@ -5676,6 +5713,15 @@ def _is_optional_desired_entry(entry: LinkEntry) -> bool:
     )
 
 
+def _allows_optional_claim_relinquishment(
+    target: PurePosixPath,
+    desired_entry: LinkEntry | None,
+) -> bool:
+    return target in OPTIONAL_PUBLIC_TARGETS and (
+        desired_entry is None or _is_optional_desired_entry(desired_entry)
+    )
+
+
 def _refresh_managed_state_from_current(
     home: Path,
     state: ManagedState,
@@ -5756,7 +5802,7 @@ def _refresh_managed_state_from_current(
     return refreshed
 
 
-def _verify_managed_state_current_claims(
+def _verify_managed_state_current_owner_claims(
     home: Path,
     state: ManagedState,
 ) -> None:
@@ -5772,6 +5818,28 @@ def _verify_managed_state_current_claims(
                 f"{owner}: state={release_sha}, "
                 f"current={actual_snapshot.link_target}"
             )
+
+
+def _verify_managed_state_link_claims(
+    home: Path,
+    state: ManagedState,
+    planned_actions: list[ReconcileAction] | None = None,
+) -> None:
+    relinquishments: dict[PurePosixPath, ReconcileAction] = {}
+    for action in planned_actions or []:
+        if action.action != PENDING_RELINQUISH_FOREIGN_ACTION:
+            continue
+        try:
+            target = PurePosixPath(*action.target.relative_to(home).parts)
+        except ValueError as error:
+            raise SyncError(
+                f"managed relinquishment target is outside home: {action.target}"
+            ) from error
+        if target in relinquishments:
+            raise SyncError(f"duplicate managed claim relinquishment: {target}")
+        relinquishments[target] = action
+
+    matched_relinquishments: set[PurePosixPath] = set()
     for target, record in state.links.items():
         actual_snapshot = _capture_reconcile_target_snapshot(
             home,
@@ -5779,12 +5847,35 @@ def _verify_managed_state_current_claims(
         )
         if actual_snapshot.link_identity is None:
             continue
-        if actual_snapshot.link_target != record.link_target:
-            raise SyncError(
-                "managed state/link target mismatch for "
-                f"{target}: state={record.link_target}, "
-                f"current={actual_snapshot.link_target}"
-            )
+        if actual_snapshot.link_target == record.link_target:
+            continue
+        relinquishment = relinquishments.get(target)
+        if (
+            relinquishment is not None
+            and relinquishment.planned_snapshot == actual_snapshot
+        ):
+            matched_relinquishments.add(target)
+            continue
+        raise SyncError(
+            "managed state/link target mismatch for "
+            f"{target}: state={record.link_target}, "
+            f"current={actual_snapshot.link_target}"
+        )
+    unmatched = set(relinquishments).difference(matched_relinquishments)
+    if unmatched:
+        raise SyncError(
+            "managed claim relinquishment is not an exact state transition: "
+            + ", ".join(target.as_posix() for target in sorted(unmatched))
+        )
+
+
+def _verify_managed_state_current_claims(
+    home: Path,
+    state: ManagedState,
+    planned_actions: list[ReconcileAction] | None = None,
+) -> None:
+    _verify_managed_state_current_owner_claims(home, state)
+    _verify_managed_state_link_claims(home, state, planned_actions)
 
 
 def _entries_owner(entries: list[LinkEntry]) -> str:
@@ -6252,6 +6343,31 @@ def _plan_reconciliation(
         )
         record = state.links.get(relative_target)
         removed_candidates = removed_by_target.get(relative_target, [])
+        if (
+            record is not None
+            and planned_snapshot is not None
+            and planned_snapshot.link_identity is not None
+            and planned_snapshot.link_target != record.link_target
+        ):
+            if _allows_optional_claim_relinquishment(
+                relative_target,
+                desired_entry,
+            ):
+                actions.append(
+                    ReconcileAction(
+                        PENDING_RELINQUISH_FOREIGN_ACTION,
+                        target,
+                        "",
+                        record.kind,
+                        planned_snapshot=planned_snapshot,
+                    )
+                )
+                continue
+            raise SyncError(
+                "managed state/link target mismatch for "
+                f"{relative_target}: state={record.link_target}, "
+                f"current={planned_snapshot.link_target}"
+            )
         if desired_entry is not None:
             desired = _desired_link_target(home, desired_entry)
             if planned_snapshot is None or planned_snapshot.link_identity is None:
@@ -6582,7 +6698,7 @@ def _pending_link_metadata_payload(
     commit_evidence: ManagedStateFileSnapshot,
 ) -> bytes:
     payload = {
-        "version": 4,
+        "version": PENDING_LINK_METADATA_VERSION,
         "batch": batch_root.name,
         "state_parent_identity": _identity_payload(state_before.parent_identity),
         "state_before": _state_evidence_payload(
@@ -6900,6 +7016,51 @@ def _verify_pending_record_bound_retired_absence(
         )
 
 
+def _pending_record_has_bound_foreign_relinquishment(
+    record: PendingLinkRecord,
+) -> bool:
+    snapshot = record.planned_snapshot
+    return (
+        record.scope == "managed"
+        and record.action == PENDING_RELINQUISH_FOREIGN_ACTION
+        and snapshot.parent_identity is not None
+        and snapshot.link_identity is not None
+        and snapshot.ancestor_identity == snapshot.parent_identity
+        and not snapshot.missing_parent_parts
+    )
+
+
+def _require_pending_record_bound_foreign_relinquishment(
+    record: PendingLinkRecord,
+) -> None:
+    if not _pending_record_has_bound_foreign_relinquishment(record):
+        raise SyncError(
+            "pending foreign relinquishment is not bound to an occupied target: "
+            f"{record.target}"
+        )
+
+
+def _verify_pending_record_bound_foreign_relinquishment(
+    home: Path,
+    record: PendingLinkRecord,
+    *,
+    phase: str,
+) -> None:
+    _require_pending_record_bound_foreign_relinquishment(record)
+    target = home / Path(*record.target.parts)
+    try:
+        actual = _capture_reconcile_target_snapshot(home, target)
+    except (OSError, SyncError) as error:
+        raise SyncError(
+            f"pending {phase} foreign relinquishment could not be verified: "
+            f"{record.target}"
+        ) from error
+    if actual != record.planned_snapshot:
+        raise SyncError(
+            f"pending {phase} foreign relinquishment changed: {record.target}"
+        )
+
+
 def _stage_pending_link_claims(
     home: Path,
     batch_root: Path,
@@ -6928,6 +7089,7 @@ def _stage_pending_link_claims(
         if phase == "before" and record is not None and record.action in {
             "create",
             "retire-absent",
+            PENDING_RELINQUISH_FOREIGN_ACTION,
         }:
             if record.action == "create":
                 _verify_pending_record_bound_create_absence(
@@ -6935,8 +7097,14 @@ def _stage_pending_link_claims(
                     record,
                     phase="before-state",
                 )
-            else:
+            elif record.action == "retire-absent":
                 _verify_pending_record_bound_retired_absence(
+                    home,
+                    record,
+                    phase="before-state",
+                )
+            else:
+                _verify_pending_record_bound_foreign_relinquishment(
                     home,
                     record,
                     phase="before-state",
@@ -7035,13 +7203,29 @@ def _pending_link_record_for_action(
         "remove",
         "quarantine-remove",
     }
-    if not producing and not destructive:
+    relinquishing_foreign = action.action == PENDING_RELINQUISH_FOREIGN_ACTION
+    if not producing and not destructive and not relinquishing_foreign:
         raise SyncError(f"unsupported pending action: {action.action}")
     source: PurePosixPath | None = None
     owner: str | None = None
     release_sha: str | None = None
     link_target = action.link_target if producing else None
-    if scope == "managed" and producing:
+    if scope == "managed" and relinquishing_foreign:
+        entry = desired_by_target.get(target)
+        state_record = current_owner_state.links.get(target)
+        if (
+            not _allows_optional_claim_relinquishment(target, entry)
+            or state_record is None
+            or state_record.kind != action.kind
+            or target != state_record.target
+            or action.planned_snapshot.link_identity is None
+            or action.planned_snapshot.link_target == state_record.link_target
+        ):
+            raise SyncError(
+                f"pending foreign relinquishment is not an optional state claim: "
+                f"{target}"
+            )
+    elif scope == "managed" and producing:
         entry = desired_by_target.get(target)
         if entry is None:
             raise SyncError(f"pending managed action has no desired entry: {target}")
@@ -7058,6 +7242,10 @@ def _pending_link_record_for_action(
         ):
             raise SyncError(f"pending managed action changed after planning: {target}")
     elif scope == "current":
+        if relinquishing_foreign:
+            raise SyncError(
+                f"pending current target cannot relinquish foreign ownership: {target}"
+            )
         owner = _pending_current_owner(
             home,
             action.target,
@@ -7317,7 +7505,11 @@ def _projected_pending_claim_payloads(
     claims: list[dict[str, Any]] = []
     for semantic in _pending_state_claim_semantics(home, state):
         action = record_actions.get((semantic[0], semantic[1]))
-        if phase == "before" and action in {"create", "retire-absent"}:
+        if phase == "before" and action in {
+            "create",
+            "retire-absent",
+            PENDING_RELINQUISH_FOREIGN_ACTION,
+        }:
             continue
         claims.append(
             _projected_pending_claim_payload(
@@ -7358,7 +7550,7 @@ def _projected_pending_metadata_payload(
         else None
     )
     return {
-        "version": 4,
+        "version": PENDING_LINK_METADATA_VERSION,
         "batch": _MAX_PENDING_BATCH_NAME,
         "state_parent_identity": _identity_payload(_MAX_PENDING_IDENTITY),
         "state_before": {
@@ -7538,6 +7730,7 @@ def _manifest_transition_capacity_profile(
     create_record_sizes: dict[PurePosixPath, int] = {}
     remove_record_sizes: dict[PurePosixPath, int] = {}
     retired_absence_record_sizes: dict[PurePosixPath, int] = {}
+    relinquish_foreign_record_sizes: dict[PurePosixPath, int] = {}
     for target, record in state.links.items():
         target_path = home / Path(*target.parts)
         create_record_sizes[target] = _projected_top_level_array_element_size(
@@ -7592,6 +7785,38 @@ def _manifest_transition_capacity_profile(
                 )
             )
         )
+        if target in OPTIONAL_PUBLIC_TARGETS:
+            relinquish_foreign_record_sizes[target] = (
+                _projected_top_level_array_element_size(
+                    _projected_pending_record_payload(
+                        home,
+                        "managed",
+                        ReconcileAction(
+                            PENDING_RELINQUISH_FOREIGN_ACTION,
+                            target_path,
+                            "",
+                            record.kind,
+                            planned_snapshot=ReconcileTargetSnapshot(
+                                parent_identity=_MAX_PENDING_IDENTITY,
+                                link_identity=_MAX_PENDING_IDENTITY,
+                                link_target=_MAX_PENDING_LINK_TARGET,
+                                ancestor_identity=_MAX_PENDING_IDENTITY,
+                            ),
+                        ),
+                        state,
+                        state,
+                        ManagedState(
+                            owners=dict(state.owners),
+                            links={
+                                candidate: candidate_record
+                                for candidate, candidate_record in state.links.items()
+                                if candidate != target
+                            },
+                        ),
+                        0,
+                    )
+                )
+            )
     historical_record_sizes: dict[PurePosixPath, int] = {}
     for raw_removed in removed_links.values():
         try:
@@ -7668,6 +7893,7 @@ def _manifest_transition_capacity_profile(
         create_record_sizes=create_record_sizes,
         remove_record_sizes=remove_record_sizes,
         retired_absence_record_sizes=retired_absence_record_sizes,
+        relinquish_foreign_record_sizes=relinquish_foreign_record_sizes,
         historical_record_sizes=historical_record_sizes,
     )
 
@@ -7708,6 +7934,7 @@ def _manifest_transition_metadata_size(
             before_record_element_sum += max(
                 previous.before_claim_sizes[target],
                 current.create_record_sizes[target],
+                previous.relinquish_foreign_record_sizes.get(target, 0),
                 historical_record_size or 0,
             )
             before_count_max += 1
@@ -7730,6 +7957,7 @@ def _manifest_transition_metadata_size(
             )
             noncanonical_size = max(
                 previous.retired_absence_record_sizes[target],
+                previous.relinquish_foreign_record_sizes.get(target, 0),
                 historical_record_size or 0,
             )
         else:
@@ -7761,6 +7989,7 @@ def _manifest_transition_metadata_size(
             )
             noncanonical_size = max(
                 current.create_record_sizes[target],
+                previous.relinquish_foreign_record_sizes.get(target, 0),
                 historical_record_size or 0,
             )
         before_record_element_sum += max(
@@ -7933,6 +8162,7 @@ def _build_pending_link_capacity_plan(
         raise SyncError("pending transaction has too many actions")
     action_keys: set[tuple[str, PurePosixPath]] = set()
     create_keys: set[tuple[str, PurePosixPath]] = set()
+    relinquish_foreign_keys: set[tuple[str, PurePosixPath]] = set()
     for scope, actions in ordered_groups:
         if scope not in {"current", "managed"}:
             raise SyncError(f"unsupported pending transaction scope: {scope}")
@@ -7949,6 +8179,29 @@ def _build_pending_link_capacity_plan(
             action_keys.add(key)
             if action.action == "create":
                 create_keys.add(key)
+            elif action.action == PENDING_RELINQUISH_FOREIGN_ACTION:
+                target = key[1]
+                before_record = state_before_value.links.get(target)
+                snapshot = action.planned_snapshot
+                if (
+                    scope != "managed"
+                    or target not in OPTIONAL_PUBLIC_TARGETS
+                    or before_record is None
+                    or planning_state_before.links.get(target) != before_record
+                    or target in state_after_value.links
+                    or snapshot is None
+                    or snapshot.parent_identity is None
+                    or snapshot.link_identity is None
+                    or snapshot.ancestor_identity != snapshot.parent_identity
+                    or snapshot.missing_parent_parts
+                    or snapshot.link_target == before_record.link_target
+                    or action.kind != before_record.kind
+                ):
+                    raise SyncError(
+                        "pending foreign relinquishment is not an exact optional "
+                        f"state transition: {target}"
+                    )
+                relinquish_foreign_keys.add(key)
     retired_absence_specs: list[tuple[PurePosixPath, ManagedLinkRecord]] = []
     for target in sorted(
         set(state_before_value.links) - set(state_after_value.links),
@@ -7995,7 +8248,9 @@ def _build_pending_link_capacity_plan(
         ("current", target)
         for target, _owner in retired_current_absence_specs
     )
-    omitted_before_keys = create_keys | retired_absence_keys
+    omitted_before_keys = (
+        create_keys | retired_absence_keys | relinquish_foreign_keys
+    )
     before_claim_count = sum(
         (semantic[0], semantic[1]) not in omitted_before_keys
         for semantic in _pending_state_claim_semantics(
@@ -8180,6 +8435,8 @@ def _stage_pending_link_batch(
                 )
                 if record.action == "create":
                     _require_pending_record_bound_create_absence(record)
+                elif record.action == PENDING_RELINQUISH_FOREIGN_ACTION:
+                    _require_pending_record_bound_foreign_relinquishment(record)
                 key = (record.scope, record.target)
                 if key in seen:
                     raise SyncError(f"duplicate pending transaction target: {record.target}")
@@ -8443,6 +8700,11 @@ def _parse_pending_planned_snapshot(value: object) -> ReconcileTargetSnapshot:
     link_target = value.get("link_target")
     if link_target is not None and (not isinstance(link_target, str) or not link_target):
         raise SyncError("pending transaction planned link target is invalid")
+    if link_target is not None:
+        _validate_reconcile_link_target(
+            link_target,
+            "pending transaction planned link target",
+        )
     raw_missing = value.get("missing_parent_parts")
     if (
         not isinstance(raw_missing, list)
@@ -8844,7 +9106,10 @@ def _parse_pending_link_batch(
     }:
         raise SyncError("pending transaction has unsupported fields or version")
     version = data.get("version")
-    if type(version) is not int or version != 4:
+    if (
+        type(version) is not int
+        or version not in SUPPORTED_PENDING_LINK_METADATA_VERSIONS
+    ):
         raise SyncError("pending transaction has unsupported fields or version")
     batch_name = data.get("batch")
     if (
@@ -8972,6 +9237,7 @@ def _parse_pending_link_batch(
         raise SyncError("pending transaction records must be a bounded array")
     records: list[PendingLinkRecord] = []
     seen: set[tuple[str, PurePosixPath]] = set()
+    relinquishment_desired_by_target: dict[PurePosixPath, LinkEntry] | None = None
     expected_fields = {
         "index",
         "scope",
@@ -8998,14 +9264,8 @@ def _parse_pending_link_batch(
             raise SyncError("pending transaction record order changed")
         scope = raw_record.get("scope")
         action = raw_record.get("action")
-        if scope not in {"current", "managed"} or action not in {
-            "create",
-            "replace",
-            "quarantine-replace",
-            "remove",
-            "quarantine-remove",
-            "retire-absent",
-        }:
+        supported_actions = PENDING_LINK_ACTIONS_BY_METADATA_VERSION[version]
+        if scope not in {"current", "managed"} or action not in supported_actions:
             raise SyncError(f"pending transaction record #{index + 1} has invalid role")
         target = _validate_relative_path(raw_record.get("target"), "pending target")
         kind = raw_record.get("kind")
@@ -9020,6 +9280,7 @@ def _parse_pending_link_batch(
             "quarantine-remove",
         }
         retiring_absence = action == "retire-absent"
+        relinquishing_foreign = action == PENDING_RELINQUISH_FOREIGN_ACTION
         if retiring_absence:
             if (
                 planned.link_identity is not None
@@ -9027,6 +9288,11 @@ def _parse_pending_link_batch(
             ):
                 raise SyncError(
                     f"pending retired target {target} has invalid absence evidence"
+                )
+        elif relinquishing_foreign:
+            if planned.link_identity is None:
+                raise SyncError(
+                    f"pending foreign relinquishment {target} is not occupied"
                 )
         elif destructive != (planned.link_identity is not None):
             raise SyncError(f"pending target {target} has inconsistent before evidence")
@@ -9122,6 +9388,61 @@ def _parse_pending_link_batch(
                     raise SyncError(f"pending current state claim changed for owner {owner}")
             elif release_sha is not None or owner in state_after_value.owners:
                 raise SyncError(f"pending current removal still has an owner claim: {owner}")
+        elif relinquishing_foreign:
+            before_record = state_before_value.links.get(target)
+            if relinquishment_desired_by_target is None:
+                manifests: dict[str, ManifestData] = {}
+                manifest_cache: dict[tuple[str, str], ManifestData | None] = {}
+                for state_owner, state_sha in sorted(state_after_value.owners.items()):
+                    manifest = _load_installed_manifest_data(
+                        home,
+                        state_owner,
+                        state_sha,
+                        manifest_cache=manifest_cache,
+                    )
+                    if manifest.owner != state_owner:
+                        raise SyncError(
+                            "pending foreign relinquishment release owner changed: "
+                            f"{state_owner}@{state_sha}"
+                        )
+                    manifests[state_owner] = manifest
+                public_manifest = manifests.get(PUBLIC_OWNER)
+                if public_manifest is None:
+                    if manifests:
+                        raise SyncError(
+                            "pending foreign relinquishment requires a public base"
+                        )
+                    relinquishment_desired_by_target = {}
+                else:
+                    overlay_manifests = [
+                        manifest
+                        for state_owner, manifest in sorted(manifests.items())
+                        if state_owner != PUBLIC_OWNER
+                    ]
+                    relinquishment_desired_by_target = _entries_by_target(
+                        _combine_entries(
+                            public_manifest.entries,
+                            overlay_manifests,
+                        )
+                    )
+            desired_entry = relinquishment_desired_by_target.get(target)
+            if (
+                scope != "managed"
+                or before_record is None
+                or before_record.kind != kind
+                or target in state_after_value.links
+                or target not in OPTIONAL_PUBLIC_TARGETS
+                or not _allows_optional_claim_relinquishment(
+                    target,
+                    desired_entry,
+                )
+                or planned.link_target == before_record.link_target
+                or any(value is not None for value in (source, owner, release_sha))
+            ):
+                raise SyncError(
+                    "pending foreign relinquishment is not an exact optional state "
+                    f"transition: {target}"
+                )
         elif retiring_absence:
             before_record = state_before_value.links.get(target)
             if (
@@ -9200,6 +9521,8 @@ def _parse_pending_link_batch(
             _require_pending_record_bound_create_absence(record)
         elif record.action == "retire-absent":
             _require_pending_record_bound_retired_absence(record)
+        elif record.action == PENDING_RELINQUISH_FOREIGN_ACTION:
+            _require_pending_record_bound_foreign_relinquishment(record)
     before_semantic_keys = {
         (semantic[0], semantic[1])
         for semantic in _pending_state_claim_semantics(home, state_before_value)
@@ -9207,7 +9530,12 @@ def _parse_pending_link_batch(
     state_claimed_absences = {
         (record.scope, record.target)
         for record in records
-        if record.action in {"create", "retire-absent"}
+        if record.action
+        in {
+            "create",
+            "retire-absent",
+            PENDING_RELINQUISH_FOREIGN_ACTION,
+        }
         and (record.scope, record.target) in before_semantic_keys
     }
     claims_before = _parse_pending_link_claims(
@@ -9247,7 +9575,12 @@ def _parse_pending_link_batch(
             "quarantine-replace",
         }
         if (
-            record.action in {"create", "retire-absent"}
+            record.action
+            in {
+                "create",
+                "retire-absent",
+                PENDING_RELINQUISH_FOREIGN_ACTION,
+            }
             and key in before_semantic_keys
         ):
             if before_claim is not None:
@@ -9499,6 +9832,13 @@ def _publish_pending_commit_marker(home: Path, batch: PendingLinkBatch) -> None:
         )
         if not _pending_commit_snapshot_matches(evidence, batch.commit_evidence):
             raise SyncError("pending transaction commit evidence changed")
+        for record in batch.records:
+            if record.action == PENDING_RELINQUISH_FOREIGN_ACTION:
+                _verify_pending_record_bound_foreign_relinquishment(
+                    home,
+                    record,
+                    phase="precommit",
+                )
         try:
             os.link(
                 evidence_path.name,
@@ -11184,6 +11524,12 @@ def _verify_pending_before_absences(
                 record,
                 phase="before-state",
             )
+        elif record.action == PENDING_RELINQUISH_FOREIGN_ACTION:
+            _verify_pending_record_bound_foreign_relinquishment(
+                home,
+                record,
+                phase="before-state",
+            )
 
 
 def _verify_pending_release_expectations(
@@ -11248,6 +11594,13 @@ def _verify_committed_pending_link_records(
     batch: PendingLinkBatch,
 ) -> None:
     for record in batch.records:
+        if record.action in {
+            "retire-absent",
+            PENDING_RELINQUISH_FOREIGN_ACTION,
+        }:
+            # The committed state deliberately relinquishes this path. Its later
+            # user-owned contents are outside the synchronizer's claim.
+            continue
         target = home / Path(*record.target.parts)
         target_snapshot, target_exists = _pending_target_snapshot(home, target)
         producing = record.action in {
@@ -11284,10 +11637,6 @@ def _verify_committed_pending_link_records(
                     "committed pending target is not the exact evidence inode: "
                     f"{record.target}"
                 )
-            continue
-        if record.action == "retire-absent":
-            # The committed state deliberately relinquishes this already-missing
-            # path. A later foreign occupant is outside the synchronizer's claim.
             continue
         if record.scope == "current":
             if target_exists:
@@ -11356,6 +11705,13 @@ def _recover_pending_link_transaction(
         state_snapshot,
     )
     for record in reversed(batch.records):
+        if record.action == PENDING_RELINQUISH_FOREIGN_ACTION:
+            _verify_pending_record_bound_foreign_relinquishment(
+                home,
+                record,
+                phase="rollback",
+            )
+            continue
         target = home / Path(*record.target.parts)
         target_snapshot, target_exists = _pending_target_snapshot(home, target)
         producing = record.action in {
@@ -11510,6 +11866,11 @@ def _ordered_reconcile_actions(
     actions: list[ReconcileAction],
     required_replacements: dict[Path, list[LinkEntry]] | None = None,
 ) -> list[ReconcileAction]:
+    record_only_actions = [
+        action
+        for action in actions
+        if action.action == PENDING_RELINQUISH_FOREIGN_ACTION
+    ]
     create_actions = [action for action in actions if action.action == "create"]
     destructive_actions = _order_destructive_reconcile_actions(
         home,
@@ -11521,7 +11882,7 @@ def _ordered_reconcile_actions(
         ],
         required_replacements or {},
     )
-    ordered = create_actions + destructive_actions
+    ordered = record_only_actions + create_actions + destructive_actions
     if len(ordered) != len(actions):
         unknown = sorted(
             {action.action for action in actions}
@@ -11531,6 +11892,7 @@ def _ordered_reconcile_actions(
                 "quarantine-replace",
                 "remove",
                 "quarantine-remove",
+                PENDING_RELINQUISH_FOREIGN_ACTION,
             }
         )
         raise SyncError(f"unknown reconciliation action(s): {', '.join(unknown)}")
@@ -11548,6 +11910,13 @@ def _apply_reconcile_actions(
     batch_root: Path | None = None,
     transaction: ReconcileTransaction | None = None,
 ) -> ReconcileTransaction | None:
+    if any(
+        action.action == PENDING_RELINQUISH_FOREIGN_ACTION
+        for action in actions
+    ):
+        raise SyncError(
+            "foreign claim relinquishments must not enter filesystem reconciliation"
+        )
     ordered_actions = _ordered_reconcile_actions(
         home,
         actions,
@@ -11587,7 +11956,9 @@ def _apply_reconcile_actions(
         expected_records = [
             record
             for record in pending_batch.records
-            if record.scope == pending_scope and record.action != "retire-absent"
+            if record.scope == pending_scope
+            and record.action
+            not in {"retire-absent", PENDING_RELINQUISH_FOREIGN_ACTION}
         ]
         if len(expected_records) != len(ordered_actions):
             raise SyncError(f"pending {pending_scope} action count changed")
@@ -12267,8 +12638,6 @@ def _managed_targets_after_reconciliation(
 ) -> set[PurePosixPath]:
     managed_targets = set(state.links)
     for action in actions:
-        if action.action not in {"create", "replace", "quarantine-replace"}:
-            continue
         try:
             relative_target = action.target.relative_to(home)
         except ValueError as error:
@@ -12277,7 +12646,13 @@ def _managed_targets_after_reconciliation(
             ) from error
         if not relative_target.parts:
             raise SyncError(f"managed target must not be sync home: {action.target}")
-        managed_targets.add(PurePosixPath(*relative_target.parts))
+        target = PurePosixPath(*relative_target.parts)
+        if action.action == PENDING_RELINQUISH_FOREIGN_ACTION:
+            managed_targets.discard(target)
+            continue
+        if action.action not in {"create", "replace", "quarantine-replace"}:
+            continue
+        managed_targets.add(target)
     return managed_targets
 
 
@@ -14499,7 +14874,7 @@ def _install_release_set_unlocked(
     _known_owners(home, install_owners)
     if not dry_run and not preflight_only:
         _try_cleanup_ready_pending_batches(home)
-    _verify_managed_state_current_claims(home, loaded_state)
+    _verify_managed_state_current_owner_claims(home, loaded_state)
     current_manifests = _installed_manifests(home)
     next_manifests = dict(current_manifests)
     for _source_root, _sha, manifest, _source_expectation in releases:
@@ -14571,9 +14946,15 @@ def _install_release_set_unlocked(
         state,
         allow_cross_owner=allow_cross_owner,
     )
+    _verify_managed_state_link_claims(home, state, actions)
+    link_actions = [
+        action
+        for action in actions
+        if action.action != PENDING_RELINQUISH_FOREIGN_ACTION
+    ]
     required_replacements = _required_replacements_for_removals(
         home,
-        actions,
+        link_actions,
         removed_links,
         desired_entries,
     )
@@ -14626,9 +15007,12 @@ def _install_release_set_unlocked(
     if preflight_only:
         return
     if dry_run:
+        for action in actions:
+            if action.action == PENDING_RELINQUISH_FOREIGN_ACTION:
+                print(f"would relinquish foreign managed claim {action.target}")
         _apply_reconcile_actions(
             home,
-            actions,
+            link_actions,
             dry_run=True,
             required_replacements=required_replacements,
         )
@@ -14769,7 +15153,7 @@ def _install_release_set_unlocked(
         )
         _apply_reconcile_actions(
             home,
-            actions,
+            link_actions,
             dry_run=False,
             required_replacements=required_replacements,
             pending_batch=pending_batch,
@@ -16119,7 +16503,7 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
             return
         if not dry_run:
             _try_cleanup_ready_pending_batches(home)
-        _verify_managed_state_current_claims(home, loaded_state)
+        _verify_managed_state_current_owner_claims(home, loaded_state)
         # Uncommitted recovery returns the exact restored before-state snapshot.
         # If that state was absent, plan this uninstall like a clean legacy retry
         # so the restored links are claimed before their owner is retired.
@@ -16189,18 +16573,27 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
             state,
             allow_cross_owner=True,
         )
+        _verify_managed_state_link_claims(home, state, actions)
+        link_actions = [
+            action
+            for action in actions
+            if action.action != PENDING_RELINQUISH_FOREIGN_ACTION
+        ]
         required_replacements = _required_replacements_for_removals(
             home,
-            actions,
+            link_actions,
             active_removed_links,
             desired_entries,
         )
         managed_targets = _managed_targets_after_reconciliation(home, state, actions)
         current = _current_link(home, owner)
         if dry_run:
+            for action in actions:
+                if action.action == PENDING_RELINQUISH_FOREIGN_ACTION:
+                    print(f"would relinquish foreign managed claim {action.target}")
             _apply_reconcile_actions(
                 home,
-                actions,
+                link_actions,
                 dry_run=True,
                 required_replacements=required_replacements,
             )
@@ -16332,7 +16725,7 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
             )
             _apply_reconcile_actions(
                 home,
-                actions,
+                link_actions,
                 dry_run=False,
                 required_replacements=required_replacements,
                 pending_batch=pending_batch,

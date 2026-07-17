@@ -167,6 +167,26 @@ def write_agent_only_release(release_root: Path, *, agent_text: str = "agent\n")
     )
 
 
+def write_reference_only_agent_release(
+    release_root: Path,
+    *,
+    agent_text: str = "agent\n",
+) -> None:
+    write_skill_manifest_release(
+        release_root,
+        skills=("reference-only-base",),
+    )
+    personal_root = release_root / "personal_codex"
+    (personal_root / "AGENTS.md").write_text(agent_text, encoding="utf-8")
+    manifest_path = personal_root / "sync-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["reference_only"] = ["personal_codex/AGENTS.md"]
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def write_rules_release(release_root: Path, *, agent_text: str = "agent\n") -> None:
     personal_root = release_root / "personal_codex"
     rules_root = personal_root / "rules"
@@ -307,6 +327,16 @@ def write_skill_manifest_release(
 
 def current_target(home: Path) -> str:
     return (home / "personal-sync" / "current").readlink().as_posix()
+
+
+def foreign_leaf_snapshot(path: Path) -> tuple[object, ...]:
+    metadata = path.lstat()
+    identity = (metadata.st_dev, metadata.st_ino)
+    if stat.S_ISLNK(metadata.st_mode):
+        return ("symlink", identity, path.readlink().as_posix())
+    if stat.S_ISREG(metadata.st_mode):
+        return ("file", identity, path.read_bytes())
+    return ("other", identity, stat.S_IFMT(metadata.st_mode))
 
 
 def write_scheduler_runner(home: Path) -> Path:
@@ -1826,6 +1856,92 @@ class CodexPersonalSyncTests(unittest.TestCase):
             {entry["owner"] for entry in state["links"]},
             {"public"},
         )
+
+    def test_uninstall_overlay_relinquishes_foreign_agents_claim(self) -> None:
+        home = self.root / "uninstall-foreign-agents" / "home" / ".codex"
+        public_release = self.root / "uninstall-foreign-agents" / "public"
+        private_release = self.root / "uninstall-foreign-agents" / "private"
+        write_reference_only_agent_release(public_release)
+        write_private_agent_release(private_release)
+        self.install_private_pair(
+            home,
+            public_release,
+            private_release,
+            public_sha=SHA1,
+            private_sha=SHA2,
+        )
+        agents = home / "AGENTS.md"
+        agents.unlink()
+        agents.write_text("local\n", encoding="utf-8")
+        foreign_before = foreign_leaf_snapshot(agents)
+
+        self.run_quietly(MODULE.uninstall_overlay, home, "private", dry_run=False)
+
+        private_current = (
+            home / "personal-sync" / "overlays" / "private" / "current"
+        )
+        self.assertFalse(os.path.lexists(private_current))
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+        self.assertEqual(foreign_leaf_snapshot(agents), foreign_before)
+        state = json.loads(MODULE._state_path(home).read_text(encoding="utf-8"))
+        self.assertEqual(state["owners"], {"public": SHA1})
+        self.assertNotIn(
+            "AGENTS.md",
+            {entry["target"] for entry in state["links"]},
+        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(home)))
+
+    def test_install_private_rejects_foreign_agents_while_still_mandatory(
+        self,
+    ) -> None:
+        home = self.root / "mandatory-foreign-agents" / "home" / ".codex"
+        public_one = self.root / "mandatory-foreign-agents" / "public-one"
+        public_two = self.root / "mandatory-foreign-agents" / "public-two"
+        private_one = self.root / "mandatory-foreign-agents" / "private-one"
+        private_two = self.root / "mandatory-foreign-agents" / "private-two"
+        write_reference_only_agent_release(public_one, agent_text="public-one\n")
+        write_reference_only_agent_release(public_two, agent_text="public-two\n")
+        write_private_agent_release(private_one, agent_text="private-one\n")
+        write_private_agent_release(private_two, agent_text="private-two\n")
+        self.install_private_pair(
+            home,
+            public_one,
+            private_one,
+            public_sha=SHA1,
+            private_sha=SHA2,
+        )
+        agents = home / "AGENTS.md"
+        agents.unlink()
+        agents.write_text("local\n", encoding="utf-8")
+        foreign_before = foreign_leaf_snapshot(agents)
+        state_before = MODULE._state_path(home).read_bytes()
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "managed state/link target mismatch",
+        ):
+            self.install_private_pair(
+                home,
+                public_two,
+                private_two,
+                public_sha=SHA3,
+                private_sha=SHA4,
+            )
+
+        self.assertEqual(foreign_leaf_snapshot(agents), foreign_before)
+        self.assertEqual(MODULE._state_path(home).read_bytes(), state_before)
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+        self.assertEqual(
+            (
+                home
+                / "personal-sync"
+                / "overlays"
+                / "private"
+                / "current"
+            ).readlink().as_posix(),
+            f"releases/{SHA2}",
+        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(home)))
 
     def test_uninstall_overlay_rolls_back_then_retries_after_write_failure(self) -> None:
         home = self.root / "home" / ".codex"
@@ -4888,6 +5004,97 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertEqual((home / "AGENTS.md").read_text(encoding="utf-8"), "local\n")
         self.assertTrue((home / "bin" / "example-tool").is_symlink())
 
+    def test_install_relinquishes_established_optional_agents_claim(self) -> None:
+        cases = (
+            ("file-public-optional", "file", True),
+            ("symlink-reference-only", "symlink", False),
+        )
+        for case, foreign_kind, next_declares_agents in cases:
+            with self.subTest(case=case):
+                home = self.root / case / "home" / ".codex"
+                release_one = self.root / case / "release-one"
+                release_two = self.root / case / "release-two"
+                write_agent_only_release(release_one, agent_text="one\n")
+                if next_declares_agents:
+                    write_agent_only_release(release_two, agent_text="two\n")
+                else:
+                    write_reference_only_agent_release(
+                        release_two,
+                        agent_text="two\n",
+                    )
+                self.run_quietly(
+                    MODULE.install_release_tree,
+                    release_one,
+                    home,
+                    SHA1,
+                    dry_run=False,
+                )
+                agents = home / "AGENTS.md"
+                agents.unlink()
+                if foreign_kind == "file":
+                    agents.write_text("local\n", encoding="utf-8")
+                else:
+                    dotfiles = self.root / case / "dotfiles"
+                    dotfiles.mkdir()
+                    local_agents = dotfiles / "AGENTS.md"
+                    local_agents.write_text("local\n", encoding="utf-8")
+                    agents.symlink_to(local_agents)
+                foreign_before = foreign_leaf_snapshot(agents)
+
+                self.run_quietly(
+                    MODULE.install_release_tree,
+                    release_two,
+                    home,
+                    SHA2,
+                    dry_run=False,
+                )
+
+                self.assertEqual(current_target(home), f"releases/{SHA2}")
+                self.assertEqual(foreign_leaf_snapshot(agents), foreign_before)
+                state = json.loads(
+                    MODULE._state_path(home).read_text(encoding="utf-8")
+                )
+                self.assertEqual(state["owners"], {"public": SHA2})
+                self.assertNotIn(
+                    "AGENTS.md",
+                    {entry["target"] for entry in state["links"]},
+                )
+                self.assertFalse(
+                    os.path.lexists(MODULE._pending_link_pointer_path(home))
+                )
+
+    def test_install_repairs_missing_established_optional_agents_claim(self) -> None:
+        home = self.root / "missing-optional" / "home" / ".codex"
+        release_one = self.root / "missing-optional" / "release-one"
+        release_two = self.root / "missing-optional" / "release-two"
+        write_agent_only_release(release_one, agent_text="one\n")
+        write_agent_only_release(release_two, agent_text="two\n")
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_one,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        (home / "AGENTS.md").unlink()
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_two,
+            home,
+            SHA2,
+            dry_run=False,
+        )
+
+        agents = home / "AGENTS.md"
+        self.assertTrue(agents.is_symlink())
+        self.assertEqual(agents.read_text(encoding="utf-8"), "two\n")
+        state = json.loads(MODULE._state_path(home).read_text(encoding="utf-8"))
+        agents_record = next(
+            entry for entry in state["links"] if entry["target"] == "AGENTS.md"
+        )
+        self.assertEqual(agents_record["release_sha"], SHA2)
+
     def test_install_release_tree_rejects_existing_non_symlink(self) -> None:
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
@@ -5241,6 +5448,47 @@ class CodexPersonalSyncTests(unittest.TestCase):
             {entry["release_sha"] for entry in state["links"]},
             {SHA1},
         )
+
+    def test_rollback_relinquishes_established_optional_agents_claim(self) -> None:
+        release_one = self.root / "rollback-optional-one"
+        release_two = self.root / "rollback-optional-two"
+        dotfiles = self.root / "rollback-optional-dotfiles"
+        home = self.root / "rollback-optional-home" / ".codex"
+        write_agent_only_release(release_one, agent_text="one\n")
+        write_agent_only_release(release_two, agent_text="two\n")
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_one,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_two,
+            home,
+            SHA2,
+            dry_run=False,
+        )
+        agents = home / "AGENTS.md"
+        agents.unlink()
+        dotfiles.mkdir()
+        local_agents = dotfiles / "AGENTS.md"
+        local_agents.write_text("local\n", encoding="utf-8")
+        agents.symlink_to(local_agents)
+        foreign_before = foreign_leaf_snapshot(agents)
+
+        self.run_quietly(MODULE.rollback, home, SHA1[:8])
+
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+        self.assertEqual(foreign_leaf_snapshot(agents), foreign_before)
+        state = json.loads(MODULE._state_path(home).read_text(encoding="utf-8"))
+        self.assertEqual(state["owners"], {"public": SHA1})
+        self.assertNotIn(
+            "AGENTS.md",
+            {entry["target"] for entry in state["links"]},
+        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(home)))
 
     def test_rollback_removes_stale_links_after_manifest_shrink(self) -> None:
         release_one = self.root / "release-one"

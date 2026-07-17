@@ -376,6 +376,140 @@ class SyncManifestChangeTests(unittest.TestCase):
             with self.subTest(repair_mask=repair_mask):
                 self.assertGreaterEqual(projected_size, actual_size)
 
+    def test_manifest_transition_projection_bounds_foreign_agents_relinquishment(
+        self,
+    ) -> None:
+        runtime = MODULE._sync_runtime_module()
+        links = {
+            "AGENTS.md": {
+                "source": "personal_codex/AGENTS.md",
+                "target": "AGENTS.md",
+                "kind": "file",
+            },
+            "skills/private-base": {
+                "source": "personal_codex/skills/private-base",
+                "target": "skills/private-base",
+                "kind": "skill",
+            },
+        }
+        profile = runtime._manifest_transition_capacity_profile(
+            "private",
+            links,
+            {},
+        )
+        projected_size = runtime._manifest_transition_metadata_size(
+            profile,
+            profile,
+        )
+        home = Path("/home/codex/.codex")
+        release_sha = profile.state.owners["private"]
+        agents_target = runtime.PurePosixPath("AGENTS.md")
+        agents_record = profile.state.links[agents_target]
+        state_after = runtime.ManagedState(
+            owners=dict(profile.state.owners),
+            links={
+                target: record
+                for target, record in profile.state.links.items()
+                if target != agents_target
+            },
+        )
+        actions = [
+            (
+                "current",
+                runtime.ReconcileAction(
+                    "replace",
+                    runtime._current_link(home, "private"),
+                    f"releases/{release_sha}",
+                    "directory",
+                    expected_link_target=runtime._MAX_PENDING_LINK_TARGET,
+                ),
+            ),
+            (
+                "managed",
+                runtime.ReconcileAction(
+                    runtime.PENDING_RELINQUISH_FOREIGN_ACTION,
+                    home / "AGENTS.md",
+                    "",
+                    agents_record.kind,
+                    planned_snapshot=runtime.ReconcileTargetSnapshot(
+                        parent_identity=runtime._MAX_PENDING_IDENTITY,
+                        link_identity=runtime._MAX_PENDING_IDENTITY,
+                        link_target=runtime._MAX_PENDING_LINK_TARGET,
+                        ancestor_identity=runtime._MAX_PENDING_IDENTITY,
+                    ),
+                ),
+            ),
+        ]
+        records = []
+        record_actions = {}
+        for scope, action in actions:
+            target = runtime.PurePosixPath(
+                *action.target.relative_to(home).parts
+            )
+            record_actions[(scope, target)] = action.action
+            records.append(
+                runtime._projected_pending_record_payload(
+                    home,
+                    scope,
+                    action,
+                    profile.state,
+                    profile.state,
+                    state_after,
+                    len(records),
+                )
+            )
+        payload = runtime._projected_pending_metadata_payload(
+            state_before_exists=True,
+            records=records,
+            claims_before=runtime._projected_pending_claim_payloads(
+                home,
+                "before",
+                profile.state,
+                record_actions,
+            ),
+            claims_after=runtime._projected_pending_claim_payloads(
+                home,
+                "after",
+                state_after,
+                record_actions,
+            ),
+            releases_before=runtime._projected_pending_release_payloads(
+                profile.state
+            ),
+            releases_after=runtime._projected_pending_release_payloads(
+                state_after
+            ),
+        )
+        actual_size = runtime._projected_json_size(
+            payload,
+            trailing_newline=True,
+        )
+
+        self.assertEqual(payload["version"], 5)
+        self.assertEqual(
+            len(os.fsencode(runtime._MAX_PENDING_LINK_TARGET)),
+            runtime.MAX_RECONCILE_LINK_TARGET_BYTES,
+        )
+        self.assertGreaterEqual(projected_size, actual_size)
+        with mock.patch.object(
+            runtime,
+            "MAX_MANAGED_STATE_BYTES",
+            projected_size,
+        ):
+            runtime._validate_manifest_transition_capacity(profile, profile)
+        with (
+            mock.patch.object(
+                runtime,
+                "MAX_MANAGED_STATE_BYTES",
+                projected_size - 1,
+            ),
+            self.assertRaisesRegex(
+                runtime.SyncError,
+                "metadata exceeds the size limit",
+            ),
+        ):
+            runtime._validate_manifest_transition_capacity(profile, profile)
+
     def test_manifest_transition_projection_bounds_mixed_actions(self) -> None:
         unchanged = tuple(f"keep-{index:02d}" for index in range(11))
         previous_raw = manifest(*unchanged, "changed", "deleted")
