@@ -104,7 +104,7 @@ superseded_by:
 - Add a combined public/private manifest capacity gate when the private release job has both exact manifests; the installer already performs this aggregate preflight and fails safely, while repository CI currently proves capacity one owner at a time.
 
 ## Evidence
-- Repository test command — 620 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
+- Repository test command — 621 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
 - Reconciliation safety module — 275 tests passed as part of the repository suite.
 - Runtime module — 153 tests passed.
 - Package builder safety module — 59 tests passed as part of the repository suite.
