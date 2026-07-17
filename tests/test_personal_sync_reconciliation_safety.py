@@ -3193,6 +3193,121 @@ class StatusManagedStateSafetyTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_hashes_each_release_once_per_status_operation(self) -> None:
+        second_release = self.root / "release-b"
+        write_skill_release(second_release)
+        install_quietly(second_release, self.home, SHA_B)
+        real_snapshot = MODULE._release_tree_snapshot_from_directory_fd
+        scanned_releases: list[str] = []
+
+        def count_release_snapshot(
+            root_fd: int,
+            display_root: Path,
+            *,
+            require_sanitized_modes: bool,
+        ):
+            scanned_releases.append(display_root.name)
+            return real_snapshot(
+                root_fd,
+                display_root,
+                require_sanitized_modes=require_sanitized_modes,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_release_tree_snapshot_from_directory_fd",
+                side_effect=count_release_snapshot,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            MODULE.status(self.home)
+            MODULE.status(self.home)
+
+        self.assertEqual(set(scanned_releases), {SHA_A, SHA_B})
+        self.assertEqual(scanned_releases.count(SHA_A), 2)
+        self.assertEqual(scanned_releases.count(SHA_B), 2)
+
+    def test_hashes_invalid_history_once_per_status_operation(self) -> None:
+        releases_root = MODULE._releases_root(self.home, MODULE.PUBLIC_OWNER)
+        invalid_release = releases_root / SHA_B
+        shutil.copytree(releases_root / SHA_A, invalid_release)
+        (invalid_release / MODULE.MANIFEST_RELATIVE_PATH).write_text(
+            "{",
+            encoding="utf-8",
+        )
+        real_snapshot = MODULE._release_tree_snapshot_from_directory_fd
+        scanned_releases: list[str] = []
+
+        def count_release_snapshot(
+            root_fd: int,
+            display_root: Path,
+            *,
+            require_sanitized_modes: bool,
+        ):
+            scanned_releases.append(display_root.name)
+            return real_snapshot(
+                root_fd,
+                display_root,
+                require_sanitized_modes=require_sanitized_modes,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_release_tree_snapshot_from_directory_fd",
+                side_effect=count_release_snapshot,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            MODULE.status(self.home)
+            MODULE.status(self.home)
+
+        self.assertEqual(set(scanned_releases), {SHA_A, SHA_B})
+        self.assertEqual(scanned_releases.count(SHA_A), 2)
+        self.assertEqual(scanned_releases.count(SHA_B), 2)
+
+    def test_private_status_hashes_public_and_private_once_per_operation(self) -> None:
+        private_release = self.root / "private-release"
+        write_skill_release(
+            private_release,
+            source_name="private",
+            target_name="private",
+            owner="private",
+            base_release_sha=SHA_A,
+        )
+        install_quietly(private_release, self.home, SHA_B)
+        real_snapshot = MODULE._release_tree_snapshot_from_directory_fd
+        scanned_releases: list[str] = []
+
+        def count_release_snapshot(
+            root_fd: int,
+            display_root: Path,
+            *,
+            require_sanitized_modes: bool,
+        ):
+            scanned_releases.append(display_root.name)
+            return real_snapshot(
+                root_fd,
+                display_root,
+                require_sanitized_modes=require_sanitized_modes,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_release_tree_snapshot_from_directory_fd",
+                side_effect=count_release_snapshot,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            MODULE.status(self.home, "private")
+            MODULE.status(self.home, "private")
+
+        self.assertEqual(set(scanned_releases), {SHA_A, SHA_B})
+        self.assertEqual(scanned_releases.count(SHA_A), 2)
+        self.assertEqual(scanned_releases.count(SHA_B), 2)
+
     def test_rejects_managed_link_parent_swap(self) -> None:
         target = self.home / "skills" / "example"
         target_parent = target.parent
@@ -3216,9 +3331,15 @@ class StatusManagedStateSafetyTests(unittest.TestCase):
             )
             target_parent.symlink_to(redirected_parent, target_is_directory=True)
 
-        def load_state_and_arm(path: Path):
+        def load_state_and_arm(
+            path: Path,
+            *,
+            manifest_cache: (
+                dict[tuple[str, str], MODULE.ManifestData | None] | None
+            ) = None,
+        ):
             nonlocal armed
-            state = real_load_state(path)
+            state = real_load_state(path, manifest_cache=manifest_cache)
             armed = True
             return state
 
@@ -10785,10 +10906,21 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             home: Path,
             owner: str,
             sha: str,
+            *,
+            manifest_cache: (
+                dict[tuple[str, str], MODULE.ManifestData | None] | None
+            ) = None,
         ) -> MODULE.ManifestData:
             if owner == MODULE.PUBLIC_OWNER and sha == SHA_B:
+                if manifest_cache is not None:
+                    manifest_cache[(owner, sha)] = counting_manifest
                 return counting_manifest
-            return real_load(home, owner, sha)
+            return real_load(
+                home,
+                owner,
+                sha,
+                manifest_cache=manifest_cache,
+            )
 
         with mock.patch.object(
             MODULE,

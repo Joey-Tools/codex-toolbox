@@ -3730,6 +3730,8 @@ def _managed_state_from_payload(
         ]
         | None
     ) = None,
+    *,
+    manifest_cache: dict[tuple[str, str], ManifestData | None] | None = None,
 ) -> ManagedState:
     version = data.get("version")
     if type(version) is not int or version != 1:
@@ -3777,6 +3779,8 @@ def _managed_state_from_payload(
 
     if manifest_entry_indexes is None:
         manifest_entry_indexes = {}
+    if manifest_cache is None:
+        manifest_cache = {}
     for owner, sha in owners.items():
         _ensure_safe_release_directory(
             home,
@@ -3785,7 +3789,12 @@ def _managed_state_from_payload(
             allow_missing=False,
         )
         try:
-            manifest = _load_installed_manifest_data(home, owner, sha)
+            manifest = _load_installed_manifest_data(
+                home,
+                owner,
+                sha,
+                manifest_cache=manifest_cache,
+            )
         except SyncError as error:
             raise SyncError(
                 f"managed link state references invalid release {owner}@{sha}: {error}"
@@ -3832,16 +3841,29 @@ def _managed_state_from_payload(
 
 def _load_managed_state_with_snapshot(
     home: Path,
+    *,
+    manifest_cache: dict[tuple[str, str], ManifestData | None] | None = None,
 ) -> tuple[ManagedState, ManagedStateFileSnapshot]:
     path = _state_path(home)
     data, snapshot = _load_managed_state_payload_with_snapshot(home, path)
     if data is None:
         return _empty_managed_state(), snapshot
-    return _managed_state_from_payload(home, data), snapshot
+    return _managed_state_from_payload(
+        home,
+        data,
+        manifest_cache=manifest_cache,
+    ), snapshot
 
 
-def _load_managed_state(home: Path) -> ManagedState:
-    state, _snapshot = _load_managed_state_with_snapshot(home)
+def _load_managed_state(
+    home: Path,
+    *,
+    manifest_cache: dict[tuple[str, str], ManifestData | None] | None = None,
+) -> ManagedState:
+    state, _snapshot = _load_managed_state_with_snapshot(
+        home,
+        manifest_cache=manifest_cache,
+    )
     return state
 
 
@@ -4649,7 +4671,12 @@ def _write_managed_state(
 
 
 
-def _current_manifest_data(home: Path, owner: str) -> ManifestData:
+def _current_manifest_data(
+    home: Path,
+    owner: str,
+    *,
+    manifest_cache: dict[tuple[str, str], ManifestData | None] | None = None,
+) -> ManifestData:
     sha = _current_sha(home, owner)
     if sha is None:
         return ManifestData(owner=owner, entries=[], removed_links=[])
@@ -4660,7 +4687,12 @@ def _current_manifest_data(home: Path, owner: str) -> ManifestData:
         allow_missing=False,
     )
     try:
-        manifest = _load_installed_manifest_data(home, owner, sha)
+        manifest = _load_installed_manifest_data(
+            home,
+            owner,
+            sha,
+            manifest_cache=manifest_cache,
+        )
     except SyncError as error:
         raise SyncError(
             f"current pointer references invalid release {owner}@{sha}: {error}"
@@ -11424,6 +11456,8 @@ def _known_manifest_target_parents(
     home: Path,
     entries: list[LinkEntry],
     owner: str | None = None,
+    *,
+    manifest_cache: dict[tuple[str, str], ManifestData | None] | None = None,
 ) -> set[Path]:
     parents = {home, home / "agents", home / "bin", home / "skills"}
     parents.update(_entry_target_path(home, entry).parent for entry in entries)
@@ -11447,6 +11481,7 @@ def _known_manifest_target_parents(
                 home,
                 manifest_owner,
                 release_dir.name,
+                manifest_cache=manifest_cache,
             ).entries
         except SyncError:
             continue
@@ -11457,6 +11492,8 @@ def _known_manifest_target_parents(
 def _known_manifest_link_targets(
     home: Path,
     entries: list[LinkEntry],
+    *,
+    manifest_cache: dict[tuple[str, str], ManifestData | None] | None = None,
 ) -> dict[Path, set[str]]:
     targets: dict[Path, set[str]] = {}
 
@@ -11488,6 +11525,7 @@ def _known_manifest_link_targets(
                 home,
                 owner,
                 release_dir.name,
+                manifest_cache=manifest_cache,
             ).entries
         except SyncError:
             continue
@@ -11496,10 +11534,21 @@ def _known_manifest_link_targets(
     return targets
 
 
-def find_stale_current_symlinks(home: Path, entries: list[LinkEntry]) -> list[Path]:
+def find_stale_current_symlinks(
+    home: Path,
+    entries: list[LinkEntry],
+    *,
+    manifest_cache: dict[tuple[str, str], ManifestData | None] | None = None,
+) -> list[Path]:
     managed_targets = {_entry_target_path(home, entry) for entry in entries}
     candidates: list[Path] = []
-    for parent in sorted(_known_manifest_target_parents(home, entries)):
+    for parent in sorted(
+        _known_manifest_target_parents(
+            home,
+            entries,
+            manifest_cache=manifest_cache,
+        )
+    ):
         if parent.is_dir():
             candidates.extend(parent.iterdir())
 
@@ -11522,10 +11571,20 @@ def find_stale_current_symlinks(home: Path, entries: list[LinkEntry]) -> list[Pa
 def plan_stale_current_link_removals(
     home: Path,
     entries: list[LinkEntry],
+    *,
+    manifest_cache: dict[tuple[str, str], ManifestData | None] | None = None,
 ) -> list[LinkAction]:
-    known_targets = _known_manifest_link_targets(home, entries)
+    known_targets = _known_manifest_link_targets(
+        home,
+        entries,
+        manifest_cache=manifest_cache,
+    )
     removals: list[LinkAction] = []
-    for stale_link in find_stale_current_symlinks(home, entries):
+    for stale_link in find_stale_current_symlinks(
+        home,
+        entries,
+        manifest_cache=manifest_cache,
+    ):
         expected_targets = known_targets.get(stale_link)
         if expected_targets is None or os.readlink(stale_link) not in expected_targets:
             continue
@@ -11982,8 +12041,31 @@ def _load_installed_manifest_data(
     home: Path,
     owner: str,
     sha: str,
+    *,
+    manifest_cache: dict[tuple[str, str], ManifestData | None] | None = None,
 ) -> ManifestData:
-    _payload, manifest, _tree_digest = _installed_release_identity(home, owner, sha)
+    owner = _validate_owner(owner)
+    sha = _validate_release_sha(sha)
+    cache_key = (owner, sha)
+    if manifest_cache is not None and cache_key in manifest_cache:
+        cached_manifest = manifest_cache[cache_key]
+        if cached_manifest is None:
+            raise SyncError(
+                f"installed release already failed validation: {owner}@{sha}"
+            )
+        return cached_manifest
+    try:
+        _payload, manifest, _tree_digest = _installed_release_identity(
+            home,
+            owner,
+            sha,
+        )
+    except SyncError:
+        if manifest_cache is not None:
+            manifest_cache[cache_key] = None
+        raise
+    if manifest_cache is not None:
+        manifest_cache[cache_key] = manifest
     return manifest
 
 
@@ -14578,9 +14660,28 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> None:
         print(f"{owner} is not installed under {_display_path(home)}")
         return
     release_root = _releases_root(home, owner) / sha
-    entries = _load_installed_manifest_data(home, owner, sha).entries
-    actions = plan_link_actions(home, entries)
-    stale_removals = plan_stale_current_link_removals(home, entries)
+    manifest_cache: dict[tuple[str, str], ManifestData | None] = {}
+    entries = _load_installed_manifest_data(
+        home,
+        owner,
+        sha,
+        manifest_cache=manifest_cache,
+    ).entries
+    public_entries = (
+        _current_manifest_data(
+            home,
+            PUBLIC_OWNER,
+            manifest_cache=manifest_cache,
+        ).entries
+        if any(entry.owner != PUBLIC_OWNER for entry in entries)
+        else None
+    )
+    actions = plan_link_actions(home, entries, public_entries=public_entries)
+    stale_removals = plan_stale_current_link_removals(
+        home,
+        entries,
+        manifest_cache=manifest_cache,
+    )
     print(f"current owner: {owner}")
     print(f"current release: {sha}")
     print(f"release root: {release_root}")
@@ -14598,7 +14699,7 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> None:
     if not _path_exists_or_is_link(state_path):
         print("managed link state: not initialized")
         return
-    state = _load_managed_state(home)
+    state = _load_managed_state(home, manifest_cache=manifest_cache)
     state_issues: list[str] = []
     if state.owners.get(owner) != sha:
         state_issues.append(
