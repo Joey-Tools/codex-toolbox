@@ -472,6 +472,222 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                 ]
             )
 
+    def test_release_validation_rejects_laundered_unrecorded_removal(self) -> None:
+        self.write_manifest(manifest("keep", "retired"))
+        older_sha = self.commit("Publish active retired link")
+        older_tag = f"personal-codex-20260715-000000-{older_sha[:7]}"
+        self.git("tag", older_tag, older_sha)
+
+        self.write_manifest(manifest("keep"))
+        newer_sha = self.commit("Publish unrecorded removal")
+        newer_tag = f"personal-codex-20260715-010000-{newer_sha[:7]}"
+        self.git("tag", newer_tag, newer_sha)
+
+        releases = [
+            complete_release(older_sha, tag=older_tag),
+            complete_release(newer_sha, tag=newer_tag),
+        ]
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": "token"}),
+            mock.patch.object(
+                MODULE,
+                "_iter_github_releases",
+                side_effect=lambda *_args: iter(releases),
+            ),
+            self.assertRaisesRegex(
+                MODULE.ValidationError,
+                f"later matching removed_links entry from release {older_sha}",
+            ),
+        ):
+            MODULE.main(
+                [
+                    "--repo-root",
+                    str(self.repo),
+                    "--manifest",
+                    MANIFEST.as_posix(),
+                    "--release-repo",
+                    "owner/repo",
+                ]
+            )
+
+    def test_release_validation_rejects_reused_historical_removal_id(self) -> None:
+        old_removal = removed("retired", "old-remove-retired")
+        self.write_manifest(
+            manifest("keep", "retired", removed_links=[old_removal])
+        )
+        older_sha = self.commit("Republish a previously removed link")
+        older_tag = f"personal-codex-20260715-000000-{older_sha[:7]}"
+        self.git("tag", older_tag, older_sha)
+
+        self.write_manifest(manifest("keep", removed_links=[old_removal]))
+        newer_sha = self.commit("Remove link without a new removal id")
+        newer_tag = f"personal-codex-20260715-010000-{newer_sha[:7]}"
+        self.git("tag", newer_tag, newer_sha)
+
+        releases = [
+            complete_release(older_sha, tag=older_tag),
+            complete_release(newer_sha, tag=newer_tag),
+        ]
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": "token"}),
+            mock.patch.object(
+                MODULE,
+                "_iter_github_releases",
+                side_effect=lambda *_args: iter(releases),
+            ),
+            self.assertRaisesRegex(
+                MODULE.ValidationError,
+                f"later matching removed_links entry from release {older_sha}",
+            ),
+        ):
+            MODULE.main(
+                [
+                    "--repo-root",
+                    str(self.repo),
+                    "--manifest",
+                    MANIFEST.as_posix(),
+                    "--release-repo",
+                    "owner/repo",
+                ]
+            )
+
+    def test_release_validation_allows_later_legacy_removal_repair(self) -> None:
+        old_removal = removed("retired", "old-remove-retired")
+        self.write_manifest(
+            manifest("keep", "retired", removed_links=[old_removal])
+        )
+        older_sha = self.commit("Republish a previously removed link")
+        older_tag = f"personal-codex-20260715-000000-{older_sha[:7]}"
+        self.git("tag", older_tag, older_sha)
+
+        self.write_manifest(manifest("keep", removed_links=[old_removal]))
+        newer_sha = self.commit("Publish unrecorded repeated removal")
+        newer_tag = f"personal-codex-20260715-010000-{newer_sha[:7]}"
+        self.git("tag", newer_tag, newer_sha)
+
+        repair_removal = removed("retired", "repair-remove-retired")
+        repair_removal["legacy"] = True
+        self.write_manifest(
+            manifest(
+                "keep",
+                removed_links=[old_removal, repair_removal],
+            )
+        )
+        self.commit("Repair historical removal ledger")
+        releases = [
+            complete_release(older_sha, tag=older_tag),
+            complete_release(newer_sha, tag=newer_tag),
+        ]
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": "token"}),
+            mock.patch.object(
+                MODULE,
+                "_iter_github_releases",
+                side_effect=lambda *_args: iter(releases),
+            ),
+            redirect_stdout(StringIO()),
+        ):
+            result = MODULE.main(
+                [
+                    "--repo-root",
+                    str(self.repo),
+                    "--manifest",
+                    MANIFEST.as_posix(),
+                    "--release-repo",
+                    "owner/repo",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+
+    def test_release_validation_allows_multiple_later_removal_episodes(
+        self,
+    ) -> None:
+        self.write_manifest(manifest("keep", "retired"))
+        oldest_sha = self.commit("Publish initial active link")
+        oldest_tag = f"personal-codex-20260715-000000-{oldest_sha[:7]}"
+        self.git("tag", oldest_tag, oldest_sha)
+
+        first_removal = removed("retired", "first-remove-retired")
+        self.write_manifest(manifest("keep", removed_links=[first_removal]))
+        middle_sha = self.commit("Publish first removal")
+        middle_tag = f"personal-codex-20260715-010000-{middle_sha[:7]}"
+        self.git("tag", middle_tag, middle_sha)
+
+        self.write_manifest(
+            manifest("keep", "retired", removed_links=[first_removal])
+        )
+        newest_sha = self.commit("Republish retired link")
+        newest_tag = f"personal-codex-20260715-020000-{newest_sha[:7]}"
+        self.git("tag", newest_tag, newest_sha)
+
+        second_removal = removed("retired", "second-remove-retired")
+        self.write_manifest(
+            manifest(
+                "keep",
+                removed_links=[first_removal, second_removal],
+            )
+        )
+        self.commit("Publish second removal")
+        releases = [
+            complete_release(oldest_sha, tag=oldest_tag),
+            complete_release(middle_sha, tag=middle_tag),
+            complete_release(newest_sha, tag=newest_tag),
+        ]
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": "token"}),
+            mock.patch.object(
+                MODULE,
+                "_iter_github_releases",
+                side_effect=lambda *_args: iter(releases),
+            ),
+            redirect_stdout(StringIO()),
+        ):
+            result = MODULE.main(
+                [
+                    "--repo-root",
+                    str(self.repo),
+                    "--manifest",
+                    MANIFEST.as_posix(),
+                    "--release-repo",
+                    "owner/repo",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+
+    def test_historical_removal_requires_replacement_retirement(self) -> None:
+        replacement = removed("old", "replace-old")
+        replacement["replacement_target"] = "skills/retired"
+        historical = manifest(
+            "retired",
+            removed_links=[replacement],
+        )
+        historical["owner"] = "overlay"
+
+        later_removal = removed("retired", "remove-retired")
+        later_removal["legacy"] = True
+        current = manifest(
+            "keep",
+            removed_links=[replacement, later_removal],
+        )
+        current["owner"] = "overlay"
+
+        historical_model = MODULE._manifest_model(
+            historical,
+            enforce_history_constraints=False,
+        )
+        current_model = MODULE._manifest_model(current)
+        with self.assertRaisesRegex(
+            MODULE.ValidationError,
+            "must retire historical replacements.*overlay:replace-old",
+        ):
+            MODULE._validate_historical_active_link_removals(
+                historical_model,
+                current_model,
+                release_sha="a" * 40,
+            )
+
     def test_release_validation_preserves_all_historical_removed_links(
         self,
     ) -> None:

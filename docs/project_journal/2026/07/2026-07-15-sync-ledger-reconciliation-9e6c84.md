@@ -18,7 +18,7 @@ superseded_by:
 ## Current State
 - Exact legacy links can be quarantined from `removed_links`; files, directories, unrelated links, and symlink parents are preserved.
 - CI validates removal history against the unique complete Release that is a Git descendant of every other complete Release candidate; release SHAs come from the unique uploaded archive/checksum pair, are batch-bound through local tags, and do not depend on a potentially movable `target_commitish` branch. Explicit target SHAs must still match, publish timestamps do not define version order, and incomparable histories fail closed.
-- Release-manifest validation unions the normalized `removed_links` history from every unique complete Release before checking the baseline transition. Historical entries must remain exact across releases and the current manifest, while a later commit may precisely restore a non-legacy tombstone that an intervening release dropped; historical replacement-retirement obligations remain enforced.
+- Release-manifest validation unions the normalized `removed_links` history from every unique complete Release before checking the baseline transition. Historical entries must remain exact across releases and the current manifest, while a later commit may precisely restore a non-legacy tombstone that an intervening release dropped; historical replacement-retirement obligations remain enforced. Every historical Release is also treated as a possible direct upgrade origin: an active link that is absent or changed in the current manifest requires at least one exact matching removal ID that origin has not seen, preserving repeated removal episodes while allowing explicit legacy repair of an older published omission.
 - Portable target identities reject case and Unicode aliases; replacements are verified before obsolete links are removed.
 - Cross-version target checks include both installed and incoming manifests, and replacement-retirement cycles are rejected.
 - Install and rollback activation plus overlay uninstall now use a durable exact-inode write-ahead log: a fixed regular-file pointer at the stable sync-home root binds one fsynced quarantine batch containing staged link inodes, preimages, and exact managed-state before/after evidence.
@@ -104,11 +104,11 @@ superseded_by:
 - Add a combined public/private manifest capacity gate when the private release job has both exact manifests; the installer already performs this aggregate preflight and fails safely, while repository CI currently proves capacity one owner at a time.
 
 ## Evidence
-- Repository test command — 615 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
+- Repository test command — 620 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
 - Reconciliation safety module — 275 tests passed as part of the repository suite.
 - Runtime module — 153 tests passed.
 - Package builder safety module — 59 tests passed as part of the repository suite.
 - Manifest change validation module — 79 tests passed as part of the repository suite.
-- Release baseline validation module — 25 tests passed.
+- Release baseline validation module — 30 tests passed.
 - Dedicated Python 3.9 compatibility selection — 9 tests passed.
 - Changed-file `ruff`, repository-wide `ruff`, `actionlint`, manifest change validation, project journal validation, Python compilation, and `git diff --check` passed.

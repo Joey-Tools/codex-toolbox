@@ -861,6 +861,72 @@ def _validate_removed_link_history_preserved(
         )
 
 
+def _validate_historical_active_link_removals(
+    historical: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    release_sha: str,
+) -> None:
+    historical_removed_ids = set(historical["removed"])
+    later_removed_by_identity: dict[
+        tuple[str, str, str],
+        list[dict[str, Any]],
+    ] = {}
+    for removed_id, entry in current["removed"].items():
+        if removed_id in historical_removed_ids:
+            continue
+        identity = (entry["source"], entry["target"], entry["kind"])
+        later_removed_by_identity.setdefault(identity, []).append(entry)
+
+    previous_replacements_by_target: dict[str, set[str]] = {}
+    for removed_id, entry in historical["removed"].items():
+        replacement_target = entry["replacement_target"]
+        if replacement_target is None:
+            continue
+        previous_replacements_by_target.setdefault(
+            replacement_target,
+            set(),
+        ).add(f"{historical['owner']}:{removed_id}")
+
+    for historical_link in sorted(
+        historical["links"].values(),
+        key=lambda entry: (entry["target"], entry["source"], entry["kind"]),
+    ):
+        if current["links"].get(historical_link["target"]) == historical_link:
+            continue
+        identity = (
+            historical_link["source"],
+            historical_link["target"],
+            historical_link["kind"],
+        )
+        matching_removals = later_removed_by_identity.get(identity, [])
+        if not matching_removals:
+            raise ValidationError(
+                "historical active link removal requires a later matching "
+                "removed_links entry"
+                f" from release {release_sha}: "
+                f"{historical_link['source']} -> {historical_link['target']} "
+                f"({historical_link['kind']})"
+            )
+        required_retirements: set[str] = set()
+        if historical_link["target"] not in current["links"]:
+            required_retirements = previous_replacements_by_target.get(
+                historical_link["target"],
+                set(),
+            )
+        if required_retirements and not any(
+            required_retirements.issubset(
+                set(matching_removal["retires_replacements"])
+            )
+            for matching_removal in matching_removals
+        ):
+            raise ValidationError(
+                "historical active link removal must retire historical "
+                f"replacements from release {release_sha}: "
+                f"{', '.join(sorted(required_retirements))}"
+            )
+
+
 def validate_manifest_change(
     previous_data: dict[str, Any],
     current_data: dict[str, Any],
@@ -2368,6 +2434,11 @@ def main(argv: list[str] | None = None) -> int:
             _validate_target_hierarchy_changes(
                 historical_targets - current_targets,
                 current_targets - historical_targets,
+            )
+            _validate_historical_active_link_removals(
+                historical_model,
+                current_model,
+                release_sha=release_sha,
             )
         verify_current_snapshot()
         _print_git_change_summary(repo_root, base_ref, manifest)
