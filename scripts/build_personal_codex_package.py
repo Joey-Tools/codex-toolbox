@@ -96,6 +96,10 @@ def _bounded_json_integer(raw_value: str) -> int:
     return int(raw_value)
 
 
+def _reject_json_constant(raw_value: str) -> Any:
+    raise ValueError(f"non-standard JSON constant is not allowed: {raw_value}")
+
+
 @dataclass(frozen=True)
 class _IndexEntry:
     mode: bytes
@@ -205,6 +209,7 @@ def _parse_manifest_bytes(payload: bytes, manifest_path: Path) -> dict[str, Any]
         data = json.loads(
             payload.decode("utf-8"),
             parse_int=_bounded_json_integer,
+            parse_constant=_reject_json_constant,
         )
     except UnicodeDecodeError as error:
         raise PackageError(f"manifest {manifest_path} is not valid UTF-8: {error}") from error
@@ -303,7 +308,12 @@ def _release_manifest_payload(manifest: dict[str, Any]) -> bytes:
     _validate_manifest_json_string_tokens(manifest)
     output = io.BytesIO()
     try:
-        encoder = json.JSONEncoder(indent=2, sort_keys=False, ensure_ascii=True)
+        encoder = json.JSONEncoder(
+            indent=2,
+            sort_keys=False,
+            ensure_ascii=True,
+            allow_nan=False,
+        )
         for chunk in encoder.iterencode(manifest):
             remaining = MAX_RELEASE_MANIFEST_BYTES - output.tell()
             if len(chunk) > remaining:

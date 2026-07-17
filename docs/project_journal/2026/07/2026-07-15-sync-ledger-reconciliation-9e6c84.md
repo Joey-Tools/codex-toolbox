@@ -44,7 +44,7 @@ superseded_by:
 - Desired-link, replacement, refresh, and published-ledger checks bind parent directories and roll back when mandatory links disappear or drift.
 - Release SHAs are validated at every install boundary, and beneath-root helpers reject dot-component and absolute/relative traversal attempts.
 - Overlay uninstall uses historical removals for cleanup while deriving replacement obligations only from the next active manifest set.
-- Archive extraction creates and publishes every member relative to bound directory descriptors, never overwrites concurrent leaves, and validates the complete extracted tree before returning its release root. It retains directory identities instead of one descriptor per directory, then reopens each path component with `O_NOFOLLOW` and verifies the recorded inode, keeping descriptor use constant even for large directory sets.
+- Archive extraction creates and publishes every member relative to bound directory descriptors, never overwrites concurrent leaves, and validates the complete extracted tree before returning its release root. The archive and destination's shared workspace is treated as the trusted anchor; every destination-parent component beneath it is opened with `O_NOFOLLOW` and inode verification, so an intermediate symlink cannot redirect extraction. It retains directory identities instead of one descriptor per directory, then reopens each path component with `O_NOFOLLOW` and verifies the recorded inode, keeping descriptor use constant even for large directory sets.
 - Checksum verification and extraction share one immutable unlinked archive snapshot; bounded regular-file reads, member and expanded-size limits, PAX metadata accounting, and complete content identities close path-replacement and in-place rewrite races.
 - Truncated gzip streams and corrupt deflate payloads are normalized to sync-domain errors during both archive inspection and extraction, avoiding raw decompressor exceptions after checksum acceptance.
 - Source release expectations flow from verified download through staging, while every active owner remains descriptor-bound across activation and managed-state publication; unchanged-owner or uninstall drift triggers rollback without deleting raced trees.
@@ -84,7 +84,7 @@ superseded_by:
 - GitHub release-history validation bounds each response, the page count, the total release count, and batch Git input/output; it normalizes malformed or over-deep JSON without traceback leakage and resolves commit-graph order with a fixed number of Git processes. Every authenticated complete Release manifest is deduplicated and batch-loaded to prove skip-upgrade target hierarchy and WAL capacity, while all declared historical removal targets remain subject to the same checks for legacy and not-yet-released state.
 - Every published personal-Codex Release must retain one complete uploaded archive/checksum pair with valid exact asset IDs and advertised sizes. All known release counts and compressed byte totals are preflighted before download; each distinct pair is checksum-bound to an immutable snapshot, scanned twice without extraction, and required to contain the unique exact package-root manifest. The archive manifest must match its Git commit with type-sensitive JSON equality, while a hard 2 GiB cross-release expanded-read budget is enforced inside both scan passes.
 - GitHub CLI JSON parsing normalizes oversized integers and recursion failures for both single and concatenated-page responses, so malformed remote data cannot escape the synchronizer error boundary with a traceback.
-- Current, historical, runtime, and GitHub JSON parsing rejects non-standard `NaN` and infinity constants, and generated Release manifests refuse non-finite programmatic values.
+- Runtime, builder, current, historical, and GitHub JSON parsing rejects non-standard `NaN` and infinity constants, and generated Release manifests refuse non-finite programmatic values.
 - Status reconciliation reads ledger-recorded links through descriptor-bound snapshots, rejects managed-link parent replacement instead of following a redirected path, and normalizes descriptor open/read races to sync-domain errors.
 - Read-only status validation records each full-tree manifest result or validation failure only for one status invocation, so public and overlay status scan every installed Release at most once per command without sharing cache with install, rollback, uninstall, or recovery.
 - First-bootstrap ownership reconstruction uses a separate cache scoped to one refresh operation, so each current or historical Release is fully hashed once while install, uninstall, rollback, and binding freshness checks continue to revalidate independently.
@@ -108,10 +108,10 @@ superseded_by:
 - Add a combined public/private manifest capacity gate when the private release job has both exact manifests; the installer already performs this aggregate preflight and fails safely, while repository CI currently proves capacity one owner at a time.
 
 ## Evidence
-- Repository test command — 652 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
+- Repository test command — 655 tests passed with Python 3.13.0 after integrating the latest `origin/master`; the upstream bounded-output consolidation replaced five guideline tests with one aggregate contract test.
 - Reconciliation safety module — 282 tests passed as part of the repository suite.
-- Runtime module — 153 tests passed.
-- Package builder safety module — 68 tests passed as part of the repository suite.
+- Runtime module — 151 tests passed.
+- Package builder safety module — 70 tests passed as part of the repository suite.
 - Manifest change validation module — 81 tests passed as part of the repository suite.
 - Release baseline validation module — 43 tests passed.
 - Authenticated historical Release validation — all 13 published archive/checksum pairs matched their corresponding Git manifests, with baseline `fdd4baaab300cd362d79a742bf75070b3b83f2d0`.

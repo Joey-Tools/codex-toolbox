@@ -1654,6 +1654,84 @@ def _archive_directory_open_flags() -> int:
     return flags
 
 
+def _archive_extraction_anchor(archive_path: Path, destination: Path) -> Path:
+    """Return the caller-owned workspace containing the archive and destination."""
+    archive_parent = Path(os.path.abspath(archive_path.parent))
+    destination_parent = Path(os.path.abspath(destination.parent))
+    if ".." in archive_path.parts or ".." in destination.parts:
+        raise SyncError("refusing archive extraction path with parent traversal")
+    try:
+        return Path(os.path.commonpath((archive_parent, destination_parent)))
+    except ValueError as error:
+        raise SyncError(
+            f"archive and destination do not share a trusted anchor: {destination}"
+        ) from error
+
+
+def _open_archive_directory_beneath(anchor: Path, directory: Path) -> int:
+    anchor = Path(os.path.abspath(anchor))
+    directory = Path(os.path.abspath(directory))
+    try:
+        parts = directory.relative_to(anchor).parts
+    except ValueError as error:
+        raise SyncError(
+            f"archive destination parent escapes its trusted anchor: {directory}"
+        ) from error
+    if any(part in {"", ".", ".."} for part in parts):
+        raise SyncError(f"refusing unsafe archive destination parent: {directory}")
+
+    anchor_fd = -1
+    directory_fd = -1
+    flags = _archive_directory_open_flags()
+    try:
+        anchor_fd = os.open(anchor, flags)
+        directory_fd = os.dup(anchor_fd)
+        for part in parts:
+            entry_metadata = os.stat(
+                part,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(entry_metadata.st_mode):
+                raise SyncError(
+                    f"refusing unsafe archive destination parent: {directory}"
+                )
+            next_fd = os.open(part, flags, dir_fd=directory_fd)
+            try:
+                bound_metadata = os.fstat(next_fd)
+                if (
+                    (entry_metadata.st_dev, entry_metadata.st_ino)
+                    != (bound_metadata.st_dev, bound_metadata.st_ino)
+                    or not _archive_entry_matches_fd(directory_fd, part, next_fd)
+                ):
+                    raise SyncError(
+                        f"archive destination ancestor changed: {directory}"
+                    )
+            except BaseException:
+                os.close(next_fd)
+                raise
+            previous_fd = directory_fd
+            directory_fd = next_fd
+            os.close(previous_fd)
+        if (
+            not _archive_path_matches_fd(anchor, anchor_fd)
+            or not _archive_path_matches_fd(directory, directory_fd)
+        ):
+            raise SyncError(f"archive destination ancestor changed: {directory}")
+        result = directory_fd
+        directory_fd = -1
+        return result
+    except OSError as error:
+        raise SyncError(
+            f"refusing unsafe archive destination parent: {directory}"
+        ) from error
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        if anchor_fd >= 0:
+            os.close(anchor_fd)
+
+
 def _create_archive_directory_at(parent_fd: int, name: str) -> int:
     temporary_name: str | None = None
     directory_fd: int | None = None
@@ -1706,15 +1784,16 @@ def _create_archive_directory_at(parent_fd: int, name: str) -> int:
         raise
 
 
-def _create_archive_destination(destination: Path) -> tuple[int, int]:
+def _create_archive_destination(
+    destination: Path,
+    destination_anchor: Path,
+) -> tuple[int, int]:
     if destination.name in {"", ".", ".."}:
         raise SyncError(f"refusing unsafe archive destination: {destination}")
-    try:
-        parent_fd = os.open(destination.parent, _archive_directory_open_flags())
-    except OSError as error:
-        raise SyncError(
-            f"refusing unsafe archive destination parent: {destination.parent}"
-        ) from error
+    parent_fd = _open_archive_directory_beneath(
+        destination_anchor,
+        destination.parent,
+    )
     destination_fd: int | None = None
     try:
         try:
@@ -2208,11 +2287,15 @@ def _validate_archive_tree_evidence(
 def _safe_extract_archive_snapshot(
     snapshot: Any,
     destination: Path,
+    destination_anchor: Path,
 ) -> tuple[Path, ReleaseTreeExpectation]:
     planned_members, release_root_parts, manifest_parts = _scan_archive_snapshot(
         snapshot
     )
-    parent_fd, destination_fd = _create_archive_destination(destination)
+    parent_fd, destination_fd = _create_archive_destination(
+        destination,
+        destination_anchor,
+    )
     directory_identities = {(): _directory_identity(destination_fd)}
     release_fd: int | None = None
     try:
@@ -2287,6 +2370,7 @@ def safe_extract_archive(archive_path: Path, destination: Path) -> Path:
         release_root, _release_expectation = _safe_extract_archive_snapshot(
             snapshot,
             destination,
+            _archive_extraction_anchor(archive_path, destination),
         )
         return release_root
     finally:
@@ -2300,7 +2384,11 @@ def verify_and_extract_archive(
 ) -> tuple[Path, ReleaseTreeExpectation]:
     snapshot = _verified_archive_snapshot(archive_path, checksum_path)
     try:
-        return _safe_extract_archive_snapshot(snapshot, destination)
+        return _safe_extract_archive_snapshot(
+            snapshot,
+            destination,
+            _archive_extraction_anchor(archive_path, destination),
+        )
     finally:
         snapshot.close()
 

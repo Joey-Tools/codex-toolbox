@@ -2471,6 +2471,30 @@ class PackageBuilderSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(BUILDER.PackageError, "invalid JSON"):
             BUILDER._parse_manifest_bytes(payload, Path("manifest.json"))
 
+    def test_manifest_parser_rejects_nonstandard_json_constants(self) -> None:
+        for constant in (b"NaN", b"Infinity", b"-Infinity"):
+            with self.subTest(constant=constant.decode("ascii")):
+                payload = b'{"version":1,"unknown":' + constant + b"}"
+
+                with self.assertRaisesRegex(
+                    BUILDER.PackageError,
+                    "invalid JSON: non-standard JSON constant",
+                ):
+                    BUILDER._parse_manifest_bytes(
+                        payload,
+                        Path("manifest.json"),
+                    )
+
+    def test_release_manifest_rejects_non_finite_programmatic_values(self) -> None:
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                BUILDER.PackageError,
+                "failed to serialize release manifest",
+            ):
+                BUILDER._release_manifest_payload(
+                    {"version": 1, "unknown": value}
+                )
+
     def test_release_manifest_rejects_escaped_surrogate_outside_paths(self) -> None:
         manifest = json.loads(
             rb'{"version":1,"unknown":{"nested":"\ud800"}}'.decode("utf-8")
