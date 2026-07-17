@@ -2241,6 +2241,14 @@ def _complete_release_identity(
         raise ValidationError(
             "complete published release has multiple matching checksum assets"
         )
+    matching_asset_count = len(archive_matches) + sum(
+        len(matches) for matches in checksum_matches.values()
+    )
+    if matching_asset_count != 2:
+        raise ValidationError(
+            "complete published release must contain exactly one personal-codex "
+            "tarball and its matching checksum asset"
+        )
     checksum_asset = matching_checksums[0]
     archive_name = archive_asset["name"]
     checksum_name = checksum_asset["name"]

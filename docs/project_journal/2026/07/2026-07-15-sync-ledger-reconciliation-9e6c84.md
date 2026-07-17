@@ -119,14 +119,14 @@ superseded_by:
 - Affected runtime and manifest-validation modules — 552 tests passed in 200.093 seconds.
 - Changed Python files — `ruff check`, Python compilation, and `git diff --check` passed.
 - Focused read-only security review of the optional-claim diff — no findings.
-- Repository test command — 718 tests passed with Python 3.13.0.
+- Repository test command — 720 tests passed with Python 3.13.0.
 - Reconciliation safety module — 299 tests passed, including locked recovery of a pending transaction that appears after first-bootstrap preflight.
-- Runtime module — 168 tests passed after workspace-capability and cleanup-lifecycle hardening.
+- Runtime module — 177 tests passed, including strict rejection of uploaded matching assets for any other SHA.
 - Workspace creation, replacement isolation, descriptor-close, and primary-error regression selection — 7 focused tests passed.
 - Strict JSON regression selection — 4 focused managed-state, WAL-pointer, single-page, and second-page tests passed in both the public and private runtime mirrors.
 - Package builder safety module — 70 tests passed as part of the repository suite.
 - Manifest change validation module — 81 tests passed as part of the repository suite.
-- Shared Release baseline and public Release workflow modules — 63 tests passed, including HEAD-bound repair eligibility, full-pair draft replacement, immutable identity checks, and final exact uploaded-pair validation.
+- Shared Release baseline and public Release workflow modules — 64 tests passed, including HEAD-bound repair eligibility, rejection of extra uploaded other-SHA assets, full-pair draft replacement, immutable identity checks, and final exact uploaded-pair validation.
 - Authenticated historical Release validation — all 13 published archive/checksum pairs matched their corresponding Git manifests, with baseline `fdd4baaab300cd362d79a742bf75070b3b83f2d0`.
 - Python 3.9 Release-history and manifest-serialization selection — 49 tests passed.
 - Changed-file `ruff`, repository-wide `ruff`, `actionlint`, manifest change validation, project journal validation, Python compilation, and `git diff --check` passed.

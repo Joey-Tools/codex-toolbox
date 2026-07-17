@@ -615,7 +615,7 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
         current_sha = "a" * 40
         historical_sha = "b" * 40
         historical_release = complete_release(historical_sha)
-        repairable_releases = [complete_release(current_sha) for _ in range(4)]
+        repairable_releases = [complete_release(current_sha) for _ in range(5)]
         for release_id, release in enumerate(repairable_releases, start=123):
             release["id"] = release_id
         repairable_releases[0]["assets"] = []
@@ -632,6 +632,14 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
             {
                 "id": 999,
                 "name": f"personal-codex-{'c' * 40}.tar.gz",
+                "size": 1,
+                "state": "uploaded",
+            }
+        )
+        repairable_releases[4]["assets"].append(
+            {
+                "id": 999,
+                "name": f"personal-codex-{'c' * 40}.sha256",
                 "size": 1,
                 "state": "uploaded",
             }
@@ -884,6 +892,33 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     MODULE.ValidationError,
                     "not uploaded",
+                ):
+                    MODULE._complete_release_identity(release)
+
+    def test_published_personal_release_rejects_extra_uploaded_other_sha_assets(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        other_sha = "b" * 40
+        cases = (
+            ("other-archive", f"personal-codex-{other_sha}.tar.gz"),
+            ("other-checksum", f"personal-codex-{other_sha}.sha256"),
+        )
+        for name, asset_name in cases:
+            with self.subTest(name=name):
+                release = complete_release(sha)
+                release["assets"].append(
+                    {
+                        "id": 999,
+                        "name": asset_name,
+                        "size": 1,
+                        "state": "uploaded",
+                    }
+                )
+                with self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    "multiple personal-codex tarball assets|"
+                    "exactly one personal-codex",
                 ):
                     MODULE._complete_release_identity(release)
 

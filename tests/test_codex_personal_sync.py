@@ -2334,6 +2334,37 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.SyncError, "not uploaded"):
                     MODULE.select_release_assets(release)
 
+    def test_select_release_assets_rejects_extra_uploaded_other_sha_assets(
+        self,
+    ) -> None:
+        cases = (
+            ("other-archive", f"personal-codex-{SHA2}.tar.gz"),
+            ("other-checksum", f"personal-codex-{SHA2}.sha256"),
+        )
+        for name, extra_name in cases:
+            with self.subTest(name=name):
+                release = {
+                    "tagName": "personal-codex-20260511-120000-1111111",
+                    "targetCommitish": SHA1,
+                    "assets": [
+                        github_release_asset(
+                            101,
+                            f"personal-codex-{SHA1}.tar.gz",
+                        ),
+                        github_release_asset(
+                            102,
+                            f"personal-codex-{SHA1}.sha256",
+                        ),
+                        github_release_asset(999, extra_name),
+                    ],
+                }
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "multiple tarball assets|exactly one personal-codex",
+                ):
+                    MODULE.select_release_assets(release)
+
     def test_select_release_assets_rejects_invalid_api_metadata(self) -> None:
         archive_name = f"personal-codex-{SHA1}.tar.gz"
         checksum_name = f"personal-codex-{SHA1}.sha256"

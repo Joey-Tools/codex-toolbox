@@ -1271,6 +1271,14 @@ def select_release_assets(release: dict[str, Any]) -> ReleaseAssets:
         raise SyncError(
             f"release {tag_name} has multiple checksum assets for {archive_name}"
         )
+    matching_asset_count = len(archive_matches) + sum(
+        len(matches) for matches in checksum_matches.values()
+    )
+    if matching_asset_count != 2:
+        raise SyncError(
+            f"release {tag_name} must contain exactly one personal-codex tarball "
+            "and its matching checksum asset"
+        )
     checksum_asset = matching_checksums[0]
     checksum_name = checksum_asset["name"]
     tag_short_sha = tag_match.group(1)
