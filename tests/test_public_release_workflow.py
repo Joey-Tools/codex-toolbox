@@ -27,6 +27,7 @@ def complete_release(
         "tag_name": tag or f"personal-codex-20260715-000000-{sha[:7]}",
         "target_commitish": sha,
         "draft": draft,
+        "prerelease": False,
         "assets": [
             {
                 "id": archive_id,
@@ -75,11 +76,16 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
 
     def run_publish_script(
         self,
-        initial_release: dict[str, object],
+        initial_release: dict[str, object] | list[dict[str, object]],
         *,
         final_release: dict[str, object] | None = None,
+        published_release: dict[str, object] | None = None,
     ) -> tuple[list[tuple[str, str]], SystemExit | None]:
         calls: list[tuple[str, str]] = []
+        initial_releases = (
+            initial_release if isinstance(initial_release, list) else [initial_release]
+        )
+        release_lookup_count = 0
 
         class FakeResponse:
             def __init__(self, payload: object) -> None:
@@ -97,12 +103,15 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
                 return self.body
 
         def fake_urlopen(request: object, *, timeout: int) -> FakeResponse:
+            nonlocal release_lookup_count
             self.assertEqual(timeout, 30)
             method = request.get_method()
             url = request.full_url
             calls.append((method, url))
             if method == "GET" and "/releases?per_page=" in url:
-                return FakeResponse([initial_release])
+                return FakeResponse(
+                    initial_releases if url.endswith("&page=1") else []
+                )
             if method == "DELETE" and "/releases/assets/" in url:
                 return FakeResponse(None)
             if method == "POST" and url.startswith("https://uploads.github.com/"):
@@ -115,11 +124,22 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
                     }
                 )
             if method == "GET" and url.endswith(f"/releases/{self.RELEASE_ID}"):
-                if final_release is None:
-                    raise AssertionError("unexpected final release lookup")
-                return FakeResponse(final_release)
+                release_lookup_count += 1
+                if release_lookup_count == 1:
+                    if final_release is None:
+                        raise AssertionError("unexpected final release lookup")
+                    return FakeResponse(final_release)
+                if release_lookup_count == 2:
+                    if published_release is not None:
+                        return FakeResponse(published_release)
+                    if final_release is None:
+                        raise AssertionError("unexpected published release lookup")
+                    default_published_release = dict(final_release)
+                    default_published_release["draft"] = False
+                    return FakeResponse(default_published_release)
+                raise AssertionError("unexpected extra release lookup")
             if method == "PATCH" and url.endswith(f"/releases/{self.RELEASE_ID}"):
-                return FakeResponse({"draft": False})
+                return FakeResponse({"untrusted": True})
             raise AssertionError(f"unexpected request: {method} {url}")
 
         exit_error = None
@@ -342,6 +362,62 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
                     )
                 )
 
+    def test_published_prerelease_does_not_anchor_formal_release(self) -> None:
+        prerelease = self.release(draft=False)
+        prerelease["prerelease"] = True
+        formal_release = self.release(draft=False)
+
+        calls, exit_error = self.run_publish_script(
+            [prerelease, formal_release]
+        )
+
+        self.assertIsNotNone(exit_error)
+        assert exit_error is not None
+        self.assertEqual(exit_error.code, 0)
+        self.assertFalse(
+            any(method in {"DELETE", "PATCH", "POST"} for method, _url in calls)
+        )
+
+    def test_prerelease_draft_fails_without_mutation(self) -> None:
+        initial_release = self.release(draft=True)
+        initial_release["prerelease"] = True
+
+        calls, exit_error = self.run_publish_script(initial_release)
+
+        self.assertIsNotNone(exit_error)
+        assert exit_error is not None
+        self.assertIn("must not be a prerelease", str(exit_error))
+        self.assertFalse(
+            any(method in {"DELETE", "PATCH", "POST"} for method, _url in calls)
+        )
+
+    def test_formal_candidate_flags_must_be_boolean_without_mutation(self) -> None:
+        cases = (
+            ("missing-prerelease", "prerelease", None),
+            ("string-prerelease", "prerelease", "false"),
+            ("missing-draft", "draft", None),
+            ("string-draft", "draft", "false"),
+        )
+        for name, field, invalid_value in cases:
+            with self.subTest(name=name):
+                initial_release = self.release(draft=True)
+                if invalid_value is None:
+                    initial_release.pop(field)
+                else:
+                    initial_release[field] = invalid_value
+
+                calls, exit_error = self.run_publish_script(initial_release)
+
+                self.assertIsNotNone(exit_error)
+                assert exit_error is not None
+                self.assertIn(f"invalid {field} flag", str(exit_error))
+                self.assertFalse(
+                    any(
+                        method in {"DELETE", "PATCH", "POST"}
+                        for method, _url in calls
+                    )
+                )
+
     def test_invalid_draft_tag_or_suffix_fails_before_asset_mutation(self) -> None:
         cases = (
             (
@@ -388,6 +464,7 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
             ),
             ("target_commitish", "b" * 40),
             ("draft", False),
+            ("prerelease", True),
         )
         for field, drifted_value in drift_cases:
             with self.subTest(field=field):
@@ -404,6 +481,23 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
                 assert exit_error is not None
                 self.assertIn("final release identity drift", str(exit_error))
                 self.assertFalse(any(method == "PATCH" for method, _url in calls))
+
+    def test_published_prerelease_drift_is_detected_after_patch(self) -> None:
+        initial_release = self.release(draft=True)
+        final_release = self.release(draft=True)
+        published_release = self.release(draft=False)
+        published_release["prerelease"] = True
+
+        calls, exit_error = self.run_publish_script(
+            initial_release,
+            final_release=final_release,
+            published_release=published_release,
+        )
+
+        self.assertIsNotNone(exit_error)
+        assert exit_error is not None
+        self.assertIn("published release identity drift", str(exit_error))
+        self.assertEqual(sum(method == "PATCH" for method, _url in calls), 1)
 
     def test_final_check_rejects_uploaded_pair_with_extra_pending_match(self) -> None:
         initial_release = self.release(draft=True)
@@ -464,6 +558,28 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
         self.assertFalse(
             any(method in {"DELETE", "PATCH", "POST"} for method, _url in calls)
         )
+
+    def test_draft_release_id_must_be_positive_integer_before_mutation(self) -> None:
+        cases = (("missing", None), ("zero", 0), ("boolean", True))
+        for name, invalid_id in cases:
+            with self.subTest(name=name):
+                initial_release = self.release(draft=True)
+                if invalid_id is None:
+                    initial_release.pop("id")
+                else:
+                    initial_release["id"] = invalid_id
+
+                calls, exit_error = self.run_publish_script(initial_release)
+
+                self.assertIsNotNone(exit_error)
+                assert exit_error is not None
+                self.assertIn("invalid release id", str(exit_error))
+                self.assertFalse(
+                    any(
+                        method in {"DELETE", "PATCH", "POST"}
+                        for method, _url in calls
+                    )
+                )
 
     def test_published_release_does_not_accept_pending_assets_by_name(self) -> None:
         initial_release = self.release(draft=False, asset_state="new")

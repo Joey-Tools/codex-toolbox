@@ -262,6 +262,16 @@ jobs:
                       f"{context} tag suffix does not match target SHA: {tag_name}"
                   )
 
+          def validated_release_id(release_snapshot, *, context):
+              release_id = release_snapshot.get("id")
+              if (
+                  not isinstance(release_id, int)
+                  or isinstance(release_id, bool)
+                  or release_id <= 0
+              ):
+                  raise SystemExit(f"{context} has invalid release id: {release_id}")
+              return release_id
+
           def matching_personal_assets(release_assets):
               matching_assets = []
               for release_asset in release_assets:
@@ -353,8 +363,23 @@ jobs:
               ):
                   continue
               validate_release_tag(tag_name, context="release candidate")
+              prerelease = candidate.get("prerelease")
+              if not isinstance(prerelease, bool):
+                  raise SystemExit(
+                      f"release candidate {tag_name} has invalid prerelease flag"
+                  )
+              if prerelease:
+                  if candidate.get("draft") is True:
+                      raise SystemExit(
+                          f"draft release candidate {tag_name} must not be a prerelease"
+                      )
+                  continue
+              if not isinstance(candidate.get("draft"), bool):
+                  raise SystemExit(
+                      f"release candidate {tag_name} has invalid draft flag"
+                  )
               release = candidate
-              if release.get("draft", False):
+              if release["draft"]:
                   break
               uploaded_asset_names = uploaded_expected_asset_names(
                   release.get("assets", []),
@@ -392,6 +417,12 @@ jobs:
               )
           if release.get("draft") is not True:
               raise SystemExit(f"release {tag} must remain a draft during asset upload")
+          if release.get("prerelease") is not False:
+              raise SystemExit(f"draft release {tag} must not be a prerelease")
+          release_id = validated_release_id(
+              release,
+              context=f"draft release {tag}",
+          )
           uploaded_asset_names = prepare_draft_assets(release)
 
           content_types = {
@@ -404,7 +435,7 @@ jobs:
                   continue
               suffix = ".sha256" if asset.name.endswith(".sha256") else asset.suffix
               url = (
-                  f"{upload_root}/repos/{repo}/releases/{release['id']}/assets"
+                  f"{upload_root}/repos/{repo}/releases/{release_id}/assets"
                   f"?name={quote(asset.name)}"
               )
               request = Request(
@@ -433,11 +464,17 @@ jobs:
           if not expected_asset_names <= uploaded_asset_names:
               raise SystemExit(f"uploaded asset mismatch: {sorted(uploaded_asset_names)}")
           final_release = request_json(
-              f"{api_root}/repos/{repo}/releases/{release['id']}"
+              f"{api_root}/repos/{repo}/releases/{release_id}"
           )
           if not isinstance(final_release, dict):
               raise SystemExit(f"final release lookup failed for draft release {tag}")
-          identity_fields = ("id", "tag_name", "target_commitish", "draft")
+          identity_fields = (
+              "id",
+              "tag_name",
+              "target_commitish",
+              "draft",
+              "prerelease",
+          )
           identity_drift = {
               field: (release.get(field), final_release.get(field))
               for field in identity_fields
@@ -457,9 +494,40 @@ jobs:
                   f"{sorted(final_uploaded_asset_names)}"
               )
           request_json(
-              f"{api_root}/repos/{repo}/releases/{release['id']}",
+              f"{api_root}/repos/{repo}/releases/{release_id}",
               method="PATCH",
               payload={"draft": False},
           )
+          published_release = request_json(
+              f"{api_root}/repos/{repo}/releases/{release_id}"
+          )
+          if not isinstance(published_release, dict):
+              raise SystemExit(f"published release lookup failed for {tag}")
+          expected_published_identity = {
+              "id": release_id,
+              "tag_name": tag,
+              "target_commitish": sha,
+              "draft": False,
+              "prerelease": False,
+          }
+          published_identity_drift = {
+              field: (expected, published_release.get(field))
+              for field, expected in expected_published_identity.items()
+              if published_release.get(field) != expected
+          }
+          if published_identity_drift:
+              raise SystemExit(
+                  f"published release identity drift for {tag}: "
+                  f"{published_identity_drift}"
+              )
+          published_asset_names = uploaded_expected_asset_names(
+              published_release.get("assets", []),
+              context=f"published release {tag} final check",
+          )
+          if expected_asset_names != published_asset_names:
+              raise SystemExit(
+                  "published uploaded asset mismatch: "
+                  f"{sorted(published_asset_names)}"
+              )
           print(f"Published {tag}")
           PY
