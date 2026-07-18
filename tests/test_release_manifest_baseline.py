@@ -870,6 +870,40 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                 ):
                     MODULE._complete_release_identities(repository, "token")
 
+    def test_legacy_mutable_exception_requires_exact_target_commitish(
+        self,
+    ) -> None:
+        missing = object()
+        cases = (
+            ("branch", "main"),
+            ("missing", missing),
+            ("null", None),
+            ("empty", ""),
+            ("malformed", "not-a-commit-sha"),
+        )
+        for repository, release in configured_legacy_mutable_releases():
+            for name, target_commitish in cases:
+                invalid_release = deepcopy(release)
+                if target_commitish is missing:
+                    invalid_release.pop("target_commitish")
+                else:
+                    invalid_release["target_commitish"] = target_commitish
+                with (
+                    self.subTest(repository=repository, target=name),
+                    mock.patch.object(
+                        MODULE,
+                        "_iter_github_releases",
+                        side_effect=lambda *_args, value=invalid_release: iter(
+                            [value]
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.ValidationError,
+                        "pinned legacy identity",
+                    ),
+                ):
+                    MODULE._complete_release_identities(repository, "token")
+
     def test_legacy_mutable_release_identity_drift_fails_closed(self) -> None:
         def set_nested_value(
             payload: dict[str, object],

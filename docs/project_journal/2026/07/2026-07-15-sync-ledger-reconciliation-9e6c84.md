@@ -127,7 +127,7 @@ superseded_by:
 - Affected runtime and manifest-validation modules — 552 tests passed in 200.093 seconds.
 - Changed Python files — `ruff check`, Python compilation, and `git diff --check` passed.
 - Focused read-only security review of the optional-claim diff — no findings.
-- Repository test command — 761 tests passed in 148.070 seconds with Python 3.13.0 after immutable-history enforcement and bounded directory-tree identity/copy handling. The test process used a process-local `commit.gpgsign=false` override; no Git configuration was changed.
+- Repository test command — 762 tests passed in 162.528 seconds with Python 3.13.0 after immutable-history enforcement, exact legacy `target_commitish` binding, and bounded directory-tree identity/copy handling. The test process used a process-local `commit.gpgsign=false` override; no Git configuration was changed.
 - Reconciliation safety module — 302 tests passed, including existing-ledger tombstone preservation for update and uninstall plus first-bootstrap legacy cleanup.
 - Runtime module — 177 tests passed, including conservative rejection and zero-destruction rollback for existing-ledger tombstone replacement and removal scenarios.
 - Workspace creation, replacement isolation, descriptor-close, and primary-error regression selection — 7 focused tests passed.
@@ -135,7 +135,7 @@ superseded_by:
 - Package builder safety module — 70 tests passed as part of the repository suite.
 - Manifest change validation module — 81 tests passed as part of the repository suite.
 - Shared Release baseline and public Release workflow modules — 82 tests passed in 20.943 seconds, including HEAD-bound repair eligibility, rejection of extra uploaded other-SHA assets, 7–40-character tag suffixes, full-pair draft replacement, local/remote size and SHA-256 binding, immutable identity checks, and final exact uploaded-pair validation.
-- Complete Release trust boundary — 244 runtime and baseline tests passed together, including exact legacy mutable identity drift, incomplete-HEAD isolation, directory member/path/byte limits, and identity-to-copy growth rejection; the final repository run includes all 60 Release-baseline tests.
+- Complete Release trust boundary — 245 runtime and baseline tests passed together across the final focused runs, including exact legacy mutable identity and `target_commitish` drift, incomplete-HEAD isolation, directory member/path/byte limits, and identity-to-copy growth rejection; the final repository run includes all 61 Release-baseline tests.
 - Authenticated historical Release validation — all 13 published archive/checksum pairs matched the complete normalized trees of their corresponding Git commits, with baseline `fdd4baaab300cd362d79a742bf75070b3b83f2d0`.
 - Python 3.9 Release-history and manifest-serialization selection — 49 tests passed.
 - Changed-file `ruff`, repository-wide `ruff`, `actionlint`, manifest change validation, project journal validation, Python compilation, and `git diff --check` passed.

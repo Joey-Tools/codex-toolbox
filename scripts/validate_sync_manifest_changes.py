@@ -2948,7 +2948,10 @@ def _validate_complete_release_immutability(
             checksum_size=identity.checksum_size,
             checksum_digest=identity.checksum_digest,
         )
-        if _LEGACY_MUTABLE_RELEASES.get(repository) == legacy_identity:
+        if (
+            release.get("target_commitish") == identity.sha
+            and _LEGACY_MUTABLE_RELEASES.get(repository) == legacy_identity
+        ):
             return
 
     raise ValidationError(
