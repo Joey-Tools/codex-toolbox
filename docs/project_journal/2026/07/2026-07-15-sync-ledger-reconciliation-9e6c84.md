@@ -3,7 +3,7 @@ id: 20260715-9e6c84
 title: Sync Ledger Reconciliation
 status: completed
 created: 2026-07-15
-updated: 2026-07-17
+updated: 2026-07-18
 branch: codex/sync-ledger-reconciliation
 pr: https://github.com/Joey-Tools/codex-toolbox/pull/15
 supersedes: []
@@ -81,7 +81,7 @@ superseded_by:
 - Public draft-Release repair validates the timestamped tag with a 7–40 character prefix of the exact target SHA, the target SHA itself, a positive non-boolean Release ID, non-prerelease flags, and all distinct positive matching asset IDs before mutation. Every formal draft matching set, including an apparently complete uploaded pair, is replaced from one bounded local archive/checksum byte snapshot instead of trusting remote contents by name; prerelease drafts are left untouched, published prereleases do not anchor a formal release, and the workflow re-fetches the same Release both before and after publishing it.
 - Public Release reuse and publication bind the exact two remote assets to that local snapshot through non-boolean IDs, uploaded state, exact byte size, and GitHub's lowercase `sha256:` digest. Published reuse and the final post-publication snapshot additionally require GitHub's immutable flag, while any identity, flag, or content drift fails closed before reuse or after publication.
 - Runtime Release discovery rejects mutable formal releases and requires GitHub's lowercase SHA-256 digest for both selected assets. Download, manifest-only inspection, and extraction verify those advertised digests while streaming the bounded archive and checksum snapshots.
-- The shared history validator exposes only a HEAD-bound incomplete-Release repair preflight: it may omit at most one immutable-metadata-valid published Release at exact `HEAD`, never omits an already complete pair, and keeps every other historical Release strict. Callers must run the ordinary strict validation again after repair.
+- The shared history validator exposes only a HEAD-bound incomplete-Release repair preflight: it may omit at most one identity-valid published Release at exact `HEAD`, never omits an already complete pair, and keeps every other historical Release strict. Callers must run the ordinary strict validation again after repair, where every complete Release must satisfy the immutable gate or its exact legacy pin.
 - Reconciliation plans bind the nearest existing ancestor plus the exact parent and leaf inode/target; missing parents are published exclusively and reused only through transaction-owned identities.
 - Install, uninstall, and `current` mutations fail closed on same-target inode or parent replacement, while failed destructive transactions restore the original quarantined inode without overwriting concurrent content.
 - Manifest-change validation applies the same 4 MiB raw and formatted payload limits to current and historical manifests, resolving exact Git commits and blobs before bounded reads.
@@ -94,7 +94,9 @@ superseded_by:
 - Public package and manifest validation now reject active removal records whose replacement target is neither present nor explicitly retired, matching the runtime release-set obligation before publication.
 - GitHub release-history validation bounds each response, the page count, the total release count, and batch Git input/output; it normalizes malformed or over-deep JSON without traceback leakage and resolves commit-graph order with a fixed number of Git processes. Every authenticated complete Release manifest is deduplicated and batch-loaded to prove skip-upgrade target hierarchy and WAL capacity, while all declared historical removal targets remain subject to the same checks for legacy and not-yet-released state.
 - Every published personal-Codex Release must retain one complete uploaded archive/checksum pair with valid exact asset IDs, advertised sizes, and lowercase GitHub SHA-256 digests. All known release counts and compressed byte totals are preflighted before download; each distinct pair is API-digest- and checksum-bound to an immutable snapshot, scanned twice without extraction, and required to contain the unique exact package-root manifest. The archive manifest must match its Git commit with type-sensitive JSON equality, and a normalized logical-tree digest binds every selected file's content and mode plus empty and implicit directories to the corresponding historical Git commit. Historical tree construction reads commit objects directly, applies the builder's generated-file exclusions, and shares bounded member, blob, and expanded-byte budgets with archive inspection.
+- Complete published Releases must report `immutable: true`. The only compatibility exception is one exact repository-scoped legacy mutable Release identity, pinned by Release ID, tag, commit SHA, and both assets' IDs, sizes, and API digests; any metadata drift fails closed, while the separate incomplete-HEAD repair preflight remains isolated from this trust decision.
 - Historical tree path validation includes the fixed `personal-codex-<sha>/` package-root prefix in the archive byte and depth limits, so a commit cannot describe a tree that the builder or runtime archive validator would reject only after prefixing.
+- Directory-backed Release identity, staging copy, and source revalidation share archive-equivalent member, path, per-file, and total expanded-byte budgets. Limits are enforced before hashing or copying, directory enumeration is bounded, and deep recursion is normalized to a sync-domain error.
 - GitHub CLI JSON parsing normalizes oversized integers, recursion failures, and non-standard numeric constants for both single and concatenated-page responses, so malformed remote data cannot escape the synchronizer error boundary with a traceback. The same strict decoder rejects `NaN` and infinity tokens in managed state and pending-WAL pointer payloads before unknown fields or schema details can be ignored.
 - Runtime, builder, current, historical, and GitHub JSON parsing rejects non-standard `NaN` and infinity constants, and generated Release manifests refuse non-finite programmatic values.
 - Status reconciliation reads ledger-recorded links through descriptor-bound snapshots, rejects managed-link parent replacement instead of following a redirected path, and normalizes descriptor open/read races to sync-domain errors.
@@ -125,7 +127,7 @@ superseded_by:
 - Affected runtime and manifest-validation modules — 552 tests passed in 200.093 seconds.
 - Changed Python files — `ruff check`, Python compilation, and `git diff --check` passed.
 - Focused read-only security review of the optional-claim diff — no findings.
-- Repository test command — 750 tests passed in 136.838 seconds with Python 3.13.0 after the complete Release-tree binding, package-root path-budget fix, and older-history mismatch regression.
+- Repository test command — 761 tests passed in 148.070 seconds with Python 3.13.0 after immutable-history enforcement and bounded directory-tree identity/copy handling. The test process used a process-local `commit.gpgsign=false` override; no Git configuration was changed.
 - Reconciliation safety module — 302 tests passed, including existing-ledger tombstone preservation for update and uninstall plus first-bootstrap legacy cleanup.
 - Runtime module — 177 tests passed, including conservative rejection and zero-destruction rollback for existing-ledger tombstone replacement and removal scenarios.
 - Workspace creation, replacement isolation, descriptor-close, and primary-error regression selection — 7 focused tests passed.
@@ -133,7 +135,7 @@ superseded_by:
 - Package builder safety module — 70 tests passed as part of the repository suite.
 - Manifest change validation module — 81 tests passed as part of the repository suite.
 - Shared Release baseline and public Release workflow modules — 82 tests passed in 20.943 seconds, including HEAD-bound repair eligibility, rejection of extra uploaded other-SHA assets, 7–40-character tag suffixes, full-pair draft replacement, local/remote size and SHA-256 binding, immutable identity checks, and final exact uploaded-pair validation.
-- Complete Release tree binding — 230 runtime and baseline tests passed together before the final path/history regressions; the final 750-test repository run includes all 55 Release-baseline tests.
+- Complete Release trust boundary — 244 runtime and baseline tests passed together, including exact legacy mutable identity drift, incomplete-HEAD isolation, directory member/path/byte limits, and identity-to-copy growth rejection; the final repository run includes all 60 Release-baseline tests.
 - Authenticated historical Release validation — all 13 published archive/checksum pairs matched the complete normalized trees of their corresponding Git commits, with baseline `fdd4baaab300cd362d79a742bf75070b3b83f2d0`.
 - Python 3.9 Release-history and manifest-serialization selection — 49 tests passed.
 - Changed-file `ruff`, repository-wide `ruff`, `actionlint`, manifest change validation, project journal validation, Python compilation, and `git diff --check` passed.

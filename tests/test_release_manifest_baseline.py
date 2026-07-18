@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import importlib.util
@@ -93,6 +94,7 @@ def complete_release(
     checksum_size: int = 1,
     archive_digest: object = "sha256:" + "a" * 64,
     checksum_digest: object = "sha256:" + "b" * 64,
+    immutable: object = True,
 ) -> dict[str, object]:
     asset_id_base = int(sha[:12], 16) * 2 + 1
     return {
@@ -101,6 +103,7 @@ def complete_release(
         "draft": draft,
         "prerelease": prerelease,
         "published_at": published_at,
+        "immutable": immutable,
         "assets": [
             {
                 "id": archive_id if archive_id is not None else asset_id_base,
@@ -118,6 +121,27 @@ def complete_release(
             },
         ],
     }
+
+
+def configured_legacy_mutable_releases() -> list[
+    tuple[str, dict[str, object]]
+]:
+    releases = []
+    for repository, identity in MODULE._LEGACY_MUTABLE_RELEASES.items():
+        release = complete_release(
+            identity.sha,
+            tag=identity.tag_name,
+            archive_id=identity.archive_id,
+            archive_size=identity.archive_size,
+            archive_digest=identity.archive_digest,
+            checksum_id=identity.checksum_id,
+            checksum_size=identity.checksum_size,
+            checksum_digest=identity.checksum_digest,
+            immutable=False,
+        )
+        release["id"] = identity.release_id
+        releases.append((repository, release))
+    return releases
 
 
 class VerifiedReleaseManifestRuntimeTests(unittest.TestCase):
@@ -748,6 +772,238 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
         self.assertIn("page=1", request_json.call_args_list[0].args[0])
         self.assertIn("page=2", request_json.call_args_list[1].args[0])
 
+    def test_complete_release_immutability_requires_true_boolean(self) -> None:
+        sha = "a" * 40
+        release = complete_release(sha)
+        with mock.patch.object(
+            MODULE,
+            "_iter_github_releases",
+            side_effect=lambda *_args: iter([release]),
+        ):
+            identities = MODULE._complete_release_identities(
+                "owner/repo",
+                "token",
+            )
+        self.assertEqual([identity.sha for identity in identities], [sha])
+
+        missing = object()
+        cases = (
+            ("false", False, "pinned legacy identity"),
+            ("missing", missing, "immutable=true"),
+            ("null", None, "immutable=true"),
+            ("integer", 1, "immutable=true"),
+            ("string", "true", "immutable=true"),
+        )
+        for name, immutable, error_pattern in cases:
+            invalid_release = complete_release(sha)
+            if immutable is missing:
+                invalid_release.pop("immutable")
+            else:
+                invalid_release["immutable"] = immutable
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    MODULE,
+                    "_iter_github_releases",
+                    side_effect=lambda *_args, value=invalid_release: iter(
+                        [value]
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    error_pattern,
+                ),
+            ):
+                MODULE._complete_release_identities("owner/repo", "token")
+
+    def test_configured_legacy_mutable_releases_are_accepted(self) -> None:
+        releases = configured_legacy_mutable_releases()
+        self.assertGreaterEqual(len(releases), 1)
+        for repository, release in releases:
+            with (
+                self.subTest(repository=repository),
+                mock.patch.object(
+                    MODULE,
+                    "_iter_github_releases",
+                    side_effect=lambda *_args, value=release: iter([value]),
+                ),
+            ):
+                identities = MODULE._complete_release_identities(
+                    repository,
+                    "token",
+                )
+            self.assertEqual(
+                [identity.sha for identity in identities],
+                [release["target_commitish"]],
+            )
+
+    def test_legacy_mutable_exception_requires_exact_false_boolean(
+        self,
+    ) -> None:
+        missing = object()
+        cases = (
+            ("missing", missing),
+            ("null", None),
+            ("integer", 0),
+            ("string", "false"),
+        )
+        for repository, release in configured_legacy_mutable_releases():
+            for name, immutable in cases:
+                invalid_release = deepcopy(release)
+                if immutable is missing:
+                    invalid_release.pop("immutable")
+                else:
+                    invalid_release["immutable"] = immutable
+                with (
+                    self.subTest(repository=repository, immutable=name),
+                    mock.patch.object(
+                        MODULE,
+                        "_iter_github_releases",
+                        side_effect=lambda *_args, value=invalid_release: iter(
+                            [value]
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.ValidationError,
+                        "immutable=true",
+                    ),
+                ):
+                    MODULE._complete_release_identities(repository, "token")
+
+    def test_legacy_mutable_release_identity_drift_fails_closed(self) -> None:
+        def set_nested_value(
+            payload: dict[str, object],
+            path: tuple[str | int, ...],
+            value: object,
+        ) -> None:
+            cursor: object = payload
+            for component in path[:-1]:
+                if isinstance(component, int):
+                    assert isinstance(cursor, list)
+                    cursor = cursor[component]
+                else:
+                    assert isinstance(cursor, dict)
+                    cursor = cursor[component]
+            key = path[-1]
+            assert isinstance(cursor, dict)
+            assert isinstance(key, str)
+            cursor[key] = value
+
+        releases = configured_legacy_mutable_releases()
+        self.assertGreaterEqual(len(releases), 1)
+        for repository, base_release in releases:
+            sha = base_release["target_commitish"]
+            release_id = base_release["id"]
+            assets = base_release["assets"]
+            assert isinstance(sha, str)
+            assert type(release_id) is int
+            assert isinstance(assets, list)
+            archive = assets[0]
+            checksum = assets[1]
+            assert isinstance(archive, dict)
+            assert isinstance(checksum, dict)
+            archive_id = archive["id"]
+            archive_size = archive["size"]
+            checksum_id = checksum["id"]
+            checksum_size = checksum["size"]
+            assert type(archive_id) is int
+            assert type(archive_size) is int
+            assert type(checksum_id) is int
+            assert type(checksum_size) is int
+
+            alternate_sha = "f" * 40
+            drift_cases = (
+                (
+                    "repository",
+                    f"{repository}-recreated",
+                    (),
+                ),
+                (
+                    "release-id",
+                    repository,
+                    ((("id",), release_id + 1),),
+                ),
+                (
+                    "tag",
+                    repository,
+                    (
+                        (
+                            ("tag_name",),
+                            f"personal-codex-20991231-235959-{sha[:7]}",
+                        ),
+                    ),
+                ),
+                (
+                    "sha",
+                    repository,
+                    (
+                        (("target_commitish",), alternate_sha),
+                        (
+                            ("tag_name",),
+                            "personal-codex-20991231-235959-fffffff",
+                        ),
+                        (
+                            ("assets", 0, "name"),
+                            f"personal-codex-{alternate_sha}.tar.gz",
+                        ),
+                        (
+                            ("assets", 1, "name"),
+                            f"personal-codex-{alternate_sha}.sha256",
+                        ),
+                    ),
+                ),
+                (
+                    "archive-id",
+                    repository,
+                    ((("assets", 0, "id"), archive_id + 1),),
+                ),
+                (
+                    "archive-size",
+                    repository,
+                    ((("assets", 0, "size"), archive_size + 1),),
+                ),
+                (
+                    "archive-digest",
+                    repository,
+                    ((("assets", 0, "digest"), "sha256:" + "0" * 64),),
+                ),
+                (
+                    "checksum-id",
+                    repository,
+                    ((("assets", 1, "id"), checksum_id + 1),),
+                ),
+                (
+                    "checksum-size",
+                    repository,
+                    ((("assets", 1, "size"), checksum_size + 1),),
+                ),
+                (
+                    "checksum-digest",
+                    repository,
+                    ((("assets", 1, "digest"), "sha256:" + "0" * 64),),
+                ),
+            )
+            for name, candidate_repository, updates in drift_cases:
+                release = deepcopy(base_release)
+                for path, value in updates:
+                    set_nested_value(release, path, value)
+                with (
+                    self.subTest(repository=repository, drift=name),
+                    mock.patch.object(
+                        MODULE,
+                        "_iter_github_releases",
+                        side_effect=lambda *_args, value=release: iter([value]),
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.ValidationError,
+                        "pinned legacy identity",
+                    ),
+                ):
+                    MODULE._complete_release_identities(
+                        candidate_repository,
+                        "token",
+                    )
+
     def test_published_personal_release_requires_complete_uploaded_pair(
         self,
     ) -> None:
@@ -875,6 +1131,35 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                 "token",
                 repair_incomplete_release_sha="c" * 40,
             )
+
+    def test_repair_skips_incomplete_head_before_immutable_validation(
+        self,
+    ) -> None:
+        current_sha = "a" * 40
+        historical_sha = "b" * 40
+        current_release = complete_release(current_sha)
+        current_release["id"] = 123
+        current_release["assets"] = []
+        current_release.pop("immutable")
+        historical_release = complete_release(historical_sha)
+
+        with mock.patch.object(
+            MODULE,
+            "_iter_github_releases",
+            side_effect=lambda *_args: iter(
+                [current_release, historical_release]
+            ),
+        ):
+            identities = MODULE._complete_release_identities(
+                "owner/repo",
+                "token",
+                repair_incomplete_release_sha=current_sha,
+            )
+
+        self.assertEqual(
+            [identity.sha for identity in identities],
+            [historical_sha],
+        )
 
     def test_repair_requires_valid_unique_matching_asset_ids(self) -> None:
         current_sha = "a" * 40

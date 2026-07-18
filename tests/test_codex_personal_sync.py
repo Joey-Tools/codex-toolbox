@@ -455,6 +455,18 @@ class CodexPersonalSyncTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return callback(*args, **kwargs)
 
+    def snapshot_release_tree(self, release_root: Path):
+        release_fd = os.open(release_root, MODULE._source_directory_flags())
+        try:
+            return MODULE._release_tree_snapshot_from_directory_fd(
+                release_fd,
+                release_root,
+                require_sanitized_modes=False,
+                capture_limits={},
+            )
+        finally:
+            os.close(release_fd)
+
     @contextlib.contextmanager
     def capture_reconcile_backups(self):
         events: list[tuple[str, str, str | None, str | None]] = []
@@ -3940,6 +3952,161 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     with self.assertRaisesRegex(MODULE.SyncError, expected):
                         self.safe_extract_archive(archive_path, destination)
                 self.assertFalse(destination.exists())
+
+    def test_release_tree_snapshot_rejects_deep_path_before_recursing(self) -> None:
+        release_root = self.root / "deep-release-tree"
+        release_root.mkdir()
+        current = release_root
+        for _ in range(MODULE.MAX_ARCHIVE_MEMBER_PATH_DEPTH + 1):
+            current /= "d"
+            current.mkdir()
+
+        with self.assertRaisesRegex(MODULE.SyncError, "path exceeds depth limit"):
+            self.snapshot_release_tree(release_root)
+
+    def test_release_tree_snapshot_enforces_path_byte_limits(self) -> None:
+        cases = (
+            (
+                "path-bytes",
+                ("aa", "bb"),
+                "MAX_ARCHIVE_MEMBER_PATH_BYTES",
+                4,
+                "path exceeds UTF-8 byte limit",
+            ),
+            (
+                "component-bytes",
+                ("wide",),
+                "MAX_ARCHIVE_MEMBER_COMPONENT_BYTES",
+                3,
+                "path component exceeds UTF-8 byte limit",
+            ),
+        )
+        for name, parts, limit_name, limit, expected in cases:
+            with self.subTest(limit=name):
+                release_root = self.root / f"bounded-release-tree-{name}"
+                release_root.mkdir()
+                target = release_root.joinpath(*parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"x")
+
+                with (
+                    mock.patch.object(MODULE, limit_name, limit),
+                    self.assertRaisesRegex(MODULE.SyncError, expected),
+                ):
+                    self.snapshot_release_tree(release_root)
+
+    def test_release_tree_snapshot_rejects_too_many_entries_before_hashing(
+        self,
+    ) -> None:
+        release_root = self.root / "many-entry-release-tree"
+        release_root.mkdir()
+        nested = release_root / "a"
+        nested.mkdir()
+        (nested / "a").write_bytes(b"a")
+        (nested / "b").write_bytes(b"b")
+        (release_root / "b").write_bytes(b"b")
+
+        with (
+            mock.patch.object(MODULE, "MAX_ARCHIVE_MEMBERS", 4),
+            mock.patch.object(
+                MODULE,
+                "_hash_exact_regular_file",
+                side_effect=AssertionError("file hashed after entry limit"),
+            ) as hash_file,
+            self.assertRaisesRegex(MODULE.SyncError, "path entry limit"),
+        ):
+            self.snapshot_release_tree(release_root)
+
+        hash_file.assert_not_called()
+
+    def test_release_tree_snapshot_rejects_oversized_file_before_hashing(
+        self,
+    ) -> None:
+        release_root = self.root / "oversized-release-tree"
+        release_root.mkdir()
+        (release_root / "payload.bin").write_bytes(b"long")
+
+        with (
+            mock.patch.object(MODULE, "MAX_ARCHIVE_MEMBER_BYTES", 3),
+            mock.patch.object(
+                MODULE,
+                "_hash_exact_regular_file",
+                side_effect=AssertionError("oversized file hashed"),
+            ) as hash_file,
+            self.assertRaisesRegex(MODULE.SyncError, "file exceeds expanded byte limit"),
+        ):
+            self.snapshot_release_tree(release_root)
+
+        hash_file.assert_not_called()
+
+    def test_release_tree_snapshot_rejects_aggregate_size_before_next_hash(
+        self,
+    ) -> None:
+        release_root = self.root / "aggregate-release-tree"
+        release_root.mkdir()
+        (release_root / "a").write_bytes(b"abc")
+        (release_root / "b").write_bytes(b"def")
+        real_hash = MODULE._hash_exact_regular_file
+
+        with (
+            mock.patch.object(MODULE, "MAX_ARCHIVE_MEMBER_BYTES", 10),
+            mock.patch.object(MODULE, "MAX_ARCHIVE_EXPANDED_BYTES", 5),
+            mock.patch.object(
+                MODULE,
+                "_hash_exact_regular_file",
+                wraps=real_hash,
+            ) as hash_file,
+            self.assertRaisesRegex(MODULE.SyncError, "total expanded byte limit"),
+        ):
+            self.snapshot_release_tree(release_root)
+
+        self.assertEqual(hash_file.call_count, 1)
+
+    def test_copy_tree_rejects_growth_after_identity_before_next_copy(self) -> None:
+        release_root = self.root / "growing-release-tree"
+        destination = self.root / "growing-release-destination"
+        write_minimal_release(release_root)
+        MODULE._source_release_identity(release_root, None)
+        baseline_files = tuple(
+            path for path in release_root.rglob("*") if path.is_file()
+        )
+        baseline_bytes = sum(path.stat().st_size for path in baseline_files)
+        (release_root / "zz-growth.bin").write_bytes(b"abc")
+        destination.mkdir()
+        source_fd = os.open(release_root, MODULE._source_directory_flags())
+        destination_fd = os.open(destination, MODULE._source_directory_flags())
+        real_copy = MODULE._copy_bytes
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "MAX_ARCHIVE_EXPANDED_BYTES",
+                    baseline_bytes + 2,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_copy_bytes",
+                    wraps=real_copy,
+                ) as copy_bytes,
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "total expanded byte limit",
+                ),
+            ):
+                MODULE._copy_tree_from_directory_fd(
+                    source_fd,
+                    destination_fd,
+                    release_root,
+                    MODULE.PurePosixPath(),
+                    {},
+                    {},
+                )
+        finally:
+            os.close(destination_fd)
+            os.close(source_fd)
+
+        self.assertEqual(copy_bytes.call_count, len(baseline_files))
+        self.assertFalse((destination / "zz-growth.bin").exists())
 
     def test_safe_extract_counts_pax_metadata_against_expanded_limit(self) -> None:
         archive_path = self.root / "pax-metadata-limit.tar.gz"

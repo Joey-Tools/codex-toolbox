@@ -13666,6 +13666,55 @@ def _release_tree_digest_field(digest: Any, payload: bytes) -> None:
     digest.update(payload)
 
 
+@dataclass
+class _ReleaseTreeResourceBudget:
+    path_entries: int = 0
+    expanded_bytes: int = 0
+
+    @property
+    def remaining_path_entries(self) -> int:
+        return MAX_ARCHIVE_MEMBERS - self.path_entries
+
+    def reserve_path_entries(self, count: int = 1) -> None:
+        if count > self.remaining_path_entries:
+            raise SyncError(
+                f"release tree exceeds {MAX_ARCHIVE_MEMBERS} path entry limit"
+            )
+        self.path_entries += count
+
+    def reserve_file_bytes(
+        self,
+        size: int,
+        display_path: Path,
+    ) -> None:
+        if size < 0 or size > MAX_ARCHIVE_MEMBER_BYTES:
+            raise SyncError(
+                "release tree file exceeds expanded byte limit: "
+                f"{display_path}: {size} > {MAX_ARCHIVE_MEMBER_BYTES}"
+            )
+        next_expanded_bytes = self.expanded_bytes + size
+        if next_expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise SyncError(
+                "release tree exceeds total expanded byte limit: "
+                f"{next_expanded_bytes} > {MAX_ARCHIVE_EXPANDED_BYTES}"
+            )
+        self.expanded_bytes = next_expanded_bytes
+
+
+def _validated_release_tree_child_path(
+    relative_root: PurePosixPath,
+    name: str,
+) -> PurePosixPath:
+    relative_name = (
+        f"{relative_root.as_posix()}/{name}" if relative_root.parts else name
+    )
+    try:
+        relative_parts = _validated_archive_member_parts(relative_name)
+    except SyncError as error:
+        raise SyncError(f"invalid release tree path: {error}") from error
+    return PurePosixPath(*relative_parts)
+
+
 def _release_tree_snapshot_from_directory_fd(
     root_fd: int,
     display_root: Path,
@@ -13688,6 +13737,7 @@ def _release_tree_snapshot_from_directory_fd(
     source_snapshots: dict[PurePosixPath, _ReleaseSourceSnapshot] = {}
     source_members: dict[PurePosixPath, tuple[str, ...]] = {}
     captured_files: dict[PurePosixPath, bytes] = {}
+    resource_budget = _ReleaseTreeResourceBudget()
 
     def normalized_mode(metadata: os.stat_result, display_path: Path) -> int:
         actual_mode = stat.S_IMODE(metadata.st_mode)
@@ -13735,10 +13785,17 @@ def _release_tree_snapshot_from_directory_fd(
             # mode can vary by extractor without changing packaged content.
             0 if not relative_root.parts else directory_mode,
         )
-        names = _directory_member_names(directory_fd)
+        names = _directory_member_names(
+            directory_fd,
+            maximum_entries=resource_budget.remaining_path_entries,
+            overflow_message=(
+                f"release tree exceeds {MAX_ARCHIVE_MEMBERS} path entry limit"
+            ),
+        )
+        resource_budget.reserve_path_entries(len(names))
         source_members[relative_root] = names
         for name in names:
-            relative_path = relative_root / name
+            relative_path = _validated_release_tree_child_path(relative_root, name)
             display_path = display_root / Path(*relative_path.parts)
             try:
                 named_metadata = os.stat(
@@ -13797,6 +13854,10 @@ def _release_tree_snapshot_from_directory_fd(
                     directory_fd,
                     name,
                     snapshot,
+                    display_path,
+                )
+                resource_budget.reserve_file_bytes(
+                    opened_snapshot.size,
                     display_path,
                 )
                 capture_limit = (
@@ -13860,7 +13921,14 @@ def _release_tree_snapshot_from_directory_fd(
             finally:
                 if file_fd >= 0:
                     _close_fd_quietly(file_fd)
-        if _directory_member_names(directory_fd) != names:
+        current_names = _directory_member_names(
+            directory_fd,
+            maximum_entries=len(names),
+            overflow_message=(
+                f"release tree directory changed while hashing: {display_directory}"
+            ),
+        )
+        if current_names != names:
             raise SyncError(
                 f"release tree directory changed while hashing: {display_directory}"
             )
@@ -13870,7 +13938,11 @@ def _release_tree_snapshot_from_directory_fd(
             display_directory,
         )
 
-    visit_directory(root_fd, PurePosixPath())
+    resource_budget.reserve_path_entries()
+    try:
+        visit_directory(root_fd, PurePosixPath())
+    except RecursionError as error:
+        raise SyncError("release tree exceeds safe traversal depth") from error
     if manifest_payload is None:
         raise SyncError(f"release manifest is missing: {display_root / MANIFEST_RELATIVE_PATH}")
     return (
@@ -13897,8 +13969,19 @@ def _release_tree_digest_from_directory_fd(
     return digest
 
 
-def _directory_member_names(directory_fd: int) -> tuple[str, ...]:
-    return tuple(sorted(entry.name for entry in os.scandir(directory_fd)))
+def _directory_member_names(
+    directory_fd: int,
+    *,
+    maximum_entries: int | None = None,
+    overflow_message: str = "directory exceeds entry limit",
+) -> tuple[str, ...]:
+    names: list[str] = []
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            if maximum_entries is not None and len(names) >= maximum_entries:
+                raise SyncError(overflow_message)
+            names.append(entry.name)
+    return tuple(sorted(names))
 
 
 def _open_source_directory_entry(
@@ -13916,23 +13999,35 @@ def _open_source_directory_entry(
         raise
 
 
-def _copy_tree_from_directory_fd(
+def _copy_tree_from_directory_fd_with_budget(
     source_fd: int,
     destination_fd: int,
     display_root: Path,
     relative_root: PurePosixPath,
     source_snapshots: dict[PurePosixPath, _ReleaseSourceSnapshot],
     source_members: dict[PurePosixPath, tuple[str, ...]],
+    resource_budget: _ReleaseTreeResourceBudget,
 ) -> None:
+    display_directory = display_root / Path(*relative_root.parts)
     directory_metadata = os.fstat(source_fd)
     if not stat.S_ISDIR(directory_metadata.st_mode):
-        raise SyncError(f"release source is not a directory: {display_root}")
+        raise SyncError(f"release source is not a directory: {display_directory}")
     directory_snapshot = _release_source_snapshot(directory_metadata)
     source_snapshots[relative_root] = directory_snapshot
-    names = _directory_member_names(source_fd)
+    changed_message = (
+        f"release source directory changed during copy: {display_directory}"
+    )
+    names = _directory_member_names(
+        source_fd,
+        maximum_entries=resource_budget.remaining_path_entries,
+        overflow_message=(
+            f"release tree exceeds {MAX_ARCHIVE_MEMBERS} path entry limit"
+        ),
+    )
+    resource_budget.reserve_path_entries(len(names))
     source_members[relative_root] = names
     for name in names:
-        relative_path = relative_root / name
+        relative_path = _validated_release_tree_child_path(relative_root, name)
         display_path = display_root / Path(*relative_path.parts)
         metadata = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
         snapshot = _release_source_snapshot(metadata)
@@ -13952,13 +14047,14 @@ def _copy_tree_from_directory_fd(
                     _source_directory_flags(),
                     dir_fd=destination_fd,
                 )
-                _copy_tree_from_directory_fd(
+                _copy_tree_from_directory_fd_with_budget(
                     child_source_fd,
                     child_destination_fd,
                     display_root,
                     relative_path,
                     source_snapshots,
                     source_members,
+                    resource_budget,
                 )
                 os.fchmod(child_destination_fd, _sanitized_release_mode(metadata))
                 os.fsync(child_destination_fd)
@@ -13990,6 +14086,7 @@ def _copy_tree_from_directory_fd(
             snapshot,
             display_path,
         )
+        resource_budget.reserve_file_bytes(opened_snapshot.size, display_path)
         destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         destination_flags |= getattr(os, "O_CLOEXEC", 0)
         destination_flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -14028,13 +14125,44 @@ def _copy_tree_from_directory_fd(
             _close_fd_quietly(child_source_fd)
             if file_fd >= 0:
                 _close_fd_quietly(file_fd)
-    if _directory_member_names(source_fd) != names:
-        raise SyncError(f"release source directory changed during copy: {display_root}")
+    if (
+        _directory_member_names(
+            source_fd,
+            maximum_entries=len(names),
+            overflow_message=changed_message,
+        )
+        != names
+    ):
+        raise SyncError(changed_message)
     _require_release_source_unchanged(
         directory_snapshot,
         os.fstat(source_fd),
-        display_root / Path(*relative_root.parts),
+        display_directory,
     )
+
+
+def _copy_tree_from_directory_fd(
+    source_fd: int,
+    destination_fd: int,
+    display_root: Path,
+    relative_root: PurePosixPath,
+    source_snapshots: dict[PurePosixPath, _ReleaseSourceSnapshot],
+    source_members: dict[PurePosixPath, tuple[str, ...]],
+) -> None:
+    resource_budget = _ReleaseTreeResourceBudget()
+    resource_budget.reserve_path_entries()
+    try:
+        _copy_tree_from_directory_fd_with_budget(
+            source_fd,
+            destination_fd,
+            display_root,
+            relative_root,
+            source_snapshots,
+            source_members,
+            resource_budget,
+        )
+    except RecursionError as error:
+        raise SyncError("release tree exceeds safe traversal depth") from error
 
 
 def _source_metadata_at_relative(
@@ -14053,14 +14181,25 @@ def _source_metadata_at_relative(
 def _source_directory_members_at_relative(
     root_fd: int,
     relative_path: PurePosixPath,
+    *,
+    maximum_entries: int | None = None,
+    overflow_message: str = "directory exceeds entry limit",
 ) -> tuple[str, ...]:
     if not relative_path.parts:
-        return _directory_member_names(root_fd)
+        return _directory_member_names(
+            root_fd,
+            maximum_entries=maximum_entries,
+            overflow_message=overflow_message,
+        )
     parent_fd, name = _open_relative_parent_fd(root_fd, relative_path)
     directory_fd = -1
     try:
         directory_fd = os.open(name, _source_directory_flags(), dir_fd=parent_fd)
-        return _directory_member_names(directory_fd)
+        return _directory_member_names(
+            directory_fd,
+            maximum_entries=maximum_entries,
+            overflow_message=overflow_message,
+        )
     finally:
         if directory_fd >= 0:
             _close_fd_quietly(directory_fd)
@@ -14089,16 +14228,20 @@ def _verify_release_source_snapshot(
             )
     for relative_path, expected_names in source_members.items():
         display_path = display_root / Path(*relative_path.parts)
+        changed_message = (
+            f"release source directory changed during {operation}: {display_path}"
+        )
         try:
-            current_names = _source_directory_members_at_relative(root_fd, relative_path)
-        except OSError as error:
-            raise SyncError(
-                f"release source directory changed during {operation}: {display_path}"
-            ) from error
-        if current_names != expected_names:
-            raise SyncError(
-                f"release source directory changed during {operation}: {display_path}"
+            current_names = _source_directory_members_at_relative(
+                root_fd,
+                relative_path,
+                maximum_entries=len(expected_names),
+                overflow_message=changed_message,
             )
+        except OSError as error:
+            raise SyncError(changed_message) from error
+        if current_names != expected_names:
+            raise SyncError(changed_message)
 
 
 def _named_entry_identity(parent_fd: int, name: str) -> tuple[int, int] | None:

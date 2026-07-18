@@ -156,6 +156,40 @@ class _CompleteRelease:
 
 
 @dataclass(frozen=True)
+class _LegacyMutableRelease:
+    release_id: int
+    tag_name: str
+    sha: str
+    archive_id: int
+    archive_size: int
+    archive_digest: str
+    checksum_id: int
+    checksum_size: int
+    checksum_digest: str
+
+
+_LEGACY_MUTABLE_RELEASES = {
+    "Joey-Tools/codex-toolbox": _LegacyMutableRelease(
+        release_id=325822894,
+        tag_name="personal-codex-20260520-100331-8de1857",
+        sha="8de18571811128cef148d13f1d474718d7cfae17",
+        archive_id=425088267,
+        archive_size=16353,
+        archive_digest=(
+            "sha256:05df0bf973e3c67aedd03838c5116471"
+            "314e7ce6c24d3435b0f8b7765624c9be"
+        ),
+        checksum_id=425088288,
+        checksum_size=129,
+        checksum_digest=(
+            "sha256:c3ed6fe4d5df9178f471c80dd9e0bb56"
+            "340b4e8c32731974ff4747e3797d4805"
+        ),
+    ),
+}
+
+
+@dataclass(frozen=True)
 class _GitReleaseTreeEntry:
     mode: bytes
     object_type: bytes
@@ -2887,6 +2921,42 @@ def _complete_release_identity(
     )
 
 
+def _validate_complete_release_immutability(
+    repository: str,
+    release: dict[str, Any],
+    identity: _CompleteRelease,
+) -> None:
+    immutable = release.get("immutable")
+    if type(immutable) is not bool:
+        raise ValidationError(
+            f"complete published release {identity.tag_name} must have "
+            "immutable=true"
+        )
+    if immutable is True:
+        return
+
+    release_id = release.get("id")
+    if type(release_id) is int:
+        legacy_identity = _LegacyMutableRelease(
+            release_id=release_id,
+            tag_name=identity.tag_name,
+            sha=identity.sha,
+            archive_id=identity.archive_id,
+            archive_size=identity.archive_size,
+            archive_digest=identity.archive_digest,
+            checksum_id=identity.checksum_id,
+            checksum_size=identity.checksum_size,
+            checksum_digest=identity.checksum_digest,
+        )
+        if _LEGACY_MUTABLE_RELEASES.get(repository) == legacy_identity:
+            return
+
+    raise ValidationError(
+        f"mutable complete published release {identity.tag_name} does not match "
+        "a pinned legacy identity"
+    )
+
+
 def _repairable_incomplete_release_for_sha(
     release: dict[str, Any],
     sha: str,
@@ -2990,6 +3060,11 @@ def _complete_release_identities(
             continue
         identity = _complete_release_identity(release)
         if identity is not None:
+            _validate_complete_release_immutability(
+                repository,
+                release,
+                identity,
+            )
             identities.append(identity)
     if not identities:
         raise ValidationError(f"no complete published release found for {repository}")
