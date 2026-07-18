@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
@@ -22,7 +24,12 @@ jobs:
           python3 -m py_compile \
             scripts/codex_personal_sync.py \
             scripts/build_personal_codex_package.py \
+            scripts/validate_sync_manifest_changes.py \
             tests/test_codex_personal_sync.py \
+            tests/test_package_builder_safety.py \
+            tests/test_personal_sync_reconciliation_safety.py \
+            tests/test_release_manifest_baseline.py \
+            tests/test_sync_manifest_changes.py \
             tests/test_submodule_worktree_sync.py
       - name: Run tests
         run: |
@@ -30,4 +37,51 @@ jobs:
             tests.test_codex_personal_sync \
             tests.test_codex_clean_tmp \
             tests.test_codex_git_helpers \
+            tests.test_package_builder_safety \
+            tests.test_personal_sync_reconciliation_safety \
+            tests.test_release_manifest_baseline \
+            tests.test_sync_manifest_changes \
             tests.test_submodule_worktree_sync
+      - name: Validate sync manifest changes
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/validate_sync_manifest_changes.py --base-ref "$BASE_REF"
+
+  python-39-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Compile supported runtime
+        run: |
+          python3 -m py_compile \
+            scripts/codex_personal_sync.py \
+            scripts/build_personal_codex_package.py \
+            scripts/validate_sync_manifest_changes.py
+      - name: Run Python 3.9 compatibility regressions
+        run: |
+          python3 -m unittest \
+            tests.test_personal_sync_reconciliation_safety.PendingLinkTransactionSafetyTests.test_empty_record_empty_state_transaction_parses_and_recovers \
+            tests.test_personal_sync_reconciliation_safety.PendingLinkTransactionSafetyTests.test_oversized_json_integer_is_normalized_to_sync_error \
+            tests.test_codex_personal_sync.CodexPersonalSyncTests.test_load_manifest_translates_oversized_json_integer \
+            tests.test_package_builder_safety.PackageBuilderSafetyTests.test_manifest_parser_reports_deep_json_as_package_error \
+            tests.test_package_builder_safety.PackageBuilderSafetyTests.test_manifest_parser_reports_oversized_integer_as_package_error \
+            tests.test_release_manifest_baseline.ReleaseManifestBaselineTests.test_release_baseline_accepts_verified_release_history \
+            tests.test_sync_manifest_changes.SyncManifestChangeTests.test_manifest_transition_counts_same_target_change_once \
+            tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_deep_raw_json_is_reported_as_validation_error \
+            tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_oversized_integer_is_reported_as_validation_error
+
+  platform-safety:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Run platform reconciliation safety tests
+        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety

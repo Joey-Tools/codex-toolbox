@@ -33,6 +33,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
@@ -45,7 +46,13 @@ jobs:
           python3 -m py_compile \
             scripts/codex_personal_sync.py \
             scripts/build_personal_codex_package.py \
+            scripts/validate_sync_manifest_changes.py \
             tests/test_codex_personal_sync.py \
+            tests/test_package_builder_safety.py \
+            tests/test_personal_sync_reconciliation_safety.py \
+            tests/test_public_release_workflow.py \
+            tests/test_release_manifest_baseline.py \
+            tests/test_sync_manifest_changes.py \
             tests/test_submodule_worktree_sync.py
 
       - name: Run tests
@@ -54,12 +61,25 @@ jobs:
             tests.test_codex_personal_sync \
             tests.test_codex_clean_tmp \
             tests.test_codex_git_helpers \
+            tests.test_package_builder_safety \
+            tests.test_personal_sync_reconciliation_safety \
+            tests.test_public_release_workflow \
+            tests.test_release_manifest_baseline \
+            tests.test_sync_manifest_changes \
             tests.test_submodule_worktree_sync
+
+      - name: Validate sync manifest changes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/validate_sync_manifest_changes.py \
+            --release-repo "$GITHUB_REPOSITORY"
 
       - name: Build release package
         run: |
           python3 scripts/build_personal_codex_package.py \
             --sha "$GITHUB_SHA" \
+            --require-clean-sources \
             --output-dir dist
 
       - name: Verify release package
@@ -79,20 +99,30 @@ jobs:
           spec.loader.exec_module(module)
 
           sha = __import__("os").environ["GITHUB_SHA"]
-          archive_path = repo_root / "dist" / f"personal-codex-{sha}.tar.gz"
-          checksum_path = repo_root / "dist" / f"personal-codex-{sha}.sha256"
-          module.verify_checksum(archive_path, checksum_path)
-          release_root = module.safe_extract_archive(archive_path, repo_root / "dist" / "extract")
-          entries = module.validate_release_tree(release_root)
-          targets = {entry.target.as_posix() for entry in entries}
-          runner = release_root / "scripts" / "codex_personal_sync.py"
+          dist = repo_root / "dist"
+          archive_path = dist / f"personal-codex-{sha}.tar.gz"
+          checksum_path = dist / f"personal-codex-{sha}.sha256"
+          with module.bind_archive_workspace(dist) as workspace:
+              release_root, release_expectation = module.verify_and_extract_archive(
+                  archive_path,
+                  checksum_path,
+                  dist / "extract",
+                  workspace=workspace,
+              )
+              entries = release_expectation[0][1].entries
+              targets = {entry.target.as_posix() for entry in entries}
+              runner_payload = module.read_expected_release_file(
+                  release_root,
+                  module.PurePosixPath("scripts/codex_personal_sync.py"),
+                  release_expectation,
+              )
 
-          if not entries or any(entry.owner != "public" for entry in entries):
-              raise SystemExit("release manifest must contain only public-owned entries")
-          if "bin/codex-personal-sync" not in targets:
-              raise SystemExit("public toolbox release must publish the sync runner")
-          if "install-private" not in runner.read_text(encoding="utf-8"):
-              raise SystemExit("sync runner must include the private overlay entrypoint")
+              if not entries or any(entry.owner != "public" for entry in entries):
+                  raise SystemExit("release manifest must contain only public-owned entries")
+              if "bin/codex-personal-sync" not in targets:
+                  raise SystemExit("public toolbox release must publish the sync runner")
+              if b"install-private" not in runner_payload:
+                  raise SystemExit("sync runner must include the private overlay entrypoint")
           PY
 
   publish:
@@ -117,6 +147,7 @@ jobs:
         run: |
           python3 scripts/build_personal_codex_package.py \
             --sha "$GITHUB_SHA" \
+            --require-clean-sources \
             --output-dir dist
 
       - name: Verify release package
@@ -136,20 +167,30 @@ jobs:
           spec.loader.exec_module(module)
 
           sha = __import__("os").environ["GITHUB_SHA"]
-          archive_path = repo_root / "dist" / f"personal-codex-{sha}.tar.gz"
-          checksum_path = repo_root / "dist" / f"personal-codex-{sha}.sha256"
-          module.verify_checksum(archive_path, checksum_path)
-          release_root = module.safe_extract_archive(archive_path, repo_root / "dist" / "extract")
-          entries = module.validate_release_tree(release_root)
-          targets = {entry.target.as_posix() for entry in entries}
-          runner = release_root / "scripts" / "codex_personal_sync.py"
+          dist = repo_root / "dist"
+          archive_path = dist / f"personal-codex-{sha}.tar.gz"
+          checksum_path = dist / f"personal-codex-{sha}.sha256"
+          with module.bind_archive_workspace(dist) as workspace:
+              release_root, release_expectation = module.verify_and_extract_archive(
+                  archive_path,
+                  checksum_path,
+                  dist / "extract",
+                  workspace=workspace,
+              )
+              entries = release_expectation[0][1].entries
+              targets = {entry.target.as_posix() for entry in entries}
+              runner_payload = module.read_expected_release_file(
+                  release_root,
+                  module.PurePosixPath("scripts/codex_personal_sync.py"),
+                  release_expectation,
+              )
 
-          if not entries or any(entry.owner != "public" for entry in entries):
-              raise SystemExit("release manifest must contain only public-owned entries")
-          if "bin/codex-personal-sync" not in targets:
-              raise SystemExit("public toolbox release must publish the sync runner")
-          if "install-private" not in runner.read_text(encoding="utf-8"):
-              raise SystemExit("sync runner must include the private overlay entrypoint")
+              if not entries or any(entry.owner != "public" for entry in entries):
+                  raise SystemExit("release manifest must contain only public-owned entries")
+              if "bin/codex-personal-sync" not in targets:
+                  raise SystemExit("public toolbox release must publish the sync runner")
+              if b"install-private" not in runner_payload:
+                  raise SystemExit("sync runner must include the private overlay entrypoint")
           PY
 
       - name: Publish GitHub release
@@ -157,8 +198,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
+          import hashlib
           import json
           import os
+          import re
           from pathlib import Path
           from urllib.parse import quote
           from urllib.request import Request, urlopen
@@ -174,6 +217,47 @@ jobs:
               dist / f"personal-codex-{sha}.sha256",
           ]
           release_tag_prefix = "personal-codex-"
+          release_tag_pattern = re.compile(
+              r"^personal-codex-[0-9]{8}-[0-9]{6}-(?P<sha_prefix>[0-9a-f]{7,40})$"
+          )
+          personal_asset_pattern = re.compile(
+              r"^personal-codex-[0-9a-f]{40}(?:\.tar\.gz|\.sha256)$"
+          )
+          asset_digest_pattern = re.compile(r"^sha256:[0-9a-f]{64}$")
+          max_asset_size = 64 * 1024 * 1024
+
+          def local_asset_content(asset):
+              digest = hashlib.sha256()
+              content = bytearray()
+              size = 0
+              try:
+                  with asset.open("rb") as asset_file:
+                      while True:
+                          chunk = asset_file.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          size += len(chunk)
+                          if size > max_asset_size:
+                              raise SystemExit(
+                                  f"release asset exceeds {max_asset_size} bytes: "
+                                  f"{asset}"
+                              )
+                          digest.update(chunk)
+                          content.extend(chunk)
+              except OSError as error:
+                  raise SystemExit(
+                      f"failed to read release asset {asset}: {error}"
+                  ) from error
+              return {
+                  "data": bytes(content),
+                  "digest": f"sha256:{digest.hexdigest()}",
+                  "size": size,
+              }
+
+          expected_asset_content = {
+              asset.name: local_asset_content(asset) for asset in assets
+          }
+          expected_asset_names = set(expected_asset_content)
 
           def request_json(url, *, method="GET", payload=None):
               data = None
@@ -187,7 +271,10 @@ jobs:
                   headers["Content-Type"] = "application/json"
               request = Request(url, data=data, headers=headers, method=method)
               with urlopen(request, timeout=30) as response:
-                  return json.loads(response.read().decode("utf-8"))
+                  response_body = response.read()
+              if not response_body:
+                  return None
+              return json.loads(response_body.decode("utf-8"))
 
           def iter_releases():
               page = 1
@@ -200,37 +287,216 @@ jobs:
                   yield from releases
                   page += 1
 
-          expected_asset_names = {asset.name for asset in assets}
+          def validate_release_tag(tag_name, *, context):
+              tag_match = release_tag_pattern.fullmatch(tag_name)
+              if tag_match is None:
+                  raise SystemExit(f"{context} has invalid release tag: {tag_name}")
+              if not sha.startswith(tag_match.group("sha_prefix")):
+                  raise SystemExit(
+                      f"{context} tag suffix does not match target SHA: {tag_name}"
+                  )
+
+          def validated_release_id(release_snapshot, *, context):
+              release_id = release_snapshot.get("id")
+              if (
+                  not isinstance(release_id, int)
+                  or isinstance(release_id, bool)
+                  or release_id <= 0
+              ):
+                  raise SystemExit(f"{context} has invalid release id: {release_id}")
+              return release_id
+
+          def matching_personal_assets(release_assets, *, context):
+              if not isinstance(release_assets, list):
+                  raise SystemExit(f"{context} has invalid assets payload")
+              matching_assets = []
+              for release_asset in release_assets:
+                  if not isinstance(release_asset, dict):
+                      raise SystemExit(f"{context} has invalid asset entry")
+                  name = release_asset.get("name")
+                  if (
+                      isinstance(name, str)
+                      and personal_asset_pattern.fullmatch(name) is not None
+                  ):
+                      matching_assets.append(release_asset)
+              return matching_assets
+
+          def validated_uploaded_asset_names(release_assets, *, context):
+              matching_assets = matching_personal_assets(
+                  release_assets,
+                  context=context,
+              )
+              non_uploaded = [
+                  asset
+                  for asset in matching_assets
+                  if asset.get("state") != "uploaded"
+              ]
+              if non_uploaded:
+                  descriptions = sorted(
+                      f"{asset.get('name')} ({asset.get('state')})"
+                      for asset in non_uploaded
+                  )
+                  raise SystemExit(
+                      f"{context} has matching assets not uploaded: {descriptions}"
+                  )
+
+              asset_ids = []
+              for release_asset in matching_assets:
+                  asset_id = release_asset.get("id")
+                  if (
+                      not isinstance(asset_id, int)
+                      or isinstance(asset_id, bool)
+                      or asset_id <= 0
+                  ):
+                      raise SystemExit(
+                          f"{context} has matching asset without a positive "
+                          f"integer id: {release_asset.get('name')}"
+                      )
+                  asset_ids.append(asset_id)
+              if len(set(asset_ids)) != len(asset_ids):
+                  raise SystemExit(f"{context} has duplicate matching asset ids")
+
+              uploaded_asset_names = [
+                  asset["name"] for asset in matching_assets
+              ]
+              unexpected_names = sorted(
+                  name
+                  for name in uploaded_asset_names
+                  if name not in expected_asset_names
+              )
+              if unexpected_names:
+                  raise SystemExit(
+                      f"{context} has unexpected uploaded assets: {unexpected_names}"
+                  )
+              uploaded_names = set(uploaded_asset_names)
+              if len(uploaded_names) != len(uploaded_asset_names):
+                  raise SystemExit(f"{context} has duplicate uploaded assets")
+
+              if uploaded_names != expected_asset_names:
+                  missing_names = sorted(expected_asset_names - uploaded_names)
+                  raise SystemExit(
+                      f"{context} has matching asset name mismatch: "
+                      f"missing={missing_names}, unexpected={unexpected_names}"
+                  )
+
+              for release_asset in matching_assets:
+                  name = release_asset["name"]
+                  expected_content = expected_asset_content[name]
+                  asset_size = release_asset.get("size")
+                  if (
+                      not isinstance(asset_size, int)
+                      or isinstance(asset_size, bool)
+                      or asset_size < 0
+                  ):
+                      raise SystemExit(
+                          f"{context} has invalid size for {name}: {asset_size}"
+                      )
+                  if asset_size != expected_content["size"]:
+                      raise SystemExit(
+                          f"{context} has size mismatch for {name}: "
+                          f"expected {expected_content['size']}, got {asset_size}"
+                      )
+
+                  asset_digest = release_asset.get("digest")
+                  if (
+                      not isinstance(asset_digest, str)
+                      or asset_digest_pattern.fullmatch(asset_digest) is None
+                  ):
+                      raise SystemExit(
+                          f"{context} has invalid digest for {name}: "
+                          f"{asset_digest}"
+                      )
+                  if asset_digest != expected_content["digest"]:
+                      raise SystemExit(
+                          f"{context} has digest mismatch for {name}: "
+                          f"expected {expected_content['digest']}, "
+                          f"got {asset_digest}"
+                      )
+              return uploaded_names
+
+          def prepare_draft_assets(draft_release):
+              matching_assets = matching_personal_assets(
+                  draft_release.get("assets", []),
+                  context=f"draft release {draft_release['tag_name']}",
+              )
+              asset_ids = []
+              for repair_asset in matching_assets:
+                  asset_id = repair_asset.get("id")
+                  if not isinstance(asset_id, int) or isinstance(asset_id, bool):
+                      raise SystemExit(
+                          f"draft release {draft_release['tag_name']} has "
+                          "matching asset without a valid id: "
+                          f"{repair_asset.get('name')}"
+                      )
+                  if asset_id <= 0:
+                      raise SystemExit(
+                          f"draft release {draft_release['tag_name']} has "
+                          "matching asset without a positive id: "
+                          f"{repair_asset.get('name')}"
+                      )
+                  asset_ids.append(asset_id)
+              if len(set(asset_ids)) != len(asset_ids):
+                  raise SystemExit(
+                      f"draft release {draft_release['tag_name']} has duplicate "
+                      "matching asset ids"
+                  )
+
+              for repair_asset, asset_id in zip(matching_assets, asset_ids):
+                  request_json(
+                      f"{api_root}/repos/{repo}/releases/assets/{asset_id}",
+                      method="DELETE",
+                  )
+                  print(
+                      "Deleted matching asset before full retry: "
+                      f"{repair_asset.get('name')} "
+                      f"(state={repair_asset.get('state')})"
+                  )
+              return set()
+
           release = None
-          uploaded_asset_names = set()
           for candidate in iter_releases():
               tag_name = candidate.get("tag_name", "")
-              asset_names = {asset["name"] for asset in candidate.get("assets", [])}
               if (
                   candidate.get("target_commitish") != sha
+                  or not isinstance(tag_name, str)
                   or not tag_name.startswith(release_tag_prefix)
               ):
                   continue
-              release = candidate
-              if expected_asset_names <= asset_names:
-                  if release.get("draft", False):
-                      request_json(
-                          f"{api_root}/repos/{repo}/releases/{release['id']}",
-                          method="PATCH",
-                          payload={"draft": False},
+              validate_release_tag(tag_name, context="release candidate")
+              prerelease = candidate.get("prerelease")
+              if not isinstance(prerelease, bool):
+                  raise SystemExit(
+                      f"release candidate {tag_name} has invalid prerelease flag"
+                  )
+              if prerelease:
+                  if candidate.get("draft") is True:
+                      raise SystemExit(
+                          f"draft release candidate {tag_name} must not be a prerelease"
                       )
-                      print(f"Published existing draft release: {release['tag_name']}")
-                      raise SystemExit(0)
-                  print(f"Release already exists: {release['tag_name']}")
-                  raise SystemExit(0)
-              if release.get("draft", False):
-                  uploaded_asset_names = set(asset_names)
+                  continue
+              if not isinstance(candidate.get("draft"), bool):
+                  raise SystemExit(
+                      f"release candidate {tag_name} has invalid draft flag"
+                  )
+              release = candidate
+              if release["draft"]:
                   break
-              raise SystemExit(
-                  f"published release {release['tag_name']} is missing expected assets"
+              validated_release_id(
+                  release,
+                  context=f"published release {release['tag_name']}",
               )
+              if release.get("immutable") is not True:
+                  raise SystemExit(
+                      f"published release {release['tag_name']} must be immutable"
+                  )
+              validated_uploaded_asset_names(
+                  release.get("assets", []),
+                  context=f"published release {release['tag_name']}",
+              )
+              print(f"Release already exists: {release['tag_name']}")
+              raise SystemExit(0)
 
-          if release is None or release.get("target_commitish") != sha:
+          if release is None:
               timestamp = __import__("datetime").datetime.now(
                   __import__("datetime").timezone.utc
               ).strftime("%Y%m%d-%H%M%S")
@@ -247,9 +513,21 @@ jobs:
                       "prerelease": False,
                   },
               )
-              uploaded_asset_names = set()
-          else:
-              tag = release["tag_name"]
+          tag = release["tag_name"]
+          validate_release_tag(tag, context="active release")
+          if release.get("target_commitish") != sha:
+              raise SystemExit(
+                  f"active release {tag} target does not match expected SHA"
+              )
+          if release.get("draft") is not True:
+              raise SystemExit(f"release {tag} must remain a draft during asset upload")
+          if release.get("prerelease") is not False:
+              raise SystemExit(f"draft release {tag} must not be a prerelease")
+          release_id = validated_release_id(
+              release,
+              context=f"draft release {tag}",
+          )
+          uploaded_asset_names = prepare_draft_assets(release)
 
           content_types = {
               ".gz": "application/gzip",
@@ -261,12 +539,12 @@ jobs:
                   continue
               suffix = ".sha256" if asset.name.endswith(".sha256") else asset.suffix
               url = (
-                  f"{upload_root}/repos/{repo}/releases/{release['id']}/assets"
+                  f"{upload_root}/repos/{repo}/releases/{release_id}/assets"
                   f"?name={quote(asset.name)}"
               )
               request = Request(
                   url,
-                  data=asset.read_bytes(),
+                  data=expected_asset_content[asset.name]["data"],
                   headers={
                       "Accept": "application/vnd.github+json",
                       "Authorization": f"Bearer {token}",
@@ -277,15 +555,95 @@ jobs:
               )
               with urlopen(request, timeout=30) as response:
                   uploaded = json.loads(response.read().decode("utf-8"))
+              if (
+                  uploaded.get("name") != asset.name
+                  or uploaded.get("state") != "uploaded"
+              ):
+                  raise SystemExit(
+                      f"asset upload did not complete as uploaded: {asset.name}"
+                  )
               print(f"Uploaded {uploaded['name']}")
               uploaded_asset_names.add(uploaded["name"])
 
           if not expected_asset_names <= uploaded_asset_names:
               raise SystemExit(f"uploaded asset mismatch: {sorted(uploaded_asset_names)}")
+          final_release = request_json(
+              f"{api_root}/repos/{repo}/releases/{release_id}"
+          )
+          if not isinstance(final_release, dict):
+              raise SystemExit(f"final release lookup failed for draft release {tag}")
+          validated_release_id(
+              final_release,
+              context=f"draft release {tag} final check",
+          )
+          identity_fields = (
+              "id",
+              "tag_name",
+              "target_commitish",
+              "draft",
+              "prerelease",
+          )
+          identity_drift = {
+              field: (release.get(field), final_release.get(field))
+              for field in identity_fields
+              if final_release.get(field) != release.get(field)
+          }
+          if identity_drift:
+              raise SystemExit(
+                  f"final release identity drift for {tag}: {identity_drift}"
+              )
+          final_uploaded_asset_names = validated_uploaded_asset_names(
+              final_release.get("assets", []),
+              context=f"draft release {tag} final check",
+          )
+          if expected_asset_names != final_uploaded_asset_names:
+              raise SystemExit(
+                  "final uploaded asset mismatch: "
+                  f"{sorted(final_uploaded_asset_names)}"
+              )
           request_json(
-              f"{api_root}/repos/{repo}/releases/{release['id']}",
+              f"{api_root}/repos/{repo}/releases/{release_id}",
               method="PATCH",
               payload={"draft": False},
           )
+          published_release = request_json(
+              f"{api_root}/repos/{repo}/releases/{release_id}"
+          )
+          if not isinstance(published_release, dict):
+              raise SystemExit(f"published release lookup failed for {tag}")
+          validated_release_id(
+              published_release,
+              context=f"published release {tag} final check",
+          )
+          expected_published_identity = {
+              "id": release_id,
+              "tag_name": tag,
+              "target_commitish": sha,
+              "draft": False,
+              "prerelease": False,
+          }
+          published_identity_drift = {
+              field: (expected, published_release.get(field))
+              for field, expected in expected_published_identity.items()
+              if published_release.get(field) != expected
+          }
+          if published_identity_drift:
+              raise SystemExit(
+                  f"published release identity drift for {tag}: "
+                  f"{published_identity_drift}"
+              )
+          if published_release.get("immutable") is not True:
+              raise SystemExit(
+                  f"published release {tag} final check must be immutable"
+              )
+          published_asset_names = validated_uploaded_asset_names(
+              published_release.get("assets", []),
+              context=f"published release {tag} final check",
+          )
+          if expected_asset_names != published_asset_names:
+              raise SystemExit(
+                  "published uploaded asset mismatch: "
+                  f"{sorted(published_asset_names)}"
+              )
           print(f"Published {tag}")
           PY
