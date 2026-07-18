@@ -10,11 +10,13 @@ import tempfile
 import textwrap
 import unittest
 from unittest import mock
+from urllib.error import HTTPError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE_PAYLOAD = b"archive"
 CHECKSUM_PAYLOAD = b"checksum"
+DEFAULT_IMMUTABLE_RELEASES = object()
 
 
 def asset_content(payload: bytes) -> dict[str, object]:
@@ -91,6 +93,8 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
         *,
         final_release: dict[str, object] | None = None,
         published_release: dict[str, object] | None = None,
+        immutable_releases: object = DEFAULT_IMMUTABLE_RELEASES,
+        immutable_releases_error: Exception | None = None,
     ) -> tuple[list[tuple[str, str]], SystemExit | None]:
         calls: list[tuple[str, str]] = []
         initial_releases = (
@@ -100,9 +104,12 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
 
         class FakeResponse:
             def __init__(self, payload: object) -> None:
-                self.body = (
-                    b"" if payload is None else json.dumps(payload).encode("utf-8")
-                )
+                if isinstance(payload, bytes):
+                    self.body = payload
+                else:
+                    self.body = (
+                        b"" if payload is None else json.dumps(payload).encode("utf-8")
+                    )
 
             def __enter__(self) -> "FakeResponse":
                 return self
@@ -121,6 +128,19 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
             calls.append((method, url))
             if method == "GET" and "/releases?per_page=" in url:
                 return FakeResponse(initial_releases if url.endswith("&page=1") else [])
+            if method == "GET" and url.endswith("/immutable-releases"):
+                self.assertEqual(
+                    request.get_header("X-github-api-version"),
+                    "2026-03-10",
+                )
+                if immutable_releases_error is not None:
+                    raise immutable_releases_error
+                settings = (
+                    {"enabled": True}
+                    if immutable_releases is DEFAULT_IMMUTABLE_RELEASES
+                    else immutable_releases
+                )
+                return FakeResponse(settings)
             if method == "DELETE" and "/releases/assets/" in url:
                 return FakeResponse(None)
             if method == "POST" and url.startswith("https://uploads.github.com/"):
@@ -260,6 +280,60 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
 
         self.assertIsNone(exit_error)
         self.assert_full_replacement(calls, deleted_asset_ids=[101, 102])
+
+    def test_mutation_preflight_uses_immutable_releases_api_version(self) -> None:
+        initial_release = self.release(draft=True)
+        final_release = self.release(draft=True)
+
+        calls, exit_error = self.run_publish_script(
+            initial_release,
+            final_release=final_release,
+        )
+
+        self.assertIsNone(exit_error)
+        self.assertIn(
+            (
+                "GET",
+                "https://api.github.com/repos/owner/repo/immutable-releases",
+            ),
+            calls,
+        )
+
+    def test_mutation_preflight_fails_closed_without_mutation(self) -> None:
+        failure_cases = (
+            ("disabled", {"enabled": False}, None, "enabled=true"),
+            ("integer-one", {"enabled": 1}, None, "enabled=true"),
+            ("missing-enabled", {}, None, "enabled=true"),
+            ("non-object", [], None, "enabled=true"),
+            ("invalid-json", b"not-json", None, "not valid JSON"),
+            ("not-found", None, 404, "HTTP 404"),
+            ("server-error", None, 500, "HTTP 500"),
+        )
+        release_states = (
+            ("new-release", []),
+            ("draft-repair", self.release(draft=True)),
+        )
+        for case, payload, status, error_text in failure_cases:
+            for release_state, initial_release in release_states:
+                with self.subTest(case=case, release_state=release_state):
+                    error = None
+                    if status is not None:
+                        error = HTTPError(
+                            "https://api.github.com/repos/owner/repo/immutable-releases",
+                            status,
+                            "preflight failed",
+                            None,
+                            None,
+                        )
+                    calls, exit_error = self.run_publish_script(
+                        initial_release,
+                        immutable_releases=payload,
+                        immutable_releases_error=error,
+                    )
+
+                    failure = self.assert_failed(exit_error)
+                    self.assertIn(error_text, str(failure))
+                    self.assert_no_mutations(calls)
 
     def test_retry_replaces_partial_uploaded_pair_in_full(self) -> None:
         initial_release = self.release(draft=True)
