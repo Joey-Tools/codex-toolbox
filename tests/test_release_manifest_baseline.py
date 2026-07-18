@@ -9,7 +9,7 @@ from io import StringIO
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 import tarfile
@@ -543,6 +543,104 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                 self.assertRaisesRegex(MODULE.ValidationError, error_pattern),
             ):
                 MODULE._release_tree_path(raw_path, sha)
+
+    def test_release_tree_plan_preserves_parents_of_filtered_tracked_files(
+        self,
+    ) -> None:
+        payload = manifest("keep")
+        self.write_manifest(payload)
+        source = self.repo / "personal_codex/skills/keep"
+        filtered_paths = (
+            source / "ds-store-only/.DS_Store",
+            source / "pyc-only/module.pyc",
+            source / "generated-parent/__pycache__/module.pyc",
+        )
+        for path in filtered_paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"generated\n")
+        self.git(
+            "add",
+            "-f",
+            *(path.relative_to(self.repo).as_posix() for path in filtered_paths),
+        )
+        sha = self.commit("Add filtered tracked files")
+
+        plan = MODULE._release_tree_plan_at_commit(
+            self.repo,
+            sha,
+            MANIFEST,
+            payload,
+        )
+
+        source_path = PurePosixPath("personal_codex/skills/keep")
+        directories = set(plan.directories)
+        self.assertIn(source_path / "ds-store-only", directories)
+        self.assertIn(source_path / "pyc-only", directories)
+        self.assertIn(source_path / "generated-parent", directories)
+        self.assertNotIn(
+            source_path / "generated-parent/__pycache__",
+            directories,
+        )
+        files = {path for path, _mode, _object_id in plan.files}
+        for path in filtered_paths:
+            with self.subTest(path=path.name):
+                self.assertNotIn(
+                    PurePosixPath(path.relative_to(self.repo).as_posix()),
+                    files,
+                )
+
+    def test_release_tree_plan_preserves_ancestors_of_filtered_directory_sources(
+        self,
+    ) -> None:
+        linked_source = PurePosixPath("personal_codex/payload/filtered-source")
+        reference_source = PurePosixPath(
+            "personal_codex/references/filtered-source"
+        )
+        payload = {
+            "version": 1,
+            "links": [
+                {
+                    "source": linked_source.as_posix(),
+                    "target": "directories/filtered-source",
+                    "kind": "directory",
+                }
+            ],
+            "reference_only": [reference_source.as_posix()],
+        }
+        self.write_manifest(payload)
+        filtered_files = (
+            self.repo / linked_source / ".DS_Store",
+            self.repo / reference_source / "module.pyc",
+        )
+        for filtered_file in filtered_files:
+            filtered_file.parent.mkdir(parents=True, exist_ok=True)
+            filtered_file.write_bytes(b"generated\n")
+        self.git(
+            "add",
+            "-f",
+            *(path.relative_to(self.repo).as_posix() for path in filtered_files),
+        )
+        sha = self.commit("Add filtered directory sources")
+
+        plan = MODULE._release_tree_plan_at_commit(
+            self.repo,
+            sha,
+            MANIFEST,
+            payload,
+        )
+
+        directories = set(plan.directories)
+        for source_path in (linked_source, reference_source):
+            with self.subTest(source=source_path):
+                self.assertIn(source_path, directories)
+                self.assertIn(source_path.parent, directories)
+        files = {path for path, _mode, _object_id in plan.files}
+        for filtered_file in filtered_files:
+            with self.subTest(path=filtered_file.name):
+                self.assertNotIn(
+                    PurePosixPath(filtered_file.relative_to(self.repo).as_posix()),
+                    files,
+                )
 
     def read_commit_manifest_as_archive(
         self,

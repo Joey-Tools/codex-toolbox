@@ -38,6 +38,12 @@ helper binaries, and public skills:
 - `personal-codex-<full-sha>.tar.gz`
 - `personal-codex-<full-sha>.sha256`
 
+Publishing requires the repository's immutable Releases setting to remain
+enabled. Configure the `IMMUTABLE_RELEASES_READ_TOKEN` Actions secret with a
+fine-grained personal access token that has repository `Administration` read
+permission. The workflow uses this token only to verify that setting; Release
+mutations continue to use the built-in `GITHUB_TOKEN` with `contents: write`.
+
 Public-only machines install this repo directly:
 
 ```bash

@@ -10,11 +10,13 @@ import tempfile
 import textwrap
 import unittest
 from unittest import mock
+from urllib.error import HTTPError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE_PAYLOAD = b"archive"
 CHECKSUM_PAYLOAD = b"checksum"
+DEFAULT_IMMUTABLE_RELEASES = object()
 
 
 def asset_content(payload: bytes) -> dict[str, object]:
@@ -91,18 +93,27 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
         *,
         final_release: dict[str, object] | None = None,
         published_release: dict[str, object] | None = None,
+        immutable_releases: object = DEFAULT_IMMUTABLE_RELEASES,
+        immutable_releases_error: Exception | None = None,
+        immutable_releases_sequence: tuple[object, ...] | None = None,
+        immutable_releases_read_token: str | None = "capability-token",
     ) -> tuple[list[tuple[str, str]], SystemExit | None]:
         calls: list[tuple[str, str]] = []
+        self.authorization_headers: list[tuple[str, str, str | None]] = []
         initial_releases = (
             initial_release if isinstance(initial_release, list) else [initial_release]
         )
         release_lookup_count = 0
+        immutable_releases_lookup_count = 0
 
         class FakeResponse:
             def __init__(self, payload: object) -> None:
-                self.body = (
-                    b"" if payload is None else json.dumps(payload).encode("utf-8")
-                )
+                if isinstance(payload, bytes):
+                    self.body = payload
+                else:
+                    self.body = (
+                        b"" if payload is None else json.dumps(payload).encode("utf-8")
+                    )
 
             def __enter__(self) -> "FakeResponse":
                 return self
@@ -114,13 +125,41 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
                 return self.body
 
         def fake_urlopen(request: object, *, timeout: int) -> FakeResponse:
-            nonlocal release_lookup_count
+            nonlocal immutable_releases_lookup_count, release_lookup_count
             self.assertEqual(timeout, 30)
             method = request.get_method()
             url = request.full_url
             calls.append((method, url))
+            self.authorization_headers.append(
+                (method, url, request.get_header("Authorization"))
+            )
             if method == "GET" and "/releases?per_page=" in url:
                 return FakeResponse(initial_releases if url.endswith("&page=1") else [])
+            if method == "GET" and url.endswith("/immutable-releases"):
+                self.assertEqual(
+                    request.get_header("X-github-api-version"),
+                    "2026-03-10",
+                )
+                if immutable_releases_error is not None:
+                    raise immutable_releases_error
+                if immutable_releases_sequence is not None:
+                    if immutable_releases_lookup_count >= len(
+                        immutable_releases_sequence
+                    ):
+                        raise AssertionError(
+                            "unexpected extra immutable releases lookup"
+                        )
+                    settings = immutable_releases_sequence[
+                        immutable_releases_lookup_count
+                    ]
+                else:
+                    settings = (
+                        {"enabled": True}
+                        if immutable_releases is DEFAULT_IMMUTABLE_RELEASES
+                        else immutable_releases
+                    )
+                immutable_releases_lookup_count += 1
+                return FakeResponse(settings)
             if method == "DELETE" and "/releases/assets/" in url:
                 return FakeResponse(None)
             if method == "POST" and url.startswith("https://uploads.github.com/"):
@@ -166,16 +205,22 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
             dist.mkdir()
             (dist / f"personal-codex-{self.SHA}.tar.gz").write_bytes(ARCHIVE_PAYLOAD)
             (dist / f"personal-codex-{self.SHA}.sha256").write_bytes(CHECKSUM_PAYLOAD)
+            environment = {
+                "GITHUB_REPOSITORY": "owner/repo",
+                "GITHUB_SHA": self.SHA,
+                "GITHUB_TOKEN": "token",
+            }
+            if immutable_releases_read_token is not None:
+                environment["IMMUTABLE_RELEASES_READ_TOKEN"] = (
+                    immutable_releases_read_token
+                )
             try:
                 os.chdir(temp_root)
                 with (
                     mock.patch.dict(
                         os.environ,
-                        {
-                            "GITHUB_REPOSITORY": "owner/repo",
-                            "GITHUB_SHA": self.SHA,
-                            "GITHUB_TOKEN": "token",
-                        },
+                        environment,
+                        clear=True,
                     ),
                     mock.patch(
                         "urllib.request.urlopen",
@@ -260,6 +305,142 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
 
         self.assertIsNone(exit_error)
         self.assert_full_replacement(calls, deleted_asset_ids=[101, 102])
+
+    def test_mutation_preflight_uses_immutable_releases_api_version(self) -> None:
+        initial_release = self.release(draft=True)
+        final_release = self.release(draft=True)
+
+        calls, exit_error = self.run_publish_script(
+            initial_release,
+            final_release=final_release,
+        )
+
+        self.assertIsNone(exit_error)
+        self.assertEqual(
+            calls.count(
+                (
+                    "GET",
+                    "https://api.github.com/repos/owner/repo/immutable-releases",
+                )
+            ),
+            2,
+        )
+
+    def test_capability_and_release_requests_use_separate_tokens(self) -> None:
+        initial_release = self.release(draft=True)
+        final_release = self.release(draft=True)
+
+        _calls, exit_error = self.run_publish_script(
+            initial_release,
+            final_release=final_release,
+        )
+
+        self.assertIsNone(exit_error)
+        capability_authorizations = [
+            authorization
+            for _method, url, authorization in self.authorization_headers
+            if url.endswith("/immutable-releases")
+        ]
+        release_authorizations = [
+            authorization
+            for _method, url, authorization in self.authorization_headers
+            if not url.endswith("/immutable-releases")
+        ]
+        self.assertEqual(
+            capability_authorizations,
+            ["Bearer capability-token", "Bearer capability-token"],
+        )
+        self.assertTrue(release_authorizations)
+        self.assertEqual(set(release_authorizations), {"Bearer token"})
+
+    def test_missing_capability_token_fails_before_any_mutation(self) -> None:
+        token_states = (
+            ("absent", None),
+            ("empty", ""),
+            ("whitespace", "   "),
+        )
+        release_states = (
+            ("new-release", []),
+            ("draft-repair", self.release(draft=True)),
+        )
+        for token_state, capability_token in token_states:
+            for release_state, initial_release in release_states:
+                with self.subTest(
+                    token_state=token_state,
+                    release_state=release_state,
+                ):
+                    calls, exit_error = self.run_publish_script(
+                        initial_release,
+                        immutable_releases_read_token=capability_token,
+                    )
+
+                    failure = self.assert_failed(exit_error)
+                    self.assertIn("IMMUTABLE_RELEASES_READ_TOKEN", str(failure))
+                    self.assert_no_mutations(calls)
+                    self.assertFalse(
+                        any(
+                            url.endswith("/immutable-releases")
+                            for _method, url in calls
+                        )
+                    )
+
+    def test_publish_rechecks_capability_immediately_before_patch(self) -> None:
+        initial_release = self.release(draft=True)
+        final_release = self.release(draft=True)
+
+        calls, exit_error = self.run_publish_script(
+            initial_release,
+            final_release=final_release,
+            immutable_releases_sequence=(
+                {"enabled": True},
+                {"enabled": False},
+            ),
+        )
+
+        failure = self.assert_failed(exit_error)
+        self.assertIn("enabled=true", str(failure))
+        self.assertEqual(
+            sum(url.endswith("/immutable-releases") for _method, url in calls),
+            2,
+        )
+        self.assertFalse(any(method == "PATCH" for method, _url in calls))
+        self.assertTrue(any(method in {"DELETE", "POST"} for method, _url in calls))
+
+    def test_mutation_preflight_fails_closed_without_mutation(self) -> None:
+        failure_cases = (
+            ("disabled", {"enabled": False}, None, "enabled=true"),
+            ("integer-one", {"enabled": 1}, None, "enabled=true"),
+            ("missing-enabled", {}, None, "enabled=true"),
+            ("non-object", [], None, "enabled=true"),
+            ("invalid-json", b"not-json", None, "not valid JSON"),
+            ("not-found", None, 404, "HTTP 404"),
+            ("server-error", None, 500, "HTTP 500"),
+        )
+        release_states = (
+            ("new-release", []),
+            ("draft-repair", self.release(draft=True)),
+        )
+        for case, payload, status, error_text in failure_cases:
+            for release_state, initial_release in release_states:
+                with self.subTest(case=case, release_state=release_state):
+                    error = None
+                    if status is not None:
+                        error = HTTPError(
+                            "https://api.github.com/repos/owner/repo/immutable-releases",
+                            status,
+                            "preflight failed",
+                            None,
+                            None,
+                        )
+                    calls, exit_error = self.run_publish_script(
+                        initial_release,
+                        immutable_releases=payload,
+                        immutable_releases_error=error,
+                    )
+
+                    failure = self.assert_failed(exit_error)
+                    self.assertIn(error_text, str(failure))
+                    self.assert_no_mutations(calls)
 
     def test_retry_replaces_partial_uploaded_pair_in_full(self) -> None:
         initial_release = self.release(draft=True)
@@ -393,12 +574,18 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
             }
         )
 
-        calls, exit_error = self.run_publish_script(initial_release)
+        calls, exit_error = self.run_publish_script(
+            initial_release,
+            immutable_releases_read_token=None,
+        )
 
         self.assertIsNotNone(exit_error)
         assert exit_error is not None
         self.assertEqual(exit_error.code, 0)
         self.assert_no_mutations(calls)
+        self.assertFalse(
+            any(url.endswith("/immutable-releases") for _method, url in calls)
+        )
 
     def test_published_release_requires_valid_release_id_without_mutation(
         self,
@@ -928,6 +1115,19 @@ class ReleaseWorkflowAssetRetryTests(unittest.TestCase):
 
 
 class PublicReleaseWorkflowContractTests(unittest.TestCase):
+    def test_publish_step_wires_immutable_releases_read_secret(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(
+            workflow.count(
+                "IMMUTABLE_RELEASES_READ_TOKEN: "
+                "${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"
+            ),
+            1,
+        )
+
     def test_publish_step_hashes_and_uploads_one_cached_asset_snapshot(self) -> None:
         publish_script = ReleaseWorkflowAssetRetryTests.publish_script()
 
