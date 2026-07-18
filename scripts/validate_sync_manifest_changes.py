@@ -2399,8 +2399,8 @@ def _release_tree_plan_at_commit(
                 f"release commit {commit} has conflicting selected file: {path}"
             )
 
-    for file_path in (*files, RELEASE_MANIFEST_PATH):
-        for parent in file_path.parents:
+    for snapshot_path in (*directories, *files, RELEASE_MANIFEST_PATH):
+        for parent in snapshot_path.parents:
             if not parent.parts:
                 break
             directories.add(parent)
