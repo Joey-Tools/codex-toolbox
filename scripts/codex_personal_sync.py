@@ -221,12 +221,15 @@ class ReleaseAssets:
     checksum_name: str
     checksum_id: int
     checksum_size: int
+    archive_digest: str | None = None
+    checksum_digest: str | None = None
 
 
 @dataclass(frozen=True)
 class VerifiedReleaseManifest:
     manifest: dict[str, Any]
     expanded_bytes: int
+    tree_digest: str
 
 
 @dataclass(frozen=True)
@@ -1248,7 +1251,30 @@ def _validated_release_asset_metadata(
     return asset_id, asset_size
 
 
-def select_release_assets(release: dict[str, Any]) -> ReleaseAssets:
+def _validated_release_asset_digest(
+    asset: dict[str, Any],
+    asset_name: str,
+    *,
+    required: bool,
+) -> str | None:
+    digest = asset.get("digest")
+    if digest is None and not required:
+        return None
+    if not isinstance(digest, str) or re.fullmatch(
+        r"sha256:[0-9a-f]{64}",
+        digest,
+    ) is None:
+        raise SyncError(
+            f"release asset {asset_name} has an invalid GitHub sha256 digest"
+        )
+    return digest
+
+
+def select_release_assets(
+    release: dict[str, Any],
+    *,
+    require_digests: bool = False,
+) -> ReleaseAssets:
     release = _normalize_release(release)
     tag_name = release.get("tagName")
     if not isinstance(tag_name, str) or not tag_name.startswith(TAG_PREFIX):
@@ -1330,6 +1356,16 @@ def select_release_assets(release: dict[str, Any]) -> ReleaseAssets:
         checksum_name,
         maximum_bytes=MAX_ARCHIVE_CHECKSUM_BYTES,
     )
+    archive_digest = _validated_release_asset_digest(
+        archive_asset,
+        archive_name,
+        required=require_digests,
+    )
+    checksum_digest = _validated_release_asset_digest(
+        checksum_asset,
+        checksum_name,
+        required=require_digests,
+    )
     if archive_id == checksum_id:
         raise SyncError("release archive and checksum must have distinct GitHub asset ids")
     return ReleaseAssets(
@@ -1341,6 +1377,8 @@ def select_release_assets(release: dict[str, Any]) -> ReleaseAssets:
         checksum_name=checksum_name,
         checksum_id=checksum_id,
         checksum_size=checksum_size,
+        archive_digest=archive_digest,
+        checksum_digest=checksum_digest,
     )
 
 
@@ -1539,6 +1577,7 @@ def _expected_archive_checksum(
     checksum_path: Path,
     *,
     workspace: BoundArchiveWorkspace | None = None,
+    expected_api_digest: str | None = None,
 ) -> str:
     checksum_payload = _read_bounded_regular_file(
         checksum_path,
@@ -1546,6 +1585,13 @@ def _expected_archive_checksum(
         description="checksum file",
         workspace=workspace,
     )
+    if expected_api_digest is not None:
+        actual_api_digest = f"sha256:{hashlib.sha256(checksum_payload).hexdigest()}"
+        if actual_api_digest != expected_api_digest:
+            raise SyncError(
+                f"GitHub API digest mismatch for {checksum_path.name}: "
+                f"expected {expected_api_digest}, got {actual_api_digest}"
+            )
     try:
         checksum_text = checksum_payload.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -1572,16 +1618,26 @@ def _verified_archive_snapshot(
     checksum_path: Path,
     *,
     workspace: BoundArchiveWorkspace | None = None,
+    archive_api_digest: str | None = None,
+    checksum_api_digest: str | None = None,
 ) -> Any:
     expected = _expected_archive_checksum(
         archive_path,
         checksum_path,
         workspace=workspace,
+        expected_api_digest=checksum_api_digest,
     )
     snapshot, actual = _copy_archive_to_immutable_snapshot(
         archive_path,
         workspace=workspace,
     )
+    actual_api_digest = f"sha256:{actual}"
+    if archive_api_digest is not None and actual_api_digest != archive_api_digest:
+        snapshot.close()
+        raise SyncError(
+            f"GitHub API digest mismatch for {archive_path.name}: "
+            f"expected {archive_api_digest}, got {actual_api_digest}"
+        )
     if actual != expected:
         snapshot.close()
         raise SyncError(
@@ -2975,6 +3031,8 @@ def verify_and_extract_archive(
     read_workspace: (
         BoundArchiveWorkspace | None | _UseArchiveWorkspace
     ) = _USE_ARCHIVE_WORKSPACE,
+    archive_api_digest: str | None = None,
+    checksum_api_digest: str | None = None,
 ) -> tuple[Path, ReleaseTreeExpectation]:
     workspace_check_fd = _duplicate_bound_archive_workspace(workspace)
     os.close(workspace_check_fd)
@@ -2987,6 +3045,8 @@ def verify_and_extract_archive(
         archive_path,
         checksum_path,
         workspace=effective_read_workspace,
+        archive_api_digest=archive_api_digest,
+        checksum_api_digest=checksum_api_digest,
     )
     try:
         return _safe_extract_archive_snapshot(
@@ -2998,12 +3058,88 @@ def verify_and_extract_archive(
         snapshot.close()
 
 
+def _release_tree_digest_from_logical_entries(
+    entries: dict[PurePosixPath, tuple[bytes, int, bytes]],
+) -> str:
+    """Hash one normalized release tree with the installed-tree wire format."""
+    digest = hashlib.sha256(b"codex-personal-sync-release-tree-v1\0")
+
+    def record(
+        entry_type: bytes,
+        relative_path: PurePosixPath,
+        mode: int,
+        content_identity: bytes,
+    ) -> None:
+        relative_bytes = (
+            relative_path.as_posix().encode("utf-8", "surrogateescape")
+            if relative_path.parts
+            else b""
+        )
+        _release_tree_digest_field(digest, entry_type)
+        _release_tree_digest_field(digest, relative_bytes)
+        _release_tree_digest_field(digest, mode.to_bytes(4, "big"))
+        _release_tree_digest_field(digest, content_identity)
+
+    record(b"directory", PurePosixPath(), 0, b"")
+    for relative_path in sorted(entries, key=lambda path: path.parts):
+        entry_type, mode, content_identity = entries[relative_path]
+        if not relative_path.parts:
+            raise SyncError("logical release tree must not contain its container root")
+        if entry_type not in {b"directory", b"file"}:
+            raise SyncError("logical release tree contains an invalid entry type")
+        if entry_type == b"directory":
+            if content_identity:
+                raise SyncError("logical release directory has file content identity")
+        elif len(content_identity) != 40:
+            raise SyncError("logical release file has an invalid content identity")
+        record(entry_type, relative_path, mode, content_identity)
+    return digest.hexdigest()
+
+
+def _logical_archive_tree_entries(
+    members: list[tarfile.TarInfo],
+    release_root_parts: tuple[str, ...],
+) -> dict[PurePosixPath, tuple[bytes, int, bytes]]:
+    entries: dict[PurePosixPath, tuple[bytes, int, bytes]] = {}
+    root_length = len(release_root_parts)
+    for member in members:
+        member_parts = PurePosixPath(member.name).parts
+        if member_parts[:root_length] != release_root_parts:
+            raise SyncError(
+                f"archive member is outside the release root: {member.name}"
+            )
+        relative_parts = member_parts[root_length:]
+        if not relative_parts:
+            if not member.isdir():
+                raise SyncError("archive release root must be a directory container")
+            continue
+        relative_path = PurePosixPath(*relative_parts)
+        for length in range(1, len(relative_parts)):
+            parent = PurePosixPath(*relative_parts[:length])
+            entries.setdefault(parent, (b"directory", 0o755, b""))
+        if member.isdir():
+            if member.mode != 0o755:
+                raise SyncError(
+                    f"archive release directory mode is not canonical: "
+                    f"{member.name}: {member.mode:#o} != 0o755"
+                )
+            entries[relative_path] = (b"directory", member.mode, b"")
+        else:
+            if member.mode not in {0o644, 0o755}:
+                raise SyncError(
+                    f"archive release file mode is not canonical: "
+                    f"{member.name}: {member.mode:#o}"
+                )
+            entries[relative_path] = (b"file", member.mode, b"")
+    return entries
+
+
 def _read_release_manifest_from_archive_snapshot(
     snapshot: Any,
     sha: str,
     *,
     maximum_expanded_bytes: int = MAX_ARCHIVE_EXPANDED_BYTES * 2,
-) -> tuple[dict[str, Any], int]:
+) -> tuple[dict[str, Any], int, str]:
     if (
         isinstance(maximum_expanded_bytes, bool)
         or not isinstance(maximum_expanded_bytes, int)
@@ -3037,6 +3173,11 @@ def _read_release_manifest_from_archive_snapshot(
             f"{expected_manifest_path}"
         )
 
+    logical_entries = _logical_archive_tree_entries(
+        planned_members,
+        release_root_parts,
+    )
+
     manifest_payload: bytes | None = None
     try:
         remaining_expanded_bytes = maximum_expanded_bytes - first_pass_bytes
@@ -3064,13 +3205,12 @@ def _read_release_manifest_from_archive_snapshot(
                         "archive snapshot metadata changed between passes"
                     )
                 member_parts = PurePosixPath(member.name).parts
-                if member_parts != expected_manifest_parts:
+                if member.isdir():
                     continue
-                if manifest_payload is not None:
-                    raise SyncError(
-                        "archive contains duplicate release manifest entries"
-                    )
-                if member.size > MAX_RELEASE_MANIFEST_BYTES:
+                is_manifest = member_parts == expected_manifest_parts
+                if is_manifest and manifest_payload is not None:
+                    raise SyncError("archive contains duplicate release manifest entries")
+                if is_manifest and member.size > MAX_RELEASE_MANIFEST_BYTES:
                     raise SyncError(
                         "archive release manifest exceeds byte limit: "
                         f"{member.size} > {MAX_RELEASE_MANIFEST_BYTES}"
@@ -3081,13 +3221,31 @@ def _read_release_manifest_from_archive_snapshot(
                         f"failed to read archive member: {member.name}"
                     )
                 try:
-                    manifest_payload = source.read(member.size + 1)
+                    content_digest = hashlib.sha256()
+                    manifest_chunks: list[bytes] | None = [] if is_manifest else None
+                    remaining = member.size
+                    while remaining:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise SyncError(f"archive member ended early: {member.name}")
+                        content_digest.update(chunk)
+                        if manifest_chunks is not None:
+                            manifest_chunks.append(chunk)
+                        remaining -= len(chunk)
+                    if source.read(1):
+                        raise SyncError(f"archive member grew while reading: {member.name}")
                 finally:
                     source.close()
-                if len(manifest_payload) != member.size:
-                    raise SyncError(
-                        f"archive member ended early: {member.name}"
-                    )
+                relative_path = PurePosixPath(
+                    *member_parts[len(release_root_parts) :]
+                )
+                logical_entries[relative_path] = (
+                    b"file",
+                    member.mode,
+                    member.size.to_bytes(8, "big") + content_digest.digest(),
+                )
+                if manifest_chunks is not None:
+                    manifest_payload = b"".join(manifest_chunks)
             if archive.next() is not None:
                 raise SyncError("archive snapshot gained members between passes")
         second_pass_bytes = bounded_reader.bytes_read
@@ -3099,7 +3257,11 @@ def _read_release_manifest_from_archive_snapshot(
         manifest_payload,
         Path(expected_manifest_path),
     )
-    return manifest, first_pass_bytes + second_pass_bytes
+    return (
+        manifest,
+        first_pass_bytes + second_pass_bytes,
+        _release_tree_digest_from_logical_entries(logical_entries),
+    )
 
 
 def read_verified_release_manifest(
@@ -3129,15 +3291,18 @@ def read_verified_release_manifest(
                     "name": assets.archive_name,
                     "size": assets.archive_size,
                     "state": "uploaded",
+                    "digest": assets.archive_digest,
                 },
                 {
                     "id": assets.checksum_id,
                     "name": assets.checksum_name,
                     "size": assets.checksum_size,
                     "state": "uploaded",
+                    "digest": assets.checksum_digest,
                 },
             ],
-        }
+        },
+        require_digests=True,
     )
     if normalized_assets != assets:
         raise SyncError("release asset metadata is internally inconsistent")
@@ -3159,9 +3324,11 @@ def read_verified_release_manifest(
                 archive_path,
                 checksum_path,
                 workspace=workspace,
+                archive_api_digest=assets.archive_digest,
+                checksum_api_digest=assets.checksum_digest,
             )
             try:
-                manifest, expanded_bytes = (
+                manifest, expanded_bytes, tree_digest = (
                     _read_release_manifest_from_archive_snapshot(
                         snapshot,
                         assets.sha,
@@ -3179,6 +3346,7 @@ def read_verified_release_manifest(
     return VerifiedReleaseManifest(
         manifest=manifest,
         expanded_bytes=expanded_bytes,
+        tree_digest=tree_digest,
     )
 
 
@@ -15518,7 +15686,21 @@ def _run_gh(args: list[str]) -> None:
         raise SyncError(completed.stderr.strip() or "gh command failed")
 
 
-def find_latest_release(repo: str) -> dict[str, Any]:
+def _require_immutable_release(
+    release: dict[str, Any],
+    tag_name: str,
+    *,
+    required: bool,
+) -> None:
+    if required and release.get("immutable") is not True:
+        raise SyncError(f"release {tag_name} is not immutable")
+
+
+def find_latest_release(
+    repo: str,
+    *,
+    require_immutable: bool = True,
+) -> dict[str, Any]:
     release_pages = _run_gh_json_stream(
         [
             "api",
@@ -15543,13 +15725,26 @@ def find_latest_release(repo: str) -> dict[str, Any]:
                 and not release_data.get("draft", False)
                 and not release_data.get("prerelease", False)
             ):
+                _require_immutable_release(
+                    release_data,
+                    tag_name,
+                    required=require_immutable,
+                )
                 normalized = _normalize_release(release_data)
-                select_release_assets(normalized)
+                select_release_assets(
+                    normalized,
+                    require_digests=require_immutable,
+                )
                 return normalized
     raise SyncError(f"no {TAG_PREFIX} release found in {repo}")
 
 
-def find_release_by_asset_sha(repo: str, sha: str) -> dict[str, Any]:
+def find_release_by_asset_sha(
+    repo: str,
+    sha: str,
+    *,
+    require_immutable: bool = True,
+) -> dict[str, Any]:
     sha = _validate_release_sha(sha)
     release_pages = _run_gh_json_stream(
         [
@@ -15574,7 +15769,15 @@ def find_release_by_asset_sha(repo: str, sha: str) -> dict[str, Any]:
             normalized = _normalize_release(release_data)
             if not _release_mentions_asset_sha(normalized, sha):
                 continue
-            assets = select_release_assets(normalized)
+            _require_immutable_release(
+                release_data,
+                tag_name,
+                required=require_immutable,
+            )
+            assets = select_release_assets(
+                normalized,
+                require_digests=require_immutable,
+            )
             if assets.sha == sha:
                 return normalized
     raise SyncError(f"no {TAG_PREFIX} release with asset SHA {sha} found in {repo}")
@@ -15663,11 +15866,17 @@ def _download_release_asset(
     destination: Path,
     *,
     bound_destination_fd: int,
+    expected_digest: str,
 ) -> None:
     _validated_release_asset_metadata(
         {"id": asset_id, "size": expected_size},
         asset_name,
         maximum_bytes=maximum_bytes,
+    )
+    _validated_release_asset_digest(
+        {"digest": expected_digest},
+        asset_name,
+        required=True,
     )
     if Path(asset_name).name != asset_name or asset_name in {"", ".", ".."}:
         raise SyncError(f"release asset has an unsafe name: {asset_name}")
@@ -15741,6 +15950,7 @@ def _download_release_asset(
                 raise SyncError(f"gh did not provide a download stream for {asset_name}")
 
             received = 0
+            downloaded_digest = hashlib.sha256()
             while True:
                 read_size = min(64 * 1024, expected_size - received + 1)
                 chunk = stdout.read(read_size)
@@ -15753,6 +15963,7 @@ def _download_release_asset(
                         f"downloaded release asset {asset_name} exceeds its "
                         f"advertised {expected_size} byte size"
                     )
+                downloaded_digest.update(chunk)
                 view = memoryview(chunk)
                 while view:
                     written = os.write(partial_fd, view)
@@ -15772,6 +15983,12 @@ def _download_release_asset(
                 raise SyncError(
                     f"downloaded release asset {asset_name} size mismatch: "
                     f"expected {expected_size}, got {received}"
+                )
+            actual_digest = f"sha256:{downloaded_digest.hexdigest()}"
+            if actual_digest != expected_digest:
+                raise SyncError(
+                    f"GitHub API digest mismatch for {asset_name}: "
+                    f"expected {expected_digest}, got {actual_digest}"
                 )
 
         actual_size = os.fstat(partial_fd).st_size
@@ -15898,20 +16115,27 @@ def download_release_assets(
             assets.archive_id,
             assets.archive_size,
             MAX_ARCHIVE_COMPRESSED_BYTES,
+            assets.archive_digest,
         ),
         (
             assets.checksum_name,
             assets.checksum_id,
             assets.checksum_size,
             MAX_ARCHIVE_CHECKSUM_BYTES,
+            assets.checksum_digest,
         ),
     )
     asset_ids: set[int] = set()
-    for asset_name, asset_id, asset_size, maximum_bytes in downloads:
+    for asset_name, asset_id, asset_size, maximum_bytes, asset_digest in downloads:
         _validated_release_asset_metadata(
             {"id": asset_id, "size": asset_size},
             asset_name,
             maximum_bytes=maximum_bytes,
+        )
+        _validated_release_asset_digest(
+            {"digest": asset_digest},
+            asset_name,
+            required=True,
         )
         if asset_id in asset_ids:
             raise SyncError("release archive and checksum must have distinct GitHub asset ids")
@@ -15922,7 +16146,8 @@ def download_release_assets(
         create=True,
     )
     try:
-        for asset_name, asset_id, asset_size, maximum_bytes in downloads:
+        for asset_name, asset_id, asset_size, maximum_bytes, asset_digest in downloads:
+            assert asset_digest is not None
             _download_release_asset(
                 repo,
                 asset_name,
@@ -15931,6 +16156,7 @@ def download_release_assets(
                 maximum_bytes,
                 destination,
                 bound_destination_fd=destination_fd,
+                expected_digest=asset_digest,
             )
         if not _archive_path_matches_fd(destination, destination_fd):
             raise SyncError(f"release download directory changed: {destination}")
@@ -15948,7 +16174,7 @@ def download_and_extract_release(
     sha: str | None = None,
 ) -> DownloadedRelease:
     release = find_release_by_asset_sha(repo, sha) if sha is not None else find_latest_release(repo)
-    assets = select_release_assets(release)
+    assets = select_release_assets(release, require_digests=True)
     destination_fd = _open_archive_directory_beneath(
         workspace,
         destination,
@@ -15974,6 +16200,8 @@ def download_and_extract_release(
             checksum_path,
             extract_root,
             workspace=destination_workspace,
+            archive_api_digest=assets.archive_digest,
+            checksum_api_digest=assets.checksum_digest,
         )
         return DownloadedRelease(
             repo=repo,

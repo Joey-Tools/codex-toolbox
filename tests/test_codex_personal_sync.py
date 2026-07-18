@@ -37,14 +37,25 @@ SHA5 = "5" * 40
 SHA6 = "6" * 40
 
 
+def github_sha256(payload: bytes) -> str:
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
 def github_release_asset(
     asset_id: object,
     name: str,
     *,
     size: object = 1,
     state: object = "uploaded",
+    digest: object = "sha256:" + "0" * 64,
 ) -> dict[str, object]:
-    return {"id": asset_id, "name": name, "size": size, "state": state}
+    return {
+        "id": asset_id,
+        "name": name,
+        "size": size,
+        "state": state,
+        "digest": digest,
+    }
 
 
 class FakeDownloadProcess:
@@ -2591,6 +2602,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             archive_size=len(archive_payload),
             checksum_id=102,
             checksum_size=len(checksum_payload),
+            archive_digest=github_sha256(archive_payload),
+            checksum_digest=github_sha256(checksum_payload),
         )
 
         def fake_popen(args, **_kwargs):
@@ -2629,6 +2642,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             archive_size=len(payload),
             checksum_id=102,
             checksum_size=1,
+            archive_digest=github_sha256(payload),
+            checksum_digest="sha256:" + "0" * 64,
         )
         destination = self.root / "replaced-partial-download"
         real_link = os.link
@@ -2688,6 +2703,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             archive_size=len(payload),
             checksum_id=102,
             checksum_size=1,
+            archive_digest=github_sha256(payload),
+            checksum_digest="sha256:" + "0" * 64,
         )
         destination = self.root / "replaced-target-download"
         real_link = os.link
@@ -2748,6 +2765,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             archive_size=len(payload),
             checksum_id=102,
             checksum_size=1,
+            archive_digest=github_sha256(payload),
+            checksum_digest="sha256:" + "0" * 64,
         )
         destination = self.root / "replaced-partial-cleanup"
         real_rename_noreplace = MODULE._rename_noreplace_at
@@ -2819,6 +2838,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             archive_size=4,
             checksum_id=102,
             checksum_size=1,
+            archive_digest="sha256:" + "0" * 64,
+            checksum_digest="sha256:" + "0" * 64,
         )
         destination = self.root / "cleanup-error-download"
         real_fsync = os.fsync
@@ -2865,6 +2886,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             archive_size=4,
             checksum_id=102,
             checksum_size=1,
+            archive_digest="sha256:" + "0" * 64,
+            checksum_digest="sha256:" + "0" * 64,
         )
         destination = self.root / "oversized-download"
 
@@ -2889,6 +2912,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             archive_size=4,
             checksum_id=102,
             checksum_size=1,
+            archive_digest="sha256:" + "0" * 64,
+            checksum_digest="sha256:" + "0" * 64,
         )
         destination = self.root / "short-download"
 
@@ -2909,6 +2934,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
             archive_size=1,
             checksum_id=102,
             checksum_size=MODULE.MAX_ARCHIVE_CHECKSUM_BYTES + 1,
+            archive_digest="sha256:" + "0" * 64,
+            checksum_digest="sha256:" + "0" * 64,
         )
         destination = self.root / "invalid-metadata-download"
 
@@ -5924,6 +5951,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     {
                         "tag_name": "personal-codex-20260511-120000-1111111",
                         "target_commitish": SHA1,
+                        "immutable": True,
                         "assets": [
                             github_release_asset(
                                 101,
@@ -5946,6 +5974,56 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertIn("--paginate", calls[0])
         self.assertNotIn("--slurp", calls[0])
         self.assertNotIn("--jq", calls[0])
+
+    def test_find_latest_release_rejects_mutable_release_without_fallback(self) -> None:
+        mutable = {
+            "tag_name": "personal-codex-20260511-120000-1111111",
+            "target_commitish": SHA1,
+            "immutable": False,
+            "assets": [
+                github_release_asset(101, f"personal-codex-{SHA1}.tar.gz"),
+                github_release_asset(102, f"personal-codex-{SHA1}.sha256"),
+            ],
+        }
+        older_immutable = {
+            "tag_name": "personal-codex-20260510-120000-2222222",
+            "target_commitish": SHA2,
+            "immutable": True,
+            "assets": [
+                github_release_asset(201, f"personal-codex-{SHA2}.tar.gz"),
+                github_release_asset(202, f"personal-codex-{SHA2}.sha256"),
+            ],
+        }
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_gh_json_stream",
+                return_value=[[mutable, older_immutable]],
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "not immutable"),
+        ):
+            MODULE.find_latest_release("owner/repo")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_gh_json_stream",
+                return_value=[[mutable]],
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "not immutable"),
+        ):
+            MODULE.find_release_by_asset_sha("owner/repo", SHA1)
+
+        with mock.patch.object(
+            MODULE,
+            "_run_gh_json_stream",
+            return_value=[[mutable]],
+        ):
+            selected = MODULE.find_latest_release(
+                "owner/repo",
+                require_immutable=False,
+            )
+        self.assertEqual(selected["targetCommitish"], SHA1)
 
     def test_find_latest_release_rejects_missing_release(self) -> None:
         with mock.patch.object(MODULE, "_run_gh_json_stream", return_value=[[]]):
@@ -5984,11 +6062,13 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     101,
                     archive_name,
                     size=archive_path.stat().st_size,
+                    digest=github_sha256(archive_path.read_bytes()),
                 ),
                 github_release_asset(
                     102,
                     checksum_name,
                     size=checksum_path.stat().st_size,
+                    digest=github_sha256(checksum_path.read_bytes()),
                 ),
             ],
         }
@@ -6078,11 +6158,13 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     101,
                     archive_name,
                     size=archive_path.stat().st_size,
+                    digest=github_sha256(archive_path.read_bytes()),
                 ),
                 github_release_asset(
                     102,
                     checksum_name,
                     size=checksum_path.stat().st_size,
+                    digest=github_sha256(checksum_path.read_bytes()),
                 ),
             ],
         }

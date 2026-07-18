@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 import hashlib
 import importlib.util
 from io import StringIO
@@ -90,6 +91,8 @@ def complete_release(
     checksum_id: int | None = None,
     archive_size: int = 1,
     checksum_size: int = 1,
+    archive_digest: object = "sha256:" + "a" * 64,
+    checksum_digest: object = "sha256:" + "b" * 64,
 ) -> dict[str, object]:
     asset_id_base = int(sha[:12], 16) * 2 + 1
     return {
@@ -104,12 +107,14 @@ def complete_release(
                 "name": f"personal-codex-{sha}.tar.gz",
                 "size": archive_size,
                 "state": asset_state,
+                "digest": archive_digest,
             },
             {
                 "id": checksum_id if checksum_id is not None else asset_id_base + 1,
                 "name": f"personal-codex-{sha}.sha256",
                 "size": checksum_size,
                 "state": asset_state,
+                "digest": checksum_digest,
             },
         ],
     }
@@ -124,12 +129,22 @@ class VerifiedReleaseManifestRuntimeTests(unittest.TestCase):
         return f"{release_root}/personal_codex/sync-manifest.json"
 
     @staticmethod
-    def archive_payload(entries: list[tuple[str, bytes]]) -> bytes:
+    def archive_payload(
+        entries: list[tuple[str, bytes]],
+        *,
+        directories: tuple[tuple[str, int], ...] = (),
+        modes: dict[str, int] | None = None,
+    ) -> bytes:
         output = io.BytesIO()
         with tarfile.open(fileobj=output, mode="w:gz") as archive:
+            for name, mode in directories:
+                member = tarfile.TarInfo(name)
+                member.type = tarfile.DIRTYPE
+                member.mode = mode
+                archive.addfile(member)
             for name, payload in entries:
                 member = tarfile.TarInfo(name)
-                member.mode = 0o644
+                member.mode = (modes or {}).get(name, 0o644)
                 member.size = len(payload)
                 archive.addfile(member, io.BytesIO(payload))
         return output.getvalue()
@@ -148,6 +163,12 @@ class VerifiedReleaseManifestRuntimeTests(unittest.TestCase):
             checksum_name=f"personal-codex-{self.SHA}.sha256",
             checksum_id=102,
             checksum_size=len(checksum_payload),
+            archive_digest=(
+                f"sha256:{hashlib.sha256(archive_payload).hexdigest()}"
+            ),
+            checksum_digest=(
+                f"sha256:{hashlib.sha256(checksum_payload).hexdigest()}"
+            ),
         )
 
     def checksum_payload(self, archive_payload: bytes) -> bytes:
@@ -162,8 +183,14 @@ class VerifiedReleaseManifestRuntimeTests(unittest.TestCase):
         checksum_payload: bytes,
         *,
         maximum_expanded_bytes: int | None = None,
+        archive_api_digest: str | None = None,
+        checksum_api_digest: str | None = None,
     ) -> tuple[object, list[tuple[str, int, int, int]]]:
         assets = self.assets_for_payloads(archive_payload, checksum_payload)
+        if archive_api_digest is not None:
+            assets = replace(assets, archive_digest=archive_api_digest)
+        if checksum_api_digest is not None:
+            assets = replace(assets, checksum_digest=checksum_api_digest)
         payloads = {
             assets.archive_name: archive_payload,
             assets.checksum_name: checksum_payload,
@@ -179,10 +206,12 @@ class VerifiedReleaseManifestRuntimeTests(unittest.TestCase):
             destination: Path,
             *,
             bound_destination_fd: int,
+            expected_digest: str,
         ) -> None:
             calls.append((asset_name, asset_id, expected_size, maximum_bytes))
             payload = payloads[asset_name]
             self.assertEqual(len(payload), expected_size)
+            self.assertRegex(expected_digest, r"^sha256:[0-9a-f]{64}$")
             opened_metadata = os.fstat(bound_destination_fd)
             path_metadata = destination.stat()
             self.assertEqual(
@@ -226,6 +255,7 @@ class VerifiedReleaseManifestRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(result.manifest, expected_manifest)
+        self.assertRegex(result.tree_digest, r"^[0-9a-f]{64}$")
         self.assertGreater(result.expanded_bytes, len(manifest_payload) * 2)
         self.assertEqual(
             calls,
@@ -244,6 +274,111 @@ class VerifiedReleaseManifestRuntimeTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_tree_digest_binds_complete_normalized_release_tree(self) -> None:
+        manifest_path = self.manifest_member_path()
+        script_path = f"personal-codex-{self.SHA}/scripts/runner.py"
+        manifest_payload = b'{"version":1,"links":[]}'
+
+        def digest_for(
+            entries: list[tuple[str, bytes]],
+            *,
+            directories: tuple[tuple[str, int], ...] = (),
+            modes: dict[str, int] | None = None,
+        ) -> str:
+            archive_payload = self.archive_payload(
+                entries,
+                directories=directories,
+                modes=modes,
+            )
+            result, _calls = self.read_with_fake_downloads(
+                archive_payload,
+                self.checksum_payload(archive_payload),
+            )
+            return result.tree_digest
+
+        base_entries = [
+            (manifest_path, manifest_payload),
+            (script_path, b"print('trusted')\n"),
+        ]
+        base_digest = digest_for(base_entries)
+        explicit_digest = digest_for(
+            base_entries,
+            directories=(
+                (f"personal-codex-{self.SHA}", 0o700),
+                (f"personal-codex-{self.SHA}/personal_codex", 0o755),
+                (f"personal-codex-{self.SHA}/scripts", 0o755),
+            ),
+        )
+        self.assertEqual(explicit_digest, base_digest)
+
+        variants = {
+            "content": digest_for(
+                [
+                    (manifest_path, manifest_payload),
+                    (script_path, b"print('replaced')\n"),
+                ]
+            ),
+            "missing": digest_for([(manifest_path, manifest_payload)]),
+            "extra-file": digest_for(
+                [*base_entries, (f"personal-codex-{self.SHA}/extra.txt", b"extra")]
+            ),
+            "extra-empty-directory": digest_for(
+                base_entries,
+                directories=((f"personal-codex-{self.SHA}/empty", 0o755),),
+            ),
+            "mode": digest_for(base_entries, modes={script_path: 0o755}),
+        }
+        for name, variant_digest in variants.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(variant_digest, base_digest)
+
+        with self.assertRaisesRegex(RUNTIME.SyncError, "directory mode is not canonical"):
+            digest_for(
+                base_entries,
+                directories=(
+                    (f"personal-codex-{self.SHA}/scripts", 0o700),
+                ),
+            )
+
+    def test_rejects_missing_invalid_and_mismatched_api_digests(self) -> None:
+        manifest_payload = b'{"version":1,"links":[]}'
+        archive_payload = self.archive_payload(
+            [(self.manifest_member_path(), manifest_payload)]
+        )
+        checksum_payload = self.checksum_payload(archive_payload)
+        assets = self.assets_for_payloads(archive_payload, checksum_payload)
+        release = {
+            "tagName": assets.tag_name,
+            "targetCommitish": assets.sha,
+            "assets": [
+                {
+                    "id": assets.archive_id,
+                    "name": assets.archive_name,
+                    "size": assets.archive_size,
+                    "state": "uploaded",
+                },
+                {
+                    "id": assets.checksum_id,
+                    "name": assets.checksum_name,
+                    "size": assets.checksum_size,
+                    "state": "uploaded",
+                    "digest": assets.checksum_digest,
+                },
+            ],
+        }
+        with self.assertRaisesRegex(RUNTIME.SyncError, "sha256 digest"):
+            RUNTIME.select_release_assets(release, require_digests=True)
+        release["assets"][0]["digest"] = "sha256:ABC"
+        with self.assertRaisesRegex(RUNTIME.SyncError, "sha256 digest"):
+            RUNTIME.select_release_assets(release, require_digests=True)
+
+        with self.assertRaisesRegex(RUNTIME.SyncError, "API digest mismatch"):
+            self.read_with_fake_downloads(
+                archive_payload,
+                checksum_payload,
+                archive_api_digest="sha256:" + "0" * 64,
+            )
 
     def test_rejects_bad_checksum(self) -> None:
         manifest_payload = b'{"version":1,"links":[]}'
@@ -350,17 +485,57 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
         self.archive_manifest_reader = archive_reader_patch.start()
         self.addCleanup(archive_reader_patch.stop)
 
+    def test_release_tree_commit_path_budget_includes_package_root_prefix(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        package_prefix_bytes = len(f"personal-codex-{sha}/".encode("ascii"))
+        relative_budget = MODULE.MAX_MANIFEST_PATH_BYTES - package_prefix_bytes
+        components: list[bytes] = []
+        remaining = relative_budget + 1
+        while remaining:
+            component_size = min(
+                MODULE.MAX_MANIFEST_TARGET_COMPONENT_BYTES,
+                remaining,
+            )
+            components.append(b"x" * component_size)
+            remaining -= component_size
+            if remaining:
+                remaining -= 1
+        oversized_path = b"/".join(components)
+        self.assertEqual(len(oversized_path), relative_budget + 1)
+
+        cases = (
+            ("bytes", oversized_path, "UTF-8 bytes"),
+            (
+                "depth",
+                b"/".join([b"x"] * MODULE.MAX_MANIFEST_SOURCE_DEPTH),
+                "components",
+            ),
+        )
+        for name, raw_path, error_pattern in cases:
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(MODULE.ValidationError, error_pattern),
+            ):
+                MODULE._release_tree_path(raw_path, sha)
+
     def read_commit_manifest_as_archive(
         self,
         _repository: str,
         identity: object,
         _maximum_expanded_bytes: int,
-    ) -> tuple[dict[str, object], int]:
+    ) -> tuple[dict[str, object], int, str]:
         sha = getattr(identity, "sha")
         payload = MODULE._manifest_at_ref(self.repo, sha, MANIFEST)
         if payload is None:
             raise AssertionError(f"missing test manifest at {sha}")
-        return payload, 0
+        tree_digest = MODULE._release_tree_digests_at_commits(
+            self.repo,
+            [(sha, payload)],
+            MANIFEST,
+        )[sha]
+        return payload, 0, tree_digest
 
     def git(self, *args: str) -> str:
         result = subprocess.run(
@@ -1053,7 +1228,11 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
         self.git("tag", tag, baseline_sha)
         release = complete_release(baseline_sha, tag=tag)
         self.archive_manifest_reader.side_effect = None
-        self.archive_manifest_reader.return_value = (manifest("different"), 1)
+        self.archive_manifest_reader.return_value = (
+            manifest("different"),
+            1,
+            "0" * 64,
+        )
 
         with (
             mock.patch.dict(os.environ, {"GITHUB_TOKEN": "token"}),
@@ -1064,6 +1243,79 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
             ),
         ):
             MODULE._release_baseline(self.repo, "owner/repo", MANIFEST)
+
+    def test_release_baseline_rejects_archive_tree_mismatch(self) -> None:
+        self.write_manifest(manifest("keep"))
+        baseline_sha = self.commit("Add manifest")
+        tag = f"personal-codex-20260715-000000-{baseline_sha[:7]}"
+        self.git("tag", tag, baseline_sha)
+        release = complete_release(baseline_sha, tag=tag)
+        self.archive_manifest_reader.side_effect = None
+        self.archive_manifest_reader.return_value = (
+            manifest("keep"),
+            1,
+            "0" * 64,
+        )
+
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": "token"}),
+            self.release_patch(release),
+            self.assertRaisesRegex(
+                MODULE.ValidationError,
+                "archive tree does not match Git commit tree",
+            ),
+        ):
+            MODULE._release_baseline(self.repo, "owner/repo", MANIFEST)
+
+    def test_release_baseline_rejects_historical_archive_tree_mismatch(
+        self,
+    ) -> None:
+        self.write_manifest(manifest("older"))
+        older_sha = self.commit("Add older manifest")
+        older_tag = f"personal-codex-20260715-000000-{older_sha[:7]}"
+        self.git("tag", older_tag, older_sha)
+
+        self.write_manifest(manifest("newer"))
+        newer_sha = self.commit("Add newer manifest")
+        newer_tag = f"personal-codex-20260715-010000-{newer_sha[:7]}"
+        self.git("tag", newer_tag, newer_sha)
+
+        def read_with_older_tree_mismatch(
+            repository: str,
+            identity: object,
+            maximum_expanded_bytes: int,
+        ) -> tuple[dict[str, object], int, str]:
+            archive_manifest, expanded_bytes, tree_digest = (
+                self.read_commit_manifest_as_archive(
+                    repository,
+                    identity,
+                    maximum_expanded_bytes,
+                )
+            )
+            if getattr(identity, "sha") == older_sha:
+                tree_digest = "0" * 64
+            return archive_manifest, expanded_bytes, tree_digest
+
+        self.archive_manifest_reader.side_effect = read_with_older_tree_mismatch
+        releases = [
+            complete_release(newer_sha, tag=newer_tag),
+            complete_release(older_sha, tag=older_tag),
+        ]
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": "token"}),
+            mock.patch.object(
+                MODULE,
+                "_iter_github_releases",
+                side_effect=lambda *_args: iter(releases),
+            ),
+            self.assertRaisesRegex(
+                MODULE.ValidationError,
+                f"archive tree does not match Git commit tree: {older_tag}",
+            ),
+        ):
+            MODULE._release_baseline(self.repo, "owner/repo", MANIFEST)
+
+        self.assertEqual(self.archive_manifest_reader.call_count, 2)
 
     def test_release_archive_manifest_comparison_is_json_type_sensitive(self) -> None:
         sha = "a" * 40
@@ -1082,6 +1334,7 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                 self.archive_manifest_reader.return_value = (
                     {"value": archive_value},
                     0,
+                    "0" * 64,
                 )
                 with self.assertRaisesRegex(
                     MODULE.ValidationError,
@@ -1091,6 +1344,7 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                         "owner/repo",
                         [identity],
                         {sha: {"value": commit_value}},
+                        {sha: "0" * 64},
                     )
 
     def test_release_archive_verification_caches_only_identical_asset_pairs(
@@ -1160,7 +1414,16 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
             ),
         ]
         self.archive_manifest_reader.side_effect = None
-        self.archive_manifest_reader.return_value = (manifest("keep"), 1)
+        expected_tree_digest = MODULE._release_tree_digests_at_commits(
+            self.repo,
+            [(baseline_sha, manifest("keep"))],
+            MANIFEST,
+        )[baseline_sha]
+        self.archive_manifest_reader.return_value = (
+            manifest("keep"),
+            1,
+            expected_tree_digest,
+        )
 
         with (
             mock.patch.dict(os.environ, {"GITHUB_TOKEN": "token"}),

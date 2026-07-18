@@ -6,6 +6,7 @@ from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
+import hashlib
 import importlib.util
 import io
 from itertools import chain
@@ -75,6 +76,8 @@ RELEASE_ARCHIVE_ASSET_RE = re.compile(
 RELEASE_CHECKSUM_ASSET_RE = re.compile(
     r"^personal-codex-([0-9a-f]{40})\.sha256$"
 )
+GITHUB_ASSET_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+RELEASE_TREE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 PUBLISHED_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 REPOSITORY_RE = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?/"
@@ -95,6 +98,12 @@ MAX_RELEASE_CHECKSUM_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_RELEASE_EXPANDED_SCAN_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 MAX_GIT_CHANGE_SUMMARY_BYTES = 1024 * 1024
 MAX_GIT_TREE_LISTING_BYTES = 16 * 1024 * 1024
+MAX_RELEASE_TREE_MEMBERS = 10_000
+MAX_RELEASE_TREE_MEMBER_BYTES = 32 * 1024 * 1024
+MAX_RELEASE_TREE_EXPANDED_BYTES = 256 * 1024 * 1024
+MAX_GIT_RELEASE_TREE_BLOB_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+MAX_GIT_BLOB_BATCH_BYTES = 64 * 1024 * 1024
+MAX_GIT_BLOB_BATCH_OBJECTS = 1024
 MAX_MANIFEST_PATH_BYTES = 4096
 MAX_MANIFEST_SOURCE_DEPTH = 64
 MAX_MANIFEST_TARGET_PATH_BYTES = 4096
@@ -108,6 +117,10 @@ MAX_MANIFEST_ACTIVE_LINKS = (
 )
 REGULAR_GIT_MODES = {b"100644", b"100755"}
 GIT_OBJECT_ID_RE = re.compile(rb"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+RELEASE_MANIFEST_PATH = PurePosixPath("personal_codex/sync-manifest.json")
+GENERATED_DIR_NAMES = frozenset({"__pycache__"})
+GENERATED_FILE_NAMES = frozenset({".DS_Store"})
+GENERATED_SUFFIXES = frozenset({".pyc", ".pyo"})
 
 
 class ValidationError(RuntimeError):
@@ -122,9 +135,11 @@ class _CompleteRelease:
     archive_name: str
     archive_id: int
     archive_size: int
+    archive_digest: str
     checksum_name: str
     checksum_id: int
     checksum_size: int
+    checksum_digest: str
 
     @property
     def asset_pair_key(self) -> tuple[str | int, ...]:
@@ -132,10 +147,28 @@ class _CompleteRelease:
             self.archive_name,
             self.archive_id,
             self.archive_size,
+            self.archive_digest,
             self.checksum_name,
             self.checksum_id,
             self.checksum_size,
+            self.checksum_digest,
         )
+
+
+@dataclass(frozen=True)
+class _GitReleaseTreeEntry:
+    mode: bytes
+    object_type: bytes
+    object_id: bytes
+
+
+@dataclass(frozen=True)
+class _ReleaseTreePlan:
+    commit: str
+    manifest_mode: int
+    manifest_payload: bytes
+    directories: tuple[PurePosixPath, ...]
+    files: tuple[tuple[PurePosixPath, int, bytes], ...]
 
 
 _SYNC_RUNTIME_MODULE: Any | None = None
@@ -2074,6 +2107,530 @@ def _release_manifests_at_commits(
     ]
 
 
+def _is_generated_release_path(
+    path: PurePosixPath,
+    *,
+    is_dir: bool | None = None,
+) -> bool:
+    if any(part in GENERATED_DIR_NAMES for part in path.parts):
+        return True
+    if path.name in GENERATED_FILE_NAMES:
+        return True
+    if is_dir is True:
+        return False
+    return path.suffix in GENERATED_SUFFIXES
+
+
+def _release_tree_path(raw_path: bytes, commit: str) -> PurePosixPath:
+    try:
+        decoded = raw_path.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ValidationError(
+            f"release commit {commit} contains a selected path that is not UTF-8"
+        ) from error
+    path = PurePosixPath(decoded)
+    if (
+        not decoded
+        or decoded.startswith("/")
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise ValidationError(
+            f"release commit {commit} contains an unsafe selected path"
+        )
+    package_root = f"personal-codex-{commit}".encode("ascii")
+    archive_member_bytes = len(package_root) + 1 + len(raw_path)
+    if archive_member_bytes > MAX_MANIFEST_PATH_BYTES:
+        raise ValidationError(
+            f"release commit {commit} archive member path exceeds "
+            f"{MAX_MANIFEST_PATH_BYTES} UTF-8 bytes: {decoded}"
+        )
+    archive_member_depth = 1 + len(path.parts)
+    if archive_member_depth > MAX_MANIFEST_SOURCE_DEPTH:
+        raise ValidationError(
+            f"release commit {commit} archive member path exceeds "
+            f"{MAX_MANIFEST_SOURCE_DEPTH} components: {decoded}"
+        )
+    for part in path.parts:
+        if len(part.encode("utf-8")) > MAX_MANIFEST_TARGET_COMPONENT_BYTES:
+            raise ValidationError(
+                f"release commit {commit} selected path has an oversized "
+                f"component: {decoded}"
+            )
+    return path
+
+
+def _git_release_tree_entries(
+    repo_root: Path,
+    commit: str,
+) -> dict[bytes, _GitReleaseTreeEntry]:
+    result = _bounded_git_output(
+        repo_root,
+        [
+            "git",
+            "ls-tree",
+            "-r",
+            "-t",
+            "-z",
+            "--full-tree",
+            commit,
+        ],
+        stdout_limit=MAX_GIT_TREE_LISTING_BYTES,
+        stdout_overflow_error=(
+            f"Git release tree listing for {commit} exceeds the 16 MiB safety limit"
+        ),
+    )
+    if result.returncode != 0:
+        raise ValidationError(
+            f"failed to inspect release tree at {commit}: {_git_error(result)}"
+        )
+    if result.stdout and not result.stdout.endswith(b"\0"):
+        raise ValidationError(
+            f"Git returned a malformed release tree listing for {commit}"
+        )
+
+    entries: dict[bytes, _GitReleaseTreeEntry] = {}
+    records = result.stdout[:-1].split(b"\0") if result.stdout else []
+    for record in records:
+        metadata, separator, raw_path = record.partition(b"\t")
+        fields = metadata.split()
+        if (
+            separator != b"\t"
+            or len(fields) != 3
+            or not raw_path
+            or GIT_OBJECT_ID_RE.fullmatch(fields[2]) is None
+        ):
+            raise ValidationError(
+                f"Git returned a malformed release tree entry for {commit}"
+            )
+        entry = _GitReleaseTreeEntry(
+            mode=fields[0],
+            object_type=fields[1],
+            object_id=fields[2],
+        )
+        if raw_path in entries:
+            raise ValidationError(
+                f"Git returned a duplicate release tree entry for {commit}"
+            )
+        entries[raw_path] = entry
+    return entries
+
+
+def _release_tree_sources(manifest: dict[str, Any]) -> tuple[PurePosixPath, ...]:
+    raw_links = manifest.get("links")
+    raw_references = manifest.get("reference_only", [])
+    assert isinstance(raw_links, list)
+    assert isinstance(raw_references, list)
+    sources = [
+        PurePosixPath(item["source"])
+        for item in raw_links
+        if isinstance(item, dict)
+    ]
+    sources.extend(PurePosixPath(reference) for reference in raw_references)
+    return tuple(dict.fromkeys(sources))
+
+
+def _release_tree_plan_at_commit(
+    repo_root: Path,
+    commit: str,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+) -> _ReleaseTreePlan:
+    entries = _git_release_tree_entries(repo_root, commit)
+    manifest_raw, encoded_manifest_path = _manifest_git_path(manifest_path)
+    manifest_entry = entries.get(encoded_manifest_path)
+    if manifest_entry is None:
+        raise ValidationError(
+            f"complete release {commit} does not contain {manifest_raw}"
+        )
+    if (
+        manifest_entry.mode not in REGULAR_GIT_MODES
+        or manifest_entry.object_type != b"blob"
+    ):
+        raise ValidationError(
+            f"complete release {commit} manifest is not a regular Git blob"
+        )
+    manifest_pure_path = PurePosixPath(manifest_raw)
+    if ".git" in manifest_pure_path.parts:
+        raise ValidationError(
+            f"complete release {commit} manifest is nested under .git"
+        )
+
+    def path_kind(raw_path: str) -> str | None:
+        encoded_path = raw_path.encode("utf-8", errors="strict")
+        entry = entries.get(encoded_path)
+        if entry is None:
+            return None
+        if entry.mode in REGULAR_GIT_MODES and entry.object_type == b"blob":
+            return "file"
+        if entry.mode == b"040000" and entry.object_type == b"tree":
+            return "directory"
+        return None
+
+    _manifest_model(
+        manifest,
+        path_kind,
+        source_context=f"release commit {commit}",
+        enforce_history_constraints=False,
+    )
+    sources = _release_tree_sources(manifest)
+    source_kinds: dict[bytes, tuple[PurePosixPath, str]] = {}
+    source_trie: dict[bytes, Any] = {}
+    for source in sources:
+        raw_source = source.as_posix().encode("utf-8", errors="strict")
+        source_kind = path_kind(source.as_posix())
+        assert source_kind in {"file", "directory"}
+        if _is_generated_release_path(
+            source,
+            is_dir=source_kind == "directory",
+        ):
+            raise ValidationError(
+                f"release commit {commit} selects generated manifest source: {source}"
+            )
+        source_kinds[raw_source] = (source, source_kind)
+        node = source_trie
+        for component in raw_source.split(b"/"):
+            node = node.setdefault(component, {})
+        node[b""] = (source, source_kind)
+
+    def selected_source(
+        raw_path: bytes,
+    ) -> tuple[PurePosixPath, str] | None:
+        node = source_trie
+        selected: tuple[PurePosixPath, str] | None = None
+        for component in raw_path.split(b"/"):
+            child = node.get(component)
+            if not isinstance(child, dict):
+                break
+            node = child
+            terminal = node.get(b"")
+            if isinstance(terminal, tuple):
+                selected = terminal
+        return selected
+
+    directories: set[PurePosixPath] = {
+        source
+        for source, source_kind in source_kinds.values()
+        if source_kind == "directory"
+    }
+    files: dict[PurePosixPath, tuple[int, bytes]] = {}
+    for raw_path, entry in entries.items():
+        selected = selected_source(raw_path)
+        if selected is None:
+            continue
+        source, source_kind = selected
+        path = _release_tree_path(raw_path, commit)
+        if ".git" in path.parts:
+            raise ValidationError(
+                f"release commit {commit} contains nested Git metadata under "
+                f"manifest source: {path}"
+            )
+        if entry.mode == b"040000" and entry.object_type == b"tree":
+            continue
+        if entry.mode not in REGULAR_GIT_MODES or entry.object_type != b"blob":
+            raise ValidationError(
+                f"release commit {commit} contains an unsupported entry under "
+                f"manifest source: {path}"
+            )
+        if source_kind == "file" and path != source:
+            raise ValidationError(
+                f"release commit {commit} contains descendants beneath file "
+                f"manifest source: {source}"
+            )
+        relative_path = PurePosixPath(*path.parts[len(source.parts) :])
+        if _is_generated_release_path(relative_path, is_dir=False):
+            continue
+        if path == RELEASE_MANIFEST_PATH:
+            if source_kind == "file" and path == source:
+                continue
+            raise ValidationError(
+                "strict release snapshot path conflicts with generated manifest: "
+                f"{RELEASE_MANIFEST_PATH} at {commit}"
+            )
+        mode = 0o755 if entry.mode == b"100755" else 0o644
+        previous = files.setdefault(path, (mode, entry.object_id))
+        if previous != (mode, entry.object_id):
+            raise ValidationError(
+                f"release commit {commit} has conflicting selected file: {path}"
+            )
+
+    for file_path in (*files, RELEASE_MANIFEST_PATH):
+        for parent in file_path.parents:
+            if not parent.parts:
+                break
+            directories.add(parent)
+    if RELEASE_MANIFEST_PATH in directories:
+        raise ValidationError(
+            "strict release snapshot path conflicts with generated manifest "
+            f"directory at {commit}: {RELEASE_MANIFEST_PATH}"
+        )
+    if any(path in files for path in directories):
+        raise ValidationError(
+            f"release commit {commit} has a file/directory snapshot conflict"
+        )
+
+    portable_entries: dict[tuple[str, ...], tuple[PurePosixPath, str]] = {}
+    for kind, paths in (
+        ("directory", directories),
+        ("file", {*files, RELEASE_MANIFEST_PATH}),
+    ):
+        for path in paths:
+            key = tuple(
+                unicodedata.normalize("NFC", part).casefold()
+                for part in path.parts
+            )
+            previous = portable_entries.setdefault(key, (path, kind))
+            if previous != (path, kind):
+                raise ValidationError(
+                    "release snapshot paths collide under portable spelling at "
+                    f"{commit}: {previous[0]} and {path}"
+                )
+
+    member_count = 1 + len(directories) + len(files) + 1
+    if member_count > MAX_RELEASE_TREE_MEMBERS:
+        raise ValidationError(
+            f"release commit {commit} exceeds {MAX_RELEASE_TREE_MEMBERS} tree members"
+        )
+    manifest_mode = 0o755 if manifest_entry.mode == b"100755" else 0o644
+    return _ReleaseTreePlan(
+        commit=commit,
+        manifest_mode=manifest_mode,
+        manifest_payload=_release_manifest_payload(manifest),
+        directories=tuple(sorted(directories, key=lambda path: path.parts)),
+        files=tuple(
+            (path, mode, object_id)
+            for path, (mode, object_id) in sorted(
+                files.items(),
+                key=lambda item: item[0].parts,
+            )
+        ),
+    )
+
+
+def _git_release_blob_metadata(
+    repo_root: Path,
+    object_ids: set[bytes],
+) -> dict[bytes, int]:
+    sizes: dict[bytes, int] = {}
+    ordered_ids = sorted(object_ids)
+    for offset in range(0, len(ordered_ids), MAX_GIT_BLOB_BATCH_OBJECTS):
+        batch = ordered_ids[offset : offset + MAX_GIT_BLOB_BATCH_OBJECTS]
+        result = _bounded_git_output(
+            repo_root,
+            [
+                "git",
+                "cat-file",
+                "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+            ],
+            stdin_data=b"\n".join(batch) + b"\n",
+            stdout_limit=len(batch) * 128,
+            stdout_overflow_error=(
+                "Git release blob metadata exceeds its bounded batch limit"
+            ),
+        )
+        if result.returncode != 0:
+            raise ValidationError(
+                f"failed to inspect release tree blobs: {_git_error(result)}"
+            )
+        lines = result.stdout.splitlines()
+        if len(lines) != len(batch):
+            raise ValidationError(
+                "Git release blob metadata did not match the query count"
+            )
+        for expected_id, line in zip(batch, lines):
+            fields = line.split()
+            if (
+                len(fields) != 3
+                or fields[0] != expected_id
+                or fields[1] != b"blob"
+                or not fields[2].isdigit()
+            ):
+                raise ValidationError(
+                    "Git returned invalid release tree blob metadata"
+                )
+            size = int(fields[2])
+            if size > MAX_RELEASE_TREE_MEMBER_BYTES:
+                raise ValidationError(
+                    "release tree blob exceeds member byte limit: "
+                    f"{size} > {MAX_RELEASE_TREE_MEMBER_BYTES}"
+                )
+            sizes[expected_id] = size
+    total_bytes = sum(sizes.values())
+    if total_bytes > MAX_GIT_RELEASE_TREE_BLOB_TOTAL_BYTES:
+        raise ValidationError(
+            "unique release tree blobs exceed history byte limit: "
+            f"{total_bytes} > {MAX_GIT_RELEASE_TREE_BLOB_TOTAL_BYTES}"
+        )
+    return sizes
+
+
+def _git_release_blob_identities(
+    repo_root: Path,
+    object_ids: set[bytes],
+) -> dict[bytes, tuple[int, bytes]]:
+    sizes = _git_release_blob_metadata(repo_root, object_ids)
+    ordered_ids = sorted(object_ids)
+    batches: list[list[bytes]] = []
+    batch: list[bytes] = []
+    batch_bytes = 0
+    for object_id in ordered_ids:
+        size = sizes[object_id]
+        if batch and (
+            len(batch) >= MAX_GIT_BLOB_BATCH_OBJECTS
+            or batch_bytes + size > MAX_GIT_BLOB_BATCH_BYTES
+        ):
+            batches.append(batch)
+            batch = []
+            batch_bytes = 0
+        batch.append(object_id)
+        batch_bytes += size
+    if batch:
+        batches.append(batch)
+
+    identities: dict[bytes, tuple[int, bytes]] = {}
+    for object_batch in batches:
+        declared_bytes = sum(sizes[object_id] for object_id in object_batch)
+        result = _bounded_git_output(
+            repo_root,
+            [
+                "git",
+                "cat-file",
+                "--batch=%(objectname) %(objecttype) %(objectsize)",
+            ],
+            stdin_data=b"\n".join(object_batch) + b"\n",
+            stdout_limit=declared_bytes + len(object_batch) * 128,
+            stdout_overflow_error=(
+                "Git release blob content exceeds its bounded batch limit"
+            ),
+        )
+        if result.returncode != 0:
+            raise ValidationError(
+                f"failed to read release tree blobs: {_git_error(result)}"
+            )
+        cursor = 0
+        for object_id in object_batch:
+            header_end = result.stdout.find(b"\n", cursor)
+            if header_end < 0:
+                raise ValidationError("Git returned truncated release blob metadata")
+            header = result.stdout[cursor:header_end].split()
+            expected_size = sizes[object_id]
+            if (
+                len(header) != 3
+                or header[0] != object_id
+                or header[1] != b"blob"
+                or not header[2].isdigit()
+                or int(header[2]) != expected_size
+            ):
+                raise ValidationError("Git returned mismatched release blob metadata")
+            payload_start = header_end + 1
+            payload_end = payload_start + expected_size
+            if (
+                payload_end >= len(result.stdout)
+                or result.stdout[payload_end : payload_end + 1] != b"\n"
+            ):
+                raise ValidationError("Git returned truncated release blob content")
+            payload = result.stdout[payload_start:payload_end]
+            identities[object_id] = (
+                expected_size,
+                hashlib.sha256(payload).digest(),
+            )
+            cursor = payload_end + 1
+        if cursor != len(result.stdout):
+            raise ValidationError("Git returned trailing release blob content")
+    return identities
+
+
+def _release_tree_digest_field(digest: Any, payload: bytes) -> None:
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+
+
+def _release_tree_digest_from_plan(
+    plan: _ReleaseTreePlan,
+    blob_identities: dict[bytes, tuple[int, bytes]],
+) -> str:
+    logical_entries: dict[PurePosixPath, tuple[bytes, int, bytes]] = {
+        path: (b"directory", 0o755, b"") for path in plan.directories
+    }
+    expanded_bytes = len(plan.manifest_payload)
+    for path, mode, object_id in plan.files:
+        identity = blob_identities.get(object_id)
+        if identity is None:
+            raise ValidationError(
+                f"release commit {plan.commit} has no cached blob identity: {path}"
+            )
+        size, content_digest = identity
+        expanded_bytes += size
+        logical_entries[path] = (
+            b"file",
+            mode,
+            size.to_bytes(8, "big") + content_digest,
+        )
+    if expanded_bytes > MAX_RELEASE_TREE_EXPANDED_BYTES:
+        raise ValidationError(
+            f"release commit {plan.commit} exceeds expanded tree byte limit: "
+            f"{expanded_bytes} > {MAX_RELEASE_TREE_EXPANDED_BYTES}"
+        )
+    manifest_identity = (
+        len(plan.manifest_payload).to_bytes(8, "big")
+        + hashlib.sha256(plan.manifest_payload).digest()
+    )
+    logical_entries[RELEASE_MANIFEST_PATH] = (
+        b"file",
+        plan.manifest_mode,
+        manifest_identity,
+    )
+
+    digest = hashlib.sha256(b"codex-personal-sync-release-tree-v1\0")
+
+    def record(
+        entry_type: bytes,
+        relative_path: PurePosixPath,
+        mode: int,
+        content_identity: bytes,
+    ) -> None:
+        relative_bytes = (
+            relative_path.as_posix().encode("utf-8", errors="strict")
+            if relative_path.parts
+            else b""
+        )
+        _release_tree_digest_field(digest, entry_type)
+        _release_tree_digest_field(digest, relative_bytes)
+        _release_tree_digest_field(digest, mode.to_bytes(4, "big"))
+        _release_tree_digest_field(digest, content_identity)
+
+    record(b"directory", PurePosixPath(), 0, b"")
+    for path in sorted(logical_entries, key=lambda item: item.parts):
+        entry_type, mode, content_identity = logical_entries[path]
+        record(entry_type, path, mode, content_identity)
+    return digest.hexdigest()
+
+
+def _release_tree_digests_at_commits(
+    repo_root: Path,
+    release_manifests: list[tuple[str, dict[str, Any]]],
+    manifest_path: Path,
+) -> dict[str, str]:
+    plans = [
+        _release_tree_plan_at_commit(
+            repo_root,
+            commit,
+            manifest_path,
+            manifest,
+        )
+        for commit, manifest in release_manifests
+    ]
+    object_ids = {
+        object_id
+        for plan in plans
+        for _path, _mode, object_id in plan.files
+    }
+    blob_identities = _git_release_blob_identities(repo_root, object_ids)
+    return {
+        plan.commit: _release_tree_digest_from_plan(plan, blob_identities)
+        for plan in plans
+    }
+
+
 def _github_token() -> str:
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
@@ -2152,7 +2709,7 @@ def _complete_release_asset_metadata(
     asset_name: str,
     *,
     maximum_bytes: int,
-) -> tuple[int, int]:
+) -> tuple[int, int, str]:
     asset_id = asset.get("id")
     if isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id <= 0:
         raise ValidationError(
@@ -2171,7 +2728,15 @@ def _complete_release_asset_metadata(
         raise ValidationError(
             f"complete release asset {asset_name} exceeds {maximum_bytes} byte limit"
         )
-    return asset_id, asset_size
+    asset_digest = asset.get("digest")
+    if (
+        not isinstance(asset_digest, str)
+        or GITHUB_ASSET_DIGEST_RE.fullmatch(asset_digest) is None
+    ):
+        raise ValidationError(
+            f"complete release asset {asset_name} has an invalid GitHub asset digest"
+        )
+    return asset_id, asset_size, asset_digest
 
 
 def _personal_codex_release_asset_matches(
@@ -2277,12 +2842,12 @@ def _complete_release_identity(
     checksum_asset = matching_checksums[0]
     archive_name = archive_asset["name"]
     checksum_name = checksum_asset["name"]
-    archive_id, archive_size = _complete_release_asset_metadata(
+    archive_id, archive_size, archive_digest = _complete_release_asset_metadata(
         archive_asset,
         archive_name,
         maximum_bytes=MAX_RELEASE_ARCHIVE_BYTES,
     )
-    checksum_id, checksum_size = _complete_release_asset_metadata(
+    checksum_id, checksum_size, checksum_digest = _complete_release_asset_metadata(
         checksum_asset,
         checksum_name,
         maximum_bytes=MAX_RELEASE_CHECKSUM_BYTES,
@@ -2314,9 +2879,11 @@ def _complete_release_identity(
         archive_name=archive_name,
         archive_id=archive_id,
         archive_size=archive_size,
+        archive_digest=archive_digest,
         checksum_name=checksum_name,
         checksum_id=checksum_id,
         checksum_size=checksum_size,
+        checksum_digest=checksum_digest,
     )
 
 
@@ -2432,23 +2999,26 @@ def _complete_release_identities(
             f"{len(identities)} > {MAX_COMPLETE_RELEASES}"
         )
 
-    assets_by_id: dict[int, tuple[str, int]] = {}
-    unique_archives: set[tuple[int, str, int]] = set()
-    unique_checksums: set[tuple[int, str, int]] = set()
+    assets_by_id: dict[int, tuple[str, int, str]] = {}
+    unique_archives: set[tuple[int, str, int, str]] = set()
+    unique_checksums: set[tuple[int, str, int, str]] = set()
     for identity in identities:
         archive = (
             identity.archive_id,
             identity.archive_name,
             identity.archive_size,
+            identity.archive_digest,
         )
         checksum = (
             identity.checksum_id,
             identity.checksum_name,
             identity.checksum_size,
+            identity.checksum_digest,
         )
-        for asset_id, asset_name, asset_size in (archive, checksum):
-            previous = assets_by_id.setdefault(asset_id, (asset_name, asset_size))
-            if previous != (asset_name, asset_size):
+        for asset_id, asset_name, asset_size, asset_digest in (archive, checksum):
+            asset_metadata = (asset_name, asset_size, asset_digest)
+            previous = assets_by_id.setdefault(asset_id, asset_metadata)
+            if previous != asset_metadata:
                 raise ValidationError(
                     "GitHub asset id has conflicting release metadata: "
                     f"{asset_id}"
@@ -2456,13 +3026,17 @@ def _complete_release_identities(
         unique_archives.add(archive)
         unique_checksums.add(checksum)
 
-    total_archive_bytes = sum(size for _id, _name, size in unique_archives)
+    total_archive_bytes = sum(
+        size for _id, _name, size, _digest in unique_archives
+    )
     if total_archive_bytes > MAX_RELEASE_ARCHIVE_TOTAL_BYTES:
         raise ValidationError(
             "complete release archives exceed compressed byte total: "
             f"{total_archive_bytes} > {MAX_RELEASE_ARCHIVE_TOTAL_BYTES}"
         )
-    total_checksum_bytes = sum(size for _id, _name, size in unique_checksums)
+    total_checksum_bytes = sum(
+        size for _id, _name, size, _digest in unique_checksums
+    )
     if total_checksum_bytes > MAX_RELEASE_CHECKSUM_TOTAL_BYTES:
         raise ValidationError(
             "complete release checksums exceed byte total: "
@@ -2580,7 +3154,7 @@ def _read_verified_release_manifest(
     repository: str,
     identity: _CompleteRelease,
     maximum_expanded_bytes: int,
-) -> tuple[dict[str, Any], int]:
+) -> tuple[dict[str, Any], int, str]:
     runtime = _sync_runtime_module()
     assets = runtime.ReleaseAssets(
         tag_name=identity.tag_name,
@@ -2588,9 +3162,11 @@ def _read_verified_release_manifest(
         archive_name=identity.archive_name,
         archive_id=identity.archive_id,
         archive_size=identity.archive_size,
+        archive_digest=identity.archive_digest,
         checksum_name=identity.checksum_name,
         checksum_id=identity.checksum_id,
         checksum_size=identity.checksum_size,
+        checksum_digest=identity.checksum_digest,
     )
     try:
         verified = runtime.read_verified_release_manifest(
@@ -2604,6 +3180,7 @@ def _read_verified_release_manifest(
         ) from error
     manifest = getattr(verified, "manifest", None)
     expanded_bytes = getattr(verified, "expanded_bytes", None)
+    tree_digest = getattr(verified, "tree_digest", None)
     if not isinstance(manifest, dict):
         raise ValidationError(
             f"release archive {identity.tag_name} returned an invalid manifest"
@@ -2616,26 +3193,38 @@ def _read_verified_release_manifest(
         raise ValidationError(
             f"release archive {identity.tag_name} returned invalid scan accounting"
         )
-    return manifest, expanded_bytes
+    if (
+        not isinstance(tree_digest, str)
+        or RELEASE_TREE_DIGEST_RE.fullmatch(tree_digest) is None
+    ):
+        raise ValidationError(
+            f"release archive {identity.tag_name} returned an invalid tree digest"
+        )
+    return manifest, expanded_bytes, tree_digest
 
 
 def _verify_release_archive_manifests(
     repository: str,
     identities: list[_CompleteRelease],
     manifests_by_sha: dict[str, dict[str, Any]],
+    tree_digests_by_sha: dict[str, str],
 ) -> None:
-    manifests_by_asset_pair: dict[tuple[str | int, ...], dict[str, Any]] = {}
+    verified_by_asset_pair: dict[
+        tuple[str | int, ...], tuple[dict[str, Any], str]
+    ] = {}
     total_expanded_bytes = 0
     for identity in identities:
-        archive_manifest = manifests_by_asset_pair.get(identity.asset_pair_key)
-        if archive_manifest is None:
+        verified_archive = verified_by_asset_pair.get(identity.asset_pair_key)
+        if verified_archive is None:
             remaining_expanded_bytes = (
                 MAX_RELEASE_EXPANDED_SCAN_TOTAL_BYTES - total_expanded_bytes
             )
-            archive_manifest, expanded_bytes = _read_verified_release_manifest(
-                repository,
-                identity,
-                remaining_expanded_bytes,
+            (
+                archive_manifest,
+                expanded_bytes,
+                archive_tree_digest,
+            ) = _read_verified_release_manifest(
+                repository, identity, remaining_expanded_bytes
             )
             if expanded_bytes > remaining_expanded_bytes:
                 raise ValidationError(
@@ -2649,7 +3238,12 @@ def _verify_release_archive_manifests(
                     f"{total_expanded_bytes} > "
                     f"{MAX_RELEASE_EXPANDED_SCAN_TOTAL_BYTES}"
                 )
-            manifests_by_asset_pair[identity.asset_pair_key] = archive_manifest
+            verified_by_asset_pair[identity.asset_pair_key] = (
+                archive_manifest,
+                archive_tree_digest,
+            )
+        else:
+            archive_manifest, archive_tree_digest = verified_archive
         commit_manifest = manifests_by_sha.get(identity.sha)
         if commit_manifest is None:
             raise ValidationError(
@@ -2658,6 +3252,17 @@ def _verify_release_archive_manifests(
         if not _strict_json_equal(archive_manifest, commit_manifest):
             raise ValidationError(
                 "release archive manifest does not match Git commit manifest: "
+                f"{identity.tag_name} ({identity.sha}; archive asset "
+                f"{identity.archive_id}, checksum asset {identity.checksum_id})"
+            )
+        commit_tree_digest = tree_digests_by_sha.get(identity.sha)
+        if commit_tree_digest is None:
+            raise ValidationError(
+                f"release archive {identity.tag_name} has no matching Git tree digest"
+            )
+        if archive_tree_digest != commit_tree_digest:
+            raise ValidationError(
+                "release archive tree does not match Git commit tree: "
                 f"{identity.tag_name} ({identity.sha}; archive asset "
                 f"{identity.archive_id}, checksum asset {identity.checksum_id})"
             )
@@ -2687,10 +3292,16 @@ def _release_history_baseline(
         release_shas,
         manifest,
     )
+    tree_digests_by_sha = _release_tree_digests_at_commits(
+        repo_root,
+        release_manifests,
+        manifest,
+    )
     _verify_release_archive_manifests(
         repository,
         identities,
         dict(release_manifests),
+        tree_digests_by_sha,
     )
     return sha, release_manifests
 
