@@ -196,6 +196,7 @@ jobs:
       - name: Publish GitHub release
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
         run: |
           python3 - <<'PY'
           import hashlib
@@ -211,7 +212,10 @@ jobs:
           upload_root = "https://uploads.github.com"
           repo = os.environ["GITHUB_REPOSITORY"]
           sha = os.environ["GITHUB_SHA"]
-          token = os.environ["GITHUB_TOKEN"]
+          release_token = os.environ["GITHUB_TOKEN"]
+          immutable_releases_read_token = os.environ.get(
+              "IMMUTABLE_RELEASES_READ_TOKEN", ""
+          ).strip()
           dist = Path("dist")
           assets = [
               dist / f"personal-codex-{sha}.tar.gz",
@@ -266,11 +270,12 @@ jobs:
               method="GET",
               payload=None,
               api_version="2022-11-28",
+              authorization_token=release_token,
           ):
               data = None
               headers = {
                   "Accept": "application/vnd.github+json",
-                  "Authorization": f"Bearer {token}",
+                  "Authorization": f"Bearer {authorization_token}",
                   "X-GitHub-Api-Version": api_version,
               }
               if payload is not None:
@@ -284,10 +289,16 @@ jobs:
               return json.loads(response_body.decode("utf-8"))
 
           def require_immutable_releases_enabled():
+              if not immutable_releases_read_token:
+                  raise SystemExit(
+                      "IMMUTABLE_RELEASES_READ_TOKEN is required to verify "
+                      "immutable releases before release mutation"
+                  )
               try:
                   settings = request_json(
                       f"{api_root}/repos/{repo}/immutable-releases",
                       api_version="2026-03-10",
+                      authorization_token=immutable_releases_read_token,
                   )
               except HTTPError as error:
                   raise SystemExit(
@@ -583,7 +594,7 @@ jobs:
                   data=expected_asset_content[asset.name]["data"],
                   headers={
                       "Accept": "application/vnd.github+json",
-                      "Authorization": f"Bearer {token}",
+                      "Authorization": f"Bearer {release_token}",
                       "Content-Type": content_types[suffix],
                       "X-GitHub-Api-Version": "2022-11-28",
                   },
@@ -637,6 +648,7 @@ jobs:
                   "final uploaded asset mismatch: "
                   f"{sorted(final_uploaded_asset_names)}"
               )
+          require_immutable_releases_enabled()
           request_json(
               f"{api_root}/repos/{repo}/releases/{release_id}",
               method="PATCH",

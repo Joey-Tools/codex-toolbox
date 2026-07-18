@@ -2371,6 +2371,18 @@ def _release_tree_plan_at_commit(
                 f"manifest source: {source}"
             )
         relative_path = PurePosixPath(*path.parts[len(source.parts) :])
+        if source_kind == "directory":
+            for parent in path.parents:
+                if parent == source:
+                    break
+                relative_parent = PurePosixPath(
+                    *parent.parts[len(source.parts) :]
+                )
+                if not _is_generated_release_path(
+                    relative_parent,
+                    is_dir=True,
+                ):
+                    directories.add(parent)
         if _is_generated_release_path(relative_path, is_dir=False):
             continue
         if path == RELEASE_MANIFEST_PATH:
