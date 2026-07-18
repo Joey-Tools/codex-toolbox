@@ -31,6 +31,7 @@ import zlib
 
 
 TAG_PREFIX = "personal-codex-"
+CANONICAL_PACKAGE_ROOT_COMPONENT = f"{TAG_PREFIX}{'0' * 40}"
 TAG_RE = re.compile(r"^personal-codex-\d{8}-\d{6}-([0-9a-f]{7,40})$")
 ASSET_RE = re.compile(r"^personal-codex-([0-9a-f]{40})\.tar\.gz$")
 SHA256_RE = re.compile(r"^personal-codex-([0-9a-f]{40})\.sha256$")
@@ -13705,14 +13706,17 @@ def _validated_release_tree_child_path(
     relative_root: PurePosixPath,
     name: str,
 ) -> PurePosixPath:
-    relative_name = (
+    release_relative_name = (
         f"{relative_root.as_posix()}/{name}" if relative_root.parts else name
     )
+    archive_member_name = (
+        f"{CANONICAL_PACKAGE_ROOT_COMPONENT}/{release_relative_name}"
+    )
     try:
-        relative_parts = _validated_archive_member_parts(relative_name)
+        archive_member_parts = _validated_archive_member_parts(archive_member_name)
     except SyncError as error:
         raise SyncError(f"invalid release tree path: {error}") from error
-    return PurePosixPath(*relative_parts)
+    return PurePosixPath(*archive_member_parts[1:])
 
 
 def _release_tree_snapshot_from_directory_fd(

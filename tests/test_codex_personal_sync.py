@@ -3953,47 +3953,73 @@ class CodexPersonalSyncTests(unittest.TestCase):
                         self.safe_extract_archive(archive_path, destination)
                 self.assertFalse(destination.exists())
 
-    def test_release_tree_snapshot_rejects_deep_path_before_recursing(self) -> None:
-        release_root = self.root / "deep-release-tree"
-        release_root.mkdir()
+    def test_release_tree_snapshot_enforces_archive_depth_boundary(self) -> None:
+        release_root = self.root / "archive-depth-release-tree"
+        manifest = release_root / MODULE.MANIFEST_RELATIVE_PATH
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{}\n", encoding="utf-8")
         current = release_root
-        for _ in range(MODULE.MAX_ARCHIVE_MEMBER_PATH_DEPTH + 1):
+        for _ in range(MODULE.MAX_ARCHIVE_MEMBER_PATH_DEPTH - 1):
             current /= "d"
             current.mkdir()
 
+        self.snapshot_release_tree(release_root)
+
+        current /= "d"
+        current.mkdir()
         with self.assertRaisesRegex(MODULE.SyncError, "path exceeds depth limit"):
             self.snapshot_release_tree(release_root)
 
-    def test_release_tree_snapshot_enforces_path_byte_limits(self) -> None:
-        cases = (
-            (
-                "path-bytes",
-                ("aa", "bb"),
+    def test_release_tree_path_validation_uses_archive_utf8_byte_boundary(
+        self,
+    ) -> None:
+        relative_root = MODULE.PurePosixPath("d")
+        child_name = "\N{CJK UNIFIED IDEOGRAPH-754C}"
+        archive_member_name = (
+            f"{MODULE.CANONICAL_PACKAGE_ROOT_COMPONENT}/"
+            f"{relative_root.as_posix()}/{child_name}"
+        )
+        boundary = len(archive_member_name.encode("utf-8"))
+
+        with mock.patch.object(MODULE, "MAX_ARCHIVE_MEMBER_PATH_BYTES", boundary):
+            self.assertEqual(
+                MODULE._validated_release_tree_child_path(
+                    relative_root,
+                    child_name,
+                ),
+                relative_root / child_name,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
                 "MAX_ARCHIVE_MEMBER_PATH_BYTES",
-                4,
-                "path exceeds UTF-8 byte limit",
+                boundary - 1,
             ),
-            (
-                "component-bytes",
-                ("wide",),
+            self.assertRaisesRegex(MODULE.SyncError, "path exceeds UTF-8 byte limit"),
+        ):
+            MODULE._validated_release_tree_child_path(relative_root, child_name)
+
+    def test_release_tree_snapshot_enforces_component_byte_limit(self) -> None:
+        release_root = self.root / "component-limit-release-tree"
+        release_root.mkdir()
+        component_limit = len(
+            MODULE.CANONICAL_PACKAGE_ROOT_COMPONENT.encode("utf-8")
+        )
+        (release_root / ("w" * (component_limit + 1))).write_bytes(b"x")
+
+        with (
+            mock.patch.object(
+                MODULE,
                 "MAX_ARCHIVE_MEMBER_COMPONENT_BYTES",
-                3,
+                component_limit,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
                 "path component exceeds UTF-8 byte limit",
             ),
-        )
-        for name, parts, limit_name, limit, expected in cases:
-            with self.subTest(limit=name):
-                release_root = self.root / f"bounded-release-tree-{name}"
-                release_root.mkdir()
-                target = release_root.joinpath(*parts)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(b"x")
-
-                with (
-                    mock.patch.object(MODULE, limit_name, limit),
-                    self.assertRaisesRegex(MODULE.SyncError, expected),
-                ):
-                    self.snapshot_release_tree(release_root)
+        ):
+            self.snapshot_release_tree(release_root)
 
     def test_release_tree_snapshot_rejects_too_many_entries_before_hashing(
         self,
