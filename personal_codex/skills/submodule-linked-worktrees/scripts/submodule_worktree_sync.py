@@ -5,7 +5,8 @@ import argparse
 import bisect
 import configparser
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field, replace
+import errno
 import hashlib
 import os
 from pathlib import Path, PureWindowsPath
@@ -29,6 +30,7 @@ GIT_ERROR_OUTPUT_LIMIT_BYTES = 256 * 1024
 GIT_INPUT_LIMIT_BYTES = 64 * 1024 * 1024
 GIT_VERSION_TIMEOUT_SECONDS = 5.0
 GIT_MINIMUM_VERSION = (2, 45, 0)
+MAX_GIT_EXECUTABLE_BYTES = 128 * 1024 * 1024
 PROCESS_CLEANUP_TIMEOUT_SECONDS = 1.0
 PROCESS_TERM_GRACE_SECONDS = 0.5
 MAX_CHECKOUT_PATHS = 250_000
@@ -41,6 +43,8 @@ MAX_PLANNED_WORKTREES = 250_000
 MAX_GIT_PATHSPEC_ARG_BYTES = 64 * 1024
 MAX_GIT_PATHSPECS_PER_BATCH = 1024
 MAX_GIT_PATHSPEC_BATCHES = 4096
+MAX_GITMODULES_FILE_BYTES = 4 * 1024 * 1024
+MAX_GITMODULES_RETAINED_BYTES = 64 * 1024 * 1024
 
 GIT_ENV_PASSTHROUGH = (
     "HOME",
@@ -116,11 +120,23 @@ class FsFingerprint:
 
 
 @dataclass(frozen=True)
-class GitRuntime:
-    executable: Path
+class ExecutableState:
     fingerprint: FsFingerprint
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True)
+class GitRuntime:
+    source_executable: Path
+    source_state: ExecutableState
+    executable: Path
+    executable_state: ExecutableState
+    content_sha256: str
     version: tuple[int, int, int]
     version_text: str
+    snapshot_guard: object = dataclass_field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -156,6 +172,41 @@ class FilterSelection:
     treeish: str
     raw_path: bytes
     driver: str
+
+
+@dataclass
+class GitmodulesReadBudget:
+    deadline: float
+    retained_limit: int = MAX_GITMODULES_RETAINED_BYTES
+    retained_bytes: int = 0
+
+    @classmethod
+    def start(cls) -> GitmodulesReadBudget:
+        return cls(deadline=time.monotonic() + GIT_ENUMERATION_TIMEOUT_SECONDS)
+
+    def remaining_seconds(self, description: str) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise PlanError(
+                f"{description} exceeded the shared .gitmodules read deadline"
+            )
+        return remaining
+
+    def check_capacity(self, byte_count: int, description: str) -> None:
+        if byte_count < 0 or byte_count > MAX_GITMODULES_FILE_BYTES:
+            raise PlanError(
+                f"{description} exceeds the "
+                f"{MAX_GITMODULES_FILE_BYTES}-byte per-file limit"
+            )
+        if self.retained_bytes + byte_count > self.retained_limit:
+            raise PlanError(
+                f"{description} exceeds the "
+                f"{self.retained_limit}-byte shared retained-content limit"
+            )
+
+    def retain(self, byte_count: int, description: str) -> None:
+        self.check_capacity(byte_count, description)
+        self.retained_bytes += byte_count
 
 
 @dataclass(frozen=True)
@@ -220,14 +271,17 @@ class TargetCollisionIndex:
         self,
         entries: list[PlannedWorktree],
         candidate: PlannedWorktree,
+        active_ancestor_indexes: Optional[set[int]] = None,
     ) -> None:
+        active_ancestors = (
+            active_ancestor_indexes if active_ancestor_indexes is not None else set()
+        )
         node = self.root
         visited = [node]
         for token in candidate.target.collision_tokens:
-            if node.terminal_index is not None and not entry_has_ancestor(
-                entries,
-                candidate.parent_index,
-                node.terminal_index,
+            if (
+                node.terminal_index is not None
+                and node.terminal_index not in active_ancestors
             ):
                 prior = entries[node.terminal_index]
                 raise PlanError(
@@ -284,6 +338,215 @@ def git_environment(
     return environment
 
 
+def executable_state_from_stat(path_stat: os.stat_result) -> ExecutableState:
+    return ExecutableState(
+        fingerprint=fingerprint_from_stat(path_stat),
+        size=path_stat.st_size,
+        modified_ns=path_stat.st_mtime_ns,
+        changed_ns=path_stat.st_ctime_ns,
+    )
+
+
+def read_fd_digest(
+    descriptor: int,
+    expected_size: int,
+    *,
+    deadline: float,
+    description: str,
+) -> str:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    retained = 0
+    while retained < expected_size:
+        if time.monotonic() >= deadline:
+            raise PlanError(f"{description} exceeded the content-copy deadline")
+        chunk = os.read(descriptor, min(64 * 1024, expected_size - retained))
+        if not chunk:
+            raise PlanError(f"{description} changed size during content binding")
+        retained += len(chunk)
+        digest.update(chunk)
+    if os.read(descriptor, 1):
+        raise PlanError(f"{description} changed size during content binding")
+    return digest.hexdigest()
+
+
+def copy_git_executable_snapshot(
+    source: Path,
+    expected_fingerprint: FsFingerprint,
+) -> tuple[
+    object,
+    Path,
+    ExecutableState,
+    ExecutableState,
+    str,
+]:
+    snapshot_guard = tempfile.TemporaryDirectory(prefix="submodule-worktree-git.")
+    snapshot_root = Path(snapshot_guard.name)
+    snapshot = snapshot_root / "git"
+    source_descriptor = -1
+    snapshot_descriptor = -1
+    try:
+        root_state = filesystem_fingerprint(snapshot_root)
+        if (
+            root_state.kind != stat.S_IFDIR
+            or root_state.owner != os.geteuid()
+            or root_state.permissions & 0o077
+        ):
+            raise PlanError(
+                "Git executable snapshot directory is not owner-private\n"
+                f"  directory: {snapshot_root}"
+            )
+        source_descriptor = os.open(
+            source,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        source_before = executable_state_from_stat(os.fstat(source_descriptor))
+        if source_before.fingerprint != expected_fingerprint:
+            raise PlanError(
+                "the resolved Git executable changed before content binding\n"
+                f"  executable: {source}"
+            )
+        if source_before.fingerprint.kind != stat.S_IFREG:
+            raise PlanError(f"resolved Git executable is not a regular file: {source}")
+        if source_before.size <= 0 or source_before.size > MAX_GIT_EXECUTABLE_BYTES:
+            raise PlanError(
+                "resolved Git executable exceeds the content-binding size limit\n"
+                f"  executable: {source}\n"
+                f"  size: {source_before.size}\n"
+                f"  limit: {MAX_GIT_EXECUTABLE_BYTES}"
+            )
+        snapshot_descriptor = os.open(
+            snapshot,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        deadline = time.monotonic() + GIT_VERSION_TIMEOUT_SECONDS
+        digest = hashlib.sha256()
+        copied = 0
+        while copied < source_before.size:
+            if time.monotonic() >= deadline:
+                raise PlanError(
+                    "Git executable snapshot exceeded the content-copy deadline"
+                )
+            chunk = os.read(
+                source_descriptor,
+                min(64 * 1024, source_before.size - copied),
+            )
+            if not chunk:
+                raise PlanError(
+                    "the resolved Git executable changed size during content binding"
+                )
+            copied += len(chunk)
+            digest.update(chunk)
+            pending = memoryview(chunk)
+            while pending:
+                written = os.write(snapshot_descriptor, pending)
+                if written <= 0:
+                    raise PlanError("failed to write the Git executable snapshot")
+                pending = pending[written:]
+        if os.read(source_descriptor, 1):
+            raise PlanError(
+                "the resolved Git executable changed size during content binding"
+            )
+        source_after = executable_state_from_stat(os.fstat(source_descriptor))
+        if source_after != source_before:
+            raise PlanError(
+                "the resolved Git executable changed during content binding\n"
+                f"  executable: {source}"
+            )
+        os.fchmod(snapshot_descriptor, 0o500)
+        os.fsync(snapshot_descriptor)
+        snapshot_digest = read_fd_digest(
+            snapshot_descriptor,
+            copied,
+            deadline=deadline,
+            description="Git executable snapshot",
+        )
+        if snapshot_digest != digest.hexdigest():
+            raise PlanError("Git executable snapshot content verification failed")
+        snapshot_state = executable_state_from_stat(os.fstat(snapshot_descriptor))
+        if (
+            snapshot_state.fingerprint.kind != stat.S_IFREG
+            or snapshot_state.fingerprint.owner != os.geteuid()
+            or snapshot_state.fingerprint.permissions != 0o500
+            or snapshot_state.size != source_before.size
+        ):
+            raise PlanError(
+                "Git executable snapshot does not satisfy its owner-private "
+                "regular-file policy"
+            )
+        snapshot = snapshot.resolve(strict=True)
+        return (
+            snapshot_guard,
+            snapshot,
+            source_before,
+            snapshot_state,
+            snapshot_digest,
+        )
+    except OSError as exc:
+        snapshot_guard.cleanup()
+        raise PlanError(
+            f"cannot create a verified Git executable snapshot: {exc}"
+        ) from exc
+    except BaseException:
+        snapshot_guard.cleanup()
+        raise
+    finally:
+        if snapshot_descriptor >= 0:
+            os.close(snapshot_descriptor)
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+
+
+def revalidate_executable_content(
+    path: Path,
+    recorded_state: ExecutableState,
+    expected_digest: str,
+    description: str,
+) -> ExecutableState:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        current_state = executable_state_from_stat(os.fstat(descriptor))
+        if current_state.fingerprint != recorded_state.fingerprint:
+            raise PlanError(
+                f"{description} object or access policy changed\n  executable: {path}"
+            )
+        if current_state == recorded_state:
+            return recorded_state
+        if current_state.size <= 0 or current_state.size > MAX_GIT_EXECUTABLE_BYTES:
+            raise PlanError(
+                f"{description} content changed after version preflight\n"
+                f"  executable: {path}"
+            )
+        deadline = time.monotonic() + GIT_VERSION_TIMEOUT_SECONDS
+        digest = read_fd_digest(
+            descriptor,
+            current_state.size,
+            deadline=deadline,
+            description=description,
+        )
+        final_state = executable_state_from_stat(os.fstat(descriptor))
+        if final_state != current_state or digest != expected_digest:
+            raise PlanError(
+                f"{description} content changed after version preflight\n"
+                f"  executable: {path}"
+            )
+        return current_state
+    except OSError as exc:
+        raise PlanError(f"cannot revalidate {description}: {path}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def discover_git_runtime() -> GitRuntime:
     if os.name != "posix":
         raise PlanError(
@@ -299,48 +562,78 @@ def discover_git_runtime() -> GitRuntime:
         raise PlanError(
             f"resolved Git executable is not an executable file: {executable}"
         )
-    result = run_bounded_bytes(
-        [str(executable), "--version"],
-        timeout_seconds=GIT_VERSION_TIMEOUT_SECONDS,
-        stdout_limit=256,
-        stderr_limit=256,
-        prepare_git_command=False,
-    )
-    version_text = os.fsdecode(result.stdout).strip()
-    match = re.fullmatch(
-        r"git version ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:[^\r\n]*)",
-        version_text,
-    )
-    if not match:
-        raise PlanError(
-            f"cannot parse the fixed Git executable version: {version_text!r}"
+    (
+        snapshot_guard,
+        snapshot,
+        source_state,
+        snapshot_state,
+        content_sha256,
+    ) = copy_git_executable_snapshot(executable, fingerprint)
+    try:
+        result = run_bounded_bytes(
+            [str(snapshot), "--version"],
+            timeout_seconds=GIT_VERSION_TIMEOUT_SECONDS,
+            stdout_limit=256,
+            stderr_limit=256,
+            prepare_git_command=False,
         )
-    version = tuple(int(value or "0") for value in match.groups())
-    if version < GIT_MINIMUM_VERSION:
-        minimum = ".".join(str(value) for value in GIT_MINIMUM_VERSION)
-        raise PlanError(
-            f"Git {minimum} or newer is required before repository access\n"
-            f"  executable: {executable}\n"
-            f"  actual: {version_text}\n"
-            "  older Git versions cannot prove the no-lazy-fetch checkout contract"
+        version_text = os.fsdecode(result.stdout).strip()
+        match = re.fullmatch(
+            r"git version ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:[^\r\n]*)",
+            version_text,
         )
-    return GitRuntime(
-        executable=executable,
-        fingerprint=fingerprint,
-        version=version,
-        version_text=version_text,
-    )
+        if not match:
+            raise PlanError(
+                f"cannot parse the fixed Git executable version: {version_text!r}"
+            )
+        version = tuple(int(value or "0") for value in match.groups())
+        if version < GIT_MINIMUM_VERSION:
+            minimum = ".".join(str(value) for value in GIT_MINIMUM_VERSION)
+            raise PlanError(
+                f"Git {minimum} or newer is required before repository access\n"
+                f"  executable: {executable}\n"
+                f"  actual: {version_text}\n"
+                "  older Git versions cannot prove the no-lazy-fetch checkout contract"
+            )
+        return GitRuntime(
+            source_executable=executable,
+            source_state=source_state,
+            executable=snapshot,
+            executable_state=snapshot_state,
+            content_sha256=content_sha256,
+            version=version,
+            version_text=version_text,
+            snapshot_guard=snapshot_guard,
+        )
+    except BaseException:
+        snapshot_guard.cleanup()
+        raise
 
 
 def git_runtime() -> GitRuntime:
     global _GIT_RUNTIME
     if _GIT_RUNTIME is None:
         _GIT_RUNTIME = discover_git_runtime()
-    current = filesystem_fingerprint(_GIT_RUNTIME.executable)
-    if current != _GIT_RUNTIME.fingerprint:
-        raise PlanError(
-            "the fixed Git executable changed after version preflight\n"
-            f"  executable: {_GIT_RUNTIME.executable}"
+    source_state = revalidate_executable_content(
+        _GIT_RUNTIME.source_executable,
+        _GIT_RUNTIME.source_state,
+        _GIT_RUNTIME.content_sha256,
+        "fixed source Git executable",
+    )
+    executable_state = revalidate_executable_content(
+        _GIT_RUNTIME.executable,
+        _GIT_RUNTIME.executable_state,
+        _GIT_RUNTIME.content_sha256,
+        "owner-private Git executable snapshot",
+    )
+    if (
+        source_state != _GIT_RUNTIME.source_state
+        or executable_state != _GIT_RUNTIME.executable_state
+    ):
+        _GIT_RUNTIME = replace(
+            _GIT_RUNTIME,
+            source_state=source_state,
+            executable_state=executable_state,
         )
     return _GIT_RUNTIME
 
@@ -896,7 +1189,7 @@ def filesystem_name_policy(root: Path) -> FilesystemNamePolicy:
         case_sensitive = darwin_volume_case_sensitive(root)
         return FilesystemNamePolicy(
             case_sensitive=case_sensitive,
-            normalization=("exact" if configured_precompose is False else "NFD"),
+            normalization="NFD",
             source="darwin-volume-capabilities",
         )
 
@@ -1116,35 +1409,147 @@ def parse_gitmodules(content: str, origin: str) -> list[Submodule]:
     return modules
 
 
-def read_worktree_gitmodules(root: Path) -> list[Submodule]:
+def decode_gitmodules(content: bytes, origin: str) -> list[Submodule]:
+    try:
+        decoded = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PlanError(f"{origin} is not valid UTF-8") from exc
+    return parse_gitmodules(decoded, origin)
+
+
+def read_worktree_gitmodules(
+    root: Path,
+    budget: Optional[GitmodulesReadBudget] = None,
+) -> list[Submodule]:
+    budget = budget or GitmodulesReadBudget.start()
     path = root / ".gitmodules"
-    if not path.exists():
+    budget.remaining_seconds(str(path))
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+    except FileNotFoundError:
         return []
-    return parse_gitmodules(path.read_text(encoding="utf-8"), str(path))
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return []
+        raise PlanError(f"cannot open {path} safely: {exc}") from exc
+    try:
+        before_stat = os.fstat(descriptor)
+        before_fingerprint = fingerprint_from_stat(before_stat)
+        if before_fingerprint.kind != stat.S_IFREG:
+            raise PlanError(f"{path} is not a regular file")
+        budget.check_capacity(before_stat.st_size, str(path))
+        content = bytearray()
+        while len(content) < before_stat.st_size:
+            budget.remaining_seconds(str(path))
+            try:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, before_stat.st_size - len(content)),
+                )
+            except BlockingIOError as exc:
+                raise PlanError(
+                    f"{path} did not provide bounded regular-file I/O"
+                ) from exc
+            if not chunk:
+                raise PlanError(f"{path} changed size during bounded read")
+            content.extend(chunk)
+        if os.read(descriptor, 1):
+            raise PlanError(f"{path} changed size during bounded read")
+        after_stat = os.fstat(descriptor)
+        after_fingerprint = fingerprint_from_stat(after_stat)
+        if (
+            after_fingerprint != before_fingerprint
+            or after_stat.st_size != before_stat.st_size
+            or after_stat.st_mtime_ns != before_stat.st_mtime_ns
+            or after_stat.st_ctime_ns != before_stat.st_ctime_ns
+        ):
+            raise PlanError(f"{path} changed during bounded read")
+        budget.retain(len(content), str(path))
+        return decode_gitmodules(bytes(content), str(path))
+    except OSError as exc:
+        raise PlanError(f"cannot read {path} safely: {exc}") from exc
+    finally:
+        os.close(descriptor)
 
 
 def read_commit_gitmodules(
-    source_git_dir: Path, work_tree: Path, commit: str
+    source_git_dir: Path,
+    work_tree: Path,
+    commit: str,
+    budget: Optional[GitmodulesReadBudget] = None,
 ) -> list[Submodule]:
     del work_tree
-    tree_entry = read_git(
+    budget = budget or GitmodulesReadBudget.start()
+    tree_result = read_git_bounded(
         [
             *source_object_repo_args(source_git_dir),
             "ls-tree",
+            "-z",
             commit,
             "--",
             ".gitmodules",
-        ]
-    ).stdout.strip()
-    if not tree_entry:
-        return []
-    fields = tree_entry.split(maxsplit=3)
-    if len(fields) != 4 or fields[1] != "blob":
-        raise PlanError(f"{commit}:.gitmodules is not a regular Git blob")
-    content = git(
-        [*source_object_repo_args(source_git_dir), "show", f"{commit}:.gitmodules"]
+        ],
+        stdout_limit=MAX_CHECKOUT_PATH_BYTES + 512,
+        timeout_seconds=budget.remaining_seconds(f"{commit}:.gitmodules tree entry"),
     )
-    return parse_gitmodules(content, f"{commit}:.gitmodules")
+    records = bounded_records(
+        tree_result.stdout,
+        f"{commit}:.gitmodules tree entry",
+        maximum_records=1,
+    )
+    if not records:
+        return []
+    try:
+        metadata, raw_path = records[0].split(b"\t", 1)
+    except ValueError as exc:
+        raise PlanError(f"{commit}:.gitmodules has an invalid tree entry") from exc
+    fields = metadata.split()
+    if (
+        len(fields) != 3
+        or not fields[0].startswith(b"100")
+        or fields[1] != b"blob"
+        or raw_path != b".gitmodules"
+    ):
+        raise PlanError(f"{commit}:.gitmodules is not a regular Git blob")
+    object_id = os.fsdecode(fields[2])
+    if not re.fullmatch(r"[0-9a-f]+", object_id):
+        raise PlanError(f"{commit}:.gitmodules returned an invalid object id")
+    size_result = read_git_bounded(
+        [
+            *source_object_repo_args(source_git_dir),
+            "cat-file",
+            "-s",
+            object_id,
+        ],
+        stdout_limit=64,
+        timeout_seconds=budget.remaining_seconds(f"{commit}:.gitmodules size"),
+    )
+    raw_size = size_result.stdout.strip()
+    if not raw_size.isdigit():
+        raise PlanError(f"{commit}:.gitmodules returned an invalid blob size")
+    blob_size = int(raw_size)
+    budget.check_capacity(blob_size, f"{commit}:.gitmodules")
+    content_result = read_git_bounded(
+        [
+            *source_object_repo_args(source_git_dir),
+            "cat-file",
+            "blob",
+            object_id,
+        ],
+        stdout_limit=blob_size,
+        timeout_seconds=budget.remaining_seconds(f"{commit}:.gitmodules content"),
+    )
+    if len(content_result.stdout) != blob_size:
+        raise PlanError(f"{commit}:.gitmodules changed size during bounded read")
+    budget.retain(blob_size, f"{commit}:.gitmodules")
+    return decode_gitmodules(content_result.stdout, f"{commit}:.gitmodules")
 
 
 def expected_sha(root: Path, rel_path: str) -> str:
@@ -1765,11 +2170,14 @@ def managed_head(worktree_path: Path) -> str:
     return value
 
 
-def managed_index_snapshot(worktree_path: Path) -> tuple[str, int]:
+def managed_index_snapshot(
+    worktree_path: Path,
+) -> tuple[str, int, tuple[tuple[str, ...], ...]]:
     result = read_git_bounded(
         ["-C", str(worktree_path), "ls-files", "--stage", "-v", "-z"]
     )
     records = bounded_records(result.stdout, "managed worktree index")
+    regular_paths: list[tuple[str, ...]] = []
     for record in records:
         if not record.startswith(b"H "):
             tag = os.fsdecode(record[:1]) if record else "<empty>"
@@ -1778,7 +2186,30 @@ def managed_index_snapshot(worktree_path: Path) -> tuple[str, int]:
                 f"  worktree: {worktree_path}\n"
                 f"  tag: {tag}"
             )
-    return hashlib.sha256(result.stdout).hexdigest(), len(records)
+        try:
+            metadata, raw_path = record[2:].split(b"\t", 1)
+        except ValueError as exc:
+            raise PlanError(
+                "managed worktree index has an invalid stage record"
+            ) from exc
+        fields = metadata.split()
+        if len(fields) != 3:
+            raise PlanError("managed worktree index has an invalid stage header")
+        mode, _object_id, stage_value = fields
+        if stage_value != b"0":
+            raise PlanError(
+                "managed worktree index has unresolved entries; resolve conflicts "
+                "before syncing"
+            )
+        if mode.startswith(b"100"):
+            regular_paths.append(
+                validate_checkout_path(raw_path, "managed worktree index")
+            )
+    return (
+        hashlib.sha256(result.stdout).hexdigest(),
+        len(records),
+        tuple(regular_paths),
+    )
 
 
 def parse_managed_tree_changes(
@@ -1924,6 +2355,62 @@ def selected_checkout_filters(
     return tuple(selections)
 
 
+def selected_index_filters(
+    worktree_path: Path,
+    paths: tuple[tuple[str, ...], ...],
+) -> tuple[FilterSelection, ...]:
+    if not paths:
+        return ()
+    encoded_paths = bytearray()
+    expected_paths: list[bytes] = []
+    for parts in paths:
+        raw_path = os.fsencode("/".join(parts))
+        if len(encoded_paths) + len(raw_path) + 1 > GIT_INPUT_LIMIT_BYTES:
+            raise PlanError(
+                "index attribute query exceeds the "
+                f"{GIT_INPUT_LIMIT_BYTES}-byte input limit"
+            )
+        encoded_paths.extend(raw_path)
+        encoded_paths.append(0)
+        expected_paths.append(raw_path)
+    result = read_git_bounded(
+        [
+            "-C",
+            str(worktree_path),
+            "check-attr",
+            "--cached",
+            "-z",
+            "--stdin",
+            "filter",
+        ],
+        input_bytes=bytes(encoded_paths),
+    )
+    records = bounded_records(
+        result.stdout,
+        "index filter attributes",
+        maximum_records=MAX_CHECKOUT_PATHS * 3,
+    )
+    if len(records) != len(paths) * 3:
+        raise PlanError("index filter attribute result has an invalid shape")
+    selections: list[FilterSelection] = []
+    for offset in range(0, len(records), 3):
+        raw_path, attribute, value = records[offset : offset + 3]
+        if raw_path != expected_paths[offset // 3]:
+            raise PlanError("index filter attribute result changed path order")
+        if attribute != b"filter":
+            raise PlanError("index filter attribute result named the wrong attribute")
+        if value in {b"unspecified", b"unset"}:
+            continue
+        selections.append(
+            FilterSelection(
+                treeish="index",
+                raw_path=raw_path,
+                driver=os.fsdecode(value),
+            )
+        )
+    return tuple(selections)
+
+
 def configured_filter_commands(
     source_git_dir: Path,
 ) -> dict[str, set[str]]:
@@ -1970,8 +2457,10 @@ def reject_checkout_filters(
     source_git_dir: Path,
     worktree_path: Path,
     tree_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...],
+    index_paths: tuple[tuple[str, ...], ...] = (),
 ) -> None:
     selections: list[FilterSelection] = []
+    selections.extend(selected_index_filters(worktree_path, index_paths))
     for treeish, paths in tree_paths:
         selections.extend(
             selected_checkout_filters(
@@ -2318,7 +2807,11 @@ def capture_checkout_preflight(
     )
     if entry.state == "managed":
         current_head = managed_head(entry.target.path)
-        index_digest, index_entry_count = managed_index_snapshot(entry.target.path)
+        (
+            index_digest,
+            index_entry_count,
+            index_blob_paths,
+        ) = managed_index_snapshot(entry.target.path)
         changes = parse_managed_tree_changes(
             entry.target.path,
             current_head,
@@ -2335,6 +2828,7 @@ def capture_checkout_preflight(
                 (current_head, current_blob_paths),
                 (entry.sha, target_blob_paths),
             ),
+            index_blob_paths,
         )
         if has_local_changes(entry.target.path, current_head):
             raise PlanError(
@@ -2385,7 +2879,9 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
         raise PlanError(
             f"managed worktree HEAD changed after preflight: {entry.target.path}"
         )
-    current_digest, current_count = managed_index_snapshot(entry.target.path)
+    current_digest, current_count, index_blob_paths = managed_index_snapshot(
+        entry.target.path
+    )
     if (
         current_digest != receipt.index_digest
         or current_count != receipt.index_entry_count
@@ -2408,6 +2904,7 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
             (current_head, current_blob_paths),
             (entry.sha, target_blob_paths),
         ),
+        index_blob_paths,
     )
     if has_local_changes(entry.target.path, current_head):
         raise PlanError(
@@ -2449,19 +2946,6 @@ def missing_commit_error(
     )
 
 
-def entry_has_ancestor(
-    entries: list[PlannedWorktree],
-    entry_parent_index: Optional[int],
-    candidate_index: int,
-) -> bool:
-    current = entry_parent_index
-    while current is not None:
-        if current == candidate_index:
-            return True
-        current = entries[current].parent_index
-    return False
-
-
 def build_sync_plan(
     *,
     root: Path,
@@ -2475,11 +2959,14 @@ def build_sync_plan(
     base_relative_parts: tuple[str, ...] = (),
     parent_source_git_dir: Optional[Path] = None,
     display_root: Optional[Path] = None,
+    gitmodules_budget: Optional[GitmodulesReadBudget] = None,
 ) -> SyncPlan:
     root = root.resolve(strict=True)
+    gitmodules_budget = gitmodules_budget or GitmodulesReadBudget.start()
     entries: list[PlannedWorktree] = []
     source_identities: dict[tuple[int, int], tuple[Submodule, Path]] = {}
     collision_index = TargetCollisionIndex()
+    active_ancestor_indexes: set[int] = set()
     planned_path_components = 0
 
     def add_entry(
@@ -2577,27 +3064,36 @@ def build_sync_plan(
             raise PlanError(
                 f"sync plan exceeds the {MAX_PLANNED_WORKTREES}-worktree safety limit"
             )
-        collision_index.add(entries, entry)
+        collision_index.add(entries, entry, active_ancestor_indexes)
         current_index = len(entries)
         entries.append(entry)
         planned_path_components += candidate_component_count
 
         if not recursive:
             return
-        for nested in read_commit_gitmodules(source_git_dir, target.path, sha):
-            nested_sha = expected_sha_from_tree(
+        active_ancestor_indexes.add(current_index)
+        try:
+            for nested in read_commit_gitmodules(
                 source_git_dir,
                 target.path,
                 sha,
-                nested.path,
-            )
-            add_entry(
-                nested,
-                nested_sha,
-                target.relative_parts,
-                source_git_dir,
-                current_index,
-            )
+                gitmodules_budget,
+            ):
+                nested_sha = expected_sha_from_tree(
+                    source_git_dir,
+                    target.path,
+                    sha,
+                    nested.path,
+                )
+                add_entry(
+                    nested,
+                    nested_sha,
+                    target.relative_parts,
+                    source_git_dir,
+                    current_index,
+                )
+        finally:
+            active_ancestor_indexes.remove(current_index)
 
     for module, sha in planned_modules:
         add_entry(
@@ -2813,6 +3309,7 @@ def execute_sync_plan(
     force_replace_empty: bool,
     dry_run: bool,
     fetch_missing: bool,
+    gitmodules_budget: Optional[GitmodulesReadBudget] = None,
 ) -> None:
     print(f"preflight {len(planned_modules)} top-level submodule path(s)", flush=True)
     plan = build_sync_plan(
@@ -2825,6 +3322,7 @@ def execute_sync_plan(
         force_replace_empty=force_replace_empty,
         fetch_missing=fetch_missing,
         display_root=root,
+        gitmodules_budget=gitmodules_budget,
     )
     print_sync_plan(plan)
 
@@ -2981,8 +3479,9 @@ def main() -> int:
     source_common_git_dir, source_superproject = choose_source_common_git_dir(
         args, root
     )
+    gitmodules_budget = GitmodulesReadBudget.start()
     modules = filter_submodules(
-        read_worktree_gitmodules(root),
+        read_worktree_gitmodules(root, gitmodules_budget),
         args.paths,
         all_paths=args.all_paths,
     )
@@ -2997,6 +3496,7 @@ def main() -> int:
         force_replace_empty=args.force_replace_empty,
         dry_run=args.dry_run,
         fetch_missing=args.fetch_missing,
+        gitmodules_budget=gitmodules_budget,
     )
     return 0
 

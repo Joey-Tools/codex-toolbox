@@ -237,6 +237,44 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         version_probe.assert_called_once()
         repository_command.assert_not_called()
 
+    def test_git_snapshot_rejects_same_inode_source_content_replacement(
+        self,
+    ) -> None:
+        fake_git = self.root / "fake-git"
+        original_content = "#!/bin/sh\nprintf 'git version 2.53.0\\n'\n"
+        replacement_content = "#!/bin/sh\nprintf 'git version 9.99.9\\n'\n"
+        self.assertEqual(len(original_content), len(replacement_content))
+        fake_git.write_text(original_content, encoding="utf-8")
+        fake_git.chmod(0o700)
+        original_inode = fake_git.stat().st_ino
+
+        with mock.patch.object(MODULE.shutil, "which", return_value=str(fake_git)):
+            runtime = MODULE.discover_git_runtime()
+        try:
+            self.assertNotEqual(runtime.executable, runtime.source_executable)
+            self.assertEqual(
+                runtime.executable.read_text(encoding="utf-8"),
+                original_content,
+            )
+            with mock.patch.object(MODULE, "_GIT_RUNTIME", runtime):
+                command = MODULE.safe_command(["git", "--version"])
+                self.assertEqual(Path(command[0]), runtime.executable)
+
+                fake_git.write_text(replacement_content, encoding="utf-8")
+                self.assertEqual(fake_git.stat().st_ino, original_inode)
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "content changed after version preflight",
+                ):
+                    MODULE.safe_command(["git", "--version"])
+
+            self.assertEqual(
+                runtime.executable.read_text(encoding="utf-8"),
+                original_content,
+            )
+        finally:
+            runtime.snapshot_guard.cleanup()
+
     def test_bounded_command_stops_at_retained_stdout_limit(self) -> None:
         with self.assertRaisesRegex(
             MODULE.PlanError,
@@ -388,6 +426,124 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         with self.assertRaisesRegex(MODULE.PlanError, "unsafe path segment"):
             MODULE.parse_gitmodules(content, ".gitmodules")
+
+    def test_worktree_gitmodules_rejects_oversized_content_before_reading(
+        self,
+    ) -> None:
+        gitmodules = self.root / ".gitmodules"
+        gitmodules.write_bytes(b"x" * 5)
+
+        with mock.patch.object(MODULE, "MAX_GITMODULES_FILE_BYTES", 4):
+            with self.assertRaisesRegex(MODULE.PlanError, "per-file limit"):
+                MODULE.read_worktree_gitmodules(self.root)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFO support is required")
+    def test_worktree_gitmodules_rejects_fifo_without_blocking(self) -> None:
+        gitmodules = self.root / ".gitmodules"
+        os.mkfifo(gitmodules)
+        started = time.monotonic()
+
+        with self.assertRaisesRegex(MODULE.PlanError, "not a regular file"):
+            MODULE.read_worktree_gitmodules(self.root)
+
+        self.assertLess(time.monotonic() - started, 1)
+
+    def test_commit_gitmodules_rejects_oversized_blob_before_content_read(
+        self,
+    ) -> None:
+        object_id = b"a" * 40
+        tree_result = subprocess.CompletedProcess(
+            ["git"],
+            0,
+            stdout=b"100644 blob " + object_id + b"\t.gitmodules\0",
+            stderr=b"",
+        )
+        size_result = subprocess.CompletedProcess(
+            ["git"],
+            0,
+            stdout=b"5\n",
+            stderr=b"",
+        )
+
+        with mock.patch.object(MODULE, "MAX_GITMODULES_FILE_BYTES", 4):
+            with mock.patch.object(
+                MODULE,
+                "read_git_bounded",
+                side_effect=[tree_result, size_result],
+            ) as bounded_git:
+                with self.assertRaisesRegex(MODULE.PlanError, "per-file limit"):
+                    MODULE.read_commit_gitmodules(
+                        self.source_git_dir,
+                        self.standard,
+                        self.sha,
+                    )
+
+        self.assertEqual(bounded_git.call_count, 2)
+
+    def test_commit_gitmodules_honors_expired_shared_deadline(self) -> None:
+        budget = MODULE.GitmodulesReadBudget(
+            deadline=time.monotonic() - 1,
+        )
+
+        with mock.patch.object(MODULE, "read_git_bounded") as bounded_git:
+            with self.assertRaisesRegex(MODULE.PlanError, "shared .* deadline"):
+                MODULE.read_commit_gitmodules(
+                    self.source_git_dir,
+                    self.standard,
+                    self.sha,
+                    budget,
+                )
+
+        bounded_git.assert_not_called()
+
+    def test_gitmodules_reads_share_one_retained_content_budget(self) -> None:
+        root_content = (
+            b'[submodule "root"]\n'
+            b"    path = root\n"
+            b"    url = https://example.invalid/root.git\n"
+        )
+        (self.root / ".gitmodules").write_bytes(root_content)
+        nested_content = (
+            b'[submodule "nested"]\n'
+            b"    path = nested\n"
+            b"    url = https://example.invalid/nested.git\n"
+        )
+        object_id = b"b" * 40
+        tree_result = subprocess.CompletedProcess(
+            ["git"],
+            0,
+            stdout=b"100644 blob " + object_id + b"\t.gitmodules\0",
+            stderr=b"",
+        )
+        size_result = subprocess.CompletedProcess(
+            ["git"],
+            0,
+            stdout=f"{len(nested_content)}\n".encode(),
+            stderr=b"",
+        )
+        budget = MODULE.GitmodulesReadBudget(
+            deadline=time.monotonic() + 5,
+            retained_limit=len(root_content) + len(nested_content) - 1,
+        )
+
+        MODULE.read_worktree_gitmodules(self.root, budget)
+        with mock.patch.object(
+            MODULE,
+            "read_git_bounded",
+            side_effect=[tree_result, size_result],
+        ) as bounded_git:
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "shared retained-content limit",
+            ):
+                MODULE.read_commit_gitmodules(
+                    self.source_git_dir,
+                    self.standard,
+                    self.sha,
+                    budget,
+                )
+
+        self.assertEqual(bounded_git.call_count, 2)
 
     def test_relative_git_paths_reject_cross_platform_escape_forms(self) -> None:
         unsafe_paths = (
@@ -872,6 +1028,31 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertFalse(policy.case_sensitive)
         self.assertEqual(policy.normalization, "NFD")
 
+    def test_darwin_canonical_unicode_is_filesystem_derived_when_precompose_false(
+        self,
+    ) -> None:
+        target_root = self.root / "darwin-unicode-target"
+        target_root.mkdir()
+
+        with mock.patch.object(MODULE.sys, "platform", "darwin"):
+            with mock.patch.object(
+                MODULE,
+                "local_git_bool",
+                side_effect=[False, False],
+            ):
+                with mock.patch.object(
+                    MODULE,
+                    "darwin_volume_case_sensitive",
+                    return_value=True,
+                ):
+                    policy = MODULE.filesystem_name_policy(target_root)
+
+        self.assertEqual(policy.normalization, "NFD")
+        self.assertEqual(
+            MODULE.normalized_path_parts(("Caf\u00e9",), policy),
+            MODULE.normalized_path_parts(("Cafe\u0301",), policy),
+        )
+
     def test_collision_index_does_not_scan_the_existing_plan(self) -> None:
         class NonIterableEntries(list[object]):
             def __iter__(self) -> object:
@@ -891,6 +1072,32 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             entries.append(candidate)
 
         self.assertEqual(len(entries), 20_000)
+
+    def test_deep_collision_chain_uses_active_ancestor_metadata(self) -> None:
+        class NoParentLookups(list[object]):
+            def __getitem__(self, index: object) -> object:
+                raise AssertionError(
+                    f"collision index walked planned parent links at {index}"
+                )
+
+        entries = NoParentLookups()
+        collision_index = MODULE.TargetCollisionIndex()
+        active_ancestors: set[int] = set()
+        tokens: list[tuple[object, ...]] = []
+        for index in range(1_024):
+            tokens.append(("missing", f"level-{index}"))
+            candidate = SimpleNamespace(
+                parent_index=index - 1 if index else None,
+                target=SimpleNamespace(
+                    path=Path(f"deep-level-{index}"),
+                    collision_tokens=tuple(tokens),
+                ),
+            )
+            collision_index.add(entries, candidate, active_ancestors)
+            entries.append(candidate)
+            active_ancestors.add(index)
+
+        self.assertEqual(len(entries), 1_024)
 
     def test_new_worktree_rejects_lfs_filter_even_when_nonrequired(self) -> None:
         target_sha = self.filtered_target_sha("lfs", required=False)
@@ -1074,6 +1281,59 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.assertFalse(marker.exists())
         self.assertEqual(run_git(target, "rev-parse", "HEAD"), base_sha)
+
+    def test_staged_new_filtered_file_is_rejected_before_status_executes_filter(
+        self,
+    ) -> None:
+        source = self.clone_named_source("index-filter")
+        target_super = self.root / "index-filter-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        self.add_managed_worktree(source, target, self.sha)
+        (target / ".gitattributes").write_text(
+            "staged.bin filter=marker\n",
+            encoding="utf-8",
+        )
+        staged_payload = target / "staged.bin"
+        staged_payload.write_text("staged\n", encoding="utf-8")
+        run_git(target, "add", ".gitattributes", "staged.bin")
+
+        marker = self.root / "index-clean-filter-executed"
+        run_git(
+            self.root,
+            f"--git-dir={source}",
+            "config",
+            "filter.marker.clean",
+            f"touch {marker}",
+        )
+        staged_payload.write_text("working tree changed\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "tree: index",
+        ):
+            MODULE.build_sync_plan(
+                root=target_super,
+                common_git_dir=self.named_common_git_dir,
+                source_superproject=None,
+                planned_modules=[
+                    (
+                        MODULE.Submodule(
+                            "index-filter",
+                            "lib",
+                            str(self.remote),
+                        ),
+                        self.sha,
+                    )
+                ],
+                depth=1,
+                recursive=False,
+                force_replace_empty=False,
+                fetch_missing=False,
+            )
+
+        self.assertFalse(marker.exists())
+        self.assertEqual(run_git(target, "rev-parse", "HEAD"), self.sha)
 
     def test_later_managed_ignored_conflict_blocks_first_checkout(self) -> None:
         (self.remote / ".gitignore").write_text(
