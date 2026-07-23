@@ -83,6 +83,19 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
 
+    def clone_named_source(self, name: str) -> Path:
+        source_git_dir = self.named_common_git_dir / "modules" / name
+        source_git_dir.parent.mkdir(parents=True, exist_ok=True)
+        run_git(
+            self.root,
+            "clone",
+            "--separate-git-dir",
+            str(source_git_dir),
+            str(self.remote),
+            str(self.root / f"{name}-standard"),
+        )
+        return source_git_dir
+
     def test_script_imports_future_annotations(self) -> None:
         first_lines = SCRIPT_PATH.read_text(encoding="utf-8").splitlines()[:4]
 
@@ -395,6 +408,318 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             first_registry_before,
         )
 
+    def test_later_symlink_alias_collision_blocks_all_apply_mutations(self) -> None:
+        target_super = self.root / "alias-target-super"
+        real_parent = target_super / "real"
+        real_parent.mkdir(parents=True)
+        (target_super / "alias").symlink_to(real_parent, target_is_directory=True)
+        first_source = self.clone_named_source("alias-first")
+        self.clone_named_source("alias-second")
+        (self.remote / "ALIAS.md").write_text("alias\n", encoding="utf-8")
+        run_git(self.remote, "add", "ALIAS.md")
+        run_git(self.remote, "commit", "-m", "alias")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        first_target = real_parent / "lib"
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={first_source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        commands: list[list[str]] = []
+        original_run = MODULE.run
+
+        def recording_run(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+            capture: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            commands.append(args)
+            return original_run(args, cwd=cwd, check=check, capture=capture)
+
+        try:
+            MODULE.run = recording_run
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(MODULE.PlanError, "symlink alias/collision"):
+                    MODULE.execute_sync_plan(
+                        root=target_super,
+                        common_git_dir=self.named_common_git_dir,
+                        source_superproject=None,
+                        planned_modules=[
+                            (
+                                MODULE.Submodule(
+                                    "alias-first",
+                                    "real/lib",
+                                    str(self.remote),
+                                ),
+                                missing_sha,
+                            ),
+                            (
+                                MODULE.Submodule(
+                                    "alias-second",
+                                    "alias/lib",
+                                    str(self.remote),
+                                ),
+                                self.sha,
+                            ),
+                        ],
+                        depth=1,
+                        recursive=False,
+                        force_replace_empty=False,
+                        dry_run=False,
+                        fetch_missing=True,
+                    )
+        finally:
+            MODULE.run = original_run
+
+        self.assertFalse(first_target.exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={first_source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+        self.assertFalse(any("fetch" in command for command in commands))
+
+    def test_later_unwritable_target_parent_blocks_first_target_mutation(self) -> None:
+        target_super = self.root / "target-policy-super"
+        first_parent = target_super / "first-parent"
+        denied_parent = target_super / "denied-parent"
+        first_parent.mkdir(parents=True)
+        denied_parent.mkdir()
+        first_source = self.clone_named_source("policy-first")
+        self.clone_named_source("policy-second")
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={first_source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        original_probe_access = MODULE.probe_access
+
+        def deny_later_parent(path: Path, mode: int) -> bool:
+            if path.resolve() == denied_parent.resolve() and mode & os.W_OK:
+                return False
+            return original_probe_access(path, mode)
+
+        try:
+            MODULE.probe_access = deny_later_parent
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(MODULE.PlanError, "target parent creation"):
+                    MODULE.execute_sync_plan(
+                        root=target_super,
+                        common_git_dir=self.named_common_git_dir,
+                        source_superproject=None,
+                        planned_modules=[
+                            (
+                                MODULE.Submodule(
+                                    "policy-first",
+                                    "first-parent/lib",
+                                    str(self.remote),
+                                ),
+                                self.sha,
+                            ),
+                            (
+                                MODULE.Submodule(
+                                    "policy-second",
+                                    "denied-parent/lib",
+                                    str(self.remote),
+                                ),
+                                self.sha,
+                            ),
+                        ],
+                        depth=1,
+                        recursive=False,
+                        force_replace_empty=False,
+                        dry_run=False,
+                        fetch_missing=False,
+                    )
+        finally:
+            MODULE.probe_access = original_probe_access
+
+        self.assertFalse((first_parent / "lib").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={first_source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
+    def test_later_unwritable_source_admin_blocks_first_target_mutation(self) -> None:
+        target_super = self.root / "source-policy-super"
+        target_super.mkdir()
+        first_source = self.clone_named_source("source-policy-first")
+        second_source = self.clone_named_source("source-policy-second")
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={first_source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        original_probe_access = MODULE.probe_access
+
+        def deny_later_source(path: Path, mode: int) -> bool:
+            if path.resolve() == second_source.resolve() and mode & os.W_OK:
+                return False
+            return original_probe_access(path, mode)
+
+        try:
+            MODULE.probe_access = deny_later_source
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(MODULE.PlanError, "source gitdir administration"):
+                    MODULE.execute_sync_plan(
+                        root=target_super,
+                        common_git_dir=self.named_common_git_dir,
+                        source_superproject=None,
+                        planned_modules=[
+                            (
+                                MODULE.Submodule(
+                                    "source-policy-first",
+                                    "first",
+                                    str(self.remote),
+                                ),
+                                self.sha,
+                            ),
+                            (
+                                MODULE.Submodule(
+                                    "source-policy-second",
+                                    "second",
+                                    str(self.remote),
+                                ),
+                                self.sha,
+                            ),
+                        ],
+                        depth=1,
+                        recursive=False,
+                        force_replace_empty=False,
+                        dry_run=False,
+                        fetch_missing=False,
+                    )
+        finally:
+            MODULE.probe_access = original_probe_access
+
+        self.assertFalse((target_super / "first").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={first_source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
+    def test_policy_drift_between_plan_and_apply_blocks_first_mutation(self) -> None:
+        target_super = self.root / "drift-super"
+        first_parent = target_super / "first-parent"
+        second_parent = target_super / "second-parent"
+        first_parent.mkdir(parents=True)
+        second_parent.mkdir()
+        second_parent.chmod(0o755)
+        first_source = self.clone_named_source("drift-first")
+        self.clone_named_source("drift-second")
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={first_source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "drift-first",
+                        "first-parent/lib",
+                        str(self.remote),
+                    ),
+                    self.sha,
+                ),
+                (
+                    MODULE.Submodule(
+                        "drift-second",
+                        "second-parent/lib",
+                        str(self.remote),
+                    ),
+                    self.sha,
+                ),
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+
+        second_parent.chmod(0o700)
+        try:
+            with self.assertRaisesRegex(MODULE.PlanError, "object or policy changed"):
+                MODULE.apply_sync_plan(plan)
+        finally:
+            second_parent.chmod(0o755)
+
+        self.assertFalse((first_parent / "lib").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={first_source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
+    def test_benign_target_parent_entry_churn_preserves_bound_policy(self) -> None:
+        target_super = self.root / "benign-churn-super"
+        target_parent = target_super / "parent"
+        target_parent.mkdir(parents=True)
+        self.clone_named_source("benign-churn")
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "benign-churn",
+                        "parent/lib",
+                        str(self.remote),
+                    ),
+                    self.sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+
+        (target_parent / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+        with redirect_stdout(io.StringIO()):
+            MODULE.apply_sync_plan(plan)
+
+        self.assertEqual(
+            run_git(target_parent / "lib", "rev-parse", "HEAD"),
+            self.sha,
+        )
+
     def test_missing_target_rejects_non_directory_parent(self) -> None:
         target_super = self.root / "target-super"
         target_super.mkdir()
@@ -553,6 +878,93 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             target_sha,
         )
 
+    def test_recursive_apply_uses_complete_parent_first_plan(self) -> None:
+        child_remote = self.root / "nested-child-remote"
+        run_git(self.root, "init", str(child_remote))
+        run_git(child_remote, "config", "user.email", "test@example.com")
+        run_git(child_remote, "config", "user.name", "Test User")
+        (child_remote / "CHILD.md").write_text("child\n", encoding="utf-8")
+        run_git(child_remote, "add", "CHILD.md")
+        run_git(child_remote, "commit", "-m", "child")
+        child_sha = run_git(child_remote, "rev-parse", "HEAD")
+
+        parent_remote = self.root / "nested-parent-remote"
+        run_git(self.root, "init", str(parent_remote))
+        run_git(parent_remote, "config", "user.email", "test@example.com")
+        run_git(parent_remote, "config", "user.name", "Test User")
+        (parent_remote / ".gitmodules").write_text(
+            "\n".join(
+                [
+                    '[submodule "nested"]',
+                    "    path = nested",
+                    f"    url = {child_remote}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        run_git(parent_remote, "add", ".gitmodules")
+        run_git(
+            parent_remote,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{child_sha},nested",
+        )
+        run_git(parent_remote, "commit", "-m", "parent")
+        parent_sha = run_git(parent_remote, "rev-parse", "HEAD")
+
+        source_common = self.root / "recursive-source" / ".git"
+        parent_source = source_common / "modules" / "parent"
+        parent_source.parent.mkdir(parents=True)
+        run_git(
+            self.root,
+            "clone",
+            "--separate-git-dir",
+            str(parent_source),
+            str(parent_remote),
+            str(self.root / "parent-standard"),
+        )
+        child_source = parent_source / "modules" / "nested"
+        child_source.parent.mkdir(parents=True)
+        run_git(
+            self.root,
+            "clone",
+            "--separate-git-dir",
+            str(child_source),
+            str(child_remote),
+            str(self.root / "child-standard"),
+        )
+        target_super = self.root / "recursive-target"
+        target_super.mkdir()
+
+        with redirect_stdout(io.StringIO()):
+            MODULE.execute_sync_plan(
+                root=target_super,
+                common_git_dir=source_common,
+                source_superproject=None,
+                planned_modules=[
+                    (
+                        MODULE.Submodule("parent", "parent", str(parent_remote)),
+                        parent_sha,
+                    )
+                ],
+                depth=1,
+                recursive=True,
+                force_replace_empty=False,
+                dry_run=False,
+                fetch_missing=False,
+            )
+
+        self.assertEqual(
+            run_git(target_super / "parent", "rev-parse", "HEAD"),
+            parent_sha,
+        )
+        self.assertEqual(
+            run_git(target_super / "parent" / "nested", "rev-parse", "HEAD"),
+            child_sha,
+        )
+
     def test_sync_uses_submodule_name_for_source_gitdir(self) -> None:
         submodule = MODULE.Submodule(
             name="custom-lib",
@@ -645,54 +1057,81 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             )
         )
 
-    def test_recursive_dry_run_stops_when_authorized_fetch_is_only_planned(self) -> None:
+    def test_recursive_missing_commit_never_fetches_before_complete_plan(self) -> None:
         submodule = MODULE.Submodule(
             name="custom-lib",
             path="third_party/libexample",
             url=str(self.remote),
         )
         output = io.StringIO()
+        commands: list[list[str]] = []
+        original_run = MODULE.run
 
-        with redirect_stdout(output):
-            with self.assertRaisesRegex(MODULE.PlanError, "cannot plan nested submodules"):
-                MODULE.sync_one(
-                    root=self.root,
-                    common_git_dir=self.named_common_git_dir,
-                    source_superproject=None,
-                    parent_source_git_dir=None,
-                    parent_root=self.root / "target-super",
-                    submodule=submodule,
-                    sha="f" * 40,
-                    depth=1,
-                    recursive=True,
-                    force_replace_empty=False,
-                    dry_run=True,
-                    fetch_missing=True,
-                )
-
-        self.assertIn("would fetch missing commit", output.getvalue())
-
-    def test_execute_sync_plan_preflights_every_path_before_apply(self) -> None:
-        modules = [
-            MODULE.Submodule("first", "third_party/first", str(self.remote)),
-            MODULE.Submodule("second", "third_party/second", str(self.remote)),
-        ]
-        calls: list[tuple[str, bool]] = []
-        original_sync_one = MODULE.sync_one
-
-        def fake_sync_one(**kwargs: object) -> None:
-            module = kwargs["submodule"]
-            self.assertIsInstance(module, MODULE.Submodule)
-            calls.append((module.path, bool(kwargs["dry_run"])))
+        def recording_run(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+            capture: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            commands.append(args)
+            return original_run(args, cwd=cwd, check=check, capture=capture)
 
         try:
-            MODULE.sync_one = fake_sync_one
+            MODULE.run = recording_run
+            with redirect_stdout(output):
+                with self.assertRaisesRegex(MODULE.PlanError, "cannot complete the recursive plan"):
+                    MODULE.sync_one(
+                        root=self.root,
+                        common_git_dir=self.named_common_git_dir,
+                        source_superproject=None,
+                        parent_source_git_dir=None,
+                        parent_root=self.root / "target-super",
+                        submodule=submodule,
+                        sha="f" * 40,
+                        depth=1,
+                        recursive=True,
+                        force_replace_empty=False,
+                        dry_run=False,
+                        fetch_missing=True,
+                    )
+        finally:
+            MODULE.run = original_run
+
+        self.assertNotIn("would fetch missing commit", output.getvalue())
+        self.assertFalse(any("fetch" in command for command in commands))
+
+    def test_execute_sync_plan_builds_and_prints_before_apply(self) -> None:
+        module = MODULE.Submodule("custom-lib", "third_party/libexample", str(self.remote))
+        calls: list[str] = []
+        sentinel = object()
+        original_build_sync_plan = MODULE.build_sync_plan
+        original_print_sync_plan = MODULE.print_sync_plan
+        original_apply_sync_plan = MODULE.apply_sync_plan
+
+        def fake_build_sync_plan(**kwargs: object) -> object:
+            self.assertEqual(kwargs["planned_modules"], [(module, self.sha)])
+            calls.append("build")
+            return sentinel
+
+        def fake_print_sync_plan(plan: object) -> None:
+            self.assertIs(plan, sentinel)
+            calls.append("print")
+
+        def fake_apply_sync_plan(plan: object) -> None:
+            self.assertIs(plan, sentinel)
+            calls.append("apply")
+
+        try:
+            MODULE.build_sync_plan = fake_build_sync_plan
+            MODULE.print_sync_plan = fake_print_sync_plan
+            MODULE.apply_sync_plan = fake_apply_sync_plan
             with redirect_stdout(io.StringIO()):
                 MODULE.execute_sync_plan(
                     root=self.root,
                     common_git_dir=self.named_common_git_dir,
                     source_superproject=None,
-                    planned_modules=[(modules[0], "a" * 40), (modules[1], "b" * 40)],
+                    planned_modules=[(module, self.sha)],
                     depth=1,
                     recursive=False,
                     force_replace_empty=False,
@@ -700,43 +1139,40 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     fetch_missing=False,
                 )
         finally:
-            MODULE.sync_one = original_sync_one
+            MODULE.build_sync_plan = original_build_sync_plan
+            MODULE.print_sync_plan = original_print_sync_plan
+            MODULE.apply_sync_plan = original_apply_sync_plan
 
-        self.assertEqual(
-            calls,
-            [
-                ("third_party/first", True),
-                ("third_party/second", True),
-                ("third_party/first", False),
-                ("third_party/second", False),
-            ],
-        )
+        self.assertEqual(calls, ["build", "print", "apply"])
 
     def test_execute_sync_plan_does_not_apply_after_failed_preflight(self) -> None:
-        modules = [
-            MODULE.Submodule("first", "third_party/first", str(self.remote)),
-            MODULE.Submodule("second", "third_party/second", str(self.remote)),
-        ]
-        calls: list[tuple[str, bool]] = []
-        original_sync_one = MODULE.sync_one
+        module = MODULE.Submodule("custom-lib", "third_party/libexample", str(self.remote))
+        calls: list[str] = []
+        original_build_sync_plan = MODULE.build_sync_plan
+        original_print_sync_plan = MODULE.print_sync_plan
+        original_apply_sync_plan = MODULE.apply_sync_plan
 
-        def fake_sync_one(**kwargs: object) -> None:
-            module = kwargs["submodule"]
-            self.assertIsInstance(module, MODULE.Submodule)
-            dry_run = bool(kwargs["dry_run"])
-            calls.append((module.path, dry_run))
-            if module.path == "third_party/second" and dry_run:
-                raise MODULE.PlanError("second path failed preflight")
+        def failed_build_sync_plan(**kwargs: object) -> object:
+            calls.append("build")
+            raise MODULE.PlanError("failed preflight")
+
+        def unexpected_print(plan: object) -> None:
+            calls.append("print")
+
+        def unexpected_apply(plan: object) -> None:
+            calls.append("apply")
 
         try:
-            MODULE.sync_one = fake_sync_one
+            MODULE.build_sync_plan = failed_build_sync_plan
+            MODULE.print_sync_plan = unexpected_print
+            MODULE.apply_sync_plan = unexpected_apply
             with redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(MODULE.PlanError, "failed preflight"):
                     MODULE.execute_sync_plan(
                         root=self.root,
                         common_git_dir=self.named_common_git_dir,
                         source_superproject=None,
-                        planned_modules=[(modules[0], "a" * 40), (modules[1], "b" * 40)],
+                        planned_modules=[(module, self.sha)],
                         depth=1,
                         recursive=False,
                         force_replace_empty=False,
@@ -744,15 +1180,11 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         fetch_missing=False,
                     )
         finally:
-            MODULE.sync_one = original_sync_one
+            MODULE.build_sync_plan = original_build_sync_plan
+            MODULE.print_sync_plan = original_print_sync_plan
+            MODULE.apply_sync_plan = original_apply_sync_plan
 
-        self.assertEqual(
-            calls,
-            [
-                ("third_party/first", True),
-                ("third_party/second", True),
-            ],
-        )
+        self.assertEqual(calls, ["build"])
 
 
 if __name__ == "__main__":
