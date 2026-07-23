@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -48,7 +49,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.remote = self.root / "remote"
         self.standard = self.root / "standard"
-        self.source_git_dir = self.root / "super" / ".git" / "modules" / "third_party" / "libexample"
+        self.source_git_dir = (
+            self.root / "super" / ".git" / "modules" / "third_party" / "libexample"
+        )
         self.named_common_git_dir = self.root / "named-super" / ".git"
         self.named_source_git_dir = self.named_common_git_dir / "modules" / "custom-lib"
         self.linked = self.root / "linked"
@@ -101,6 +104,51 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.assertIn("from __future__ import annotations", first_lines)
 
+    def test_git_reads_disable_lazy_fetch_and_strip_repository_redirection(
+        self,
+    ) -> None:
+        poisoned = {
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(self.root / "alternate"),
+            "GIT_COMMON_DIR": str(self.root / "common"),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.worktree",
+            "GIT_CONFIG_VALUE_0": str(self.root / "attacker"),
+            "GIT_DIR": str(self.root / "gitdir"),
+            "GIT_INDEX_FILE": str(self.root / "index"),
+            "GIT_OBJECT_DIRECTORY": str(self.root / "objects"),
+            "GIT_SHALLOW_FILE": str(self.root / "shallow"),
+            "GIT_SSH_COMMAND": "false",
+            "GIT_WORK_TREE": str(self.root / "worktree"),
+        }
+        completed = subprocess.CompletedProcess(
+            ["git"],
+            0,
+            stdout="ok\n",
+            stderr="",
+        )
+        with mock.patch.dict(os.environ, poisoned, clear=False):
+            with mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                return_value=completed,
+            ) as subprocess_run:
+                result = MODULE.read_git(["cat-file", "-e", self.sha])
+
+        self.assertEqual(result.stdout, "ok\n")
+        child_env = subprocess_run.call_args.kwargs["env"]
+        self.assertEqual(child_env["GIT_NO_LAZY_FETCH"], "1")
+        self.assertEqual(child_env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(child_env["GIT_CONFIG_SYSTEM"], os.devnull)
+        for key in poisoned:
+            if key in MODULE.SAFE_GIT_ENV:
+                self.assertEqual(child_env[key], MODULE.SAFE_GIT_ENV[key])
+            else:
+                self.assertNotIn(key, child_env)
+        command = subprocess_run.call_args.args[0]
+        self.assertEqual(command[0], "git")
+        self.assertIn("core.hooksPath=/dev/null", command)
+        self.assertIn("credential.helper=", command)
+
     def test_parse_gitmodules_rejects_unsafe_path(self) -> None:
         content = """
 [submodule "custom-lib"]
@@ -143,7 +191,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             )
         ]
 
-        with self.assertRaisesRegex(MODULE.PlanError, "explicit top-level paths or --all"):
+        with self.assertRaisesRegex(
+            MODULE.PlanError, "explicit top-level paths or --all"
+        ):
             MODULE.filter_submodules(modules, [])
 
     def test_filter_submodules_rejects_empty_path(self) -> None:
@@ -207,7 +257,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         try:
             MODULE.parse_args = lambda: args
             MODULE.repo_paths = fail_repo_lookup
-            with self.assertRaisesRegex(MODULE.PlanError, "no submodule paths selected"):
+            with self.assertRaisesRegex(
+                MODULE.PlanError, "no submodule paths selected"
+            ):
                 MODULE.main()
         finally:
             MODULE.parse_args = original_parse_args
@@ -254,8 +306,12 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
     def test_expected_sha_rejects_unmerged_index_entries(self) -> None:
         original_git = MODULE.git
 
-        def fake_git(args: list[str], *, cwd: Path | None = None, check: bool = True) -> str:
-            self.assertEqual(args[:4], ["ls-files", "-s", "--", "third_party/libexample"])
+        def fake_git(
+            args: list[str], *, cwd: Path | None = None, check: bool = True
+        ) -> str:
+            self.assertEqual(
+                args[:4], ["ls-files", "-s", "--", "third_party/libexample"]
+            )
             return "\n".join(
                 [
                     f"160000 {'a' * 40} 1\tthird_party/libexample",
@@ -274,8 +330,12 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
     def test_expected_sha_rejects_nonzero_index_stage(self) -> None:
         original_git = MODULE.git
 
-        def fake_git(args: list[str], *, cwd: Path | None = None, check: bool = True) -> str:
-            self.assertEqual(args[:4], ["ls-files", "-s", "--", "third_party/libexample"])
+        def fake_git(
+            args: list[str], *, cwd: Path | None = None, check: bool = True
+        ) -> str:
+            self.assertEqual(
+                args[:4], ["ls-files", "-s", "--", "third_party/libexample"]
+            )
             return f"160000 {'a' * 40} 2\tthird_party/libexample"
 
         try:
@@ -285,7 +345,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         finally:
             MODULE.git = original_git
 
-    def test_default_common_git_dir_does_not_suggest_target_submodule_update(self) -> None:
+    def test_default_common_git_dir_does_not_suggest_target_submodule_update(
+        self,
+    ) -> None:
         args = type(
             "Args",
             (),
@@ -295,7 +357,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             },
         )()
 
-        source_common_git_dir, source_superproject = MODULE.choose_source_common_git_dir(args, self.remote)
+        source_common_git_dir, source_superproject = (
+            MODULE.choose_source_common_git_dir(args, self.remote)
+        )
 
         self.assertEqual(source_common_git_dir, (self.remote / ".git").resolve())
         self.assertIsNone(source_superproject)
@@ -373,18 +437,24 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         )
         output = io.StringIO()
         with redirect_stdout(output):
-            with self.assertRaisesRegex(MODULE.PlanError, "registered.*not a usable managed"):
+            with self.assertRaisesRegex(
+                MODULE.PlanError, "registered.*not a usable managed"
+            ):
                 MODULE.execute_sync_plan(
                     root=target_super,
                     common_git_dir=self.named_common_git_dir,
                     source_superproject=None,
                     planned_modules=[
                         (
-                            MODULE.Submodule("first", "third_party/first", str(self.remote)),
+                            MODULE.Submodule(
+                                "first", "third_party/first", str(self.remote)
+                            ),
                             self.sha,
                         ),
                         (
-                            MODULE.Submodule("second", "third_party/second", str(self.remote)),
+                            MODULE.Submodule(
+                                "second", "third_party/second", str(self.remote)
+                            ),
                             self.sha,
                         ),
                     ],
@@ -443,7 +513,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         try:
             MODULE.run = recording_run
             with redirect_stdout(io.StringIO()):
-                with self.assertRaisesRegex(MODULE.PlanError, "symlink alias/collision"):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError, "symlink alias/collision"
+                ):
                     MODULE.execute_sync_plan(
                         root=target_super,
                         common_git_dir=self.named_common_git_dir,
@@ -487,6 +559,50 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             registry_before,
         )
         self.assertFalse(any("fetch" in command for command in commands))
+
+    def test_source_gitdir_physical_alias_blocks_complete_plan(self) -> None:
+        target_super = self.root / "source-alias-target"
+        target_super.mkdir()
+        first_source = self.clone_named_source("source-alias-first")
+        second_source = self.named_common_git_dir / "modules" / "source-alias-second"
+        second_source.symlink_to(first_source, target_is_directory=True)
+
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "source gitdir collision or filesystem alias",
+            ):
+                MODULE.execute_sync_plan(
+                    root=target_super,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[
+                        (
+                            MODULE.Submodule(
+                                "source-alias-first",
+                                "first",
+                                str(self.remote),
+                            ),
+                            self.sha,
+                        ),
+                        (
+                            MODULE.Submodule(
+                                "source-alias-second",
+                                "second",
+                                str(self.remote),
+                            ),
+                            self.sha,
+                        ),
+                    ],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    dry_run=False,
+                    fetch_missing=False,
+                )
+
+        self.assertFalse((target_super / "first").exists())
+        self.assertFalse((target_super / "second").exists())
 
     def test_later_unwritable_target_parent_blocks_first_target_mutation(self) -> None:
         target_super = self.root / "target-policy-super"
@@ -579,7 +695,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         try:
             MODULE.probe_access = deny_later_source
             with redirect_stdout(io.StringIO()):
-                with self.assertRaisesRegex(MODULE.PlanError, "source gitdir administration"):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError, "source gitdir administration"
+                ):
                     MODULE.execute_sync_plan(
                         root=target_super,
                         common_git_dir=self.named_common_git_dir,
@@ -726,7 +844,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         (target_super / "blocked").write_text("not a directory\n", encoding="utf-8")
 
         with redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(MODULE.PlanError, "existing parent is not a directory"):
+            with self.assertRaisesRegex(
+                MODULE.PlanError, "existing parent is not a directory"
+            ):
                 MODULE.sync_one(
                     root=target_super,
                     common_git_dir=self.named_common_git_dir,
@@ -816,10 +936,15 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         finally:
             MODULE.run = original_run
 
-        git_commands = [command for command in commands if command and command[0] == "git"]
+        git_commands = [
+            command for command in commands if command and command[0] == "git"
+        ]
         self.assertTrue(any("status" in command for command in git_commands))
         self.assertTrue(
-            all(command[:2] == ["git", "--no-optional-locks"] for command in git_commands)
+            all(
+                command[:2] == ["git", "--no-optional-locks"]
+                for command in git_commands
+            )
         )
         self.assertEqual(index_path.read_bytes(), index_bytes_before)
         self.assertEqual(index_metadata(), index_metadata_before)
@@ -1080,7 +1205,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         try:
             MODULE.run = recording_run
             with redirect_stdout(output):
-                with self.assertRaisesRegex(MODULE.PlanError, "cannot complete the recursive plan"):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError, "cannot complete the recursive plan"
+                ):
                     MODULE.sync_one(
                         root=self.root,
                         common_git_dir=self.named_common_git_dir,
@@ -1102,7 +1229,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertFalse(any("fetch" in command for command in commands))
 
     def test_execute_sync_plan_builds_and_prints_before_apply(self) -> None:
-        module = MODULE.Submodule("custom-lib", "third_party/libexample", str(self.remote))
+        module = MODULE.Submodule(
+            "custom-lib", "third_party/libexample", str(self.remote)
+        )
         calls: list[str] = []
         sentinel = object()
         original_build_sync_plan = MODULE.build_sync_plan
@@ -1146,7 +1275,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertEqual(calls, ["build", "print", "apply"])
 
     def test_execute_sync_plan_does_not_apply_after_failed_preflight(self) -> None:
-        module = MODULE.Submodule("custom-lib", "third_party/libexample", str(self.remote))
+        module = MODULE.Submodule(
+            "custom-lib", "third_party/libexample", str(self.remote)
+        )
         calls: list[str] = []
         original_build_sync_plan = MODULE.build_sync_plan
         original_print_sync_plan = MODULE.print_sync_plan

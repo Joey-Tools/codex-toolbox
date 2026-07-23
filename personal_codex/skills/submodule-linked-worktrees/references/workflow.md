@@ -88,7 +88,7 @@ If the commit is missing, the default is to stop without a network mutation and 
 git --git-dir=<source-gitdir> --work-tree=<target-path> fetch --depth 1 origin <sha>
 ```
 
-`--dry-run --fetch-missing` prints this action without executing it. If a missing parent commit prevents recursive `.gitmodules` inspection, that plan-only run stops rather than pretending its nested plan is complete. An apply invocation with `--fetch-missing` performs authorized shallow fetches during preflight, after validating each affected target path, so recursive gitlinks can be inspected; it still does not begin the target apply phase unless that complete preflight passes.
+`--dry-run --fetch-missing` prints this action without executing it. If a missing parent commit prevents recursive `.gitmodules` inspection, both plan-only and apply runs stop before any fetch because the helper cannot prove the complete recursive target set first. Fetch that commit separately and rerun, or explicitly use `--no-recursive --fetch-missing` for the selected parent and then rerun the recursive plan once the object is local. The helper never performs a recursive preflight mutation merely to discover more targets.
 
 Some servers reject raw SHA fetches. In that case, report the failure and request or use separately authorized branch/tag fetch semantics before rerunning:
 

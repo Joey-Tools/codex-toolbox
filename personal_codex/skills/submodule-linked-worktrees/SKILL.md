@@ -74,7 +74,7 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/submodule-linked-worktrees/scripts/s
   --all
 ```
 
-Missing target commits are read-only failures by default. Use `--fetch-missing` only when the task explicitly authorizes shallow network fetches. With `--dry-run`, the helper prints an authorized missing-commit fetch but does not execute it.
+Missing target commits are read-only failures by default. Use `--fetch-missing` only when the task explicitly authorizes shallow network fetches. With `--dry-run`, the helper prints an authorized missing-commit fetch but does not execute it. A recursive plan whose parent commit is missing always stops before fetching because its complete descendant target set is not yet knowable; prefetch separately, or use an explicitly authorized non-recursive fetch and then rerun recursively.
 
 If `--source-superproject` is omitted, the script uses the target repo's own `git rev-parse --git-common-dir`. This works for many Git linked worktrees because their common gitdir is the canonical checkout's `.git` directory.
 
@@ -85,6 +85,7 @@ Use `--source-common-git-dir /path/to/repo/.git` only when there is no usable so
 - Resolve and pass exact top-level submodule paths. Never translate an empty path list into all submodules.
 - Use `--all` only when the task itself authorizes the complete top-level set; convenience or a vague request to "set up submodules" is not enough.
 - The helper always preflights the complete selected set before applying target-worktree changes. Use `--dry-run` to stop after that preflight, not as a substitute for resolving scope.
+- Every Git subprocess uses a controlled environment that rejects ambient repository/index/object/config redirection and disables promisor lazy fetches. Only an explicit `--fetch-missing` operation may perform network I/O.
 - Start with one small submodule path unless the task explicitly calls for a broader set.
 - Do not let the helper overwrite non-empty directories. It intentionally refuses non-empty paths that are not already managed linked worktrees.
 - Do not clean or deinitialize submodules as part of this workflow unless the user explicitly approves the destructive cleanup.

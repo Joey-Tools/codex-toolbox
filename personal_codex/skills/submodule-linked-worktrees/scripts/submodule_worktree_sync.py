@@ -14,6 +14,52 @@ from typing import Iterable, Optional
 import unicodedata
 
 
+GIT_ENV_PASSTHROUGH = (
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "SSH_AUTH_SOCK",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+)
+SAFE_GIT_ENV = {
+    "GIT_ASKPASS": "/usr/bin/false",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_LITERAL_PATHSPECS": "1",
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GCM_INTERACTIVE": "Never",
+    "SSH_ASKPASS": "/usr/bin/false",
+    "SSH_ASKPASS_REQUIRE": "never",
+}
+SAFE_GIT_CONFIG_ARGS = (
+    "--no-pager",
+    "-c",
+    f"core.attributesFile={os.devnull}",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    f"core.hooksPath={os.devnull}",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "credential.interactive=never",
+    "-c",
+    "protocol.ext.allow=never",
+    "-c",
+    "submodule.recurse=false",
+)
+
+
 class GitError(RuntimeError):
     pass
 
@@ -85,6 +131,20 @@ class SyncPlan:
     fetch_missing: bool
 
 
+def git_environment() -> dict[str, str]:
+    environment = {
+        key: os.environ[key] for key in GIT_ENV_PASSTHROUGH if key in os.environ
+    }
+    environment.update(SAFE_GIT_ENV)
+    return environment
+
+
+def safe_command(args: list[str]) -> list[str]:
+    if not args or args[0] != "git":
+        return args
+    return ["git", *SAFE_GIT_CONFIG_ARGS, *args[1:]]
+
+
 def run(
     args: list[str],
     *,
@@ -92,16 +152,21 @@ def run(
     check: bool = True,
     capture: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    command = safe_command(args)
     result = subprocess.run(
-        args,
+        command,
         cwd=str(cwd) if cwd else None,
+        env=git_environment(),
+        stdin=subprocess.DEVNULL,
         text=True,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
     )
     if check and result.returncode != 0:
         stderr = (result.stderr or "").strip()
-        raise GitError(f"{shell_join(args)} failed with exit code {result.returncode}: {stderr}")
+        raise GitError(
+            f"{shell_join(command)} failed with exit code {result.returncode}: {stderr}"
+        )
     return result
 
 
@@ -211,10 +276,7 @@ def capture_typed_access(
 ) -> AccessBinding:
     binding = capture_access(path, mode, purpose)
     if binding.fingerprint.kind != expected_kind:
-        raise PlanError(
-            f"{purpose} path has an unsafe object type\n"
-            f"  path: {path}"
-        )
+        raise PlanError(f"{purpose} path has an unsafe object type\n  path: {path}")
     return binding
 
 
@@ -261,7 +323,9 @@ def lexical_relative_parts(root: Path, path: Path, label: str) -> tuple[str, ...
     return parts
 
 
-def bind_target_path(root: Path, relative_parts: tuple[str, ...], label: str) -> BoundTarget:
+def bind_target_path(
+    root: Path, relative_parts: tuple[str, ...], label: str
+) -> BoundTarget:
     root = root.resolve(strict=True)
     nodes: list[BoundNode] = []
     current = root
@@ -305,7 +369,11 @@ def bind_target_path(root: Path, relative_parts: tuple[str, ...], label: str) ->
         )
     else:
         target_fingerprint = nodes[-1].fingerprint
-        collision_key = ("existing", target_fingerprint.device, target_fingerprint.inode)
+        collision_key = (
+            "existing",
+            target_fingerprint.device,
+            target_fingerprint.inode,
+        )
     return BoundTarget(
         path=path,
         relative_parts=relative_parts,
@@ -324,7 +392,9 @@ def revalidate_bound_target(target: BoundTarget) -> None:
         if current != node.fingerprint:
             raise PlanError(f"target-path object or policy changed: {node.path}")
         if current.kind == stat.S_IFLNK:
-            raise PlanError(f"target path became a symlink alias/collision: {node.path}")
+            raise PlanError(
+                f"target path became a symlink alias/collision: {node.path}"
+            )
     if target.missing_parts:
         first_missing = target.existing_nodes[-1].path / target.missing_parts[0]
         try:
@@ -333,7 +403,9 @@ def revalidate_bound_target(target: BoundTarget) -> None:
             return
         except PermissionError as exc:
             raise PlanError(f"target path became unreadable: {first_missing}") from exc
-        raise PlanError(f"target path changed after preflight: {first_missing} now exists")
+        raise PlanError(
+            f"target path changed after preflight: {first_missing} now exists"
+        )
 
 
 def source_repo_args(source_git_dir: Path, work_tree: Path) -> list[str]:
@@ -376,7 +448,9 @@ def parse_gitmodules(content: str, origin: str) -> list[Submodule]:
             )
             url = parser.get(section, "url").strip()
         except configparser.Error as exc:
-            raise PlanError(f"section [{section}] in {origin} is missing required keys: {exc}") from exc
+            raise PlanError(
+                f"section [{section}] in {origin} is missing required keys: {exc}"
+            ) from exc
         name = validate_relative_git_path(
             section[len("submodule ") :].strip().strip('"'),
             f"name for [{section}]",
@@ -399,7 +473,9 @@ def read_worktree_gitmodules(root: Path) -> list[Submodule]:
     return parse_gitmodules(path.read_text(encoding="utf-8"), str(path))
 
 
-def read_commit_gitmodules(source_git_dir: Path, work_tree: Path, commit: str) -> list[Submodule]:
+def read_commit_gitmodules(
+    source_git_dir: Path, work_tree: Path, commit: str
+) -> list[Submodule]:
     del work_tree
     tree_entry = read_git(
         [
@@ -427,17 +503,25 @@ def expected_sha(root: Path, rel_path: str) -> str:
     if not lines:
         raise PlanError(f"{rel_path} is not a gitlink in the current index")
     if len(lines) != 1:
-        raise PlanError(f"{rel_path} has unresolved index entries; resolve conflicts before syncing")
+        raise PlanError(
+            f"{rel_path} has unresolved index entries; resolve conflicts before syncing"
+        )
     fields = lines[0].split()
     if len(fields) < 4 or fields[0] != "160000":
         raise PlanError(f"{rel_path} is not a gitlink in the current index")
     if fields[2] != "0":
-        raise PlanError(f"{rel_path} has unresolved index stage {fields[2]}; resolve conflicts before syncing")
+        raise PlanError(
+            f"{rel_path} has unresolved index stage {fields[2]}; resolve conflicts before syncing"
+        )
     return fields[1]
 
 
-def expected_sha_from_tree(source_git_dir: Path, work_tree: Path, treeish: str, rel_path: str) -> str:
-    output = git([*source_object_repo_args(source_git_dir), "ls-tree", treeish, "--", rel_path])
+def expected_sha_from_tree(
+    source_git_dir: Path, work_tree: Path, treeish: str, rel_path: str
+) -> str:
+    output = git(
+        [*source_object_repo_args(source_git_dir), "ls-tree", treeish, "--", rel_path]
+    )
     fields = output.split()
     if len(fields) < 4 or fields[0] != "160000":
         raise PlanError(f"{rel_path} is not a gitlink in {treeish}")
@@ -520,7 +604,12 @@ def ensure_source_repo(
 
 def commit_exists(source_git_dir: Path, work_tree: Path, sha: str) -> bool:
     result = read_git(
-        [*source_object_repo_args(source_git_dir), "cat-file", "-e", f"{sha}^{{commit}}"],
+        [
+            *source_object_repo_args(source_git_dir),
+            "cat-file",
+            "-e",
+            f"{sha}^{{commit}}",
+        ],
         check=False,
     )
     return result.returncode == 0
@@ -565,7 +654,9 @@ def fetch_missing_commit(
     if dry_run:
         print(f"would fetch missing commit for {submodule.path}: {shell_join(command)}")
         return False
-    print(f"fetch missing commit for {submodule.path}: {shell_join(command)}", flush=True)
+    print(
+        f"fetch missing commit for {submodule.path}: {shell_join(command)}", flush=True
+    )
     result = run(command, check=False)
     if result.returncode == 0 and commit_exists(source_git_dir, work_tree, sha):
         return True
@@ -614,7 +705,9 @@ def gitdir_file_target(worktree_path: Path) -> Optional[Path]:
 def worktree_common_git_dir(worktree_path: Path) -> Optional[Path]:
     if not (worktree_path / ".git").exists():
         return None
-    result = read_git(["-C", str(worktree_path), "rev-parse", "--git-common-dir"], check=False)
+    result = read_git(
+        ["-C", str(worktree_path), "rev-parse", "--git-common-dir"], check=False
+    )
     if result.returncode != 0:
         return None
     common = Path(result.stdout.strip())
@@ -687,7 +780,9 @@ def ensure_target_parent_is_creatable(path: Path) -> None:
         )
 
 
-def prepare_target_path(path: Path, source_git_dir: Path, force_replace_empty: bool, dry_run: bool) -> str:
+def prepare_target_path(
+    path: Path, source_git_dir: Path, force_replace_empty: bool, dry_run: bool
+) -> str:
     registered_path = registered_target_path(source_git_dir, path)
     managed = path.exists() and is_managed_linked_worktree(path, source_git_dir)
 
@@ -713,7 +808,9 @@ def prepare_target_path(path: Path, source_git_dir: Path, force_replace_empty: b
 
     if is_empty_dir(path):
         if not force_replace_empty:
-            raise PlanError(f"{path} is an empty directory; pass --force-replace-empty to use it")
+            raise PlanError(
+                f"{path} is an empty directory; pass --force-replace-empty to use it"
+            )
         if dry_run:
             print(f"would use empty directory: {path}")
         return "empty"
@@ -742,7 +839,9 @@ def checkout_existing_worktree(worktree_path: Path, sha: str, dry_run: bool) -> 
     run(command)
 
 
-def add_worktree(source_git_dir: Path, worktree_path: Path, sha: str, dry_run: bool) -> None:
+def add_worktree(
+    source_git_dir: Path, worktree_path: Path, sha: str, dry_run: bool
+) -> None:
     command = [
         "git",
         *source_repo_args(source_git_dir, worktree_path),
@@ -809,7 +908,9 @@ def classify_planned_target(
     )
 
 
-def source_access_bindings(source_git_dir: Path, needs_fetch: bool) -> list[AccessBinding]:
+def source_access_bindings(
+    source_git_dir: Path, needs_fetch: bool
+) -> list[AccessBinding]:
     bindings = [
         capture_typed_access(
             source_git_dir,
@@ -902,7 +1003,9 @@ def target_access_bindings(
     )
     admin_dir = gitdir_file_target(target.path)
     if not admin_dir:
-        raise PlanError(f"cannot resolve managed worktree admin directory: {target.path}")
+        raise PlanError(
+            f"cannot resolve managed worktree admin directory: {target.path}"
+        )
     bindings.append(
         capture_typed_access(
             admin_dir,
@@ -1035,6 +1138,7 @@ def build_sync_plan(
 ) -> SyncPlan:
     root = root.resolve(strict=True)
     entries: list[PlannedWorktree] = []
+    source_identities: dict[tuple[int, int], tuple[Submodule, Path]] = {}
 
     def add_entry(
         submodule: Submodule,
@@ -1067,6 +1171,22 @@ def build_sync_plan(
             source_superproject,
             parent_source,
         )
+        source_fingerprint = filesystem_fingerprint(source_git_dir)
+        source_identity = (
+            source_fingerprint.device,
+            source_fingerprint.inode,
+        )
+        prior_source = source_identities.get(source_identity)
+        if prior_source is not None:
+            prior_module, prior_path = prior_source
+            raise PlanError(
+                "planned source gitdir collision or filesystem alias\n"
+                f"  first submodule: {prior_module.path}\n"
+                f"  first source: {prior_path}\n"
+                f"  second submodule: {submodule.path}\n"
+                f"  second source: {source_git_dir}"
+            )
+        source_identities[source_identity] = (submodule, source_git_dir)
         state = classify_planned_target(target, source_git_dir, force_replace_empty)
         commit_available = commit_exists(source_git_dir, target.path, sha)
         if not commit_available and not fetch_missing:
@@ -1157,7 +1277,9 @@ def print_sync_plan(plan: SyncPlan) -> None:
         else:
             if entry.state == "empty":
                 print(f"would use empty directory: {entry.target.path}")
-            add_worktree(entry.source_git_dir, entry.target.path, entry.sha, dry_run=True)
+            add_worktree(
+                entry.source_git_dir, entry.target.path, entry.sha, dry_run=True
+            )
         if entry.needs_fetch:
             print(
                 f"would fetch missing commit for {entry.submodule.path}: "
@@ -1346,11 +1468,15 @@ def normalize_requested_paths(
     all_paths: bool = False,
 ) -> Optional[list[str]]:
     if all_paths and requested_paths:
-        raise PlanError("use either explicit top-level submodule paths or --all, not both")
+        raise PlanError(
+            "use either explicit top-level submodule paths or --all, not both"
+        )
     if all_paths:
         return None
     if not requested_paths:
-        raise PlanError("no submodule paths selected; pass explicit top-level paths or --all")
+        raise PlanError(
+            "no submodule paths selected; pass explicit top-level paths or --all"
+        )
 
     normalized_paths = [
         validate_relative_git_path(path.rstrip("/"), "requested path", "command line")
@@ -1388,13 +1514,19 @@ def relative_display_path(root: Path, path: Path) -> str:
         return str(path)
 
 
-def choose_source_common_git_dir(args: argparse.Namespace, target_root: Path) -> tuple[Path, Optional[Path]]:
+def choose_source_common_git_dir(
+    args: argparse.Namespace, target_root: Path
+) -> tuple[Path, Optional[Path]]:
     if args.source_common_git_dir and args.source_superproject:
-        raise PlanError("use only one of --source-common-git-dir or --source-superproject")
+        raise PlanError(
+            "use only one of --source-common-git-dir or --source-superproject"
+        )
     if args.source_common_git_dir:
         return resolved_path(args.source_common_git_dir), None
     if args.source_superproject:
-        source_root, _, source_common_git_dir = repo_paths(resolved_path(args.source_superproject))
+        source_root, _, source_common_git_dir = repo_paths(
+            resolved_path(args.source_superproject)
+        )
         return source_common_git_dir, source_root
     _, _, target_common_git_dir = repo_paths(target_root)
     return target_common_git_dir, None
@@ -1418,8 +1550,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="sync every top-level submodule; use only when the task explicitly authorizes all paths",
     )
-    parser.add_argument("--repo", default=".", help="target superproject worktree; defaults to current directory")
-    parser.add_argument("--depth", type=int, default=1, help="depth used when fetching a missing target commit")
+    parser.add_argument(
+        "--repo",
+        default=".",
+        help="target superproject worktree; defaults to current directory",
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=1,
+        help="depth used when fetching a missing target commit",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -1433,8 +1574,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "use only when the task explicitly authorizes network fetches"
         ),
     )
-    parser.add_argument("--force-replace-empty", action="store_true", help="allow using existing empty directories")
-    parser.add_argument("--no-recursive", action="store_true", help="do not sync nested submodules")
+    parser.add_argument(
+        "--force-replace-empty",
+        action="store_true",
+        help="allow using existing empty directories",
+    )
+    parser.add_argument(
+        "--no-recursive", action="store_true", help="do not sync nested submodules"
+    )
     parser.add_argument(
         "--source-superproject",
         help="source checkout whose .git/modules tree should provide submodule repositories",
@@ -1456,7 +1603,9 @@ def main() -> int:
     normalize_requested_paths(args.paths, all_paths=args.all_paths)
 
     root, _, _ = repo_paths(resolved_path(args.repo))
-    source_common_git_dir, source_superproject = choose_source_common_git_dir(args, root)
+    source_common_git_dir, source_superproject = choose_source_common_git_dir(
+        args, root
+    )
     modules = filter_submodules(
         read_worktree_gitmodules(root),
         args.paths,
