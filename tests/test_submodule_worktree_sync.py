@@ -196,10 +196,46 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             else:
                 self.assertNotIn(key, child_env)
         command = subprocess_run.call_args.args[0]
-        self.assertEqual(command[0], "git")
+        self.assertEqual(
+            Path(command[0]).resolve(),
+            MODULE.git_runtime().executable,
+        )
+        self.assertTrue(Path(command[0]).is_absolute())
         self.assertIn("core.hooksPath=/dev/null", command)
         self.assertIn("credential.helper=", command)
         self.assertIn("core.excludesFile=/dev/null", command)
+
+    def test_old_git_is_rejected_before_the_first_repository_command(self) -> None:
+        actual_git = MODULE.git_runtime().executable
+        old_version = subprocess.CompletedProcess(
+            [str(actual_git), "--version"],
+            0,
+            stdout=b"git version 2.44.9\n",
+            stderr=b"",
+        )
+        with mock.patch.object(MODULE, "_GIT_RUNTIME", None):
+            with mock.patch.object(
+                MODULE.shutil,
+                "which",
+                return_value=str(actual_git),
+            ):
+                with mock.patch.object(
+                    MODULE,
+                    "run_bounded_bytes",
+                    return_value=old_version,
+                ) as version_probe:
+                    with mock.patch.object(
+                        MODULE.subprocess,
+                        "run",
+                    ) as repository_command:
+                        with self.assertRaisesRegex(
+                            MODULE.PlanError,
+                            "Git 2.45.0 or newer",
+                        ):
+                            MODULE.repo_paths(self.root)
+
+        version_probe.assert_called_once()
+        repository_command.assert_not_called()
 
     def test_bounded_command_stops_at_retained_stdout_limit(self) -> None:
         with self.assertRaisesRegex(
@@ -244,6 +280,41 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             )
         self.assertLess(time.monotonic() - started, 2)
 
+    def test_process_cleanup_reports_an_unreapable_direct_child(self) -> None:
+        class UnreapableProcess:
+            pid = 424242
+
+            def __init__(self) -> None:
+                self.wait_timeouts: list[float | None] = []
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> None:
+                self.wait_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired(["unreapable"], timeout)
+
+            def terminate(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                return None
+
+        process = UnreapableProcess()
+        with mock.patch.object(MODULE.os, "killpg"):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "cleanup-incomplete",
+            ):
+                MODULE.terminate_process_group(
+                    process,
+                    cleanup_timeout_seconds=0.01,
+                    term_grace_seconds=0.005,
+                )
+
+        self.assertEqual(len(process.wait_timeouts), 1)
+        self.assertTrue(all(timeout is not None for timeout in process.wait_timeouts))
+
     def test_bounded_command_rejects_oversized_input_before_spawn(self) -> None:
         with mock.patch.object(MODULE, "GIT_INPUT_LIMIT_BYTES", 4):
             with mock.patch.object(MODULE.subprocess, "Popen") as popen:
@@ -255,6 +326,59 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         popen.assert_not_called()
 
+    def test_tracked_status_is_bounded_and_skips_untracked_inventory(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["git"],
+            0,
+            stdout=b"",
+            stderr=b"",
+        )
+        with mock.patch.object(
+            MODULE,
+            "read_git_bounded",
+            return_value=completed,
+        ) as bounded_git:
+            self.assertFalse(
+                MODULE.has_local_changes(
+                    self.root,
+                    self.sha,
+                )
+            )
+
+        args = bounded_git.call_args.args[0]
+        self.assertIn("status", args)
+        self.assertIn("--untracked-files=no", args)
+        self.assertIn("--no-renames", args)
+        self.assertEqual(
+            bounded_git.call_args.kwargs["extra_env"],
+            {"GIT_ATTR_SOURCE": self.sha},
+        )
+
+    def test_worktree_registry_enforces_a_bounded_record_count(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["git"],
+            0,
+            stdout=b"worktree /first\0HEAD deadbeef\0",
+            stderr=b"",
+        )
+        with mock.patch.object(
+            MODULE,
+            "MAX_REGISTERED_WORKTREE_FIELDS",
+            1,
+        ):
+            with mock.patch.object(
+                MODULE,
+                "read_git_bounded",
+                return_value=completed,
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "record safety limit",
+                ):
+                    MODULE.registered_worktree_paths(
+                        self.named_source_git_dir,
+                    )
+
     def test_parse_gitmodules_rejects_unsafe_path(self) -> None:
         content = """
 [submodule "custom-lib"]
@@ -264,6 +388,45 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         with self.assertRaisesRegex(MODULE.PlanError, "unsafe path segment"):
             MODULE.parse_gitmodules(content, ".gitmodules")
+
+    def test_relative_git_paths_reject_cross_platform_escape_forms(self) -> None:
+        unsafe_paths = (
+            r"..\outside",
+            r"C:\outside",
+            "C:/outside",
+            r"\\server\share",
+            "/absolute/path",
+        )
+        for unsafe_path in unsafe_paths:
+            with self.subTest(unsafe_path=unsafe_path):
+                with self.assertRaises(MODULE.PlanError):
+                    MODULE.validate_relative_git_path(
+                        unsafe_path,
+                        "test path",
+                        "test",
+                    )
+
+    def test_native_windows_runtime_fails_before_git_discovery(self) -> None:
+        with mock.patch.object(MODULE.os, "name", "nt"):
+            with mock.patch.object(MODULE.shutil, "which") as which_git:
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "supports only POSIX hosts",
+                ):
+                    MODULE.discover_git_runtime()
+
+        which_git.assert_not_called()
+
+    def test_bound_target_rejects_a_cross_platform_lexical_escape(self) -> None:
+        target_root = self.root / "lexical-target"
+        target_root.mkdir()
+
+        with self.assertRaises(MODULE.PlanError):
+            MODULE.bind_target_path(
+                target_root,
+                ("safe/../../outside",),
+                "escaped target",
+            )
 
     def test_parse_gitmodules_rejects_unsafe_name(self) -> None:
         content = """
@@ -549,7 +712,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             policy,
         )
 
-        self.assertNotEqual(first.collision_key, second.collision_key)
+        self.assertNotEqual(first.collision_tokens, second.collision_tokens)
 
     def test_missing_target_collision_uses_case_insensitive_volume_semantics(
         self,
@@ -575,7 +738,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             policy,
         )
 
-        self.assertEqual(first.collision_key, second.collision_key)
+        self.assertEqual(first.collision_tokens, second.collision_tokens)
 
     def test_actual_case_sensitive_directory_overrides_stale_git_hint(self) -> None:
         target_root = self.root / "actual-case-sensitive-target"
@@ -626,6 +789,108 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.assertFalse(policy.case_sensitive)
         self.assertEqual(policy.normalization, "exact")
+
+    def test_descendant_ext4_casefold_anchor_controls_missing_aliases(self) -> None:
+        target_root = self.root / "mixed-name-policy-target"
+        casefold_anchor = target_root / "casefold-anchor"
+        casefold_anchor.mkdir(parents=True)
+        sensitive_policy = MODULE.FilesystemNamePolicy(
+            case_sensitive=True,
+            normalization="exact",
+            source="mock-sensitive",
+        )
+        casefold_policy = MODULE.FilesystemNamePolicy(
+            case_sensitive=False,
+            normalization="NFD",
+            source="mock-ext4-casefold",
+        )
+
+        def policy_for(path: Path) -> object:
+            if path.resolve() == casefold_anchor.resolve():
+                return casefold_policy
+            return sensitive_policy
+
+        with mock.patch.object(
+            MODULE,
+            "filesystem_name_policy",
+            side_effect=policy_for,
+        ):
+            first = MODULE.bind_target_path(
+                target_root,
+                ("casefold-anchor", "Caf\u00e9"),
+                "first",
+            )
+            second = MODULE.bind_target_path(
+                target_root,
+                ("casefold-anchor", "CAFE\u0301"),
+                "second",
+            )
+            sensitive_first = MODULE.bind_target_path(
+                target_root,
+                ("Caf\u00e9",),
+                "sensitive first",
+            )
+            sensitive_second = MODULE.bind_target_path(
+                target_root,
+                ("CAFE\u0301",),
+                "sensitive second",
+            )
+
+        self.assertEqual(first.collision_tokens, second.collision_tokens)
+        self.assertNotEqual(
+            sensitive_first.collision_tokens,
+            sensitive_second.collision_tokens,
+        )
+        self.assertEqual(first.name_policy.source, "mock-ext4-casefold")
+        self.assertEqual(
+            first.name_policy_anchor.path,
+            casefold_anchor.resolve(),
+        )
+
+    def test_linux_casefold_flag_overrides_a_case_sensitive_probe(self) -> None:
+        target_root = self.root / "linux-casefold-target"
+        target_root.mkdir()
+
+        with mock.patch.object(MODULE.sys, "platform", "linux"):
+            with mock.patch.object(
+                MODULE,
+                "local_git_bool",
+                side_effect=[False, False],
+            ):
+                with mock.patch.object(
+                    MODULE,
+                    "probe_directory_case_sensitive",
+                    return_value=True,
+                ):
+                    with mock.patch.object(
+                        MODULE,
+                        "linux_directory_casefold",
+                        return_value=True,
+                    ):
+                        policy = MODULE.filesystem_name_policy(target_root)
+
+        self.assertFalse(policy.case_sensitive)
+        self.assertEqual(policy.normalization, "NFD")
+
+    def test_collision_index_does_not_scan_the_existing_plan(self) -> None:
+        class NonIterableEntries(list[object]):
+            def __iter__(self) -> object:
+                raise AssertionError("collision index must not scan all entries")
+
+        entries = NonIterableEntries()
+        collision_index = MODULE.TargetCollisionIndex()
+        for index in range(20_000):
+            candidate = SimpleNamespace(
+                parent_index=None,
+                target=SimpleNamespace(
+                    path=Path(f"module-{index}"),
+                    collision_tokens=(("missing", f"module-{index}"),),
+                ),
+            )
+            collision_index.add(entries, candidate)
+            entries.append(candidate)
+
+        self.assertEqual(len(entries), 20_000)
 
     def test_new_worktree_rejects_lfs_filter_even_when_nonrequired(self) -> None:
         target_sha = self.filtered_target_sha("lfs", required=False)
@@ -740,6 +1005,75 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             )
 
         self.assertEqual(run_git(target, "rev-parse", "HEAD"), self.sha)
+
+    def test_current_clean_filter_is_rejected_before_status_can_execute_it(
+        self,
+    ) -> None:
+        (self.remote / ".gitattributes").write_text(
+            "payload.bin filter=marker\n",
+            encoding="utf-8",
+        )
+        (self.remote / "payload.bin").write_text(
+            "payload\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", ".gitattributes", "payload.bin")
+        run_git(self.remote, "commit", "-m", "add current filter")
+        base_sha = run_git(self.remote, "rev-parse", "HEAD")
+        (self.remote / "README.md").write_text("target\n", encoding="utf-8")
+        run_git(self.remote, "add", "README.md")
+        run_git(self.remote, "commit", "-m", "update target")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+
+        source = self.clone_named_source("current-filter")
+        target_super = self.root / "current-filter-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        self.add_managed_worktree(source, target, base_sha)
+        marker = self.root / "clean-filter-executed"
+        run_git(
+            self.root,
+            f"--git-dir={source}",
+            "config",
+            "filter.marker.clean",
+            f"touch {marker}",
+        )
+        payload = target / "payload.bin"
+        payload_stat = payload.stat()
+        os.utime(
+            payload,
+            ns=(
+                payload_stat.st_atime_ns,
+                payload_stat.st_mtime_ns + 2_000_000_000,
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "before tracked-status inspection",
+        ):
+            MODULE.build_sync_plan(
+                root=target_super,
+                common_git_dir=self.named_common_git_dir,
+                source_superproject=None,
+                planned_modules=[
+                    (
+                        MODULE.Submodule(
+                            "current-filter",
+                            "lib",
+                            str(self.remote),
+                        ),
+                        target_sha,
+                    )
+                ],
+                depth=1,
+                recursive=False,
+                force_replace_empty=False,
+                fetch_missing=False,
+            )
+
+        self.assertFalse(marker.exists())
+        self.assertEqual(run_git(target, "rev-parse", "HEAD"), base_sha)
 
     def test_later_managed_ignored_conflict_blocks_first_checkout(self) -> None:
         (self.remote / ".gitignore").write_text(
@@ -1449,6 +1783,93 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             registry_before,
         )
 
+    def test_anchor_name_policy_drift_blocks_the_first_mutation(self) -> None:
+        target_super = self.root / "name-policy-drift-super"
+        first_parent = target_super / "first-parent"
+        second_parent = target_super / "second-parent"
+        first_parent.mkdir(parents=True)
+        second_parent.mkdir()
+        first_source = self.clone_named_source("name-policy-first")
+        self.clone_named_source("name-policy-second")
+        stable_policy = MODULE.FilesystemNamePolicy(
+            case_sensitive=True,
+            normalization="exact",
+            source="mock-stable",
+        )
+        drifted_policy = MODULE.FilesystemNamePolicy(
+            case_sensitive=False,
+            normalization="NFD",
+            source="mock-drifted",
+        )
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={first_source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "filesystem_name_policy",
+            return_value=stable_policy,
+        ):
+            plan = MODULE.build_sync_plan(
+                root=target_super,
+                common_git_dir=self.named_common_git_dir,
+                source_superproject=None,
+                planned_modules=[
+                    (
+                        MODULE.Submodule(
+                            "name-policy-first",
+                            "first-parent/lib",
+                            str(self.remote),
+                        ),
+                        self.sha,
+                    ),
+                    (
+                        MODULE.Submodule(
+                            "name-policy-second",
+                            "second-parent/lib",
+                            str(self.remote),
+                        ),
+                        self.sha,
+                    ),
+                ],
+                depth=1,
+                recursive=False,
+                force_replace_empty=False,
+                fetch_missing=False,
+            )
+
+        def drift_second_anchor(path: Path) -> object:
+            if path.resolve() == second_parent.resolve():
+                return drifted_policy
+            return stable_policy
+
+        with mock.patch.object(
+            MODULE,
+            "filesystem_name_policy",
+            side_effect=drift_second_anchor,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "name semantics changed",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertFalse((first_parent / "lib").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={first_source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
     def test_benign_target_parent_entry_churn_preserves_bound_policy(self) -> None:
         target_super = self.root / "benign-churn-super"
         target_parent = target_super / "parent"
@@ -1546,7 +1967,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         index_bytes_before = index_path.read_bytes()
         index_metadata_before = index_metadata()
         commands: list[list[str]] = []
+        bounded_commands: list[list[str]] = []
         original_run = MODULE.run
+        original_read_git_bounded = MODULE.read_git_bounded
 
         def recording_run(
             args: list[str],
@@ -1558,8 +1981,16 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             commands.append(args)
             return original_run(args, cwd=cwd, check=check, capture=capture)
 
+        def recording_read_git_bounded(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            bounded_commands.append(args)
+            return original_read_git_bounded(args, **kwargs)
+
         try:
             MODULE.run = recording_run
+            MODULE.read_git_bounded = recording_read_git_bounded
             with redirect_stdout(io.StringIO()):
                 MODULE.sync_one(
                     root=self.root,
@@ -1580,11 +2011,12 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 )
         finally:
             MODULE.run = original_run
+            MODULE.read_git_bounded = original_read_git_bounded
 
         git_commands = [
             command for command in commands if command and command[0] == "git"
         ]
-        self.assertTrue(any("status" in command for command in git_commands))
+        self.assertTrue(any("status" in command for command in bounded_commands))
         self.assertTrue(
             all(
                 command[:2] == ["git", "--no-optional-locks"]

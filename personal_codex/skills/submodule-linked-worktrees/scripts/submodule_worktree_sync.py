@@ -8,9 +8,11 @@ import ctypes
 from dataclasses import dataclass
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+import re
 import selectors
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -25,11 +27,20 @@ GIT_ENUMERATION_TIMEOUT_SECONDS = 120.0
 GIT_ENUMERATION_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
 GIT_ERROR_OUTPUT_LIMIT_BYTES = 256 * 1024
 GIT_INPUT_LIMIT_BYTES = 64 * 1024 * 1024
+GIT_VERSION_TIMEOUT_SECONDS = 5.0
+GIT_MINIMUM_VERSION = (2, 45, 0)
+PROCESS_CLEANUP_TIMEOUT_SECONDS = 1.0
+PROCESS_TERM_GRACE_SECONDS = 0.5
 MAX_CHECKOUT_PATHS = 250_000
 MAX_CHECKOUT_PATH_BYTES = 4096
 MAX_CHECKOUT_PATH_COMPONENTS = 1_000_000
 MAX_CHECKOUT_ACCESS_BINDINGS = 500_000
 MAX_NAME_POLICY_PROBE_ENTRIES = 256
+MAX_REGISTERED_WORKTREE_FIELDS = 1_000_000
+MAX_PLANNED_WORKTREES = 250_000
+MAX_GIT_PATHSPEC_ARG_BYTES = 64 * 1024
+MAX_GIT_PATHSPECS_PER_BATCH = 1024
+MAX_GIT_PATHSPEC_BATCHES = 4096
 
 GIT_ENV_PASSTHROUGH = (
     "HOME",
@@ -105,6 +116,14 @@ class FsFingerprint:
 
 
 @dataclass(frozen=True)
+class GitRuntime:
+    executable: Path
+    fingerprint: FsFingerprint
+    version: tuple[int, int, int]
+    version_text: str
+
+
+@dataclass(frozen=True)
 class BoundNode:
     path: Path
     fingerprint: FsFingerprint
@@ -133,6 +152,13 @@ class TreeChange:
 
 
 @dataclass(frozen=True)
+class FilterSelection:
+    treeish: str
+    raw_path: bytes
+    driver: str
+
+
+@dataclass(frozen=True)
 class CheckoutPreflight:
     kind: str
     current_head: Optional[str]
@@ -149,7 +175,9 @@ class BoundTarget:
     relative_parts: tuple[str, ...]
     existing_nodes: tuple[BoundNode, ...]
     missing_parts: tuple[str, ...]
-    collision_key: tuple[object, ...]
+    name_policy: FilesystemNamePolicy
+    name_policy_anchor: BoundNode
+    collision_tokens: tuple[tuple[object, ...], ...]
 
 
 @dataclass
@@ -175,21 +203,153 @@ class SyncPlan:
     depth: int
     force_replace_empty: bool
     fetch_missing: bool
-    name_policy: FilesystemNamePolicy
 
 
-def git_environment() -> dict[str, str]:
+class TargetCollisionNode:
+    def __init__(self) -> None:
+        self.children: dict[tuple[object, ...], TargetCollisionNode] = {}
+        self.terminal_index: Optional[int] = None
+        self.first_descendant_index: Optional[int] = None
+
+
+class TargetCollisionIndex:
+    def __init__(self) -> None:
+        self.root = TargetCollisionNode()
+
+    def add(
+        self,
+        entries: list[PlannedWorktree],
+        candidate: PlannedWorktree,
+    ) -> None:
+        node = self.root
+        visited = [node]
+        for token in candidate.target.collision_tokens:
+            if node.terminal_index is not None and not entry_has_ancestor(
+                entries,
+                candidate.parent_index,
+                node.terminal_index,
+            ):
+                prior = entries[node.terminal_index]
+                raise PlanError(
+                    "planned worktree targets overlap or alias each other\n"
+                    f"  first: {prior.target.path}\n"
+                    f"  second: {candidate.target.path}"
+                )
+            node = node.children.setdefault(token, TargetCollisionNode())
+            visited.append(node)
+
+        if node.terminal_index is not None:
+            prior = entries[node.terminal_index]
+            raise PlanError(
+                "planned worktree target collision\n"
+                f"  first: {prior.target.path}\n"
+                f"  second: {candidate.target.path}"
+            )
+        if node.first_descendant_index is not None:
+            prior = entries[node.first_descendant_index]
+            raise PlanError(
+                "planned worktree targets overlap or alias each other\n"
+                f"  first: {prior.target.path}\n"
+                f"  second: {candidate.target.path}"
+            )
+
+        candidate_index = len(entries)
+        node.terminal_index = candidate_index
+        for visited_node in visited:
+            if visited_node.first_descendant_index is None:
+                visited_node.first_descendant_index = candidate_index
+
+
+_GIT_RUNTIME: Optional[GitRuntime] = None
+
+
+def git_environment(
+    extra_env: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
     environment = {
         key: os.environ[key] for key in GIT_ENV_PASSTHROUGH if key in os.environ
     }
     environment.update(SAFE_GIT_ENV)
+    if extra_env:
+        unsupported = set(extra_env) - {
+            "GIT_ATTR_SOURCE",
+            "GIT_LITERAL_PATHSPECS",
+        }
+        if unsupported:
+            raise PlanError(
+                "unsupported Git environment override: "
+                + ", ".join(sorted(unsupported))
+            )
+        environment.update(extra_env)
     return environment
+
+
+def discover_git_runtime() -> GitRuntime:
+    if os.name != "posix":
+        raise PlanError(
+            "submodule-linked-worktrees supports only POSIX hosts; "
+            "native Windows path and process semantics are unsupported"
+        )
+    candidate = shutil.which("git")
+    if not candidate:
+        raise PlanError("cannot resolve the required Git executable from PATH")
+    executable = Path(candidate).resolve(strict=True)
+    fingerprint = filesystem_fingerprint(executable)
+    if fingerprint.kind != stat.S_IFREG or not probe_access(executable, os.X_OK):
+        raise PlanError(
+            f"resolved Git executable is not an executable file: {executable}"
+        )
+    result = run_bounded_bytes(
+        [str(executable), "--version"],
+        timeout_seconds=GIT_VERSION_TIMEOUT_SECONDS,
+        stdout_limit=256,
+        stderr_limit=256,
+        prepare_git_command=False,
+    )
+    version_text = os.fsdecode(result.stdout).strip()
+    match = re.fullmatch(
+        r"git version ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:[^\r\n]*)",
+        version_text,
+    )
+    if not match:
+        raise PlanError(
+            f"cannot parse the fixed Git executable version: {version_text!r}"
+        )
+    version = tuple(int(value or "0") for value in match.groups())
+    if version < GIT_MINIMUM_VERSION:
+        minimum = ".".join(str(value) for value in GIT_MINIMUM_VERSION)
+        raise PlanError(
+            f"Git {minimum} or newer is required before repository access\n"
+            f"  executable: {executable}\n"
+            f"  actual: {version_text}\n"
+            "  older Git versions cannot prove the no-lazy-fetch checkout contract"
+        )
+    return GitRuntime(
+        executable=executable,
+        fingerprint=fingerprint,
+        version=version,
+        version_text=version_text,
+    )
+
+
+def git_runtime() -> GitRuntime:
+    global _GIT_RUNTIME
+    if _GIT_RUNTIME is None:
+        _GIT_RUNTIME = discover_git_runtime()
+    current = filesystem_fingerprint(_GIT_RUNTIME.executable)
+    if current != _GIT_RUNTIME.fingerprint:
+        raise PlanError(
+            "the fixed Git executable changed after version preflight\n"
+            f"  executable: {_GIT_RUNTIME.executable}"
+        )
+    return _GIT_RUNTIME
 
 
 def safe_command(args: list[str]) -> list[str]:
     if not args or args[0] != "git":
         return args
-    return ["git", *SAFE_GIT_CONFIG_ARGS, *args[1:]]
+    runtime = git_runtime()
+    return [str(runtime.executable), *SAFE_GIT_CONFIG_ARGS, *args[1:]]
 
 
 def run(
@@ -198,12 +358,13 @@ def run(
     cwd: Optional[Path] = None,
     check: bool = True,
     capture: bool = True,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> subprocess.CompletedProcess[str]:
     command = safe_command(args)
     result = subprocess.run(
         command,
         cwd=str(cwd) if cwd else None,
-        env=git_environment(),
+        env=git_environment(extra_env),
         stdin=subprocess.DEVNULL,
         text=True,
         stdout=subprocess.PIPE if capture else None,
@@ -217,27 +378,75 @@ def run(
     return result
 
 
-def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+def wait_for_process_reap(
+    process: subprocess.Popen[bytes],
+    timeout_seconds: float,
+) -> bool:
+    if process.poll() is not None:
+        return True
+    try:
+        process.wait(timeout=max(0.0, timeout_seconds))
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def terminate_process_group(
+    process: subprocess.Popen[bytes],
+    *,
+    cleanup_timeout_seconds: float = PROCESS_CLEANUP_TIMEOUT_SECONDS,
+    term_grace_seconds: float = PROCESS_TERM_GRACE_SECONDS,
+) -> None:
+    cleanup_deadline = time.monotonic() + max(0.0, cleanup_timeout_seconds)
+    group_cleanup_error: Optional[str] = None
+    term_sent = False
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGTERM)
         else:
             process.terminate()
+        term_sent = True
     except ProcessLookupError:
         pass
-    if process.poll() is None:
+    except OSError as exc:
+        group_cleanup_error = f"cannot signal the process group with TERM: {exc}"
         try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
+            process.terminate()
+            term_sent = True
+        except (OSError, ProcessLookupError):
             pass
+
+    if term_sent:
+        remaining = cleanup_deadline - time.monotonic()
+        grace = min(max(0.0, term_grace_seconds), max(0.0, remaining))
+        if grace:
+            # Do not reap the group leader before KILL. Retaining the zombie
+            # prevents PID/PGID reuse during the TERM grace window.
+            time.sleep(grace)
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGKILL)
-        elif process.poll() is None:
+        else:
             process.kill()
     except ProcessLookupError:
         pass
-    process.wait()
+    except OSError as exc:
+        if group_cleanup_error is None:
+            group_cleanup_error = f"cannot signal the process group with KILL: {exc}"
+        try:
+            process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+
+    remaining = cleanup_deadline - time.monotonic()
+    reaped = wait_for_process_reap(process, max(0.0, remaining))
+    if not reaped:
+        raise PlanError(
+            "process cleanup-incomplete: direct child could not be reaped within "
+            f"{cleanup_timeout_seconds:g} seconds"
+        )
+    if group_cleanup_error is not None:
+        raise PlanError(f"process cleanup-incomplete: {group_cleanup_error}")
 
 
 def run_bounded_bytes(
@@ -249,12 +458,14 @@ def run_bounded_bytes(
     timeout_seconds: float = GIT_ENUMERATION_TIMEOUT_SECONDS,
     stdout_limit: int = GIT_ENUMERATION_OUTPUT_LIMIT_BYTES,
     stderr_limit: int = GIT_ERROR_OUTPUT_LIMIT_BYTES,
+    extra_env: Optional[dict[str, str]] = None,
+    prepare_git_command: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
     if input_bytes is not None and len(input_bytes) > GIT_INPUT_LIMIT_BYTES:
         raise PlanError(
             f"Git command input exceeds the {GIT_INPUT_LIMIT_BYTES}-byte safety limit"
         )
-    command = safe_command(args)
+    command = safe_command(args) if prepare_git_command else args
     input_file = tempfile.TemporaryFile()
     if input_bytes is not None:
         input_file.write(input_bytes)
@@ -263,7 +474,7 @@ def run_bounded_bytes(
         process = subprocess.Popen(
             command,
             cwd=str(cwd) if cwd else None,
-            env=git_environment(),
+            env=git_environment(extra_env),
             stdin=input_file,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -309,7 +520,6 @@ def run_bounded_bytes(
             if failure is not None:
                 break
         if failure is not None:
-            terminate_process_group(process)
             raise PlanError(f"{shell_join(command)} {failure}")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -320,10 +530,12 @@ def run_bounded_bytes(
             except subprocess.TimeoutExpired:
                 failure = f"exceeded the {timeout_seconds:g}-second deadline"
         if failure is not None:
-            terminate_process_group(process)
             raise PlanError(f"{shell_join(command)} {failure}")
-    except BaseException:
-        terminate_process_group(process)
+    except BaseException as exc:
+        try:
+            terminate_process_group(process)
+        except PlanError as cleanup_error:
+            raise PlanError(f"{exc}\n{cleanup_error}") from exc
         raise
     finally:
         if selector is not None:
@@ -355,6 +567,8 @@ def read_git_bounded(
     check: bool = True,
     input_bytes: Optional[bytes] = None,
     stdout_limit: int = GIT_ENUMERATION_OUTPUT_LIMIT_BYTES,
+    extra_env: Optional[dict[str, str]] = None,
+    timeout_seconds: float = GIT_ENUMERATION_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[bytes]:
     return run_bounded_bytes(
         ["git", "--no-optional-locks", *args],
@@ -362,6 +576,8 @@ def read_git_bounded(
         check=check,
         input_bytes=input_bytes,
         stdout_limit=stdout_limit,
+        extra_env=extra_env,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -370,8 +586,15 @@ def read_git(
     *,
     cwd: Optional[Path] = None,
     check: bool = True,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> subprocess.CompletedProcess[str]:
-    return run(["git", "--no-optional-locks", *args], cwd=cwd, check=check)
+    kwargs: dict[str, object] = {
+        "cwd": cwd,
+        "check": check,
+    }
+    if extra_env is not None:
+        kwargs["extra_env"] = extra_env
+    return run(["git", "--no-optional-locks", *args], **kwargs)
 
 
 def git(args: list[str], *, cwd: Optional[Path] = None, check: bool = True) -> str:
@@ -389,7 +612,24 @@ def resolved_path(value: str) -> Path:
 def validate_relative_git_path(value: str, field: str, origin: str) -> str:
     if not value:
         raise PlanError(f"{field} in {origin} must not be empty")
-    if value.startswith("/"):
+    if "\0" in value:
+        raise PlanError(f"{field} in {origin} contains a NUL byte")
+    if len(os.fsencode(value)) > MAX_CHECKOUT_PATH_BYTES:
+        raise PlanError(
+            f"{field} in {origin} exceeds the {MAX_CHECKOUT_PATH_BYTES}-byte path limit"
+        )
+    if "\\" in value:
+        raise PlanError(
+            f"{field} in {origin} contains an unsupported path separator: {value}"
+        )
+    windows_path = PureWindowsPath(value)
+    if (
+        value.startswith("/")
+        or Path(value).is_absolute()
+        or windows_path.is_absolute()
+        or bool(windows_path.drive)
+        or bool(windows_path.root)
+    ):
         raise PlanError(f"{field} in {origin} must be relative: {value}")
     parts = value.split("/")
     if any(part in {"", ".", ".."} for part in parts):
@@ -718,8 +958,22 @@ def bind_target_path(
     name_policy: Optional[FilesystemNamePolicy] = None,
 ) -> BoundTarget:
     root = root.resolve(strict=True)
-    if name_policy is None:
-        name_policy = filesystem_name_policy(root)
+    validated_parts: list[str] = []
+    for part in relative_parts:
+        normalized = validate_relative_git_path(part, label, str(root))
+        if "/" in normalized:
+            raise PlanError(f"{label} path component contains a separator: {part}")
+        validated_parts.append(normalized)
+    relative_parts = tuple(validated_parts)
+    relative_path_bytes = len(os.fsencode("/".join(relative_parts)))
+    if relative_path_bytes > MAX_CHECKOUT_PATH_BYTES:
+        raise PlanError(
+            f"{label} exceeds the {MAX_CHECKOUT_PATH_BYTES}-byte target path limit"
+        )
+    path = root.joinpath(*relative_parts)
+    if lexical_relative_parts(root, path, label) != relative_parts:
+        raise PlanError(f"{label} escapes its lexical target root: {path}")
+
     nodes: list[BoundNode] = []
     current = root
     root_fingerprint = filesystem_fingerprint(root)
@@ -751,28 +1005,25 @@ def bind_target_path(
             raise PlanError(f"{label} already exists and is not a directory: {current}")
         nodes.append(BoundNode(current, current_fingerprint))
 
-    path = root.joinpath(*relative_parts)
-    if missing_parts:
-        anchor = nodes[-1].fingerprint
-        collision_key: tuple[object, ...] = (
-            "missing",
-            anchor.device,
-            anchor.inode,
-            *normalized_path_parts(missing_parts, name_policy),
-        )
-    else:
-        target_fingerprint = nodes[-1].fingerprint
-        collision_key = (
-            "existing",
-            target_fingerprint.device,
-            target_fingerprint.inode,
-        )
+    name_policy_anchor = nodes[-1]
+    if name_policy is None:
+        name_policy = filesystem_name_policy(name_policy_anchor.path)
+    collision_tokens: list[tuple[object, ...]] = [
+        ("existing", node.fingerprint.device, node.fingerprint.inode)
+        for node in nodes[1:]
+    ]
+    collision_tokens.extend(
+        ("missing", normalized)
+        for normalized in normalized_path_parts(missing_parts, name_policy)
+    )
     return BoundTarget(
         path=path,
         relative_parts=relative_parts,
         existing_nodes=tuple(nodes),
         missing_parts=missing_parts,
-        collision_key=collision_key,
+        name_policy=name_policy,
+        name_policy_anchor=name_policy_anchor,
+        collision_tokens=tuple(collision_tokens),
     )
 
 
@@ -788,6 +1039,12 @@ def revalidate_bound_target(target: BoundTarget) -> None:
             raise PlanError(
                 f"target path became a symlink alias/collision: {node.path}"
             )
+    current_policy = filesystem_name_policy(target.name_policy_anchor.path)
+    if current_policy != target.name_policy:
+        raise PlanError(
+            "target directory name semantics changed after preflight\n"
+            f"  anchor: {target.name_policy_anchor.path}"
+        )
     if target.missing_parts:
         first_missing = target.existing_nodes[-1].path / target.missing_parts[0]
         try:
@@ -1130,13 +1387,28 @@ def is_empty_dir(path: Path) -> bool:
     return path.is_dir() and next(path.iterdir(), None) is None
 
 
-def has_local_changes(worktree_path: Path) -> bool:
-    result = read_git(["-C", str(worktree_path), "status", "--porcelain"], check=True)
-    return bool(result.stdout.strip())
+def has_local_changes(worktree_path: Path, current_head: str) -> bool:
+    result = read_git_bounded(
+        [
+            "-C",
+            str(worktree_path),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+            "--no-renames",
+        ],
+        extra_env={"GIT_ATTR_SOURCE": current_head},
+    )
+    records = bounded_records(
+        result.stdout,
+        "managed worktree tracked-status inventory",
+    )
+    return bool(records)
 
 
 def registered_worktree_paths(source_git_dir: Path) -> list[Path]:
-    result = read_git(
+    result = read_git_bounded(
         [
             *source_object_repo_args(source_git_dir),
             "worktree",
@@ -1146,9 +1418,19 @@ def registered_worktree_paths(source_git_dir: Path) -> list[Path]:
         ]
     )
     paths: list[Path] = []
-    for field in result.stdout.split("\0"):
-        if field.startswith("worktree "):
-            paths.append(Path(field[len("worktree ") :]).resolve(strict=False))
+    for field in bounded_records(
+        result.stdout,
+        "source worktree registry",
+        maximum_records=MAX_REGISTERED_WORKTREE_FIELDS,
+    ):
+        if not field.startswith(b"worktree "):
+            continue
+        raw_path = field[len(b"worktree ") :]
+        if not raw_path or len(raw_path) > MAX_CHECKOUT_PATH_BYTES:
+            raise PlanError(
+                "source worktree registry contains an empty or oversized path"
+            )
+        paths.append(Path(os.fsdecode(raw_path)).resolve(strict=False))
     return paths
 
 
@@ -1223,8 +1505,6 @@ def prepare_target_path(
 
 
 def checkout_existing_worktree(worktree_path: Path, sha: str, dry_run: bool) -> None:
-    if has_local_changes(worktree_path):
-        raise PlanError(f"{worktree_path} has local changes; clean it before syncing")
     command = [
         "git",
         "-C",
@@ -1238,7 +1518,7 @@ def checkout_existing_worktree(worktree_path: Path, sha: str, dry_run: bool) -> 
     if dry_run:
         print(f"would checkout existing worktree: {shell_join(command)}")
         return
-    run(command)
+    run(command, extra_env={"GIT_ATTR_SOURCE": sha})
 
 
 def add_worktree(
@@ -1586,27 +1866,15 @@ def target_tree_blob_paths(
     return tuple(paths)
 
 
-def materialized_blob_paths(
+def selected_checkout_filters(
     source_git_dir: Path,
-    target_sha: str,
-    changes: Optional[tuple[TreeChange, ...]],
-) -> tuple[tuple[str, ...], ...]:
-    if changes is None:
-        return target_tree_blob_paths(source_git_dir, target_sha)
-    return tuple(
-        change.relative_parts for change in changes if change.new_mode.startswith("100")
-    )
-
-
-def reject_checkout_filters(
-    source_git_dir: Path,
-    worktree_path: Path,
-    target_sha: str,
+    treeish: str,
     paths: tuple[tuple[str, ...], ...],
-) -> None:
+) -> tuple[FilterSelection, ...]:
     if not paths:
-        return
+        return ()
     encoded_paths = bytearray()
+    expected_paths: list[bytes] = []
     for parts in paths:
         raw_path = os.fsencode("/".join(parts))
         if len(encoded_paths) + len(raw_path) + 1 > GIT_INPUT_LIMIT_BYTES:
@@ -1616,11 +1884,12 @@ def reject_checkout_filters(
             )
         encoded_paths.extend(raw_path)
         encoded_paths.append(0)
+        expected_paths.append(raw_path)
     result = read_git_bounded(
         [
             *source_object_repo_args(source_git_dir),
             "check-attr",
-            f"--source={target_sha}",
+            f"--source={treeish}",
             "-z",
             "--stdin",
             "filter",
@@ -1634,21 +1903,100 @@ def reject_checkout_filters(
     )
     if len(records) != len(paths) * 3:
         raise PlanError("checkout filter attribute result has an invalid shape")
+    selections: list[FilterSelection] = []
     for offset in range(0, len(records), 3):
         raw_path, attribute, value = records[offset : offset + 3]
+        if raw_path != expected_paths[offset // 3]:
+            raise PlanError("checkout filter attribute result changed path order")
         if attribute != b"filter":
             raise PlanError(
                 "checkout filter attribute result named the wrong attribute"
             )
         if value in {b"unspecified", b"unset"}:
             continue
-        raise PlanError(
-            "checkout requires an untrusted content filter and is blocked before mutation\n"
-            f"  worktree: {worktree_path}\n"
-            f"  path: {os.fsdecode(raw_path)}\n"
-            f"  filter: {os.fsdecode(value)}\n"
-            "  this helper does not execute repository-defined smudge filters"
+        selections.append(
+            FilterSelection(
+                treeish=treeish,
+                raw_path=raw_path,
+                driver=os.fsdecode(value),
+            )
         )
+    return tuple(selections)
+
+
+def configured_filter_commands(
+    source_git_dir: Path,
+) -> dict[str, set[str]]:
+    result = read_git_bounded(
+        [
+            *source_object_repo_args(source_git_dir),
+            "config",
+            "--local",
+            "--no-includes",
+            "--name-only",
+            "-z",
+            "--get-regexp",
+            r"^filter\..*\.(clean|process)$",
+        ],
+        check=False,
+    )
+    if result.returncode == 1:
+        return {}
+    if result.returncode != 0:
+        detail = os.fsdecode(result.stderr).strip()
+        raise PlanError(
+            "cannot inspect local clean/process filter configuration\n"
+            f"  source gitdir: {source_git_dir}\n"
+            f"  error: {detail or 'git config failed'}"
+        )
+    commands: dict[str, set[str]] = {}
+    for raw_key in bounded_records(
+        result.stdout,
+        "local clean/process filter configuration",
+    ):
+        key = os.fsdecode(raw_key)
+        match = re.fullmatch(r"filter\.(.+)\.(clean|process)", key, re.IGNORECASE)
+        if not match:
+            raise PlanError(
+                f"local filter configuration returned an invalid key: {key!r}"
+            )
+        commands.setdefault(match.group(1).casefold(), set()).add(
+            match.group(2).lower()
+        )
+    return commands
+
+
+def reject_checkout_filters(
+    source_git_dir: Path,
+    worktree_path: Path,
+    tree_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...],
+) -> None:
+    selections: list[FilterSelection] = []
+    for treeish, paths in tree_paths:
+        selections.extend(
+            selected_checkout_filters(
+                source_git_dir,
+                treeish,
+                paths,
+            )
+        )
+    configured_commands = configured_filter_commands(source_git_dir)
+    if not selections:
+        return
+    selection = selections[0]
+    command_kinds = sorted(configured_commands.get(selection.driver.casefold(), set()))
+    configured_text = ", ".join(command_kinds) if command_kinds else "none"
+    raise PlanError(
+        "checkout requires an untrusted content filter and is blocked before "
+        "tracked-status inspection or mutation\n"
+        f"  worktree: {worktree_path}\n"
+        f"  tree: {selection.treeish}\n"
+        f"  path: {os.fsdecode(selection.raw_path)}\n"
+        f"  filter: {selection.driver}\n"
+        f"  configured clean/process commands: {configured_text}\n"
+        "  this helper does not execute repository-defined clean, process, "
+        "or smudge filters"
+    )
 
 
 def checkout_write_access_bindings(
@@ -1718,26 +2066,142 @@ def checkout_write_access_bindings(
 
 def ignored_worktree_paths(
     worktree_path: Path,
+    changes: tuple[TreeChange, ...],
 ) -> tuple[tuple[str, ...], ...]:
-    result = read_git_bounded(
-        [
-            "-C",
-            str(worktree_path),
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--full-name",
-            "-z",
-        ]
+    write_paths = sorted(
+        {change.relative_parts for change in changes if change.new_mode != "000000"}
     )
-    return tuple(
-        validate_checkout_path(raw_path, "ignored worktree inventory")
+    if not write_paths:
+        return ()
+
+    deadline = time.monotonic() + GIT_ENUMERATION_TIMEOUT_SECONDS
+    ignored: dict[tuple[str, ...], None] = {}
+    existing_prefixes: set[tuple[str, ...]] = set()
+    component_count = 0
+    root = worktree_path.resolve(strict=True)
+    for parts in write_paths:
+        for length in range(1, len(parts) + 1):
+            prefix = parts[:length]
+            component_count += 1
+            if component_count > MAX_CHECKOUT_PATH_COMPONENTS:
+                raise PlanError(
+                    "managed ignored-path probe exceeds the "
+                    f"{MAX_CHECKOUT_PATH_COMPONENTS}-component safety limit"
+                )
+            if path_entry_exists(root.joinpath(*prefix)):
+                existing_prefixes.add(prefix)
+
+    if existing_prefixes:
+        check_input = bytearray()
+        for parts in sorted(existing_prefixes):
+            raw_path = b"./" + os.fsencode("/".join(parts))
+            if len(check_input) + len(raw_path) + 1 > GIT_INPUT_LIMIT_BYTES:
+                raise PlanError(
+                    "managed ignored-prefix query exceeds the "
+                    f"{GIT_INPUT_LIMIT_BYTES}-byte input limit"
+                )
+            check_input.extend(raw_path)
+            check_input.append(0)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PlanError("managed ignored-path probe exceeded its deadline")
+        result = read_git_bounded(
+            [
+                "-C",
+                str(worktree_path),
+                "check-ignore",
+                "-z",
+                "--stdin",
+            ],
+            check=False,
+            input_bytes=bytes(check_input),
+            extra_env={"GIT_LITERAL_PATHSPECS": "0"},
+            timeout_seconds=remaining,
+        )
+        if result.returncode not in {0, 1}:
+            detail = os.fsdecode(result.stderr).strip()
+            raise PlanError(
+                "cannot inspect ignored target prefixes\n"
+                f"  worktree: {worktree_path}\n"
+                f"  error: {detail or 'git check-ignore failed'}"
+            )
         for raw_path in bounded_records(
             result.stdout,
-            "ignored worktree inventory",
+            "ignored target-prefix inventory",
+        ):
+            if not raw_path.startswith(b"./"):
+                raise PlanError(
+                    "ignored target-prefix inventory returned an unbound path"
+                )
+            raw_path = raw_path[2:]
+            ignored[validate_checkout_path(raw_path, "ignored target prefix")] = None
+
+    batches: list[list[str]] = []
+    batch: list[str] = []
+    batch_bytes = 0
+    for parts in write_paths:
+        path = "/".join(parts)
+        path_bytes = len(os.fsencode(path)) + 1
+        if path_bytes > MAX_GIT_PATHSPEC_ARG_BYTES:
+            raise PlanError("managed ignored-path pathspec is too large")
+        if batch and (
+            batch_bytes + path_bytes > MAX_GIT_PATHSPEC_ARG_BYTES
+            or len(batch) >= MAX_GIT_PATHSPECS_PER_BATCH
+        ):
+            batches.append(batch)
+            batch = []
+            batch_bytes = 0
+        batch.append(path)
+        batch_bytes += path_bytes
+    if batch:
+        batches.append(batch)
+    if len(batches) > MAX_GIT_PATHSPEC_BATCHES:
+        raise PlanError(
+            "managed ignored-path probe exceeds the "
+            f"{MAX_GIT_PATHSPEC_BATCHES}-batch safety limit"
         )
-    )
+
+    retained_bytes = 0
+    for batch_paths in batches:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PlanError("managed ignored-path probe exceeded its deadline")
+        retained_limit = GIT_ENUMERATION_OUTPUT_LIMIT_BYTES - retained_bytes
+        if retained_limit <= 0:
+            raise PlanError(
+                "managed ignored-path inventory exceeds the "
+                f"{GIT_ENUMERATION_OUTPUT_LIMIT_BYTES}-byte aggregate limit"
+            )
+        result = read_git_bounded(
+            [
+                "-C",
+                str(worktree_path),
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--full-name",
+                "-z",
+                "--",
+                *batch_paths,
+            ],
+            stdout_limit=retained_limit,
+            timeout_seconds=remaining,
+        )
+        retained_bytes += len(result.stdout)
+        for raw_path in bounded_records(
+            result.stdout,
+            "ignored target-descendant inventory",
+        ):
+            ignored[validate_checkout_path(raw_path, "ignored target descendant")] = (
+                None
+            )
+            if len(ignored) > MAX_CHECKOUT_PATHS:
+                raise PlanError(
+                    "managed ignored-path inventory exceeds the "
+                    f"{MAX_CHECKOUT_PATHS}-entry safety limit"
+                )
+    return tuple(ignored)
 
 
 def reject_managed_ignored_conflicts(
@@ -1768,7 +2232,7 @@ def reject_managed_ignored_conflicts(
     if not changes_by_key:
         return
     sorted_change_keys = sorted(changes_by_key)
-    for ignored_parts in ignored_worktree_paths(worktree_path):
+    for ignored_parts in ignored_worktree_paths(worktree_path, changes):
         normalized_ignored = normalized_path_parts(ignored_parts, policy)
         component_count += len(normalized_ignored)
         if component_count > MAX_CHECKOUT_PATH_COMPONENTS:
@@ -1848,11 +2312,11 @@ def capture_checkout_preflight(
     index_digest: Optional[str] = None
     index_entry_count: Optional[int] = None
     write_bindings: tuple[AccessBinding, ...] = ()
+    target_blob_paths = target_tree_blob_paths(
+        entry.source_git_dir,
+        entry.sha,
+    )
     if entry.state == "managed":
-        if has_local_changes(entry.target.path):
-            raise PlanError(
-                f"{entry.target.path} has local changes; clean it before syncing"
-            )
         current_head = managed_head(entry.target.path)
         index_digest, index_entry_count = managed_index_snapshot(entry.target.path)
         changes = parse_managed_tree_changes(
@@ -1860,27 +2324,37 @@ def capture_checkout_preflight(
             current_head,
             entry.sha,
         )
+        current_blob_paths = target_tree_blob_paths(
+            entry.source_git_dir,
+            current_head,
+        )
+        reject_checkout_filters(
+            entry.source_git_dir,
+            entry.target.path,
+            (
+                (current_head, current_blob_paths),
+                (entry.sha, target_blob_paths),
+            ),
+        )
+        if has_local_changes(entry.target.path, current_head):
+            raise PlanError(
+                f"{entry.target.path} has local changes; clean it before syncing"
+            )
         write_bindings = checkout_write_access_bindings(
             entry.target.path,
             changes,
         )
         reject_managed_ignored_conflicts(entry.target.path, changes)
         probe_managed_checkout(entry.target.path, entry.sha)
-
-    blob_paths = materialized_blob_paths(
-        entry.source_git_dir,
-        entry.sha,
-        changes,
-    )
-    reject_checkout_filters(
-        entry.source_git_dir,
-        entry.target.path,
-        entry.sha,
-        blob_paths,
-    )
+    else:
+        reject_checkout_filters(
+            entry.source_git_dir,
+            entry.target.path,
+            ((entry.sha, target_blob_paths),),
+        )
     digest_paths: Iterable[tuple[str, ...]]
     if changes is None:
-        digest_paths = blob_paths
+        digest_paths = target_blob_paths
         kind = "new"
     else:
         digest_paths = (change.relative_parts for change in changes)
@@ -1906,11 +2380,8 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
         raise PlanError(f"checkout preflight is incomplete for {entry.submodule.path}")
     if receipt.kind != "managed":
         return
-    if has_local_changes(entry.target.path):
-        raise PlanError(
-            f"{entry.target.path} has local changes; clean it before syncing"
-        )
-    if managed_head(entry.target.path) != receipt.current_head:
+    current_head = managed_head(entry.target.path)
+    if current_head != receipt.current_head:
         raise PlanError(
             f"managed worktree HEAD changed after preflight: {entry.target.path}"
         )
@@ -1921,6 +2392,26 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
     ):
         raise PlanError(
             f"managed worktree index changed after preflight: {entry.target.path}"
+        )
+    current_blob_paths = target_tree_blob_paths(
+        entry.source_git_dir,
+        current_head,
+    )
+    target_blob_paths = target_tree_blob_paths(
+        entry.source_git_dir,
+        entry.sha,
+    )
+    reject_checkout_filters(
+        entry.source_git_dir,
+        entry.target.path,
+        (
+            (current_head, current_blob_paths),
+            (entry.sha, target_blob_paths),
+        ),
+    )
+    if has_local_changes(entry.target.path, current_head):
+        raise PlanError(
+            f"{entry.target.path} has local changes; clean it before syncing"
         )
     reject_managed_ignored_conflicts(entry.target.path, receipt.changes)
     probe_managed_checkout(entry.target.path, entry.sha)
@@ -1971,48 +2462,6 @@ def entry_has_ancestor(
     return False
 
 
-def reject_plan_collision(
-    entries: list[PlannedWorktree],
-    candidate: PlannedWorktree,
-    name_policy: FilesystemNamePolicy,
-) -> None:
-    candidate_parts = normalized_path_parts(
-        candidate.target.relative_parts,
-        name_policy,
-    )
-    for prior_index, prior in enumerate(entries):
-        prior_parts = normalized_path_parts(
-            prior.target.relative_parts,
-            name_policy,
-        )
-        if candidate.target.collision_key == prior.target.collision_key:
-            raise PlanError(
-                "planned worktree target collision\n"
-                f"  first: {prior.target.path}\n"
-                f"  second: {candidate.target.path}"
-            )
-        prior_prefix = (
-            len(prior_parts) < len(candidate_parts)
-            and candidate_parts[: len(prior_parts)] == prior_parts
-        )
-        candidate_prefix = (
-            len(candidate_parts) < len(prior_parts)
-            and prior_parts[: len(candidate_parts)] == candidate_parts
-        )
-        if prior_prefix and entry_has_ancestor(
-            entries,
-            candidate.parent_index,
-            prior_index,
-        ):
-            continue
-        if prior_prefix or candidate_prefix or prior_parts == candidate_parts:
-            raise PlanError(
-                "planned worktree targets overlap or alias each other\n"
-                f"  first: {prior.target.path}\n"
-                f"  second: {candidate.target.path}"
-            )
-
-
 def build_sync_plan(
     *,
     root: Path,
@@ -2028,9 +2477,10 @@ def build_sync_plan(
     display_root: Optional[Path] = None,
 ) -> SyncPlan:
     root = root.resolve(strict=True)
-    name_policy = filesystem_name_policy(root)
     entries: list[PlannedWorktree] = []
     source_identities: dict[tuple[int, int], tuple[Submodule, Path]] = {}
+    collision_index = TargetCollisionIndex()
+    planned_path_components = 0
 
     def add_entry(
         submodule: Submodule,
@@ -2039,6 +2489,7 @@ def build_sync_plan(
         parent_source: Optional[Path],
         parent_index: Optional[int],
     ) -> None:
+        nonlocal planned_path_components
         module_parts = tuple(
             validate_relative_git_path(
                 submodule.path,
@@ -2046,11 +2497,19 @@ def build_sync_plan(
                 ".gitmodules",
             ).split("/")
         )
+        candidate_component_count = len(parent_target_parts) + len(module_parts)
+        if (
+            planned_path_components + candidate_component_count
+            > MAX_CHECKOUT_PATH_COMPONENTS
+        ):
+            raise PlanError(
+                "sync plan exceeds the "
+                f"{MAX_CHECKOUT_PATH_COMPONENTS}-component safety limit"
+            )
         target = bind_target_path(
             root,
             parent_target_parts + module_parts,
             f"worktree path for submodule {submodule.path}",
-            name_policy,
         )
         source_git_dir = (
             nested_source_git_dir_for(parent_source, submodule.name)
@@ -2114,9 +2573,14 @@ def build_sync_plan(
             checkout_preflight, write_bindings = capture_checkout_preflight(entry)
             entry.checkout_preflight = checkout_preflight
             entry.target_bindings = (*entry.target_bindings, *write_bindings)
-        reject_plan_collision(entries, entry, name_policy)
+        if len(entries) >= MAX_PLANNED_WORKTREES:
+            raise PlanError(
+                f"sync plan exceeds the {MAX_PLANNED_WORKTREES}-worktree safety limit"
+            )
+        collision_index.add(entries, entry)
         current_index = len(entries)
         entries.append(entry)
+        planned_path_components += candidate_component_count
 
         if not recursive:
             return
@@ -2150,7 +2614,6 @@ def build_sync_plan(
         depth=depth,
         force_replace_empty=force_replace_empty,
         fetch_missing=fetch_missing,
-        name_policy=name_policy,
     )
 
 
@@ -2212,7 +2675,6 @@ def revalidate_planned_entry(
             plan.root,
             entry.target.relative_parts,
             f"worktree path for submodule {entry.submodule.path}",
-            plan.name_policy,
         )
         current_state = classify_planned_target(
             current_target,
@@ -2255,12 +2717,6 @@ def revalidate_planned_entry(
 
 
 def validate_sync_plan(plan: SyncPlan) -> None:
-    current_policy = filesystem_name_policy(plan.root)
-    if current_policy != plan.name_policy:
-        raise PlanError(
-            "target filesystem name semantics changed after preflight\n"
-            f"  root: {plan.root}"
-        )
     for entry in plan.entries:
         revalidate_planned_entry(plan, entry)
 
@@ -2516,6 +2972,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    git_runtime()
     if args.depth < 1:
         raise PlanError("--depth must be greater than zero")
     normalize_requested_paths(args.paths, all_paths=args.all_paths)

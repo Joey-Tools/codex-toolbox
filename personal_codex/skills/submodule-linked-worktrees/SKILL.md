@@ -9,7 +9,7 @@ description: Safely set up or sync large Git submodule repositories with disk-sa
 
 Use this skill to reduce duplicated Git object storage in repositories with many submodules, especially when a large checkout is used through multiple linked worktrees.
 
-The bundled helper creates detached submodule linked worktrees that reuse an existing source repo under `.git/modules`. It locates source repos by submodule name and worktrees by submodule path. It requires explicit top-level paths unless the task authorizes `--all`, and it preflights the complete selected set before changing any target worktree. It does not hard link working-tree files and does not replace ordinary submodule workflows unless the repository shape calls for it.
+The bundled POSIX-only helper creates detached submodule linked worktrees that reuse an existing source repo under `.git/modules`. It requires Git 2.45 or newer, locates source repos by submodule name and worktrees by submodule path, requires explicit top-level paths unless the task authorizes `--all`, and preflights the complete selected set before changing any target worktree. It does not hard link working-tree files and does not replace ordinary submodule workflows unless the repository shape calls for it.
 
 ## Decision Path
 
@@ -85,11 +85,12 @@ Use `--source-common-git-dir /path/to/repo/.git` only when there is no usable so
 - Resolve and pass exact top-level submodule paths. Never translate an empty path list into all submodules.
 - Use `--all` only when the task itself authorizes the complete top-level set; convenience or a vague request to "set up submodules" is not enough.
 - The helper always preflights the complete selected set before applying target-worktree changes. Use `--dry-run` to stop after that preflight, not as a substitute for resolving scope.
-- Every Git subprocess uses a controlled environment that rejects ambient repository/index/object/config redirection and disables promisor lazy fetches. Only an explicit `--fetch-missing` operation may perform network I/O.
+- Before any repository read, the helper resolves one absolute Git executable, requires version 2.45 or newer, and binds its filesystem identity for every later invocation. Every Git subprocess uses a controlled environment that rejects ambient repository/index/object/config redirection and disables promisor lazy fetches. Only an explicit `--fetch-missing` operation may perform network I/O.
 - Git inventories used by checkout preflight have hard time, retained-output, input, path-count, path-length, and access-binding limits. A repository beyond those limits fails closed instead of falling back to an unbounded command.
-- Missing-path alias checks use the target volume's case and Unicode-normalization semantics. Distinct `Foo`/`foo` paths remain distinct on a case-sensitive volume; aliases are rejected on a case-insensitive or normalization-insensitive volume.
-- The helper rejects any materialized path whose target-tree attributes select a content filter, including LFS and both required and non-required custom filters. It does not execute repository-defined smudge filters or accept a raw pointer as a successful checkout.
+- Missing-path alias checks bind and revalidate the deepest existing parent directory's case and Unicode-normalization semantics. Distinct `Foo`/`foo` paths remain distinct on a case-sensitive directory; aliases are rejected on a case-insensitive, ext4-casefold, or normalization-insensitive anchor. A bounded trie indexes the plan without pairwise target scans.
+- Before any tracked-status command, the helper inspects current- and target-tree attributes plus local clean/process filter configuration with non-converting bounded Git plumbing. It rejects LFS and both required and non-required custom filters, never executes repository-defined filters, and never accepts a raw pointer as a successful checkout.
 - Existing managed checkouts use `--no-overwrite-ignore`. The complete plan inventories ignored conflicts before the first target checkout and repeats the check during final revalidation.
+- Git paths containing Windows drive/UNC forms or backslashes are rejected. Native Windows execution is unsupported rather than silently applying different separator or process semantics.
 - Start with one small submodule path unless the task explicitly calls for a broader set.
 - Do not let the helper overwrite non-empty directories. It intentionally refuses non-empty paths that are not already managed linked worktrees.
 - Do not clean or deinitialize submodules as part of this workflow unless the user explicitly approves the destructive cleanup.
