@@ -106,6 +106,98 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "unsafe path segment"):
             MODULE.parse_gitmodules(content, ".gitmodules")
 
+    def test_parse_gitmodules_rejects_duplicate_paths(self) -> None:
+        content = """
+[submodule "first"]
+    path = third_party/libexample
+    url = https://example.invalid/first.git
+[submodule "second"]
+    path = third_party/libexample
+    url = https://example.invalid/second.git
+"""
+
+        with self.assertRaisesRegex(MODULE.PlanError, "duplicate submodule path"):
+            MODULE.parse_gitmodules(content, ".gitmodules")
+
+    def test_filter_submodules_requires_explicit_paths_or_all(self) -> None:
+        modules = [
+            MODULE.Submodule(
+                name="custom-lib",
+                path="third_party/libexample",
+                url=str(self.remote),
+            )
+        ]
+
+        with self.assertRaisesRegex(MODULE.PlanError, "explicit top-level paths or --all"):
+            MODULE.filter_submodules(modules, [])
+
+    def test_filter_submodules_rejects_empty_path(self) -> None:
+        modules = [
+            MODULE.Submodule(
+                name="custom-lib",
+                path="third_party/libexample",
+                url=str(self.remote),
+            )
+        ]
+
+        with self.assertRaisesRegex(MODULE.PlanError, "must not be empty"):
+            MODULE.filter_submodules(modules, [""])
+
+    def test_filter_submodules_requires_exclusive_all_selection(self) -> None:
+        modules = [
+            MODULE.Submodule(
+                name="custom-lib",
+                path="third_party/libexample",
+                url=str(self.remote),
+            )
+        ]
+
+        with self.assertRaisesRegex(MODULE.PlanError, "either explicit.*or --all"):
+            MODULE.filter_submodules(
+                modules,
+                ["third_party/libexample"],
+                all_paths=True,
+            )
+
+    def test_filter_submodules_supports_explicit_all_selection(self) -> None:
+        modules = [
+            MODULE.Submodule(
+                name="custom-lib",
+                path="third_party/libexample",
+                url=str(self.remote),
+            )
+        ]
+
+        self.assertEqual(
+            MODULE.filter_submodules(modules, [], all_paths=True),
+            modules,
+        )
+
+    def test_main_rejects_empty_selection_before_repo_lookup(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "depth": 1,
+                "paths": [],
+                "all_paths": False,
+            },
+        )()
+        original_parse_args = MODULE.parse_args
+        original_repo_paths = MODULE.repo_paths
+
+        def fail_repo_lookup(repo: Path) -> tuple[Path, Path, Path]:
+            self.fail(f"unexpected repo lookup for {repo}")
+
+        try:
+            MODULE.parse_args = lambda: args
+            MODULE.repo_paths = fail_repo_lookup
+            with self.assertRaisesRegex(MODULE.PlanError, "no submodule paths selected"):
+                MODULE.main()
+        finally:
+            MODULE.parse_args = original_parse_args
+            MODULE.repo_paths = original_repo_paths
+
     def test_source_gitdir_rejects_symlink_escape(self) -> None:
         common_git_dir = self.root / "escape-super" / ".git"
         modules_dir = common_git_dir / "modules"
@@ -223,6 +315,60 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.assertEqual(state, "managed")
 
+    def test_cli_targeted_apply_preflights_then_adds_worktree(self) -> None:
+        (self.remote / "CLI.md").write_text("cli\n", encoding="utf-8")
+        run_git(self.remote, "add", "CLI.md")
+        run_git(self.remote, "commit", "-m", "cli")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        target = self.root / "target-super"
+        run_git(self.root, "init", str(target))
+        (target / ".gitmodules").write_text(
+            "\n".join(
+                [
+                    '[submodule "custom-lib"]',
+                    "    path = third_party/libexample",
+                    f"    url = {self.remote}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        run_git(target, "add", ".gitmodules")
+        run_git(
+            target,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{target_sha},third_party/libexample",
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(target),
+                "--source-common-git-dir",
+                str(self.named_common_git_dir),
+                "--no-recursive",
+                "--fetch-missing",
+                "--",
+                "third_party/libexample",
+            ],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertIn("preflight 1 top-level submodule path(s)", result.stdout)
+        self.assertIn("fetch missing commit for third_party/libexample", result.stdout)
+        self.assertIn("preflight complete; applying plan", result.stdout)
+        self.assertEqual(
+            run_git(target / "third_party" / "libexample", "rev-parse", "HEAD"),
+            target_sha,
+        )
+
     def test_sync_uses_submodule_name_for_source_gitdir(self) -> None:
         submodule = MODULE.Submodule(
             name="custom-lib",
@@ -248,7 +394,74 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.assertIn(".git/modules/custom-lib", output.getvalue())
 
-    def test_recursive_dry_run_stops_when_target_commit_is_missing(self) -> None:
+    def test_missing_commit_requires_explicit_fetch_authorization(self) -> None:
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        commands: list[list[str]] = []
+        original_run = MODULE.run
+
+        def recording_run(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+            capture: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            commands.append(args)
+            return original_run(args, cwd=cwd, check=check, capture=capture)
+
+        try:
+            MODULE.run = recording_run
+            with self.assertRaisesRegex(MODULE.PlanError, "network fetch is disabled"):
+                MODULE.fetch_missing_commit(
+                    self.named_source_git_dir,
+                    self.root / "target-super" / "third_party" / "libexample",
+                    submodule,
+                    "f" * 40,
+                    1,
+                    fetch_missing=False,
+                    dry_run=False,
+                )
+        finally:
+            MODULE.run = original_run
+
+        self.assertFalse(any("fetch" in command for command in commands))
+
+    def test_authorized_missing_commit_fetches_shallow_target(self) -> None:
+        (self.remote / "SECOND.md").write_text("second\n", encoding="utf-8")
+        run_git(self.remote, "add", "SECOND.md")
+        run_git(self.remote, "commit", "-m", "second")
+        second_sha = run_git(self.remote, "rev-parse", "HEAD")
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(
+                MODULE.fetch_missing_commit(
+                    self.named_source_git_dir,
+                    self.root / "target-super" / "third_party" / "libexample",
+                    submodule,
+                    second_sha,
+                    1,
+                    dry_run=False,
+                    fetch_missing=True,
+                )
+            )
+        self.assertTrue(
+            MODULE.commit_exists(
+                self.named_source_git_dir,
+                self.root / "target-super" / "third_party" / "libexample",
+                second_sha,
+            )
+        )
+
+    def test_recursive_dry_run_stops_when_authorized_fetch_is_only_planned(self) -> None:
         submodule = MODULE.Submodule(
             name="custom-lib",
             path="third_party/libexample",
@@ -270,7 +483,92 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     recursive=True,
                     force_replace_empty=False,
                     dry_run=True,
+                    fetch_missing=True,
                 )
+
+        self.assertIn("would fetch missing commit", output.getvalue())
+
+    def test_execute_sync_plan_preflights_every_path_before_apply(self) -> None:
+        modules = [
+            MODULE.Submodule("first", "third_party/first", str(self.remote)),
+            MODULE.Submodule("second", "third_party/second", str(self.remote)),
+        ]
+        calls: list[tuple[str, bool]] = []
+        original_sync_one = MODULE.sync_one
+
+        def fake_sync_one(**kwargs: object) -> None:
+            module = kwargs["submodule"]
+            self.assertIsInstance(module, MODULE.Submodule)
+            calls.append((module.path, bool(kwargs["dry_run"])))
+
+        try:
+            MODULE.sync_one = fake_sync_one
+            with redirect_stdout(io.StringIO()):
+                MODULE.execute_sync_plan(
+                    root=self.root,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[(modules[0], "a" * 40), (modules[1], "b" * 40)],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    dry_run=False,
+                    fetch_missing=False,
+                )
+        finally:
+            MODULE.sync_one = original_sync_one
+
+        self.assertEqual(
+            calls,
+            [
+                ("third_party/first", True),
+                ("third_party/second", True),
+                ("third_party/first", False),
+                ("third_party/second", False),
+            ],
+        )
+
+    def test_execute_sync_plan_does_not_apply_after_failed_preflight(self) -> None:
+        modules = [
+            MODULE.Submodule("first", "third_party/first", str(self.remote)),
+            MODULE.Submodule("second", "third_party/second", str(self.remote)),
+        ]
+        calls: list[tuple[str, bool]] = []
+        original_sync_one = MODULE.sync_one
+
+        def fake_sync_one(**kwargs: object) -> None:
+            module = kwargs["submodule"]
+            self.assertIsInstance(module, MODULE.Submodule)
+            dry_run = bool(kwargs["dry_run"])
+            calls.append((module.path, dry_run))
+            if module.path == "third_party/second" and dry_run:
+                raise MODULE.PlanError("second path failed preflight")
+
+        try:
+            MODULE.sync_one = fake_sync_one
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(MODULE.PlanError, "failed preflight"):
+                    MODULE.execute_sync_plan(
+                        root=self.root,
+                        common_git_dir=self.named_common_git_dir,
+                        source_superproject=None,
+                        planned_modules=[(modules[0], "a" * 40), (modules[1], "b" * 40)],
+                        depth=1,
+                        recursive=False,
+                        force_replace_empty=False,
+                        dry_run=False,
+                        fetch_missing=False,
+                    )
+        finally:
+            MODULE.sync_one = original_sync_one
+
+        self.assertEqual(
+            calls,
+            [
+                ("third_party/first", True),
+                ("third_party/second", True),
+            ],
+        )
 
 
 if __name__ == "__main__":

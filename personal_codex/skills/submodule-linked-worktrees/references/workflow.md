@@ -40,6 +40,10 @@ Notes:
 
 Use this when the source checkout already has `.git/modules/<submodule-name>` and the target is another worktree that should share those object stores.
 
+Select exact top-level submodule paths before running the helper. An empty path list is rejected rather than expanded to every submodule. Use `--all` only when the task explicitly authorizes the complete top-level set.
+
+For an apply invocation, the helper first resolves gitlink SHAs and preflights every selected target, including recursive descendants, before changing a target worktree. A failure in that phase prevents the apply phase from starting. `--dry-run` stops after the plan/preflight. When the task already names the exact paths and the preflight succeeds, the apply phase does not need a separate confirmation solely because the plan was printed.
+
 The core operation is:
 
 ```bash
@@ -72,19 +76,21 @@ If automation policy forbids cloning, stop and report the missing source repo.
 
 ### Missing Commit In A Shallow Source
 
-The helper checks:
+The helper first checks:
 
 ```bash
 git --git-dir=<source-gitdir> --work-tree=<target-path> cat-file -e <sha>^{commit}
 ```
 
-If missing, it attempts:
+If the commit is missing, the default is to stop without a network mutation and report the exact planned fetch. The helper may attempt the fetch only when the task explicitly authorizes missing-commit fetches and the invocation includes `--fetch-missing`:
 
 ```bash
 git --git-dir=<source-gitdir> --work-tree=<target-path> fetch --depth 1 origin <sha>
 ```
 
-Some servers reject raw SHA fetches. In that case, fetch a branch or tag that contains the commit, then rerun:
+`--dry-run --fetch-missing` prints this action without executing it. If a missing parent commit prevents recursive `.gitmodules` inspection, that plan-only run stops rather than pretending its nested plan is complete. An apply invocation with `--fetch-missing` performs authorized shallow fetches during preflight, after validating each affected target path, so recursive gitlinks can be inspected; it still does not begin the target apply phase unless that complete preflight passes.
+
+Some servers reject raw SHA fetches. In that case, report the failure and request or use separately authorized branch/tag fetch semantics before rerunning:
 
 ```bash
 git --git-dir=<source-gitdir> --work-tree=<target-path> fetch --depth 100 origin <branch-or-tag>

@@ -106,6 +106,7 @@ def parse_gitmodules(content: str, origin: str) -> list[Submodule]:
         raise PlanError(f"failed to parse {origin}: {exc}") from exc
 
     modules: list[Submodule] = []
+    seen_paths: dict[str, str] = {}
     for section in parser.sections():
         if not section.startswith("submodule "):
             continue
@@ -123,6 +124,12 @@ def parse_gitmodules(content: str, origin: str) -> list[Submodule]:
             f"name for [{section}]",
             origin,
         )
+        if path in seen_paths:
+            raise PlanError(
+                f"duplicate submodule path in {origin}: {path} "
+                f"is used by {seen_paths[path]} and {name}"
+            )
+        seen_paths[path] = name
         modules.append(Submodule(name=name, path=path, url=url))
     return modules
 
@@ -256,6 +263,7 @@ def fetch_missing_commit(
     sha: str,
     depth: int,
     dry_run: bool,
+    fetch_missing: bool = False,
 ) -> bool:
     if commit_exists(source_git_dir, work_tree, sha):
         return True
@@ -268,9 +276,26 @@ def fetch_missing_commit(
         "origin",
         sha,
     ]
+    if not fetch_missing:
+        raise PlanError(
+            "\n".join(
+                [
+                    f"target commit is missing for {submodule.path}",
+                    f"  url: {submodule.url}",
+                    f"  sha: {sha}",
+                    f"  source gitdir: {source_git_dir}",
+                    "  network fetch is disabled by default",
+                    "  fix:",
+                    "    fetch the commit manually, or pass --fetch-missing only when the task "
+                    "explicitly authorizes fetching missing commits",
+                    f"    planned command: {shell_join(command)}",
+                ]
+            )
+        )
     if dry_run:
         print(f"would fetch missing commit for {submodule.path}: {shell_join(command)}")
         return False
+    print(f"fetch missing commit for {submodule.path}: {shell_join(command)}", flush=True)
     result = run(command, check=False)
     if result.returncode == 0 and commit_exists(source_git_dir, work_tree, sha):
         return True
@@ -422,6 +447,8 @@ def sync_one(
     recursive: bool,
     force_replace_empty: bool,
     dry_run: bool,
+    fetch_missing: bool = False,
+    fetch_during_preflight: bool = False,
 ) -> None:
     worktree_path = contained_child_path(
         parent_root,
@@ -437,20 +464,36 @@ def sync_one(
 
     print(f"sync {display_path} -> {sha}", flush=True)
     ensure_source_repo(source_git_dir, worktree_path, submodule, source_superproject, parent_source_git_dir)
-    commit_available = fetch_missing_commit(source_git_dir, worktree_path, submodule, sha, depth, dry_run)
-
     state = prepare_target_path(worktree_path, source_git_dir, force_replace_empty, dry_run)
-    if state == "managed":
-        checkout_existing_worktree(worktree_path, sha, dry_run)
-    else:
-        add_worktree(source_git_dir, worktree_path, sha, dry_run)
+    if dry_run:
+        if state == "managed":
+            checkout_existing_worktree(worktree_path, sha, dry_run=True)
+        else:
+            add_worktree(source_git_dir, worktree_path, sha, dry_run=True)
+
+    commit_available = fetch_missing_commit(
+        source_git_dir,
+        worktree_path,
+        submodule,
+        sha,
+        depth,
+        dry_run=dry_run and not fetch_during_preflight,
+        fetch_missing=fetch_missing,
+    )
+
+    if not dry_run:
+        if state == "managed":
+            checkout_existing_worktree(worktree_path, sha, dry_run=False)
+        else:
+            add_worktree(source_git_dir, worktree_path, sha, dry_run=False)
 
     if not recursive:
         return
     if not commit_available:
         raise PlanError(
             f"cannot plan nested submodules for {submodule.path} in dry-run because {sha} is missing locally\n"
-            "  rerun without --dry-run to fetch the target commit, fetch it manually, or pass --no-recursive"
+            "  fetch it manually, use --fetch-missing in an apply only when the task authorizes it, "
+            "or pass --no-recursive"
         )
     for nested in read_commit_gitmodules(source_git_dir, worktree_path, sha):
         nested_sha = expected_sha_from_tree(source_git_dir, worktree_path, sha, nested.path)
@@ -466,13 +509,96 @@ def sync_one(
             recursive=True,
             force_replace_empty=force_replace_empty,
             dry_run=dry_run,
+            fetch_missing=fetch_missing,
+            fetch_during_preflight=fetch_during_preflight,
         )
 
 
-def filter_submodules(modules: list[Submodule], requested_paths: list[str]) -> list[Submodule]:
+def execute_sync_plan(
+    *,
+    root: Path,
+    common_git_dir: Path,
+    source_superproject: Optional[Path],
+    planned_modules: list[tuple[Submodule, str]],
+    depth: int,
+    recursive: bool,
+    force_replace_empty: bool,
+    dry_run: bool,
+    fetch_missing: bool,
+) -> None:
+    print(f"preflight {len(planned_modules)} top-level submodule path(s)", flush=True)
+    for module, sha in planned_modules:
+        sync_one(
+            root=root,
+            common_git_dir=common_git_dir,
+            source_superproject=source_superproject,
+            parent_source_git_dir=None,
+            parent_root=root,
+            submodule=module,
+            sha=sha,
+            depth=depth,
+            recursive=recursive,
+            force_replace_empty=force_replace_empty,
+            dry_run=True,
+            fetch_missing=fetch_missing,
+            fetch_during_preflight=fetch_missing and not dry_run,
+        )
+
+    if dry_run:
+        print("preflight complete; no worktrees changed", flush=True)
+        return
+
+    print("preflight complete; applying plan", flush=True)
+    for module, sha in planned_modules:
+        sync_one(
+            root=root,
+            common_git_dir=common_git_dir,
+            source_superproject=source_superproject,
+            parent_source_git_dir=None,
+            parent_root=root,
+            submodule=module,
+            sha=sha,
+            depth=depth,
+            recursive=recursive,
+            force_replace_empty=force_replace_empty,
+            dry_run=False,
+            fetch_missing=False,
+        )
+
+
+def normalize_requested_paths(
+    requested_paths: list[str],
+    *,
+    all_paths: bool = False,
+) -> Optional[list[str]]:
+    if all_paths and requested_paths:
+        raise PlanError("use either explicit top-level submodule paths or --all, not both")
+    if all_paths:
+        return None
     if not requested_paths:
+        raise PlanError("no submodule paths selected; pass explicit top-level paths or --all")
+
+    normalized_paths = [
+        validate_relative_git_path(path.rstrip("/"), "requested path", "command line")
+        for path in requested_paths
+    ]
+    if len(set(normalized_paths)) != len(normalized_paths):
+        raise PlanError("duplicate top-level submodule paths are not allowed")
+    return normalized_paths
+
+
+def filter_submodules(
+    modules: list[Submodule],
+    requested_paths: list[str],
+    *,
+    all_paths: bool = False,
+) -> list[Submodule]:
+    normalized_paths = normalize_requested_paths(requested_paths, all_paths=all_paths)
+    if normalized_paths is None:
+        if not modules:
+            raise PlanError("--all selected no top-level submodules")
         return modules
-    normalized_paths = [path.rstrip("/") for path in requested_paths]
+
     wanted = set(normalized_paths)
     by_path = {module.path: module for module in modules}
     missing = sorted(wanted - set(by_path))
@@ -500,14 +626,39 @@ def choose_source_common_git_dir(args: argparse.Namespace, target_root: Path) ->
     return target_common_git_dir, None
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Sync submodules as detached linked worktrees that reuse .git/modules source repositories."
+        description=(
+            "Preflight, then sync explicitly selected submodules as detached linked worktrees "
+            "that reuse .git/modules source repositories."
+        )
     )
-    parser.add_argument("paths", nargs="*", help="top-level submodule paths to sync; defaults to all")
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        help="explicit top-level submodule paths to sync; required unless --all is authorized",
+    )
+    parser.add_argument(
+        "--all",
+        dest="all_paths",
+        action="store_true",
+        help="sync every top-level submodule; use only when the task explicitly authorizes all paths",
+    )
     parser.add_argument("--repo", default=".", help="target superproject worktree; defaults to current directory")
     parser.add_argument("--depth", type=int, default=1, help="depth used when fetching a missing target commit")
-    parser.add_argument("--dry-run", action="store_true", help="print actions without changing worktrees")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="run the preflight and print its plan without changing worktrees or fetching commits",
+    )
+    parser.add_argument(
+        "--fetch-missing",
+        action="store_true",
+        help=(
+            "allow shallow-fetching missing target commits during apply; "
+            "use only when the task explicitly authorizes network fetches"
+        ),
+    )
     parser.add_argument("--force-replace-empty", action="store_true", help="allow using existing empty directories")
     parser.add_argument("--no-recursive", action="store_true", help="do not sync nested submodules")
     parser.add_argument(
@@ -521,32 +672,34 @@ def parse_args() -> argparse.Namespace:
             "mutually exclusive with --source-superproject"
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
     args = parse_args()
     if args.depth < 1:
         raise PlanError("--depth must be greater than zero")
+    normalize_requested_paths(args.paths, all_paths=args.all_paths)
 
     root, _, _ = repo_paths(resolved_path(args.repo))
     source_common_git_dir, source_superproject = choose_source_common_git_dir(args, root)
-    modules = filter_submodules(read_worktree_gitmodules(root), args.paths)
-    for module in modules:
-        sha = expected_sha(root, module.path)
-        sync_one(
-            root=root,
-            common_git_dir=source_common_git_dir,
-            source_superproject=source_superproject,
-            parent_source_git_dir=None,
-            parent_root=root,
-            submodule=module,
-            sha=sha,
-            depth=args.depth,
-            recursive=not args.no_recursive,
-            force_replace_empty=args.force_replace_empty,
-            dry_run=args.dry_run,
-        )
+    modules = filter_submodules(
+        read_worktree_gitmodules(root),
+        args.paths,
+        all_paths=args.all_paths,
+    )
+    planned_modules = [(module, expected_sha(root, module.path)) for module in modules]
+    execute_sync_plan(
+        root=root,
+        common_git_dir=source_common_git_dir,
+        source_superproject=source_superproject,
+        planned_modules=planned_modules,
+        depth=args.depth,
+        recursive=not args.no_recursive,
+        force_replace_empty=args.force_replace_empty,
+        dry_run=args.dry_run,
+        fetch_missing=args.fetch_missing,
+    )
     return 0
 
 

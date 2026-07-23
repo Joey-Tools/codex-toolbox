@@ -1,6 +1,6 @@
 ---
 name: submodule-linked-worktrees
-description: Set up large Git submodule repositories with disk-saving linked worktrees and shared `.git/modules` object stores. Use when Codex is asked about saving disk space for submodules, replacing `git submodule update --init --recursive` in linked worktrees, using `--reference`/alternates/ref clones, avoiding hard-linked submodule worktrees, or syncing submodule checkout SHAs across macOS/Linux Git worktrees.
+description: Safely set up or sync large Git submodule repositories with disk-saving linked worktrees and shared `.git/modules` object stores. Use when Codex is asked about saving disk space for submodules, replacing `git submodule update --init --recursive` in linked worktrees, planning explicit submodule-path changes, authorizing all-path or missing-commit fetch operations, using `--reference`/alternates/ref clones, avoiding hard-linked submodule worktrees, or syncing submodule checkout SHAs across macOS/Linux Git worktrees.
 ---
 
 # Submodule Linked Worktrees
@@ -9,7 +9,7 @@ description: Set up large Git submodule repositories with disk-saving linked wor
 
 Use this skill to reduce duplicated Git object storage in repositories with many submodules, especially when a large checkout is used through multiple linked worktrees.
 
-The bundled helper creates detached submodule linked worktrees that reuse an existing source repo under `.git/modules`. It locates source repos by submodule name and worktrees by submodule path. It does not hard link working-tree files and does not replace ordinary submodule workflows unless the repository shape calls for it.
+The bundled helper creates detached submodule linked worktrees that reuse an existing source repo under `.git/modules`. It locates source repos by submodule name and worktrees by submodule path. It requires explicit top-level paths unless the task authorizes `--all`, and it preflights the complete selected set before changing any target worktree. It does not hard link working-tree files and does not replace ordinary submodule workflows unless the repository shape calls for it.
 
 ## Decision Path
 
@@ -39,9 +39,9 @@ The bundled helper creates detached submodule linked worktrees that reuse an exi
 
 ## Helper Script
 
-Use `scripts/submodule_worktree_sync.py` from this skill when linked submodule worktrees are the right model.
+Use `scripts/submodule_worktree_sync.py` from this skill when linked submodule worktrees are the right model. Resolve the exact top-level paths from the task before invocation. Passing no paths is an error; it never means all submodules.
 
-Typical dry run:
+Optional plan-only run:
 
 ```bash
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/submodule-linked-worktrees/scripts/submodule_worktree_sync.py" \
@@ -62,27 +62,50 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/submodule-linked-worktrees/scripts/s
   -- third_party/libexample
 ```
 
+The targeted sync automatically runs the same full preflight before it applies the plan. Once the task has resolved the exact target paths, a successful preflight may proceed to apply without a redundant confirmation step. Keep `--dry-run` when the task asks only for a plan or when another unresolved safety decision remains.
+
+Use `--all` only when the task explicitly authorizes every top-level submodule:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/submodule-linked-worktrees/scripts/submodule_worktree_sync.py" \
+  --repo /path/to/target-worktree \
+  --source-superproject /path/to/canonical-checkout \
+  --force-replace-empty \
+  --all
+```
+
+Missing target commits are read-only failures by default. Use `--fetch-missing` only when the task explicitly authorizes shallow network fetches. With `--dry-run`, the helper prints an authorized missing-commit fetch but does not execute it.
+
 If `--source-superproject` is omitted, the script uses the target repo's own `git rev-parse --git-common-dir`. This works for many Git linked worktrees because their common gitdir is the canonical checkout's `.git` directory.
 
 Use `--source-common-git-dir /path/to/repo/.git` only when there is no usable source worktree but the `.git/modules` tree is known and intentionally kept.
 
 ## Safety Rules
 
-- Run `--dry-run` first for any repo that has not used this helper before.
-- Start with one small submodule path before attempting all submodules.
+- Resolve and pass exact top-level submodule paths. Never translate an empty path list into all submodules.
+- Use `--all` only when the task itself authorizes the complete top-level set; convenience or a vague request to "set up submodules" is not enough.
+- The helper always preflights the complete selected set before applying target-worktree changes. Use `--dry-run` to stop after that preflight, not as a substitute for resolving scope.
+- Start with one small submodule path unless the task explicitly calls for a broader set.
 - Do not let the helper overwrite non-empty directories. It intentionally refuses non-empty paths that are not already managed linked worktrees.
 - Do not clean or deinitialize submodules as part of this workflow unless the user explicitly approves the destructive cleanup.
 - If a source repo is missing, initialize it in the source checkout first; do not clone repositories during automation unless the user requested that.
+- Do not pass `--fetch-missing` unless task semantics explicitly authorize fetching missing commits. Without it, the helper reports the path, URL, target SHA, source gitdir, and planned fetch command without network mutation.
 - If shallow fetching a raw commit SHA fails, report the path, URL, target SHA, and source gitdir. Do not silently unshallow or fetch the full history.
 - After deleting target worktrees, use `git worktree prune` on the relevant source repos only when stale worktree records need cleanup.
 
 ## Validation
 
-For script edits, run:
+For script edits, run from the skill directory:
 
 ```bash
 python3 -m py_compile scripts/submodule_worktree_sync.py
 python3 scripts/submodule_worktree_sync.py --help
+```
+
+For repository source updates, also run from the repository root:
+
+```bash
+python3 -m unittest tests.test_submodule_worktree_sync
 ```
 
 For a real repo, validate in this order:
