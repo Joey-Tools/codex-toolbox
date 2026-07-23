@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -314,6 +316,188 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         )
 
         self.assertEqual(state, "managed")
+
+    def test_later_stale_registration_blocks_all_apply_mutations(self) -> None:
+        target_super = self.root / "target-super"
+        target_super.mkdir()
+        first_source_git_dir = self.named_common_git_dir / "modules" / "first"
+        second_source_git_dir = self.named_common_git_dir / "modules" / "second"
+        for name, source_git_dir in (
+            ("first", first_source_git_dir),
+            ("second", second_source_git_dir),
+        ):
+            source_git_dir.parent.mkdir(parents=True, exist_ok=True)
+            run_git(
+                self.root,
+                "clone",
+                "--separate-git-dir",
+                str(source_git_dir),
+                str(self.remote),
+                str(self.root / f"{name}-standard"),
+            )
+
+        stale_target = target_super / "third_party" / "second"
+        stale_target.parent.mkdir(parents=True)
+        run_git(
+            self.root,
+            f"--git-dir={second_source_git_dir}",
+            f"--work-tree={stale_target}",
+            "worktree",
+            "add",
+            "--detach",
+            str(stale_target),
+            self.sha,
+        )
+        shutil.rmtree(stale_target)
+
+        first_target = target_super / "third_party" / "first"
+        first_registry_before = run_git(
+            self.root,
+            f"--git-dir={first_source_git_dir}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaisesRegex(MODULE.PlanError, "registered.*not a usable managed"):
+                MODULE.execute_sync_plan(
+                    root=target_super,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[
+                        (
+                            MODULE.Submodule("first", "third_party/first", str(self.remote)),
+                            self.sha,
+                        ),
+                        (
+                            MODULE.Submodule("second", "third_party/second", str(self.remote)),
+                            self.sha,
+                        ),
+                    ],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    dry_run=False,
+                    fetch_missing=False,
+                )
+
+        self.assertNotIn("preflight complete; applying plan", output.getvalue())
+        self.assertFalse(first_target.exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={first_source_git_dir}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            first_registry_before,
+        )
+
+    def test_missing_target_rejects_non_directory_parent(self) -> None:
+        target_super = self.root / "target-super"
+        target_super.mkdir()
+        (target_super / "blocked").write_text("not a directory\n", encoding="utf-8")
+
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(MODULE.PlanError, "existing parent is not a directory"):
+                MODULE.sync_one(
+                    root=target_super,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    parent_source_git_dir=None,
+                    parent_root=target_super,
+                    submodule=MODULE.Submodule(
+                        "custom-lib",
+                        "blocked/libexample",
+                        str(self.remote),
+                    ),
+                    sha=self.sha,
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    dry_run=True,
+                )
+
+    def test_dry_run_read_queries_preserve_linked_worktree_index(self) -> None:
+        run_git(
+            self.root,
+            f"--git-dir={self.source_git_dir}",
+            f"--work-tree={self.linked}",
+            "worktree",
+            "add",
+            "--detach",
+            str(self.linked),
+            self.sha,
+        )
+        readme_path = self.linked / "README.md"
+        readme_stat = readme_path.stat()
+        os.utime(
+            readme_path,
+            ns=(readme_stat.st_atime_ns, readme_stat.st_mtime_ns + 2_000_000_000),
+        )
+
+        index_path = Path(run_git(self.linked, "rev-parse", "--git-path", "index"))
+        if not index_path.is_absolute():
+            index_path = (self.linked / index_path).resolve()
+
+        def index_metadata() -> tuple[int, int, int, int, int, int]:
+            stat = index_path.stat()
+            return (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_mode,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+
+        index_bytes_before = index_path.read_bytes()
+        index_metadata_before = index_metadata()
+        commands: list[list[str]] = []
+        original_run = MODULE.run
+
+        def recording_run(
+            args: list[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+            capture: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            commands.append(args)
+            return original_run(args, cwd=cwd, check=check, capture=capture)
+
+        try:
+            MODULE.run = recording_run
+            with redirect_stdout(io.StringIO()):
+                MODULE.sync_one(
+                    root=self.root,
+                    common_git_dir=self.root / "super" / ".git",
+                    source_superproject=None,
+                    parent_source_git_dir=None,
+                    parent_root=self.root,
+                    submodule=MODULE.Submodule(
+                        "third_party/libexample",
+                        "linked",
+                        str(self.remote),
+                    ),
+                    sha=self.sha,
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    dry_run=True,
+                )
+        finally:
+            MODULE.run = original_run
+
+        git_commands = [command for command in commands if command and command[0] == "git"]
+        self.assertTrue(any("status" in command for command in git_commands))
+        self.assertTrue(
+            all(command[:2] == ["git", "--no-optional-locks"] for command in git_commands)
+        )
+        self.assertEqual(index_path.read_bytes(), index_bytes_before)
+        self.assertEqual(index_metadata(), index_metadata_before)
 
     def test_cli_targeted_apply_preflights_then_adds_worktree(self) -> None:
         (self.remote / "CLI.md").write_text("cli\n", encoding="utf-8")

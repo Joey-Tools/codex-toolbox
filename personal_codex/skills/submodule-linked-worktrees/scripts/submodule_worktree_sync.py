@@ -45,8 +45,17 @@ def run(
     return result
 
 
+def read_git(
+    args: list[str],
+    *,
+    cwd: Optional[Path] = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return run(["git", "--no-optional-locks", *args], cwd=cwd, check=check)
+
+
 def git(args: list[str], *, cwd: Optional[Path] = None, check: bool = True) -> str:
-    return run(["git", *args], cwd=cwd, check=check).stdout.strip()
+    return read_git(args, cwd=cwd, check=check).stdout.strip()
 
 
 def shell_join(args: Iterable[str]) -> str:
@@ -142,8 +151,8 @@ def read_worktree_gitmodules(root: Path) -> list[Submodule]:
 
 
 def read_commit_gitmodules(source_git_dir: Path, work_tree: Path, commit: str) -> list[Submodule]:
-    result = run(
-        ["git", *source_object_repo_args(source_git_dir), "show", f"{commit}:.gitmodules"],
+    result = read_git(
+        [*source_object_repo_args(source_git_dir), "show", f"{commit}:.gitmodules"],
         check=False,
     )
     if result.returncode != 0:
@@ -193,8 +202,8 @@ def nested_source_git_dir_for(parent_source_git_dir: Path, submodule_name: str) 
 def is_valid_git_dir(source_git_dir: Path, work_tree: Path) -> bool:
     if not source_git_dir.exists():
         return False
-    result = run(
-        ["git", *source_object_repo_args(source_git_dir), "rev-parse", "--git-dir"],
+    result = read_git(
+        [*source_object_repo_args(source_git_dir), "rev-parse", "--git-dir"],
         check=False,
     )
     return result.returncode == 0
@@ -249,8 +258,8 @@ def ensure_source_repo(
 
 
 def commit_exists(source_git_dir: Path, work_tree: Path, sha: str) -> bool:
-    result = run(
-        ["git", *source_object_repo_args(source_git_dir), "cat-file", "-e", f"{sha}^{{commit}}"],
+    result = read_git(
+        [*source_object_repo_args(source_git_dir), "cat-file", "-e", f"{sha}^{{commit}}"],
         check=False,
     )
     return result.returncode == 0
@@ -344,7 +353,7 @@ def gitdir_file_target(worktree_path: Path) -> Optional[Path]:
 def worktree_common_git_dir(worktree_path: Path) -> Optional[Path]:
     if not (worktree_path / ".git").exists():
         return None
-    result = run(["git", "-C", str(worktree_path), "rev-parse", "--git-common-dir"], check=False)
+    result = read_git(["-C", str(worktree_path), "rev-parse", "--git-common-dir"], check=False)
     if result.returncode != 0:
         return None
     common = Path(result.stdout.strip())
@@ -375,16 +384,71 @@ def is_empty_dir(path: Path) -> bool:
 
 
 def has_local_changes(worktree_path: Path) -> bool:
-    result = run(["git", "-C", str(worktree_path), "status", "--porcelain"], check=True)
+    result = read_git(["-C", str(worktree_path), "status", "--porcelain"], check=True)
     return bool(result.stdout.strip())
 
 
-def prepare_target_path(path: Path, source_git_dir: Path, force_replace_empty: bool, dry_run: bool) -> str:
-    if not path.exists():
-        return "missing"
+def registered_worktree_paths(source_git_dir: Path) -> list[Path]:
+    result = read_git(
+        [
+            *source_object_repo_args(source_git_dir),
+            "worktree",
+            "list",
+            "--porcelain",
+            "-z",
+        ]
+    )
+    paths: list[Path] = []
+    for field in result.stdout.split("\0"):
+        if field.startswith("worktree "):
+            paths.append(Path(field[len("worktree ") :]).resolve(strict=False))
+    return paths
 
-    if is_managed_linked_worktree(path, source_git_dir):
+
+def registered_target_path(source_git_dir: Path, target_path: Path) -> Optional[Path]:
+    resolved_target = target_path.resolve(strict=False)
+    for registered_path in registered_worktree_paths(source_git_dir):
+        if registered_path == resolved_target:
+            return registered_path
+    return None
+
+
+def ensure_target_parent_is_creatable(path: Path) -> None:
+    ancestor = path.parent
+    while not ancestor.exists():
+        if ancestor == ancestor.parent:
+            raise PlanError(f"cannot resolve an existing parent directory for {path}")
+        ancestor = ancestor.parent
+    if not ancestor.is_dir():
+        raise PlanError(
+            f"cannot create worktree path {path}\n"
+            f"  existing parent is not a directory: {ancestor}"
+        )
+
+
+def prepare_target_path(path: Path, source_git_dir: Path, force_replace_empty: bool, dry_run: bool) -> str:
+    registered_path = registered_target_path(source_git_dir, path)
+    managed = path.exists() and is_managed_linked_worktree(path, source_git_dir)
+
+    if managed:
+        if registered_path is None:
+            raise PlanError(
+                f"{path} looks like a managed linked worktree but is absent from the source registry\n"
+                f"  source gitdir: {source_git_dir}"
+            )
         return "managed"
+
+    if registered_path is not None:
+        raise PlanError(
+            f"{path} is registered in the source repository but is not a usable managed linked worktree\n"
+            f"  source gitdir: {source_git_dir}\n"
+            f"  registered path: {registered_path}\n"
+            "  inspect the stale worktree record and prune it manually before rerunning"
+        )
+
+    if not path.exists():
+        ensure_target_parent_is_creatable(path)
+        return "missing"
 
     if is_empty_dir(path):
         if not force_replace_empty:
