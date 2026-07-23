@@ -62,7 +62,7 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/submodule-linked-worktrees/scripts/s
   -- third_party/libexample
 ```
 
-The targeted sync automatically runs the same full preflight before it applies the plan. Once the task has resolved the exact target paths, a successful preflight may proceed to apply without a redundant confirmation step. Keep `--dry-run` when the task asks only for a plan or when another unresolved safety decision remains.
+The targeted sync automatically runs the same full preflight before it applies the plan. For an existing managed worktree, that preflight binds the current HEAD and index, derives the bounded target write set, checks every existing write ancestor/object, inventories ignored conflicts, and performs Git's checkout dry run. Once the task has resolved the exact target paths, a successful preflight may proceed to apply without a redundant confirmation step. Keep `--dry-run` when the task asks only for a plan or when another unresolved safety decision remains.
 
 Use `--all` only when the task explicitly authorizes every top-level submodule:
 
@@ -86,6 +86,10 @@ Use `--source-common-git-dir /path/to/repo/.git` only when there is no usable so
 - Use `--all` only when the task itself authorizes the complete top-level set; convenience or a vague request to "set up submodules" is not enough.
 - The helper always preflights the complete selected set before applying target-worktree changes. Use `--dry-run` to stop after that preflight, not as a substitute for resolving scope.
 - Every Git subprocess uses a controlled environment that rejects ambient repository/index/object/config redirection and disables promisor lazy fetches. Only an explicit `--fetch-missing` operation may perform network I/O.
+- Git inventories used by checkout preflight have hard time, retained-output, input, path-count, path-length, and access-binding limits. A repository beyond those limits fails closed instead of falling back to an unbounded command.
+- Missing-path alias checks use the target volume's case and Unicode-normalization semantics. Distinct `Foo`/`foo` paths remain distinct on a case-sensitive volume; aliases are rejected on a case-insensitive or normalization-insensitive volume.
+- The helper rejects any materialized path whose target-tree attributes select a content filter, including LFS and both required and non-required custom filters. It does not execute repository-defined smudge filters or accept a raw pointer as a successful checkout.
+- Existing managed checkouts use `--no-overwrite-ignore`. The complete plan inventories ignored conflicts before the first target checkout and repeats the check during final revalidation.
 - Start with one small submodule path unless the task explicitly calls for a broader set.
 - Do not let the helper overwrite non-empty directories. It intentionally refuses non-empty paths that are not already managed linked worktrees.
 - Do not clean or deinitialize submodules as part of this workflow unless the user explicitly approves the destructive cleanup.

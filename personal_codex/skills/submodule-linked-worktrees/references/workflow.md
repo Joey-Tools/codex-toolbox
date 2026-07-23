@@ -44,6 +44,12 @@ Select exact top-level submodule paths before running the helper. An empty path 
 
 For an apply invocation, the helper first resolves gitlink SHAs and preflights every selected target, including recursive descendants, before changing a target worktree. A failure in that phase prevents the apply phase from starting. `--dry-run` stops after the plan/preflight. When the task already names the exact paths and the preflight succeeds, the apply phase does not need a separate confirmation solely because the plan was printed.
 
+For every existing managed worktree, the preflight binds its detached HEAD and semantic index snapshot, derives the bounded `HEAD..target` write set with renames disabled, and binds the identity and access policy of each existing object and parent needed by that write set. It also checks ignored untracked paths and runs a no-update `read-tree` probe. The actual checkout repeats the decisive checks and uses `--no-overwrite-ignore --no-recurse-submodules`.
+
+Before any target-tree materialization, the helper evaluates the target commit's `filter` attribute for every blob that Git would write. Any selected driver—including `lfs`, a required driver, or a non-required driver—is blocked. The helper deliberately has no trusted filter allowlist, so an unavailable non-required filter cannot silently leave a pointer file behind.
+
+All new Git inventories have hard deadlines and retained-byte, input-byte, entry-count, and path-length ceilings. An authorized non-recursive fetch first revalidates only that entry's original source binding; after all fetches finish, the helper creates any deferred checkout receipts and performs one complete plan revalidation. It does not rerun the full plan once per fetch.
+
 The core operation is:
 
 ```bash
@@ -113,6 +119,16 @@ Unsafe cases:
 - Worktree with local changes.
 
 Stop and report rather than deleting or overwriting.
+
+### Ignored Or Filtered Checkout Content
+
+An ignored untracked path that overlaps a managed target write is a preflight error even though ordinary `git status` omits it. Move or preserve that content outside the worktree and rerun; the helper will not ask Git to overwrite it.
+
+A target-tree `filter=<driver>` attribute is also a preflight error. Install/configure the filter separately and use an ordinary repository workflow that intentionally trusts it, or remove the attribute requirement in an authorized source change. This helper never treats a missing optional filter as a safe raw checkout.
+
+### Filesystem Name Aliases
+
+The plan binds name comparison to the target filesystem rather than always case-folding paths. On macOS it reads the volume's case capability and uses the platform's canonical Unicode comparison; on other supported hosts it uses the repository's filesystem probe recorded by `core.ignoreCase` / `core.precomposeUnicode`, with case-sensitive exact-name defaults when no contrary probe exists. A policy change between plan and apply blocks the operation.
 
 ## Example Large Repo Pattern
 
