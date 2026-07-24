@@ -22,8 +22,11 @@ superseded_by:
 - Only strict shared prefixes whose complete participant set belongs to the current parent's direct planned children are eligible.
 - Prefix traversal is descriptor-relative and no-follow from the held parent target; receipts bind directory-entry/object identity, owner, group, mode, and effective write/search access.
 - Parent-root and checkout-created shared-prefix receipts are validated and published as one plan-state update.
+- Deeper descendants collapse to their nearest direct-child worktree subtree when a recursive parent authorizes a shared prefix; ownership stops at each direct child's final root.
 - Unrelated checkout paths, final target roots, symlinks, replacement objects, and unsafe access policy remain untrusted.
-- New-registration failures remove the exact worktree through the held parent descriptor and verify target and registry cleanup.
+- New leaf and recursive-parent registrations remain provisional through final source, HEAD, common-gitdir, object-closure, and receipt validation.
+- Registration failures remove the exact worktree through the held parent descriptor, verify target and registry cleanup, and remove only still-matching transaction-created parent directories.
+- Pre-registration materialization failures remove exact created directory identities in reverse order; replacement, access drift, and non-empty state are preserved with a structured recovery location.
 
 ## Next Steps
 
@@ -37,4 +40,6 @@ superseded_by:
 - `tests/test_submodule_worktree_sync.py`
 - Eight focused recursive-parent/shared-prefix regressions passed in 45.770 seconds.
 - The complete helper suite passed 153 tests in 153.742 seconds.
+- Fresh-review follow-up: 16 shared-prefix/finalization/materialization regressions passed in 53.219 seconds, plus the access-policy drift regression passed independently.
+- The updated complete helper suite passed 160 tests in 147.698 seconds.
 - Ruff lint/format, Python compilation, helper `--help`, skill validation, project-journal validation, and `git diff --check` passed.

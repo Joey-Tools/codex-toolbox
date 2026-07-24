@@ -180,6 +180,37 @@ class FsFingerprint:
     permissions: int
 
 
+class TargetMaterializationCleanupError(PlanError):
+    def __init__(
+        self,
+        *,
+        status: str,
+        location: Path,
+        expected: Optional[FsFingerprint],
+        detail: str,
+    ) -> None:
+        self.status = status
+        self.location = location
+        self.expected = expected
+        expected_text = (
+            "unbound"
+            if expected is None
+            else (
+                f"dev={expected.device},ino={expected.inode},"
+                f"kind={expected.kind},uid={expected.owner},"
+                f"gid={expected.group},mode={expected.permissions:04o}"
+            )
+        )
+        super().__init__(
+            "target materialization cleanup is incomplete\n"
+            "  recovery_schema: target-materialization-cleanup-v1\n"
+            f"  recovery_status: {status}\n"
+            f"  recovery_location: {location}\n"
+            f"  expected_identity: {expected_text}\n"
+            f"  recovery_detail: {detail}"
+        )
+
+
 @dataclass(frozen=True)
 class ExecutableState:
     fingerprint: FsFingerprint
@@ -481,6 +512,7 @@ class MaterializedTargetLease:
     parent_descriptor: int
     entry_name: str
     created_nodes: tuple[CreatedTargetNode, ...] = ()
+    materialization_target: Optional[BoundTarget] = None
 
     def close(self) -> None:
         descriptors = (self.target_descriptor, self.parent_descriptor)
@@ -2707,17 +2739,37 @@ def record_materialized_shared_ancestors(
     commit_materialized_shared_ancestor_updates(plan, updates)
 
 
-def direct_child_target_parts(
+def recursive_parent_target_owners(
+    plan: SyncPlan,
+    owner_index: int,
+) -> dict[tuple[str, ...], tuple[str, ...]]:
+    if owner_index < 0 or owner_index >= len(plan.entries):
+        raise PlanError("checkout-created shared ancestor has an invalid owner index")
+    owner_by_index: dict[int, tuple[str, ...]] = {}
+    owner_by_target: dict[tuple[str, ...], tuple[str, ...]] = {}
+    for candidate_index, candidate in enumerate(plan.entries):
+        parent_index = candidate.parent_index
+        if parent_index == owner_index:
+            direct_owner = candidate.target.relative_parts
+        elif parent_index is not None and parent_index in owner_by_index:
+            direct_owner = owner_by_index[parent_index]
+        else:
+            continue
+        prior = owner_by_target.get(candidate.target.relative_parts)
+        if prior is not None and prior != direct_owner:
+            raise PlanError(
+                "recursive target belongs to multiple direct-child subtrees"
+            )
+        owner_by_index[candidate_index] = direct_owner
+        owner_by_target[candidate.target.relative_parts] = direct_owner
+    return owner_by_target
+
+
+def recursive_parent_subtree_target_parts(
     plan: SyncPlan,
     owner_index: int,
 ) -> frozenset[tuple[str, ...]]:
-    if owner_index < 0 or owner_index >= len(plan.entries):
-        raise PlanError("checkout-created shared ancestor has an invalid owner index")
-    return frozenset(
-        candidate.target.relative_parts
-        for candidate in plan.entries
-        if candidate.parent_index == owner_index
-    )
+    return frozenset(recursive_parent_target_owners(plan, owner_index))
 
 
 def capture_checkout_materialized_shared_ancestors(
@@ -2749,7 +2801,7 @@ def capture_checkout_materialized_shared_ancestors(
             "checkout-created shared ancestor lease does not match its parent target"
         )
 
-    child_targets = direct_child_target_parts(plan, owner_index)
+    target_owners = recursive_parent_target_owners(plan, owner_index)
     parent_parts = entry.target.relative_parts
     eligible: list[tuple[str, ...]] = []
     for relative_parts, ancestor in getattr(
@@ -2766,17 +2818,21 @@ def capture_checkout_materialized_shared_ancestors(
             continue
         if not ancestor.participant_targets:
             raise PlanError("checkout-created shared ancestor has no plan participants")
-        if not ancestor.participant_targets <= child_targets:
+        participant_owners = {
+            target_owners.get(participant)
+            for participant in ancestor.participant_targets
+        }
+        if None in participant_owners:
             continue
         if any(
-            len(target_parts) <= len(relative_parts)
-            or target_parts[: len(relative_parts)] != relative_parts
-            for target_parts in ancestor.participant_targets
+            direct_owner is None
+            or len(direct_owner) <= len(relative_parts)
+            or direct_owner[: len(relative_parts)] != relative_parts
+            for direct_owner in participant_owners
         ):
-            raise PlanError(
-                "checkout-created shared ancestor is not a strict prefix of "
-                "its plan-authorized descendants"
-            )
+            # A prefix beneath a direct child's final worktree root belongs
+            # to that child transaction, not to the recursive parent checkout.
+            continue
         eligible.append(relative_parts)
 
     captured: list[CreatedTargetNode] = []
@@ -2920,7 +2976,10 @@ def record_checkout_materialized_shared_ancestors(
     updates = prepare_materialized_shared_ancestor_updates(
         plan,
         created_nodes,
-        authorized_targets=direct_child_target_parts(plan, owner_index),
+        authorized_targets=recursive_parent_subtree_target_parts(
+            plan,
+            owner_index,
+        ),
         require_all_participants_authorized=True,
     )
     commit_materialized_shared_ancestor_updates(plan, updates)
@@ -3003,6 +3062,295 @@ def record_applied_target_root(
     revalidate_applied_target_root(plan, owner_index)
 
 
+def remove_created_target_node(
+    target: BoundTarget,
+    created_nodes: tuple[CreatedTargetNode, ...],
+    created: CreatedTargetNode,
+) -> None:
+    """Remove one transaction-created directory through its bound parent chain."""
+
+    root = target.existing_nodes[0]
+    expected_by_path = {node.path: node.fingerprint for node in target.existing_nodes}
+    expected_by_path.update(
+        {candidate.node.path: candidate.node.fingerprint for candidate in created_nodes}
+    )
+    current_descriptor = -1
+    leaf_descriptor = -1
+    try:
+        try:
+            current_descriptor = open_directory_descriptor(
+                root.path,
+                "target materialization cleanup root",
+            )
+        except PlanError as exc:
+            raise TargetMaterializationCleanupError(
+                status="root-unavailable",
+                location=root.path,
+                expected=root.fingerprint,
+                detail=str(exc),
+            ) from exc
+        current_path = root.path
+        current_fingerprint = fingerprint_from_stat(os.fstat(current_descriptor))
+        if current_fingerprint != root.fingerprint:
+            raise TargetMaterializationCleanupError(
+                status="root-identity-mismatch",
+                location=root.path,
+                expected=root.fingerprint,
+                detail="cleanup root no longer names the preflight object",
+            )
+
+        for part in created.relative_parts[:-1]:
+            validate_descriptor_entry_name(part)
+            child_path = current_path / part
+            expected = expected_by_path.get(child_path)
+            if expected is None:
+                raise TargetMaterializationCleanupError(
+                    status="parent-chain-unbound",
+                    location=child_path,
+                    expected=None,
+                    detail="cleanup parent is outside the materialization receipt",
+                )
+            try:
+                revalidate_directory_descriptor(
+                    AccessBinding(
+                        path=current_path,
+                        fingerprint=current_fingerprint,
+                        mode=os.X_OK,
+                        purpose="target materialization cleanup traversal",
+                    ),
+                    current_descriptor,
+                )
+                entry_before = fingerprint_from_stat(
+                    os.stat(
+                        part,
+                        dir_fd=current_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+            except FileNotFoundError as exc:
+                raise TargetMaterializationCleanupError(
+                    status="parent-chain-missing",
+                    location=child_path,
+                    expected=expected,
+                    detail="a cleanup parent disappeared",
+                ) from exc
+            except (OSError, PlanError) as exc:
+                raise TargetMaterializationCleanupError(
+                    status="parent-chain-unreadable",
+                    location=child_path,
+                    expected=expected,
+                    detail=str(exc),
+                ) from exc
+            if entry_before != expected or entry_before.kind != stat.S_IFDIR:
+                raise TargetMaterializationCleanupError(
+                    status="parent-identity-mismatch",
+                    location=child_path,
+                    expected=expected,
+                    detail="a cleanup parent was replaced or its policy changed",
+                )
+            child_descriptor = -1
+            try:
+                child_descriptor = os.open(
+                    part,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                    dir_fd=current_descriptor,
+                )
+                child_fingerprint = fingerprint_from_stat(os.fstat(child_descriptor))
+                entry_after = fingerprint_from_stat(
+                    os.stat(
+                        part,
+                        dir_fd=current_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+            except OSError as exc:
+                if child_descriptor >= 0:
+                    os.close(child_descriptor)
+                raise TargetMaterializationCleanupError(
+                    status="parent-chain-unreadable",
+                    location=child_path,
+                    expected=expected,
+                    detail=str(exc),
+                ) from exc
+            if child_fingerprint != expected or entry_after != expected:
+                os.close(child_descriptor)
+                raise TargetMaterializationCleanupError(
+                    status="parent-identity-mismatch",
+                    location=child_path,
+                    expected=expected,
+                    detail="a cleanup parent changed during descriptor binding",
+                )
+            os.close(current_descriptor)
+            current_descriptor = child_descriptor
+            current_path = child_path
+            current_fingerprint = child_fingerprint
+
+        leaf_name = created.relative_parts[-1]
+        validate_descriptor_entry_name(leaf_name)
+        try:
+            revalidate_directory_descriptor(
+                AccessBinding(
+                    path=current_path,
+                    fingerprint=current_fingerprint,
+                    mode=os.W_OK | os.X_OK,
+                    purpose="target materialization cleanup parent",
+                ),
+                current_descriptor,
+            )
+        except PlanError as exc:
+            raise TargetMaterializationCleanupError(
+                status="parent-access-or-identity-drift",
+                location=current_path,
+                expected=current_fingerprint,
+                detail=str(exc),
+            ) from exc
+        if not probe_access_at(
+            current_descriptor,
+            ".",
+            os.W_OK | os.X_OK,
+        ):
+            raise TargetMaterializationCleanupError(
+                status="parent-access-blocked",
+                location=current_path,
+                expected=current_fingerprint,
+                detail="cleanup parent lacks effective write/search access",
+            )
+        try:
+            entry_before = fingerprint_from_stat(
+                os.stat(
+                    leaf_name,
+                    dir_fd=current_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise TargetMaterializationCleanupError(
+                status="entry-unreadable",
+                location=created.node.path,
+                expected=created.node.fingerprint,
+                detail=str(exc),
+            ) from exc
+        if (
+            entry_before != created.node.fingerprint
+            or entry_before.kind != stat.S_IFDIR
+        ):
+            raise TargetMaterializationCleanupError(
+                status="entry-identity-mismatch",
+                location=created.node.path,
+                expected=created.node.fingerprint,
+                detail="transaction-created directory was replaced or its policy changed",
+            )
+        try:
+            leaf_descriptor = os.open(
+                leaf_name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                dir_fd=current_descriptor,
+            )
+            leaf_fingerprint = fingerprint_from_stat(os.fstat(leaf_descriptor))
+            entry_after = fingerprint_from_stat(
+                os.stat(
+                    leaf_name,
+                    dir_fd=current_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+        except OSError as exc:
+            raise TargetMaterializationCleanupError(
+                status="entry-unreadable",
+                location=created.node.path,
+                expected=created.node.fingerprint,
+                detail=str(exc),
+            ) from exc
+        if (
+            leaf_fingerprint != created.node.fingerprint
+            or entry_after != created.node.fingerprint
+        ):
+            raise TargetMaterializationCleanupError(
+                status="entry-identity-mismatch",
+                location=created.node.path,
+                expected=created.node.fingerprint,
+                detail="transaction-created directory changed during cleanup binding",
+            )
+        try:
+            os.rmdir(leaf_name, dir_fd=current_descriptor)
+        except OSError as exc:
+            raise TargetMaterializationCleanupError(
+                status=(
+                    "entry-not-empty"
+                    if exc.errno in {errno.ENOTEMPTY, errno.EEXIST}
+                    else "rmdir-failed"
+                ),
+                location=created.node.path,
+                expected=created.node.fingerprint,
+                detail=str(exc),
+            ) from exc
+        if fingerprint_from_stat(os.fstat(leaf_descriptor)) != created.node.fingerprint:
+            raise TargetMaterializationCleanupError(
+                status="removed-object-identity-drift",
+                location=created.node.path,
+                expected=created.node.fingerprint,
+                detail="the opened directory identity changed during rmdir",
+            )
+        try:
+            os.stat(
+                leaf_name,
+                dir_fd=current_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise TargetMaterializationCleanupError(
+                status="post-rmdir-unreadable",
+                location=created.node.path,
+                expected=created.node.fingerprint,
+                detail=str(exc),
+            ) from exc
+        else:
+            raise TargetMaterializationCleanupError(
+                status="post-rmdir-replacement",
+                location=created.node.path,
+                expected=created.node.fingerprint,
+                detail="an entry appeared at the cleaned name",
+            )
+        try:
+            revalidate_directory_descriptor(
+                AccessBinding(
+                    path=current_path,
+                    fingerprint=current_fingerprint,
+                    mode=os.W_OK | os.X_OK,
+                    purpose="target materialization cleanup parent",
+                ),
+                current_descriptor,
+            )
+        except PlanError as exc:
+            raise TargetMaterializationCleanupError(
+                status="parent-post-rmdir-drift",
+                location=current_path,
+                expected=current_fingerprint,
+                detail=str(exc),
+            ) from exc
+    finally:
+        if leaf_descriptor >= 0:
+            os.close(leaf_descriptor)
+        if current_descriptor >= 0:
+            os.close(current_descriptor)
+
+
+def cleanup_materialized_target_nodes(
+    target: BoundTarget,
+    created_nodes: tuple[CreatedTargetNode, ...],
+) -> None:
+    for created in reversed(created_nodes):
+        remove_created_target_node(
+            target,
+            created_nodes,
+            created,
+        )
+
+
 def materialize_bound_target_directory(
     target: BoundTarget,
 ) -> MaterializedTargetLease:
@@ -3021,6 +3369,8 @@ def materialize_bound_target_directory(
     parent_descriptor = -1
     target_descriptor = -1
     created_nodes: list[CreatedTargetNode] = []
+    unbound_created_path: Optional[Path] = None
+    lease: Optional[MaterializedTargetLease] = None
     try:
         root_binding = AccessBinding(
             path=root.path,
@@ -3056,6 +3406,38 @@ def materialize_bound_target_directory(
                         f"  path: {child_path}\n"
                         f"  error: {exc}"
                     ) from exc
+                unbound_created_path = child_path
+                # Portable mkdirat does not return a descriptor. The first
+                # no-follow entry snapshot plus the immediately following
+                # open/fstat/entry recheck defines the created-object receipt.
+                # A malicious same-UID replacement before that first snapshot
+                # is outside this portable cooperative-race guarantee.
+                try:
+                    created_fingerprint = fingerprint_from_stat(
+                        os.stat(
+                            part,
+                            dir_fd=current_descriptor,
+                            follow_symlinks=False,
+                        )
+                    )
+                except OSError as exc:
+                    raise PlanError(
+                        "cannot bind newly created target directory\n"
+                        f"  path: {child_path}\n"
+                        f"  error: {exc}"
+                    ) from exc
+                if created_fingerprint.kind != stat.S_IFDIR:
+                    raise PlanError(
+                        "newly created target entry is not a directory\n"
+                        f"  path: {child_path}"
+                    )
+                created_nodes.append(
+                    CreatedTargetNode(
+                        relative_parts=target.relative_parts[: index + 1],
+                        node=BoundNode(child_path, created_fingerprint),
+                    )
+                )
+                unbound_created_path = None
             try:
                 child_descriptor = os.open(
                     part,
@@ -3072,6 +3454,15 @@ def materialize_bound_target_directory(
             if expected is not None and child_fingerprint != expected:
                 os.close(child_descriptor)
                 raise PlanError(f"target-path object or policy changed: {child_path}")
+            if (
+                expected is None
+                and child_fingerprint != created_nodes[-1].node.fingerprint
+            ):
+                os.close(child_descriptor)
+                raise PlanError(
+                    "newly created target directory changed before descriptor binding\n"
+                    f"  path: {child_path}"
+                )
             try:
                 path_fingerprint = fingerprint_from_stat(
                     os.stat(
@@ -3092,13 +3483,6 @@ def materialize_bound_target_directory(
                 raise PlanError(
                     "target directory entry changed during descriptor binding\n"
                     f"  path: {child_path}"
-                )
-            if expected is None:
-                created_nodes.append(
-                    CreatedTargetNode(
-                        relative_parts=target.relative_parts[: index + 1],
-                        node=BoundNode(child_path, child_fingerprint),
-                    )
                 )
             if index == len(target.relative_parts) - 1:
                 parent_descriptor = current_descriptor
@@ -3135,16 +3519,57 @@ def materialize_bound_target_directory(
             parent_descriptor=parent_descriptor,
             entry_name=target.relative_parts[-1],
             created_nodes=tuple(created_nodes),
+            materialization_target=target,
         )
         revalidate_materialized_target_lease(lease)
         return lease
-    except Exception:
-        if target_descriptor >= 0:
-            os.close(target_descriptor)
-        if parent_descriptor >= 0:
-            os.close(parent_descriptor)
-        if current_descriptor >= 0:
-            os.close(current_descriptor)
+    except BaseException as exc:
+        descriptor_cleanup_error: Optional[BaseException] = None
+        if lease is not None:
+            try:
+                lease.close()
+            except BaseException as cleanup_exc:
+                descriptor_cleanup_error = cleanup_exc
+            parent_descriptor = -1
+            target_descriptor = -1
+        for descriptor in (
+            target_descriptor,
+            parent_descriptor,
+            current_descriptor,
+        ):
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except BaseException as cleanup_exc:
+                if descriptor_cleanup_error is None:
+                    descriptor_cleanup_error = cleanup_exc
+
+        recovery_error: Optional[BaseException] = None
+        if unbound_created_path is not None:
+            recovery_error = TargetMaterializationCleanupError(
+                status="created-identity-unbound",
+                location=unbound_created_path,
+                expected=None,
+                detail="mkdir succeeded but the new object could not be safely bound",
+            )
+        else:
+            try:
+                cleanup_materialized_target_nodes(
+                    target,
+                    tuple(created_nodes),
+                )
+            except BaseException as cleanup_exc:
+                recovery_error = cleanup_exc
+        if descriptor_cleanup_error is not None and recovery_error is None:
+            recovery_error = TargetMaterializationCleanupError(
+                status="descriptor-cleanup-failed",
+                location=target.path,
+                expected=None,
+                detail=str(descriptor_cleanup_error),
+            )
+        if recovery_error is not None:
+            raise PlanError(f"{exc}\n{recovery_error}") from exc
         raise
 
 
@@ -7128,11 +7553,17 @@ def add_worktree(
 
         rollback_error: Optional[BaseException] = None
         should_rollback = registered
+        registry_known_clean = not registration_attempted
         if registration_attempted and not should_rollback:
             try:
                 should_rollback = (
-                    registered_target_path(source_git_dir, worktree_path) is not None
+                    registered_target_path(
+                        source_git_dir,
+                        worktree_path,
+                    )
+                    is not None
                 )
+                registry_known_clean = not should_rollback
             except BaseException as registry_exc:
                 rollback_error = registry_exc
         if should_rollback:
@@ -7141,6 +7572,20 @@ def add_worktree(
                     source_git_dir,
                     lease,
                     source_lease,
+                )
+                registry_known_clean = True
+            except BaseException as cleanup_exc:
+                rollback_error = cleanup_exc
+                registry_known_clean = False
+        if (
+            registry_known_clean
+            and lease.materialization_target is not None
+            and lease.created_nodes
+        ):
+            try:
+                cleanup_materialized_target_nodes(
+                    lease.materialization_target,
+                    lease.created_nodes,
                 )
             except BaseException as cleanup_exc:
                 rollback_error = cleanup_exc
@@ -7151,7 +7596,9 @@ def add_worktree(
                 f"control receipt cleanup failed: {control_cleanup_error}"
             )
         if rollback_error is not None:
-            cleanup_details.append(f"worktree rollback failed: {rollback_error}")
+            cleanup_details.append(
+                f"worktree/materialization rollback failed: {rollback_error}"
+            )
         if cleanup_details:
             raise PlanError(f"{exc}\n" + "\n".join(cleanup_details)) from exc
         raise
@@ -8971,6 +9418,31 @@ def postvalidate_applied_entry(
     revalidate_materialized_target_lease(lease)
 
 
+def finalize_leaf_checkout(
+    plan: SyncPlan,
+    entry: PlannedWorktree,
+    lease: MaterializedTargetLease,
+) -> None:
+    """Commit leaf receipts only after every final checkout check passes."""
+
+    ancestors = getattr(plan, "shared_missing_ancestors", {})
+    prior_shared_nodes = {
+        relative_parts: ancestor.materialized_node
+        for relative_parts, ancestor in ancestors.items()
+    }
+    try:
+        postvalidate_applied_entry(entry, lease)
+        record_materialized_shared_ancestors(
+            plan,
+            entry,
+            lease.created_nodes,
+        )
+    except BaseException:
+        for relative_parts, materialized_node in prior_shared_nodes.items():
+            ancestors[relative_parts].materialized_node = materialized_node
+        raise
+
+
 def finalize_recursive_parent_checkout(
     plan: SyncPlan,
     owner_index: int,
@@ -8997,7 +9469,10 @@ def finalize_recursive_parent_checkout(
         updates = prepare_materialized_shared_ancestor_updates(
             plan,
             checkout_created,
-            authorized_targets=direct_child_target_parts(plan, owner_index),
+            authorized_targets=recursive_parent_subtree_target_parts(
+                plan,
+                owner_index,
+            ),
             require_all_participants_authorized=True,
         )
         updates = prepare_materialized_shared_ancestor_updates(
@@ -9095,11 +9570,10 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                         lease,
                     )
                 else:
-                    postvalidate_applied_entry(entry, lease)
-                    record_materialized_shared_ancestors(
+                    finalize_leaf_checkout(
                         plan,
                         entry,
-                        lease.created_nodes,
+                        lease,
                     )
             else:
                 if index in recursive_parent_indexes:
@@ -9109,11 +9583,14 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                         entry.sha,
                         dry_run=False,
                         lease=lease,
-                        finalize_checkout=lambda: finalize_recursive_parent_checkout(
-                            plan,
-                            index,
-                            entry,
-                            lease,
+                        finalize_checkout=lambda current_plan=plan,
+                        current_index=index,
+                        current_entry=entry,
+                        current_lease=lease: finalize_recursive_parent_checkout(
+                            current_plan,
+                            current_index,
+                            current_entry,
+                            current_lease,
                         ),
                     )
                 else:
@@ -9123,12 +9600,13 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                         entry.sha,
                         dry_run=False,
                         lease=lease,
-                    )
-                    postvalidate_applied_entry(entry, lease)
-                    record_materialized_shared_ancestors(
-                        plan,
-                        entry,
-                        lease.created_nodes,
+                        finalize_checkout=lambda current_plan=plan,
+                        current_entry=entry,
+                        current_lease=lease: finalize_leaf_checkout(
+                            current_plan,
+                            current_entry,
+                            current_lease,
+                        ),
                     )
         finally:
             lease.close()

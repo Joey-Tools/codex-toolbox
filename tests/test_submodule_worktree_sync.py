@@ -13,7 +13,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from unittest import mock
 
 
@@ -229,6 +229,82 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             fetch_missing=False,
         )
         return plan, target_super, parent_source, tuple(child_results)
+
+    def make_grouped_recursive_plan_with_grandchild(
+        self,
+        scenario: str,
+    ) -> tuple[MODULE.SyncPlan, Path, Path]:
+        grandchild_remote, grandchild_sha = self.create_gitlink_remote(
+            f"{scenario}-grandchild",
+        )
+        left_remote, left_sha = self.create_gitlink_remote(
+            f"{scenario}-left",
+            (
+                (
+                    "grandchild",
+                    "nested/grandchild",
+                    grandchild_remote,
+                    grandchild_sha,
+                ),
+            ),
+        )
+        right_remote, right_sha = self.create_gitlink_remote(
+            f"{scenario}-right",
+        )
+        parent_remote, parent_sha = self.create_gitlink_remote(
+            f"{scenario}-parent",
+            (
+                ("left", "group/left", left_remote, left_sha),
+                ("right", "group/right", right_remote, right_sha),
+            ),
+        )
+
+        source_common = self.root / f"{scenario}-source" / ".git"
+        parent_source = source_common / "modules" / "parent"
+        left_source = parent_source / "modules" / "left"
+        self.clone_recursive_source(
+            parent_source,
+            parent_remote,
+            f"{scenario}-parent-standard",
+        )
+        self.clone_recursive_source(
+            left_source,
+            left_remote,
+            f"{scenario}-left-standard",
+        )
+        self.clone_recursive_source(
+            left_source / "modules" / "grandchild",
+            grandchild_remote,
+            f"{scenario}-grandchild-standard",
+        )
+        self.clone_recursive_source(
+            parent_source / "modules" / "right",
+            right_remote,
+            f"{scenario}-right-standard",
+        )
+
+        target_super = self.root / f"{scenario}-target"
+        target_super.mkdir()
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=source_common,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "parent",
+                        "parent",
+                        str(parent_remote),
+                    ),
+                    parent_sha,
+                )
+            ],
+            depth=1,
+            recursive=True,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        return plan, target_super, parent_source
 
     def fetch_source(self, source_git_dir: Path) -> None:
         run_git(
@@ -5193,6 +5269,490 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             )
         )
 
+    def test_recursive_parent_collapses_grandchild_to_direct_child_subtree(
+        self,
+    ) -> None:
+        plan, target_super, _parent_source = (
+            self.make_grouped_recursive_plan_with_grandchild(
+                "checkout-grandchild-owner",
+            )
+        )
+        group_parts = ("parent", "group")
+        self.assertEqual(
+            plan.shared_missing_ancestors[group_parts].participant_targets,
+            frozenset(
+                {
+                    ("parent", "group", "left"),
+                    (
+                        "parent",
+                        "group",
+                        "left",
+                        "nested",
+                        "grandchild",
+                    ),
+                    ("parent", "group", "right"),
+                }
+            ),
+        )
+        self.assertEqual(
+            MODULE.recursive_parent_target_owners(plan, 0),
+            {
+                ("parent", "group", "left"): (
+                    "parent",
+                    "group",
+                    "left",
+                ),
+                (
+                    "parent",
+                    "group",
+                    "left",
+                    "nested",
+                    "grandchild",
+                ): ("parent", "group", "left"),
+                ("parent", "group", "right"): (
+                    "parent",
+                    "group",
+                    "right",
+                ),
+            },
+        )
+
+        with redirect_stdout(io.StringIO()):
+            MODULE.apply_sync_plan(plan)
+
+        receipt = plan.shared_missing_ancestors[group_parts].materialized_node
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(
+            receipt.fingerprint,
+            MODULE.filesystem_fingerprint(target_super / "parent/group"),
+        )
+        for relative_path in (
+            "parent/group/left",
+            "parent/group/left/nested/grandchild",
+            "parent/group/right",
+        ):
+            self.assertEqual(
+                run_git(target_super / relative_path, "status", "--porcelain"),
+                "",
+            )
+
+    def test_recursive_parent_grandchild_plan_detects_shared_prefix_replacement_at_boundaries(
+        self,
+    ) -> None:
+        triggers = {
+            "before-first-subtree": ("parent", "group", "left"),
+            "between-direct-subtrees": ("parent", "group", "right"),
+        }
+        for boundary, trigger_parts in triggers.items():
+            with self.subTest(boundary=boundary):
+                scenario = f"checkout-grandchild-replace-{boundary}"
+                plan, target_super, parent_source = (
+                    self.make_grouped_recursive_plan_with_grandchild(
+                        scenario,
+                    )
+                )
+                right_source = parent_source / "modules" / "right"
+                right_registry_before = run_git(
+                    self.root,
+                    f"--git-dir={right_source}",
+                    "worktree",
+                    "list",
+                    "--porcelain",
+                )
+                original_revalidate = MODULE.revalidate_planned_entry
+                quarantined = self.root / f"{scenario}-quarantined"
+                replaced = False
+
+                def replace_group_at_boundary(
+                    current_plan: object,
+                    current_entry: object,
+                    *,
+                    allow_parent_materialization: bool = False,
+                ) -> object:
+                    nonlocal replaced
+                    if (
+                        not replaced
+                        and current_entry.target.relative_parts == trigger_parts
+                        and plan.shared_missing_ancestors[
+                            ("parent", "group")
+                        ].materialized_node
+                        is not None
+                    ):
+                        replaced = True
+                        group = target_super / "parent/group"
+                        group.rename(quarantined)
+                        group.mkdir()
+                    return original_revalidate(
+                        current_plan,
+                        current_entry,
+                        allow_parent_materialization=allow_parent_materialization,
+                    )
+
+                with mock.patch.object(
+                    MODULE,
+                    "revalidate_planned_entry",
+                    side_effect=replace_group_at_boundary,
+                ):
+                    with redirect_stdout(io.StringIO()):
+                        with self.assertRaisesRegex(
+                            MODULE.PlanError,
+                            "plan-owned shared target ancestor changed",
+                        ):
+                            MODULE.apply_sync_plan(plan)
+
+                self.assertTrue(replaced)
+                self.assertTrue((target_super / "parent/group").is_dir())
+                self.assertTrue(quarantined.is_dir())
+                self.assertEqual(
+                    run_git(
+                        self.root,
+                        f"--git-dir={right_source}",
+                        "worktree",
+                        "list",
+                        "--porcelain",
+                    ),
+                    right_registry_before,
+                )
+
+    def test_new_leaf_finalization_failures_restore_target_and_registry(
+        self,
+    ) -> None:
+        stages = (
+            "source-access",
+            "source-completeness",
+            "source-admission",
+            "head",
+            "common-gitdir",
+            "object-closure",
+            "shared-receipt",
+        )
+        for stage in stages:
+            with self.subTest(stage=stage):
+                target, module, input_receipt = self.make_target_superproject(
+                    f"leaf-finalize-{stage}",
+                    self.sha,
+                )
+                plan = MODULE.build_sync_plan(
+                    root=target,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[(module, self.sha)],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    fetch_missing=False,
+                    input_receipt=input_receipt,
+                )
+                entry = plan.entries[0]
+                registry_before = run_git(
+                    self.root,
+                    f"--git-dir={entry.source_git_dir}",
+                    "worktree",
+                    "list",
+                    "--porcelain",
+                )
+                final_target = target / module.path
+
+                def registration_exists() -> bool:
+                    return (
+                        MODULE.registered_target_path(
+                            entry.source_git_dir,
+                            final_target,
+                        )
+                        is not None
+                    )
+
+                with ExitStack() as patches:
+                    if stage == "source-access":
+                        original = MODULE.revalidate_access
+
+                        def fail_source_access(binding: object) -> None:
+                            if (
+                                registration_exists()
+                                and binding in entry.source_bindings
+                            ):
+                                raise MODULE.PlanError(
+                                    "injected final source-access failure"
+                                )
+                            original(binding)
+
+                        patches.enter_context(
+                            mock.patch.object(
+                                MODULE,
+                                "revalidate_access",
+                                side_effect=fail_source_access,
+                            )
+                        )
+                    elif stage == "source-completeness":
+                        original = MODULE.revalidate_source_completeness_receipt
+
+                        def fail_source_completeness(*args: object) -> None:
+                            if registration_exists():
+                                raise MODULE.PlanError(
+                                    "injected final source-completeness failure"
+                                )
+                            original(*args)
+
+                        patches.enter_context(
+                            mock.patch.object(
+                                MODULE,
+                                "revalidate_source_completeness_receipt",
+                                side_effect=fail_source_completeness,
+                            )
+                        )
+                    elif stage == "source-admission":
+                        original = MODULE.revalidate_source_object_admission
+
+                        def fail_source_admission(*args: object) -> None:
+                            if registration_exists():
+                                raise MODULE.PlanError(
+                                    "injected final source-admission failure"
+                                )
+                            original(*args)
+
+                        patches.enter_context(
+                            mock.patch.object(
+                                MODULE,
+                                "revalidate_source_object_admission",
+                                side_effect=fail_source_admission,
+                            )
+                        )
+                    elif stage == "head":
+                        patches.enter_context(
+                            mock.patch.object(
+                                MODULE,
+                                "managed_head_at_descriptor",
+                                side_effect=MODULE.PlanError(
+                                    "injected final HEAD failure"
+                                ),
+                            )
+                        )
+                    elif stage == "common-gitdir":
+                        patches.enter_context(
+                            mock.patch.object(
+                                MODULE,
+                                "common_git_dir_at_descriptor",
+                                side_effect=MODULE.PlanError(
+                                    "injected final common-gitdir failure"
+                                ),
+                            )
+                        )
+                    elif stage == "object-closure":
+                        original = MODULE.target_object_closure
+
+                        def fail_object_closure(*args: object) -> object:
+                            if registration_exists():
+                                raise MODULE.PlanError(
+                                    "injected final object-closure failure"
+                                )
+                            return original(*args)
+
+                        patches.enter_context(
+                            mock.patch.object(
+                                MODULE,
+                                "target_object_closure",
+                                side_effect=fail_object_closure,
+                            )
+                        )
+                    else:
+                        patches.enter_context(
+                            mock.patch.object(
+                                MODULE,
+                                "record_materialized_shared_ancestors",
+                                side_effect=MODULE.PlanError(
+                                    "injected final shared-receipt failure"
+                                ),
+                            )
+                        )
+
+                    with redirect_stdout(io.StringIO()):
+                        with self.assertRaisesRegex(
+                            MODULE.PlanError,
+                            "injected final",
+                        ) as raised:
+                            MODULE.apply_sync_plan(plan)
+
+                self.assertNotIn(
+                    "worktree/materialization rollback failed",
+                    str(raised.exception),
+                )
+                self.assertFalse(final_target.exists())
+                self.assertFalse((target / "third_party").exists())
+                self.assertEqual(
+                    run_git(
+                        self.root,
+                        f"--git-dir={entry.source_git_dir}",
+                        "worktree",
+                        "list",
+                        "--porcelain",
+                    ),
+                    registry_before,
+                )
+                self.assertTrue(
+                    all(
+                        ancestor.materialized_node is None
+                        for ancestor in plan.shared_missing_ancestors.values()
+                    )
+                )
+
+    def test_materialization_open_failure_cleans_created_parent_chain(self) -> None:
+        target_root = self.root / "materialize-open-cleanup"
+        target_root.mkdir()
+        target = MODULE.bind_target_path(
+            target_root,
+            ("one", "two", "three"),
+            "materialization cleanup test",
+        )
+        original_open = MODULE.os.open
+        failed = False
+
+        def fail_middle_open(
+            path: object,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal failed
+            if not failed and path == "two" and dir_fd is not None:
+                failed = True
+                raise OSError(errno.EIO, "injected directory open failure")
+            return original_open(
+                path,
+                flags,
+                mode,
+                dir_fd=dir_fd,
+            )
+
+        with mock.patch.object(
+            MODULE.os,
+            "open",
+            side_effect=fail_middle_open,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "cannot open descriptor-relative target directory",
+            ) as raised:
+                MODULE.materialize_bound_target_directory(target)
+
+        self.assertTrue(failed)
+        self.assertNotIn("recovery_schema", str(raised.exception))
+        self.assertFalse((target_root / "one").exists())
+
+    def test_materialization_final_validation_failure_cleans_all_levels(
+        self,
+    ) -> None:
+        target_root = self.root / "materialize-final-cleanup"
+        target_root.mkdir()
+        target = MODULE.bind_target_path(
+            target_root,
+            ("one", "two", "three"),
+            "materialization cleanup test",
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "revalidate_materialized_target_lease",
+            side_effect=MODULE.PlanError("injected final lease failure"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "injected final lease failure",
+            ) as raised:
+                MODULE.materialize_bound_target_directory(target)
+
+        self.assertNotIn("recovery_schema", str(raised.exception))
+        self.assertFalse((target_root / "one").exists())
+
+    def test_materialization_cleanup_preserves_replaced_boundary_with_recovery(
+        self,
+    ) -> None:
+        for boundary in ("one", "two", "three"):
+            with self.subTest(boundary=boundary):
+                target_root = self.root / f"materialize-replaced-{boundary}"
+                target_root.mkdir()
+                target = MODULE.bind_target_path(
+                    target_root,
+                    ("one", "two", "three"),
+                    "materialization replacement test",
+                )
+                quarantine = self.root / f"materialize-original-{boundary}"
+                replaced = False
+
+                def replace_boundary(_lease: object) -> None:
+                    nonlocal replaced
+                    replaced = True
+                    boundary_path = target_root.joinpath(
+                        *("one", "two", "three")[
+                            : ("one", "two", "three").index(boundary) + 1
+                        ]
+                    )
+                    boundary_path.rename(quarantine)
+                    boundary_path.mkdir()
+                    raise MODULE.PlanError("injected final lease replacement failure")
+
+                with mock.patch.object(
+                    MODULE,
+                    "revalidate_materialized_target_lease",
+                    side_effect=replace_boundary,
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.PlanError,
+                        "recovery_schema: target-materialization-cleanup-v1",
+                    ) as raised:
+                        MODULE.materialize_bound_target_directory(target)
+
+                boundary_path = target_root.joinpath(
+                    *("one", "two", "three")[
+                        : ("one", "two", "three").index(boundary) + 1
+                    ]
+                )
+                self.assertTrue(replaced)
+                self.assertTrue(boundary_path.is_dir())
+                self.assertTrue(quarantine.is_dir())
+                self.assertIn(
+                    f"recovery_location: {boundary_path.resolve()}",
+                    str(raised.exception),
+                )
+
+    def test_materialization_cleanup_preserves_access_policy_drift(
+        self,
+    ) -> None:
+        target_root = self.root / "materialize-access-drift"
+        target_root.mkdir()
+        target = MODULE.bind_target_path(
+            target_root,
+            ("one", "two", "three"),
+            "materialization access-policy test",
+        )
+        drifted_path = target_root / "one/two"
+
+        def change_mode_then_fail(_lease: object) -> None:
+            drifted_path.chmod(0o555)
+            raise MODULE.PlanError("injected final access-policy failure")
+
+        with mock.patch.object(
+            MODULE,
+            "revalidate_materialized_target_lease",
+            side_effect=change_mode_then_fail,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "recovery_schema: target-materialization-cleanup-v1",
+            ) as raised:
+                MODULE.materialize_bound_target_directory(target)
+
+        self.assertTrue(drifted_path.is_dir())
+        self.assertEqual(
+            stat.S_IMODE(drifted_path.stat().st_mode),
+            0o555,
+        )
+        self.assertIn(
+            f"recovery_location: {drifted_path.resolve()}",
+            str(raised.exception),
+        )
+
     def test_recursive_apply_two_level_chain_uses_each_parent_receipt(
         self,
     ) -> None:
@@ -6671,10 +7231,13 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             dry_run: bool,
             *,
             lease: object | None = None,
+            finalize_checkout: object | None = None,
         ) -> None:
             self.assertFalse(dry_run)
             self.assertIsNotNone(lease)
             events.append(f"add:{target.name}")
+            if callable(finalize_checkout):
+                finalize_checkout()
 
         lease = mock.MagicMock()
         with mock.patch.object(MODULE, "validate_sync_plan", side_effect=validate):
