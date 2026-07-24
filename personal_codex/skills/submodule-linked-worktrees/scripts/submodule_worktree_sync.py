@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path, PureWindowsPath
 import re
+import secrets
 import selectors
 import shlex
 import shutil
@@ -38,6 +39,8 @@ MAX_CHECKOUT_PATHS = 250_000
 MAX_CHECKOUT_PATH_BYTES = 4096
 MAX_CHECKOUT_PATH_COMPONENTS = 1_000_000
 MAX_CHECKOUT_ACCESS_BINDINGS = 500_000
+MAX_CHECKOUT_OBJECTS = 500_000
+MAX_CHECKOUT_LOGICAL_BYTES = 64 * 1024 * 1024 * 1024
 MAX_NAME_POLICY_PROBE_ENTRIES = 256
 MAX_REGISTERED_WORKTREE_FIELDS = 1_000_000
 MAX_PLANNED_WORKTREES = 250_000
@@ -47,12 +50,15 @@ MAX_GIT_PATHSPEC_BATCHES = 4096
 MAX_GITMODULES_FILE_BYTES = 4 * 1024 * 1024
 MAX_GITMODULES_RETAINED_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_CONFIG_BYTES = 4 * 1024 * 1024
+MAX_GITDIR_FILE_BYTES = 64 * 1024
 MAX_SOURCE_SHALLOW_BYTES = 64 * 1024 * 1024
 MAX_SUPERPROJECT_INDEX_BYTES = 512 * 1024 * 1024
 MAX_TRANSPORT_EXECUTABLE_BYTES = 128 * 1024 * 1024
 MAX_CONFIG_ENTRIES = 100_000
 SOURCE_SHALLOW_NAME = "shallow"
 SOURCE_SHALLOW_LOCK_NAME = "shallow.lock"
+SOURCE_FETCH_TRANSACTION_NAME = "codex-submodule-fetch.pending"
+MAX_SOURCE_FETCH_TRANSACTION_BYTES = 64 * 1024
 LINUX_RENAME_NOREPLACE = 0x00000001
 LINUX_RENAME_EXCHANGE = 0x00000002
 DARWIN_RENAME_SWAP = 0x00000002
@@ -282,7 +288,100 @@ class CheckoutPreflight:
     index_entry_count: Optional[int]
     path_count: int
     path_digest: str
+    object_count: int
+    object_logical_bytes: int
+    object_digest: str
     changes: tuple[TreeChange, ...]
+
+
+@dataclass(frozen=True)
+class ObjectClosureReceipt:
+    object_count: int
+    logical_bytes: int
+    digest: str
+
+
+@dataclass(frozen=True)
+class SourceCompletenessReceipt:
+    gitdir_binding: AccessBinding
+    config_binding: FileContentBinding
+    objects_binding: AccessBinding
+    alternates_parent_binding: AccessBinding
+    pack_binding: Optional[AccessBinding]
+
+
+@dataclass
+class DirectoryEntryLease:
+    path: Path
+    binding: AccessBinding
+    descriptor: int
+    parent_binding: AccessBinding
+    parent_descriptor: int
+    entry_name: str
+
+    def close(self) -> None:
+        descriptors = (self.descriptor, self.parent_descriptor)
+        self.descriptor = -1
+        self.parent_descriptor = -1
+        first_error: Optional[OSError] = None
+        for descriptor in descriptors:
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise PlanError(
+                f"directory-entry lease cleanup failed: {first_error}"
+            ) from first_error
+
+
+@dataclass
+class ManagedControlReceipt:
+    git_file_binding: FileContentBinding
+    admin_git_dir: Path
+    admin_lease: DirectoryEntryLease
+    admin_gitdir_binding: FileContentBinding
+
+    def close(self) -> None:
+        self.admin_lease.close()
+
+
+@dataclass
+class SourceFetchTransaction:
+    source_git_dir: Path
+    directory_binding: AccessBinding
+    directory_descriptor: int
+    fence_binding: FileContentBinding
+    fence_descriptor: int
+    transaction_id: str
+    active: bool = True
+
+    def close_descriptors(self) -> None:
+        descriptors = (self.fence_descriptor, self.directory_descriptor)
+        self.fence_descriptor = -1
+        self.directory_descriptor = -1
+        first_error: Optional[OSError] = None
+        for descriptor in descriptors:
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise PlanError(
+                f"source fetch descriptor cleanup failed: {first_error}"
+            ) from first_error
+
+    def __del__(self) -> None:
+        try:
+            self.close_descriptors()
+        except Exception:
+            pass
 
 
 @dataclass(frozen=True)
@@ -334,6 +433,40 @@ class BoundTarget:
 
 
 @dataclass
+class MaterializedTargetLease:
+    target: Path
+    target_binding: AccessBinding
+    target_descriptor: int
+    parent_binding: AccessBinding
+    parent_descriptor: int
+    entry_name: str
+
+    def close(self) -> None:
+        descriptors = (self.target_descriptor, self.parent_descriptor)
+        self.target_descriptor = -1
+        self.parent_descriptor = -1
+        first_error: Optional[OSError] = None
+        for descriptor in descriptors:
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise PlanError(
+                f"target lease descriptor cleanup failed: {first_error}"
+            ) from first_error
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+@dataclass
 class PlannedWorktree:
     submodule: Submodule
     sha: str
@@ -343,6 +476,7 @@ class PlannedWorktree:
     parent_index: Optional[int]
     state: str
     source_bindings: tuple[AccessBinding, ...]
+    source_completeness: SourceCompletenessReceipt
     target_bindings: tuple[AccessBinding, ...]
     checkout_preflight: Optional[CheckoutPreflight]
     transport_receipt: Optional[TransportReceipt]
@@ -431,6 +565,7 @@ def git_environment(
     if extra_env:
         unsupported = set(extra_env) - {
             "GIT_ATTR_SOURCE",
+            "GIT_COMMON_DIR",
             "GIT_LITERAL_PATHSPECS",
         }
         if unsupported:
@@ -438,6 +573,9 @@ def git_environment(
                 "unsupported Git environment override: "
                 + ", ".join(sorted(unsupported))
             )
+        common_git_dir = extra_env.get("GIT_COMMON_DIR")
+        if common_git_dir is not None and not Path(common_git_dir).is_absolute():
+            raise PlanError("GIT_COMMON_DIR override must be an absolute path")
         environment.update(extra_env)
     return environment
 
@@ -858,6 +996,8 @@ def run_bounded_bytes(
     extra_env: Optional[dict[str, str]] = None,
     fixed_env: Optional[dict[str, str]] = None,
     prepare_git_command: bool = True,
+    directory_descriptor: Optional[int] = None,
+    directory_identity_leases: tuple[DirectoryEntryLease, ...] = (),
 ) -> subprocess.CompletedProcess[bytes]:
     if input_bytes is not None and len(input_bytes) > GIT_INPUT_LIMIT_BYTES:
         raise PlanError(
@@ -871,6 +1011,94 @@ def run_bounded_bytes(
     environment = (
         dict(fixed_env) if fixed_env is not None else git_environment(extra_env)
     )
+    if (
+        directory_descriptor is not None or directory_identity_leases
+    ) and os.name != "posix":
+        raise PlanError("descriptor-anchored Git writes require a POSIX runtime")
+
+    def enter_bound_directory() -> None:
+        for lease in directory_identity_leases:
+            expected_parent = lease.parent_binding.fingerprint
+            expected_entry = lease.binding.fingerprint
+            parent_stat = os.stat(
+                lease.parent_binding.path,
+                follow_symlinks=False,
+            )
+            parent_descriptor_stat = os.fstat(lease.parent_descriptor)
+            entry_stat = os.stat(
+                lease.entry_name,
+                dir_fd=lease.parent_descriptor,
+                follow_symlinks=False,
+            )
+            object_stat = os.fstat(lease.descriptor)
+            parent_values = (
+                parent_stat.st_dev,
+                parent_stat.st_ino,
+                stat.S_IFMT(parent_stat.st_mode),
+                parent_stat.st_uid,
+                parent_stat.st_gid,
+                stat.S_IMODE(parent_stat.st_mode),
+            )
+            parent_descriptor_values = (
+                parent_descriptor_stat.st_dev,
+                parent_descriptor_stat.st_ino,
+                stat.S_IFMT(parent_descriptor_stat.st_mode),
+                parent_descriptor_stat.st_uid,
+                parent_descriptor_stat.st_gid,
+                stat.S_IMODE(parent_descriptor_stat.st_mode),
+            )
+            expected_parent_values = (
+                expected_parent.device,
+                expected_parent.inode,
+                expected_parent.kind,
+                expected_parent.owner,
+                expected_parent.group,
+                expected_parent.permissions,
+            )
+            entry_values = (
+                entry_stat.st_dev,
+                entry_stat.st_ino,
+                stat.S_IFMT(entry_stat.st_mode),
+                entry_stat.st_uid,
+                entry_stat.st_gid,
+                stat.S_IMODE(entry_stat.st_mode),
+            )
+            object_values = (
+                object_stat.st_dev,
+                object_stat.st_ino,
+                stat.S_IFMT(object_stat.st_mode),
+                object_stat.st_uid,
+                object_stat.st_gid,
+                stat.S_IMODE(object_stat.st_mode),
+            )
+            expected_entry_values = (
+                expected_entry.device,
+                expected_entry.inode,
+                expected_entry.kind,
+                expected_entry.owner,
+                expected_entry.group,
+                expected_entry.permissions,
+            )
+            if (
+                parent_values != expected_parent_values
+                or parent_descriptor_values != expected_parent_values
+                or entry_values != expected_entry_values
+                or object_values != expected_entry_values
+            ):
+                raise OSError(
+                    errno.ESTALE,
+                    f"{lease.binding.purpose} changed before exec",
+                )
+        if directory_descriptor is not None:
+            os.fchdir(directory_descriptor)
+
+    inherited_descriptors: set[int] = set()
+    if directory_descriptor is not None:
+        inherited_descriptors.add(directory_descriptor)
+    for lease in directory_identity_leases:
+        inherited_descriptors.add(lease.descriptor)
+        inherited_descriptors.add(lease.parent_descriptor)
+
     input_file = tempfile.TemporaryFile()
     if input_bytes is not None:
         input_file.write(input_bytes)
@@ -884,8 +1112,14 @@ def run_bounded_bytes(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=os.name == "posix",
+            pass_fds=tuple(sorted(inherited_descriptors)),
+            preexec_fn=(
+                enter_bound_directory
+                if directory_descriptor is not None or directory_identity_leases
+                else None
+            ),
         )
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         input_file.close()
         raise GitError(f"failed to start {shell_join(command)}: {exc}") from exc
 
@@ -963,6 +1197,37 @@ def run_bounded_bytes(
             f"{shell_join(command)} failed with exit code {returncode}: {error}"
         )
     return result
+
+
+def run_git_at_directory_descriptor(
+    args: list[str],
+    directory_descriptor: int,
+    *,
+    extra_env: Optional[dict[str, str]] = None,
+    directory_identity_leases: tuple[DirectoryEntryLease, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    result = run_bounded_bytes(
+        args,
+        timeout_seconds=GIT_ENUMERATION_TIMEOUT_SECONDS,
+        stdout_limit=GIT_ERROR_OUTPUT_LIMIT_BYTES,
+        stderr_limit=GIT_ERROR_OUTPUT_LIMIT_BYTES,
+        extra_env=extra_env,
+        directory_descriptor=directory_descriptor,
+        directory_identity_leases=directory_identity_leases,
+    )
+    decoded = subprocess.CompletedProcess(
+        args=result.args,
+        returncode=result.returncode,
+        stdout=os.fsdecode(result.stdout),
+        stderr=os.fsdecode(result.stderr),
+    )
+    if decoded.returncode != 0:
+        detail = (decoded.stderr or "").strip()
+        raise GitError(
+            f"{shell_join(list(decoded.args))} failed with exit code "
+            f"{decoded.returncode}: {detail}"
+        )
+    return decoded
 
 
 def read_git_bounded(
@@ -2141,6 +2406,174 @@ def revalidate_bound_target(target: BoundTarget) -> None:
         )
 
 
+def materialize_bound_target_directory(
+    target: BoundTarget,
+) -> MaterializedTargetLease:
+    # Protected property: every created component is reached from the exact
+    # descriptor-bound root without following symlinks. The final directory
+    # object and its direct parent remain held through Git's write and are
+    # checked again afterwards.
+    if not target.relative_parts:
+        raise PlanError("a submodule worktree target cannot be the target root")
+    expected_by_path = {node.path: node.fingerprint for node in target.existing_nodes}
+    root = target.existing_nodes[0]
+    current_descriptor = open_directory_descriptor(
+        root.path,
+        "target materialization root",
+    )
+    parent_descriptor = -1
+    target_descriptor = -1
+    try:
+        root_binding = AccessBinding(
+            path=root.path,
+            fingerprint=root.fingerprint,
+            mode=os.X_OK,
+            purpose="target materialization root",
+        )
+        revalidate_directory_descriptor(root_binding, current_descriptor)
+        current_path = root.path
+        for index, part in enumerate(target.relative_parts):
+            child_path = current_path / part
+            expected = expected_by_path.get(child_path)
+            if expected is None:
+                if not probe_access_at(
+                    current_descriptor,
+                    ".",
+                    os.W_OK | os.X_OK,
+                ):
+                    raise PlanError(
+                        "target parent no longer permits descriptor-relative "
+                        f"creation: {current_path}"
+                    )
+                try:
+                    os.mkdir(part, mode=0o777, dir_fd=current_descriptor)
+                except FileExistsError as exc:
+                    raise PlanError(
+                        "target path appeared during descriptor-relative "
+                        f"materialization: {child_path}"
+                    ) from exc
+                except OSError as exc:
+                    raise PlanError(
+                        "cannot create descriptor-relative target directory\n"
+                        f"  path: {child_path}\n"
+                        f"  error: {exc}"
+                    ) from exc
+            try:
+                child_descriptor = os.open(
+                    part,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                    dir_fd=current_descriptor,
+                )
+            except OSError as exc:
+                raise PlanError(
+                    "cannot open descriptor-relative target directory\n"
+                    f"  path: {child_path}\n"
+                    f"  error: {exc}"
+                ) from exc
+            child_fingerprint = fingerprint_from_stat(os.fstat(child_descriptor))
+            if expected is not None and child_fingerprint != expected:
+                os.close(child_descriptor)
+                raise PlanError(f"target-path object or policy changed: {child_path}")
+            try:
+                path_fingerprint = fingerprint_from_stat(
+                    os.stat(
+                        part,
+                        dir_fd=current_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+            except OSError as exc:
+                os.close(child_descriptor)
+                raise PlanError(
+                    "cannot revalidate descriptor-relative target directory\n"
+                    f"  path: {child_path}\n"
+                    f"  error: {exc}"
+                ) from exc
+            if path_fingerprint != child_fingerprint:
+                os.close(child_descriptor)
+                raise PlanError(
+                    "target directory entry changed during descriptor binding\n"
+                    f"  path: {child_path}"
+                )
+            if index == len(target.relative_parts) - 1:
+                parent_descriptor = current_descriptor
+                target_descriptor = child_descriptor
+                current_descriptor = -1
+                current_path = child_path
+                break
+            os.close(current_descriptor)
+            current_descriptor = child_descriptor
+            current_path = child_path
+
+        if parent_descriptor < 0 or target_descriptor < 0:
+            raise PlanError("target materialization did not reach the final directory")
+        parent_path = target.path.parent
+        parent_fingerprint = fingerprint_from_stat(os.fstat(parent_descriptor))
+        target_fingerprint = fingerprint_from_stat(os.fstat(target_descriptor))
+        parent_binding = AccessBinding(
+            path=parent_path,
+            fingerprint=parent_fingerprint,
+            mode=(os.W_OK | os.X_OK if target.missing_parts else os.X_OK),
+            purpose="descriptor-bound target parent",
+        )
+        target_binding = AccessBinding(
+            path=target.path,
+            fingerprint=target_fingerprint,
+            mode=os.R_OK | os.W_OK | os.X_OK,
+            purpose="descriptor-bound target worktree",
+        )
+        lease = MaterializedTargetLease(
+            target=target.path,
+            target_binding=target_binding,
+            target_descriptor=target_descriptor,
+            parent_binding=parent_binding,
+            parent_descriptor=parent_descriptor,
+            entry_name=target.relative_parts[-1],
+        )
+        revalidate_materialized_target_lease(lease)
+        return lease
+    except Exception:
+        if target_descriptor >= 0:
+            os.close(target_descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+        if current_descriptor >= 0:
+            os.close(current_descriptor)
+        raise
+
+
+def revalidate_materialized_target_lease(
+    lease: MaterializedTargetLease,
+) -> None:
+    revalidate_directory_descriptor(
+        lease.parent_binding,
+        lease.parent_descriptor,
+    )
+    revalidate_directory_descriptor(
+        lease.target_binding,
+        lease.target_descriptor,
+    )
+    try:
+        entry_fingerprint = fingerprint_from_stat(
+            os.stat(
+                lease.entry_name,
+                dir_fd=lease.parent_descriptor,
+                follow_symlinks=False,
+            )
+        )
+    except OSError as exc:
+        raise PlanError(
+            "cannot revalidate the descriptor-bound target entry\n"
+            f"  path: {lease.target}\n"
+            f"  error: {exc}"
+        ) from exc
+    if entry_fingerprint != lease.target_binding.fingerprint:
+        raise PlanError(
+            "target directory entry changed during the Git write\n"
+            f"  path: {lease.target}"
+        )
+
+
 def source_repo_args(source_git_dir: Path, work_tree: Path) -> list[str]:
     return [f"--git-dir={source_git_dir}", f"--work-tree={work_tree}"]
 
@@ -2617,7 +3050,543 @@ def ensure_source_repo(
     raise PlanError("\n".join(lines))
 
 
-def commit_exists(source_git_dir: Path, work_tree: Path, sha: str) -> bool:
+def reject_incomplete_source_config(
+    entries: tuple[tuple[str, str], ...],
+    source: Path,
+) -> None:
+    for key, value in entries:
+        lowered = key.casefold()
+        if (
+            lowered == "include.path"
+            or lowered.startswith("include.")
+            or lowered.startswith("includeif.")
+            or lowered == "extensions.partialclone"
+            or lowered == "extensions.worktreeconfig"
+            or (
+                lowered.startswith("remote.")
+                and (
+                    lowered.endswith(".promisor")
+                    or lowered.endswith(".partialclonefilter")
+                )
+            )
+        ):
+            raise PlanError(
+                "source repository completeness depends on unsupported include or "
+                "promisor policy\n"
+                f"  path: {source}\n"
+                f"  key: {key}\n"
+                f"  value: {value}"
+            )
+
+
+def reject_source_object_alternates(source_git_dir: Path) -> None:
+    for name in ("alternates", "http-alternates"):
+        path = source_git_dir / "objects" / "info" / name
+        if path_entry_exists(path):
+            raise PlanError(
+                "source repository completeness depends on an alternate object "
+                "database\n"
+                f"  path: {path}\n"
+                "  materialize the required objects in the source repository before "
+                "using linked submodule worktrees"
+            )
+
+
+def reject_source_commondir(source_git_dir: Path) -> None:
+    commondir = source_git_dir / "commondir"
+    if path_entry_exists(commondir):
+        raise PlanError(
+            "source repository uses an unsupported commondir indirection\n"
+            f"  path: {commondir}\n"
+            "  use the canonical common gitdir as the source repository"
+        )
+
+
+def reject_source_promisor_markers(source_git_dir: Path) -> None:
+    pack_dir = source_git_dir / "objects" / "pack"
+    if not path_entry_exists(pack_dir):
+        return
+    descriptor = open_directory_descriptor(
+        pack_dir,
+        "source pack directory",
+    )
+    try:
+        names = os.listdir(descriptor)
+        if len(names) > MAX_CHECKOUT_OBJECTS:
+            raise PlanError(
+                "source pack directory exceeds the "
+                f"{MAX_CHECKOUT_OBJECTS}-entry safety limit"
+            )
+        marker = next(
+            (
+                name
+                for name in names
+                if isinstance(name, str) and name.casefold().endswith(".promisor")
+            ),
+            None,
+        )
+        if marker is not None:
+            raise PlanError(
+                "source repository completeness depends on a promisor pack\n"
+                f"  path: {pack_dir / marker}\n"
+                "  materialize the required objects in a non-promisor source "
+                "repository before using linked submodule worktrees"
+            )
+    finally:
+        os.close(descriptor)
+
+
+def capture_source_completeness_receipt(
+    source_git_dir: Path,
+) -> SourceCompletenessReceipt:
+    gitdir_binding = capture_typed_access(
+        source_git_dir,
+        os.R_OK | os.X_OK,
+        "source completeness gitdir",
+        stat.S_IFDIR,
+    )
+    reject_source_commondir(source_git_dir)
+    config_path = source_git_dir / "config"
+    config_binding, config_content = read_bound_regular_file(
+        config_path,
+        maximum_bytes=MAX_SOURCE_CONFIG_BYTES,
+        mode=os.R_OK,
+        purpose="source completeness config",
+        retain_content=True,
+    )
+    if config_content is None:
+        raise PlanError("source completeness config returned no content")
+    reject_incomplete_source_config(
+        parse_bound_git_config(config_content, config_path),
+        config_path,
+    )
+    objects_dir = source_git_dir / "objects"
+    objects_binding = capture_typed_access(
+        objects_dir,
+        os.R_OK | os.X_OK,
+        "source completeness object directory",
+        stat.S_IFDIR,
+    )
+    info_dir = source_git_dir / "objects" / "info"
+    alternates_parent = (
+        info_dir if path_entry_exists(info_dir) else source_git_dir / "objects"
+    )
+    alternates_parent_binding = capture_typed_access(
+        alternates_parent,
+        os.R_OK | os.X_OK,
+        "source alternate-object policy parent",
+        stat.S_IFDIR,
+    )
+    pack_dir = objects_dir / "pack"
+    pack_binding = (
+        capture_typed_access(
+            pack_dir,
+            os.R_OK | os.X_OK,
+            "source promisor-pack policy directory",
+            stat.S_IFDIR,
+        )
+        if path_entry_exists(pack_dir)
+        else None
+    )
+    reject_source_object_alternates(source_git_dir)
+    reject_source_promisor_markers(source_git_dir)
+    reject_source_commondir(source_git_dir)
+    revalidate_access(gitdir_binding)
+    revalidate_file_content_binding(config_binding)
+    revalidate_access(objects_binding)
+    revalidate_access(alternates_parent_binding)
+    if pack_binding is not None:
+        revalidate_access(pack_binding)
+    reject_source_object_alternates(source_git_dir)
+    reject_source_promisor_markers(source_git_dir)
+    reject_source_commondir(source_git_dir)
+    return SourceCompletenessReceipt(
+        gitdir_binding=gitdir_binding,
+        config_binding=config_binding,
+        objects_binding=objects_binding,
+        alternates_parent_binding=alternates_parent_binding,
+        pack_binding=pack_binding,
+    )
+
+
+def revalidate_source_completeness_receipt(
+    source_git_dir: Path,
+    receipt: SourceCompletenessReceipt,
+) -> None:
+    if receipt.config_binding.path != source_git_dir / "config":
+        raise PlanError("source completeness receipt does not match the source gitdir")
+    if receipt.gitdir_binding.path != source_git_dir:
+        raise PlanError("source completeness receipt names the wrong source gitdir")
+    revalidate_access(receipt.gitdir_binding)
+    reject_source_commondir(source_git_dir)
+    revalidate_file_content_binding(receipt.config_binding)
+    revalidate_access(receipt.objects_binding)
+    revalidate_access(receipt.alternates_parent_binding)
+    current_pack = source_git_dir / "objects" / "pack"
+    if receipt.pack_binding is None:
+        if path_entry_exists(current_pack):
+            current_pack_binding = capture_typed_access(
+                current_pack,
+                os.R_OK | os.X_OK,
+                "source promisor-pack policy directory",
+                stat.S_IFDIR,
+            )
+            reject_source_promisor_markers(source_git_dir)
+            revalidate_access(current_pack_binding)
+    else:
+        revalidate_access(receipt.pack_binding)
+    reject_source_object_alternates(source_git_dir)
+    reject_source_promisor_markers(source_git_dir)
+    reject_source_commondir(source_git_dir)
+    revalidate_access(receipt.gitdir_binding)
+
+
+def unresolved_source_transaction_payload(
+    source_git_dir: Path,
+    directory_descriptor: int,
+    *,
+    detail: str,
+) -> str:
+    payload = {
+        "detail": detail,
+        "fetch_transaction": inspect_shallow_entry_for_recovery(
+            directory_descriptor,
+            SOURCE_FETCH_TRANSACTION_NAME,
+            source_git_dir / SOURCE_FETCH_TRANSACTION_NAME,
+        ),
+        "profile": "source-fetch-transaction-v1",
+        "shallow": inspect_shallow_entry_for_recovery(
+            directory_descriptor,
+            SOURCE_SHALLOW_NAME,
+            source_git_dir / SOURCE_SHALLOW_NAME,
+        ),
+        "shallow_lock": inspect_shallow_entry_for_recovery(
+            directory_descriptor,
+            SOURCE_SHALLOW_LOCK_NAME,
+            source_git_dir / SOURCE_SHALLOW_LOCK_NAME,
+        ),
+        "source_git_dir": str(source_git_dir),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def revalidate_source_object_admission(
+    source_git_dir: Path,
+    transaction: Optional[SourceFetchTransaction] = None,
+) -> None:
+    if transaction is not None:
+        if transaction.source_git_dir != source_git_dir or not transaction.active:
+            raise PlanError("source fetch transaction does not match the source gitdir")
+        revalidate_directory_descriptor(
+            transaction.directory_binding,
+            transaction.directory_descriptor,
+        )
+        observed, _ = bind_regular_file_descriptor_at(
+            transaction.fence_descriptor,
+            transaction.directory_descriptor,
+            SOURCE_FETCH_TRANSACTION_NAME,
+            source_git_dir / SOURCE_FETCH_TRANSACTION_NAME,
+            maximum_bytes=MAX_SOURCE_FETCH_TRANSACTION_BYTES,
+            mode=os.R_OK | os.W_OK,
+            purpose="active source fetch recovery fence",
+            retain_content=False,
+        )
+        require_matching_file_binding(
+            transaction.fence_binding,
+            observed,
+            "active source fetch recovery fence",
+        )
+        require_absent_entry_at(
+            transaction.directory_descriptor,
+            SOURCE_SHALLOW_LOCK_NAME,
+            source_git_dir / SOURCE_SHALLOW_LOCK_NAME,
+            "source shallow lock",
+        )
+        return
+
+    directory_binding = capture_typed_access(
+        source_git_dir,
+        os.R_OK | os.X_OK,
+        "source object-admission directory",
+        stat.S_IFDIR,
+    )
+    directory_descriptor = open_directory_descriptor(
+        source_git_dir,
+        "source object-admission directory",
+    )
+    try:
+        revalidate_directory_descriptor(directory_binding, directory_descriptor)
+        present = []
+        for name in (
+            SOURCE_SHALLOW_LOCK_NAME,
+            SOURCE_FETCH_TRANSACTION_NAME,
+        ):
+            try:
+                os.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise PlanError(
+                    f"cannot inspect source recovery fence: "
+                    f"{source_git_dir / name}\n  error: {exc}"
+                ) from exc
+            present.append(name)
+        if present:
+            detail = "unresolved source recovery fence(s): " + ", ".join(present)
+            raise PlanError(
+                "source objects are unavailable until the shallow/fetch transaction "
+                "is recovered\n"
+                f"  recovery_identity: "
+                f"{unresolved_source_transaction_payload(source_git_dir, directory_descriptor, detail=detail)}"
+            )
+        revalidate_directory_descriptor(directory_binding, directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def begin_source_fetch_transaction(
+    receipt: TransportReceipt,
+) -> SourceFetchTransaction:
+    source_git_dir = receipt.source_shallow_parent_binding.path
+    revalidate_source_object_admission(source_git_dir)
+    directory_descriptor = open_directory_descriptor(
+        source_git_dir,
+        "source fetch transaction directory",
+    )
+    fence_descriptor = -1
+    try:
+        revalidate_directory_descriptor(
+            receipt.source_shallow_parent_binding,
+            directory_descriptor,
+        )
+        transaction_id = secrets.token_hex(16)
+        payload = json.dumps(
+            {
+                "expected_shallow": file_binding_recovery_payload(
+                    receipt.source_shallow_binding
+                ),
+                "profile": "source-fetch-transaction-v1",
+                "source_git_dir": str(source_git_dir),
+                "transaction_id": transaction_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(payload) > MAX_SOURCE_FETCH_TRANSACTION_BYTES:
+            raise PlanError("source fetch recovery receipt exceeds its byte limit")
+        fence_descriptor = os.open(
+            SOURCE_FETCH_TRANSACTION_NAME,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | os.O_NONBLOCK
+            | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        pending = memoryview(payload)
+        while pending:
+            written = os.write(fence_descriptor, pending)
+            if written <= 0:
+                raise PlanError("cannot persist the source fetch recovery receipt")
+            pending = pending[written:]
+        os.fsync(fence_descriptor)
+        fence_binding, _ = bind_regular_file_descriptor_at(
+            fence_descriptor,
+            directory_descriptor,
+            SOURCE_FETCH_TRANSACTION_NAME,
+            source_git_dir / SOURCE_FETCH_TRANSACTION_NAME,
+            maximum_bytes=MAX_SOURCE_FETCH_TRANSACTION_BYTES,
+            mode=os.R_OK | os.W_OK,
+            purpose="source fetch recovery fence",
+            retain_content=False,
+        )
+        os.fsync(directory_descriptor)
+        transaction = SourceFetchTransaction(
+            source_git_dir=source_git_dir,
+            directory_binding=receipt.source_shallow_parent_binding,
+            directory_descriptor=directory_descriptor,
+            fence_binding=fence_binding,
+            fence_descriptor=fence_descriptor,
+            transaction_id=transaction_id,
+        )
+        revalidate_source_object_admission(source_git_dir, transaction)
+        return transaction
+    except BaseException as exc:
+        try:
+            recovery_identity = unresolved_source_transaction_payload(
+                source_git_dir,
+                directory_descriptor,
+                detail=f"source fetch transaction creation failed: {exc}",
+            )
+        except BaseException as inspection_exc:
+            recovery_identity = json.dumps(
+                {
+                    "detail": f"source fetch transaction creation failed: {exc}",
+                    "inspection_error": (
+                        f"{type(inspection_exc).__name__}: {inspection_exc}"
+                    ),
+                    "profile": "source-fetch-transaction-v1",
+                    "source_git_dir": str(source_git_dir),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        finally:
+            if fence_descriptor >= 0:
+                os.close(fence_descriptor)
+            os.close(directory_descriptor)
+        raise PlanError(
+            "source fetch transaction could not be established cleanly\n"
+            f"  recovery_identity: {recovery_identity}"
+        ) from exc
+
+
+def retain_source_fetch_transaction(
+    transaction: SourceFetchTransaction,
+    detail: str,
+) -> PlanError:
+    try:
+        recovery_identity = unresolved_source_transaction_payload(
+            transaction.source_git_dir,
+            transaction.directory_descriptor,
+            detail=detail,
+        )
+    except BaseException as exc:
+        recovery_identity = json.dumps(
+            {
+                "detail": detail,
+                "inspection_error": f"{type(exc).__name__}: {exc}",
+                "profile": "source-fetch-transaction-v1",
+                "source_git_dir": str(transaction.source_git_dir),
+                "transaction_id": transaction.transaction_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    finally:
+        transaction.close_descriptors()
+    return PlanError(
+        "source fetch did not reach a clean boundary/object terminal state; "
+        "the recovery fence was retained\n"
+        f"  recovery_identity: {recovery_identity}"
+    )
+
+
+def complete_source_fetch_transaction(
+    transaction: SourceFetchTransaction,
+) -> None:
+    revalidate_source_object_admission(
+        transaction.source_git_dir,
+        transaction,
+    )
+    os.unlink(
+        SOURCE_FETCH_TRANSACTION_NAME,
+        dir_fd=transaction.directory_descriptor,
+    )
+    try:
+        os.fsync(transaction.directory_descriptor)
+    except OSError as exc:
+        recovery_detail = (
+            "fetch transaction fence was unlinked but directory durability "
+            "is unverified"
+        )
+        replacement_descriptor = -1
+        replacement_error: Optional[str] = None
+        try:
+            payload = json.dumps(
+                {
+                    "detail": recovery_detail,
+                    "profile": "source-fetch-transaction-v1",
+                    "source_git_dir": str(transaction.source_git_dir),
+                    "transaction_id": transaction.transaction_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            replacement_descriptor = os.open(
+                SOURCE_FETCH_TRANSACTION_NAME,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | os.O_NONBLOCK
+                | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=transaction.directory_descriptor,
+            )
+            pending = memoryview(payload)
+            while pending:
+                written = os.write(replacement_descriptor, pending)
+                if written <= 0:
+                    raise PlanError("cannot restore the source fetch recovery fence")
+                pending = pending[written:]
+            os.fsync(replacement_descriptor)
+            try:
+                os.fsync(transaction.directory_descriptor)
+            except OSError as restore_exc:
+                replacement_error = (
+                    "replacement fence exists but its directory durability is "
+                    f"unverified: {restore_exc}"
+                )
+        except BaseException as restore_exc:
+            replacement_error = (
+                "could not restore the source fetch recovery fence: "
+                f"{type(restore_exc).__name__}: {restore_exc}"
+            )
+        finally:
+            if replacement_descriptor >= 0:
+                os.close(replacement_descriptor)
+        try:
+            recovery_identity = unresolved_source_transaction_payload(
+                transaction.source_git_dir,
+                transaction.directory_descriptor,
+                detail=(
+                    recovery_detail
+                    if replacement_error is None
+                    else f"{recovery_detail}; {replacement_error}"
+                ),
+            )
+        except BaseException as inspection_exc:
+            recovery_identity = json.dumps(
+                {
+                    "detail": recovery_detail,
+                    "inspection_error": (
+                        f"{type(inspection_exc).__name__}: {inspection_exc}"
+                    ),
+                    "profile": "source-fetch-transaction-v1",
+                    "replacement_error": replacement_error,
+                    "source_git_dir": str(transaction.source_git_dir),
+                    "transaction_id": transaction.transaction_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        finally:
+            transaction.active = False
+            transaction.close_descriptors()
+        raise PlanError(
+            "source fetch transaction cleanup durability is unverified\n"
+            f"  recovery_identity: {recovery_identity}"
+        ) from exc
+    transaction.active = False
+    transaction.close_descriptors()
+
+
+def commit_exists(
+    source_git_dir: Path,
+    work_tree: Path,
+    sha: str,
+    *,
+    transaction: Optional[SourceFetchTransaction] = None,
+) -> bool:
+    del work_tree
+    revalidate_source_object_admission(source_git_dir, transaction)
     result = read_git(
         [
             *source_object_repo_args(source_git_dir),
@@ -2627,6 +3596,7 @@ def commit_exists(source_git_dir: Path, work_tree: Path, sha: str) -> bool:
         ],
         check=False,
     )
+    revalidate_source_object_admission(source_git_dir, transaction)
     return result.returncode == 0
 
 
@@ -4145,7 +5115,7 @@ def capture_transport_receipt(
                 "ProxyJump=none",
             ]
         )
-    source_object_directory = source_git_dir / "objects"
+    source_object_directory = (source_git_dir / "objects").resolve(strict=True)
     source_object_bindings = [
         capture_typed_access(
             source_object_directory,
@@ -4331,6 +5301,7 @@ def fetch_missing_commit(
     depth: int,
     dry_run: bool,
     transport_receipt: Optional[TransportReceipt] = None,
+    source_completeness: Optional[SourceCompletenessReceipt] = None,
     fetch_missing: bool = False,
 ) -> bool:
     if commit_exists(source_git_dir, work_tree, sha):
@@ -4377,26 +5348,100 @@ def fetch_missing_commit(
         raise PlanError(
             f"authorized fetch for {submodule.path} lacks a bound transport receipt"
         )
+    completeness = source_completeness or capture_source_completeness_receipt(
+        source_git_dir
+    )
+    revalidate_source_completeness_receipt(source_git_dir, completeness)
     revalidate_transport_receipt(receipt, submodule)
-    print(
-        f"fetch missing commit for {submodule.path}: {shell_join(command)}", flush=True
+    expected_object_binding = access_binding_for_path(
+        receipt.fetch_access_bindings,
+        receipt.source_object_directory,
+        f"authorized fetch object database for {submodule.path}",
     )
-    bounded_result = run_bounded_bytes(
-        command,
-        check=False,
-        timeout_seconds=GIT_ENUMERATION_TIMEOUT_SECONDS,
-        stdout_limit=GIT_ERROR_OUTPUT_LIMIT_BYTES,
-        stderr_limit=GIT_ERROR_OUTPUT_LIMIT_BYTES,
-        fixed_env=dict(receipt.git_environment),
+    source_object_lease = capture_directory_entry_lease(
+        expected_object_binding.path,
+        expected_object_binding.mode,
+        expected_object_binding.purpose,
     )
+    try:
+        if source_object_lease.binding != expected_object_binding:
+            raise PlanError(
+                "authorized fetch object database changed during descriptor binding"
+            )
+        revalidate_directory_entry_lease(source_object_lease)
+        transaction = begin_source_fetch_transaction(receipt)
+    except BaseException:
+        source_object_lease.close()
+        raise
+    try:
+        print(
+            f"fetch missing commit for {submodule.path}: {shell_join(command)}",
+            flush=True,
+        )
+        bounded_result = run_bounded_bytes(
+            command,
+            check=False,
+            timeout_seconds=GIT_ENUMERATION_TIMEOUT_SECONDS,
+            stdout_limit=GIT_ERROR_OUTPUT_LIMIT_BYTES,
+            stderr_limit=GIT_ERROR_OUTPUT_LIMIT_BYTES,
+            fixed_env=dict(receipt.git_environment),
+            directory_identity_leases=(source_object_lease,),
+        )
+    except BaseException as exc:
+        try:
+            source_object_lease.close()
+        except BaseException as cleanup_exc:
+            exc = PlanError(
+                f"{exc}; source object-directory lease cleanup failed: {cleanup_exc}"
+            )
+        raise retain_source_fetch_transaction(
+            transaction,
+            f"fetch process failed before boundary installation: {exc}",
+        ) from exc
+    try:
+        source_object_lease.close()
+    except BaseException as exc:
+        raise retain_source_fetch_transaction(
+            transaction,
+            f"source object-directory lease cleanup failed: {exc}",
+        ) from exc
     result = subprocess.CompletedProcess(
         args=bounded_result.args,
         returncode=bounded_result.returncode,
         stdout=os.fsdecode(bounded_result.stdout),
         stderr=os.fsdecode(bounded_result.stderr),
     )
-    if result.returncode == 0 and commit_exists(source_git_dir, work_tree, sha):
-        install_post_fetch_shallow_state(receipt)
+    try:
+        commit_available = result.returncode == 0 and commit_exists(
+            source_git_dir,
+            work_tree,
+            sha,
+            transaction=transaction,
+        )
+    except BaseException as exc:
+        raise retain_source_fetch_transaction(
+            transaction,
+            f"post-fetch object verification failed: {exc}",
+        ) from exc
+    if commit_available:
+        try:
+            install_post_fetch_shallow_state(receipt)
+            revalidate_source_object_admission(source_git_dir, transaction)
+            target_object_closure(
+                source_git_dir,
+                sha,
+                completeness,
+                transaction=transaction,
+            )
+            complete_source_fetch_transaction(transaction)
+        except BaseException as exc:
+            if transaction.active:
+                raise retain_source_fetch_transaction(
+                    transaction,
+                    "post-fetch shallow installation or complete object "
+                    f"verification failed: {exc}",
+                ) from exc
+            raise
         return True
     stderr = (result.stderr or "").strip()
     branch_fetch_command = transport_fetch_command(
@@ -4405,7 +5450,7 @@ def fetch_missing_commit(
         "<branch-or-tag>",
         100,
     )
-    raise PlanError(
+    error = PlanError(
         "\n".join(
             [
                 f"failed to shallow-fetch target commit for {submodule.path}",
@@ -4421,6 +5466,10 @@ def fetch_missing_commit(
             ]
         )
     )
+    raise retain_source_fetch_transaction(
+        transaction,
+        str(error),
+    ) from error
 
 
 def gitdir_file_target(worktree_path: Path) -> Optional[Path]:
@@ -4435,6 +5484,299 @@ def gitdir_file_target(worktree_path: Path) -> Optional[Path]:
     if not target.is_absolute():
         target = (worktree_path / target).resolve()
     return target
+
+
+def parse_managed_gitdir_content(
+    worktree_path: Path,
+    source_git_dir: Path,
+    content: bytes,
+) -> Path:
+    raw = content.rstrip(b"\r\n")
+    if b"\n" in raw or b"\r" in raw or not raw.startswith(b"gitdir: "):
+        raise PlanError(
+            f"managed worktree has a malformed .git control file: {worktree_path}"
+        )
+    raw_path = raw[len(b"gitdir: ") :]
+    if not raw_path or len(raw_path) > MAX_CHECKOUT_PATH_BYTES:
+        raise PlanError(
+            f"managed worktree has an empty or oversized admin path: {worktree_path}"
+        )
+    admin_git_dir = Path(os.fsdecode(raw_path))
+    if not admin_git_dir.is_absolute():
+        admin_git_dir = worktree_path / admin_git_dir
+    try:
+        resolved_admin = admin_git_dir.resolve(strict=True)
+        worktrees_root = (source_git_dir / "worktrees").resolve(strict=True)
+        relative_admin = resolved_admin.relative_to(worktrees_root)
+    except (OSError, ValueError) as exc:
+        raise PlanError(
+            "managed worktree admin directory is outside the selected source\n"
+            f"  worktree: {worktree_path}\n"
+            f"  admin: {admin_git_dir}\n"
+            f"  source: {source_git_dir}"
+        ) from exc
+    if len(relative_admin.parts) != 1:
+        raise PlanError(
+            "managed worktree admin directory has an unexpected nested shape\n"
+            f"  admin: {resolved_admin}"
+        )
+    return resolved_admin
+
+
+def capture_directory_entry_lease(
+    path: Path,
+    mode: int,
+    purpose: str,
+) -> DirectoryEntryLease:
+    resolved = path.resolve(strict=True)
+    parent = resolved.parent
+    parent_binding = capture_typed_access(
+        parent,
+        os.R_OK | os.X_OK,
+        f"{purpose} parent",
+        stat.S_IFDIR,
+    )
+    parent_descriptor = open_directory_descriptor(
+        parent,
+        f"{purpose} parent",
+    )
+    descriptor = -1
+    try:
+        revalidate_directory_descriptor(parent_binding, parent_descriptor)
+        descriptor = os.open(
+            resolved.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+            dir_fd=parent_descriptor,
+        )
+        fingerprint = fingerprint_from_stat(os.fstat(descriptor))
+        entry_fingerprint = fingerprint_from_stat(
+            os.stat(
+                resolved.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        )
+        if fingerprint != entry_fingerprint:
+            raise PlanError(f"{purpose} changed during descriptor binding")
+        binding = AccessBinding(
+            path=resolved,
+            fingerprint=fingerprint,
+            mode=mode,
+            purpose=purpose,
+        )
+        revalidate_directory_descriptor(binding, descriptor)
+        return DirectoryEntryLease(
+            path=resolved,
+            binding=binding,
+            descriptor=descriptor,
+            parent_binding=parent_binding,
+            parent_descriptor=parent_descriptor,
+            entry_name=resolved.name,
+        )
+    except BaseException:
+        try:
+            if descriptor >= 0:
+                os.close(descriptor)
+        finally:
+            os.close(parent_descriptor)
+        raise
+
+
+def revalidate_directory_entry_lease(lease: DirectoryEntryLease) -> None:
+    revalidate_directory_descriptor(
+        lease.parent_binding,
+        lease.parent_descriptor,
+    )
+    revalidate_directory_descriptor(
+        lease.binding,
+        lease.descriptor,
+    )
+    try:
+        entry_fingerprint = fingerprint_from_stat(
+            os.stat(
+                lease.entry_name,
+                dir_fd=lease.parent_descriptor,
+                follow_symlinks=False,
+            )
+        )
+    except OSError as exc:
+        raise PlanError(
+            f"cannot revalidate {lease.binding.purpose}\n"
+            f"  path: {lease.path}\n"
+            f"  error: {exc}"
+        ) from exc
+    if entry_fingerprint != lease.binding.fingerprint:
+        raise PlanError(
+            f"{lease.binding.purpose} directory entry changed\n  path: {lease.path}"
+        )
+
+
+def capture_managed_control_receipt(
+    worktree_path: Path,
+    source_git_dir: Path,
+    target_descriptor: int,
+) -> ManagedControlReceipt:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            ".git",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=target_descriptor,
+        )
+        git_file_binding, content = bind_regular_file_descriptor_at(
+            descriptor,
+            target_descriptor,
+            ".git",
+            worktree_path / ".git",
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose="descriptor-bound managed worktree control file",
+            retain_content=True,
+        )
+    except OSError as exc:
+        raise PlanError(
+            "cannot bind the managed worktree control file\n"
+            f"  worktree: {worktree_path}\n"
+            f"  error: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if content is None:
+        raise PlanError("managed worktree control-file binding returned no content")
+    admin_git_dir = parse_managed_gitdir_content(
+        worktree_path,
+        source_git_dir,
+        content,
+    )
+    admin_lease = capture_directory_entry_lease(
+        admin_git_dir,
+        os.R_OK | os.W_OK | os.X_OK,
+        "managed worktree administration",
+    )
+    backlink_descriptor = -1
+    try:
+        backlink_descriptor = os.open(
+            "gitdir",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=admin_lease.descriptor,
+        )
+        admin_gitdir_binding, backlink_content = bind_regular_file_descriptor_at(
+            backlink_descriptor,
+            admin_lease.descriptor,
+            "gitdir",
+            admin_git_dir / "gitdir",
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose="managed worktree admin backlink",
+            retain_content=True,
+        )
+        descriptor_to_close = backlink_descriptor
+        backlink_descriptor = -1
+        os.close(descriptor_to_close)
+        if backlink_content is None:
+            raise PlanError("managed worktree admin backlink returned no content")
+        raw_backlink = backlink_content.rstrip(b"\r\n")
+        if (
+            not raw_backlink
+            or b"\n" in raw_backlink
+            or b"\r" in raw_backlink
+            or len(raw_backlink) > MAX_CHECKOUT_PATH_BYTES
+        ):
+            raise PlanError("managed worktree admin backlink is malformed")
+        backlink_path = Path(os.fsdecode(raw_backlink))
+        if not backlink_path.is_absolute():
+            backlink_path = admin_git_dir / backlink_path
+        expected_gitfile = (worktree_path / ".git").resolve(strict=True)
+        if backlink_path.resolve(strict=True) != expected_gitfile:
+            raise PlanError(
+                "managed worktree admin backlink points at a different worktree\n"
+                f"  worktree: {worktree_path}\n"
+                f"  admin: {admin_git_dir}\n"
+                f"  backlink: {backlink_path}\n"
+                f"  expected: {expected_gitfile}"
+            )
+        return ManagedControlReceipt(
+            git_file_binding=git_file_binding,
+            admin_git_dir=admin_git_dir,
+            admin_lease=admin_lease,
+            admin_gitdir_binding=admin_gitdir_binding,
+        )
+    except BaseException:
+        admin_lease.close()
+        raise
+    finally:
+        if backlink_descriptor >= 0:
+            os.close(backlink_descriptor)
+
+
+def revalidate_managed_control_receipt(
+    receipt: ManagedControlReceipt,
+    target_descriptor: int,
+) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            ".git",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=target_descriptor,
+        )
+        current_binding, _ = bind_regular_file_descriptor_at(
+            descriptor,
+            target_descriptor,
+            ".git",
+            receipt.git_file_binding.path,
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose="descriptor-bound managed worktree control file",
+            retain_content=False,
+        )
+    except OSError as exc:
+        raise PlanError(
+            "cannot revalidate the managed worktree control file\n"
+            f"  path: {receipt.git_file_binding.path}\n"
+            f"  error: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    require_matching_file_binding(
+        receipt.git_file_binding,
+        current_binding,
+        "descriptor-bound managed worktree control file",
+    )
+    backlink_descriptor = -1
+    try:
+        backlink_descriptor = os.open(
+            "gitdir",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=receipt.admin_lease.descriptor,
+        )
+        current_backlink, _ = bind_regular_file_descriptor_at(
+            backlink_descriptor,
+            receipt.admin_lease.descriptor,
+            "gitdir",
+            receipt.admin_gitdir_binding.path,
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose="managed worktree admin backlink",
+            retain_content=False,
+        )
+    except OSError as exc:
+        raise PlanError(
+            "cannot revalidate the managed worktree admin backlink\n"
+            f"  path: {receipt.admin_gitdir_binding.path}\n"
+            f"  error: {exc}"
+        ) from exc
+    finally:
+        if backlink_descriptor >= 0:
+            os.close(backlink_descriptor)
+    require_matching_file_binding(
+        receipt.admin_gitdir_binding,
+        current_backlink,
+        "managed worktree admin backlink",
+    )
+    revalidate_directory_entry_lease(receipt.admin_lease)
 
 
 def worktree_common_git_dir(worktree_path: Path) -> Optional[Path]:
@@ -4589,7 +5931,14 @@ def prepare_target_path(
     )
 
 
-def checkout_existing_worktree(worktree_path: Path, sha: str, dry_run: bool) -> None:
+def checkout_existing_worktree(
+    worktree_path: Path,
+    sha: str,
+    dry_run: bool,
+    *,
+    target_descriptor: Optional[int] = None,
+    source_git_dir: Optional[Path] = None,
+) -> None:
     command = [
         "git",
         "-C",
@@ -4603,26 +5952,146 @@ def checkout_existing_worktree(worktree_path: Path, sha: str, dry_run: bool) -> 
     if dry_run:
         print(f"would checkout existing worktree: {shell_join(command)}")
         return
-    run(command, extra_env={"GIT_ATTR_SOURCE": sha})
+    if target_descriptor is None:
+        raise PlanError("managed checkout requires a descriptor-bound target directory")
+    if source_git_dir is None:
+        raise PlanError("managed checkout requires an explicit common gitdir")
+    control = capture_managed_control_receipt(
+        worktree_path,
+        source_git_dir,
+        target_descriptor,
+    )
+    try:
+        source_lease = capture_directory_entry_lease(
+            source_git_dir,
+            os.R_OK | os.W_OK | os.X_OK,
+            "selected source common gitdir",
+        )
+    except BaseException:
+        control.close()
+        raise
+    try:
+        revalidate_managed_control_receipt(control, target_descriptor)
+        revalidate_directory_entry_lease(source_lease)
+        run_git_at_directory_descriptor(
+            [
+                "git",
+                f"--git-dir={control.admin_git_dir}",
+                "--work-tree=.",
+                "checkout",
+                "--no-overwrite-ignore",
+                "--no-recurse-submodules",
+                "--detach",
+                sha,
+            ],
+            target_descriptor,
+            extra_env={
+                "GIT_ATTR_SOURCE": sha,
+                "GIT_COMMON_DIR": str(source_git_dir),
+            },
+            directory_identity_leases=(
+                source_lease,
+                control.admin_lease,
+            ),
+        )
+        revalidate_managed_control_receipt(control, target_descriptor)
+        revalidate_directory_entry_lease(source_lease)
+    finally:
+        try:
+            control.close()
+        finally:
+            source_lease.close()
 
 
 def add_worktree(
-    source_git_dir: Path, worktree_path: Path, sha: str, dry_run: bool
+    source_git_dir: Path,
+    worktree_path: Path,
+    sha: str,
+    dry_run: bool,
+    *,
+    lease: Optional[MaterializedTargetLease] = None,
 ) -> None:
     command = [
         "git",
-        *source_repo_args(source_git_dir, worktree_path),
+        f"--git-dir={source_git_dir}",
         "worktree",
         "add",
         "--detach",
+        "--no-checkout",
         str(worktree_path),
         sha,
     ]
     if dry_run:
         print(f"would add worktree: {shell_join(command)}")
         return
-    worktree_path.parent.mkdir(parents=True, exist_ok=True)
-    run(command)
+    if lease is None or lease.target != worktree_path:
+        raise PlanError("new worktree creation requires a matching target lease")
+    source_lease = capture_directory_entry_lease(
+        source_git_dir,
+        os.R_OK | os.W_OK | os.X_OK,
+        "selected source common gitdir",
+    )
+    control: Optional[ManagedControlReceipt] = None
+    try:
+        revalidate_materialized_target_lease(lease)
+        revalidate_directory_entry_lease(source_lease)
+        # Run from the held target directory and name that exact object as ".".
+        # Passing the final pathname from its parent would let Git follow a
+        # same-UID symlink replacement after our precheck and write outside the
+        # planned target before postvalidation could detect the race.
+        run_git_at_directory_descriptor(
+            [
+                "git",
+                f"--git-dir={source_git_dir}",
+                "worktree",
+                "add",
+                "--detach",
+                "--no-checkout",
+                ".",
+                sha,
+            ],
+            lease.target_descriptor,
+            extra_env={"GIT_COMMON_DIR": str(source_git_dir)},
+            directory_identity_leases=(source_lease,),
+        )
+        revalidate_materialized_target_lease(lease)
+        revalidate_directory_entry_lease(source_lease)
+        control = capture_managed_control_receipt(
+            worktree_path,
+            source_git_dir,
+            lease.target_descriptor,
+        )
+        revalidate_managed_control_receipt(control, lease.target_descriptor)
+        run_git_at_directory_descriptor(
+            [
+                "git",
+                f"--git-dir={control.admin_git_dir}",
+                "--work-tree=.",
+                "checkout",
+                "--no-overwrite-ignore",
+                "--no-recurse-submodules",
+                "--detach",
+                sha,
+            ],
+            lease.target_descriptor,
+            extra_env={
+                "GIT_ATTR_SOURCE": sha,
+                "GIT_COMMON_DIR": str(source_git_dir),
+            },
+            directory_identity_leases=(
+                source_lease,
+                control.admin_lease,
+            ),
+        )
+        revalidate_managed_control_receipt(control, lease.target_descriptor)
+        revalidate_directory_entry_lease(source_lease)
+        revalidate_materialized_target_lease(lease)
+    finally:
+        try:
+            if control is not None:
+                control.close()
+        finally:
+            source_lease.close()
 
 
 def classify_planned_target(
@@ -4850,6 +6319,33 @@ def managed_head(worktree_path: Path) -> str:
     return value
 
 
+def managed_head_at_descriptor(directory_descriptor: int) -> str:
+    result = run_git_at_directory_descriptor(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+        directory_descriptor,
+    )
+    value = result.stdout.strip()
+    if not value or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
+        raise PlanError("descriptor-bound worktree returned an invalid HEAD")
+    return value
+
+
+def common_git_dir_at_descriptor(directory_descriptor: int) -> Path:
+    result = run_git_at_directory_descriptor(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        directory_descriptor,
+    )
+    value = result.stdout.strip()
+    if not value:
+        raise PlanError("descriptor-bound worktree returned an empty common gitdir")
+    common = Path(value)
+    if not common.is_absolute():
+        raise PlanError(
+            "descriptor-bound worktree returned a non-absolute common gitdir"
+        )
+    return common.resolve(strict=True)
+
+
 def managed_index_snapshot(
     worktree_path: Path,
 ) -> tuple[str, int, tuple[tuple[str, ...], ...]]:
@@ -4975,6 +6471,374 @@ def target_tree_blob_paths(
         if object_type == b"blob" and mode.startswith(b"100"):
             paths.append(validate_checkout_path(raw_path, "target checkout tree"))
     return tuple(paths)
+
+
+def verify_target_object_payloads(
+    source_git_dir: Path,
+    ordered: list[str],
+    expected_types: dict[str, str],
+) -> ObjectClosureReceipt:
+    # `cat-file --batch-check` can read a corrupt loose object's header while
+    # never decompressing its payload. Stream every required object instead,
+    # independently recompute its object id, and discard payload bytes after
+    # hashing so retained memory remains bounded.
+    object_input = b"".join(object_id.encode("ascii") + b"\n" for object_id in ordered)
+    if len(object_input) > GIT_INPUT_LIMIT_BYTES:
+        raise PlanError(
+            "target checkout object closure exceeds the "
+            f"{GIT_INPUT_LIMIT_BYTES}-byte object-query input limit"
+        )
+    command = safe_command(
+        [
+            "git",
+            "--no-optional-locks",
+            *source_object_repo_args(source_git_dir),
+            "cat-file",
+            "--batch",
+        ]
+    )
+    input_file = tempfile.TemporaryFile()
+    input_file.write(object_input)
+    input_file.seek(0)
+    try:
+        process = subprocess.Popen(
+            command,
+            env=git_environment(),
+            stdin=input_file,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=os.name == "posix",
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        input_file.close()
+        raise GitError(
+            f"failed to start target object payload verification: {exc}"
+        ) from exc
+
+    stdout_pipe = process.stdout
+    stderr_pipe = process.stderr
+    selector: Optional[selectors.BaseSelector] = None
+    stdout_buffer = bytearray()
+    retained_stderr = bytearray()
+    producer_stdout_bytes = 0
+    maximum_producer_bytes = MAX_CHECKOUT_LOGICAL_BYTES + len(ordered) * 256 + 1
+    deadline = time.monotonic() + GIT_ENUMERATION_TIMEOUT_SECONDS
+    inventory_digest = hashlib.sha256()
+    logical_bytes = 0
+    object_index = 0
+    current_id: Optional[str] = None
+    current_type: Optional[str] = None
+    current_size = 0
+    current_remaining: Optional[int] = None
+    current_object_digest = None
+    failure: Optional[str] = None
+    returncode: Optional[int] = None
+
+    def consume_stdout_buffer() -> None:
+        nonlocal current_id
+        nonlocal current_object_digest
+        nonlocal current_remaining
+        nonlocal current_size
+        nonlocal current_type
+        nonlocal failure
+        nonlocal logical_bytes
+        nonlocal object_index
+        while failure is None:
+            if current_remaining is None:
+                if object_index >= len(ordered):
+                    if stdout_buffer:
+                        failure = (
+                            "target checkout object payload stream returned "
+                            "unexpected trailing bytes"
+                        )
+                    return
+                header_end = stdout_buffer.find(b"\n")
+                if header_end < 0:
+                    if len(stdout_buffer) > 256:
+                        failure = (
+                            "target checkout object payload stream returned an "
+                            "oversized header"
+                        )
+                    return
+                header = bytes(stdout_buffer[:header_end])
+                del stdout_buffer[: header_end + 1]
+                fields = header.split()
+                if len(fields) != 3:
+                    failure = (
+                        "target checkout object payload stream contains a "
+                        "missing or malformed object"
+                    )
+                    return
+                actual_id = os.fsdecode(fields[0])
+                actual_type = os.fsdecode(fields[1])
+                try:
+                    object_size = int(fields[2])
+                except ValueError:
+                    failure = (
+                        "target checkout object payload stream returned an "
+                        "invalid object size"
+                    )
+                    return
+                expected_id = ordered[object_index]
+                expected_type = expected_types[expected_id]
+                if actual_id != expected_id or actual_type != expected_type:
+                    failure = (
+                        "target checkout object payload stream changed object "
+                        "identity or type"
+                    )
+                    return
+                if object_size < 0:
+                    failure = (
+                        "target checkout object payload stream returned a "
+                        "negative object size"
+                    )
+                    return
+                logical_bytes += object_size
+                if logical_bytes > MAX_CHECKOUT_LOGICAL_BYTES:
+                    failure = (
+                        "target checkout object closure exceeds the "
+                        f"{MAX_CHECKOUT_LOGICAL_BYTES}-byte logical-size safety limit"
+                    )
+                    return
+                current_id = actual_id
+                current_type = actual_type
+                current_size = object_size
+                current_remaining = object_size
+                current_object_digest = (
+                    hashlib.sha1() if len(actual_id) == 40 else hashlib.sha256()
+                )
+                current_object_digest.update(
+                    f"{actual_type} {object_size}\0".encode("ascii")
+                )
+            if current_remaining:
+                if not stdout_buffer:
+                    return
+                consumed = min(current_remaining, len(stdout_buffer))
+                current_object_digest.update(stdout_buffer[:consumed])
+                del stdout_buffer[:consumed]
+                current_remaining -= consumed
+                if current_remaining:
+                    return
+            if not stdout_buffer:
+                return
+            if stdout_buffer[0] != 0x0A:
+                failure = (
+                    "target checkout object payload stream omitted its object separator"
+                )
+                return
+            del stdout_buffer[0]
+            if current_object_digest.hexdigest() != current_id:
+                failure = (
+                    "target checkout object payload bytes do not match their "
+                    "declared object id"
+                )
+                return
+            inventory_digest.update(current_id.encode("ascii"))
+            inventory_digest.update(b"\0")
+            inventory_digest.update(current_type.encode("ascii"))
+            inventory_digest.update(b"\0")
+            inventory_digest.update(str(current_size).encode("ascii"))
+            inventory_digest.update(b"\0")
+            object_index += 1
+            current_id = None
+            current_type = None
+            current_size = 0
+            current_remaining = None
+            current_object_digest = None
+
+    try:
+        if stdout_pipe is None or stderr_pipe is None:
+            raise GitError("target object payload verification lacks capture pipes")
+        selector = selectors.DefaultSelector()
+        selector.register(stdout_pipe, selectors.EVENT_READ, "stdout")
+        selector.register(stderr_pipe, selectors.EVENT_READ, "stderr")
+        while selector.get_map() and failure is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = (
+                    "target checkout object payload verification exceeded the "
+                    f"{GIT_ENUMERATION_TIMEOUT_SECONDS:g}-second deadline"
+                )
+                break
+            for key, _ in selector.select(min(remaining, 0.25)):
+                chunk = os.read(key.fd, 64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                if key.data == "stderr":
+                    if len(retained_stderr) + len(chunk) > GIT_ERROR_OUTPUT_LIMIT_BYTES:
+                        failure = (
+                            "target checkout object payload verification stderr "
+                            f"exceeds the {GIT_ERROR_OUTPUT_LIMIT_BYTES}-byte "
+                            "retained-output limit"
+                        )
+                        break
+                    retained_stderr.extend(chunk)
+                    continue
+                producer_stdout_bytes += len(chunk)
+                if producer_stdout_bytes > maximum_producer_bytes:
+                    failure = (
+                        "target checkout object payload stream exceeds its "
+                        "producer-byte safety limit"
+                    )
+                    break
+                stdout_buffer.extend(chunk)
+                consume_stdout_buffer()
+                if failure is not None:
+                    break
+        if failure is None:
+            consume_stdout_buffer()
+        if failure is None and (
+            object_index != len(ordered)
+            or current_remaining is not None
+            or stdout_buffer
+        ):
+            failure = (
+                "target checkout object payload stream ended before every "
+                "required object was verified"
+            )
+        if failure is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = (
+                    "target checkout object payload verification exceeded the "
+                    f"{GIT_ENUMERATION_TIMEOUT_SECONDS:g}-second deadline"
+                )
+            else:
+                try:
+                    returncode = process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    failure = (
+                        "target checkout object payload verification exceeded the "
+                        f"{GIT_ENUMERATION_TIMEOUT_SECONDS:g}-second deadline"
+                    )
+        if failure is not None:
+            raise PlanError(failure)
+    except BaseException as exc:
+        try:
+            terminate_process_group(process)
+        except PlanError as cleanup_error:
+            raise PlanError(f"{exc}\n{cleanup_error}") from exc
+        raise
+    finally:
+        if selector is not None:
+            selector.close()
+        if stdout_pipe is not None:
+            stdout_pipe.close()
+        if stderr_pipe is not None:
+            stderr_pipe.close()
+        input_file.close()
+
+    if returncode != 0:
+        detail = os.fsdecode(retained_stderr).strip()
+        raise PlanError(
+            "target checkout object payload verification failed"
+            + (f": {detail}" if detail else "")
+        )
+    return ObjectClosureReceipt(
+        object_count=len(ordered),
+        logical_bytes=logical_bytes,
+        digest=inventory_digest.hexdigest(),
+    )
+
+
+def target_object_closure(
+    source_git_dir: Path,
+    target_sha: str,
+    completeness: SourceCompletenessReceipt,
+    *,
+    transaction: Optional[SourceFetchTransaction] = None,
+) -> ObjectClosureReceipt:
+    # Protected property: every commit/tree/blob byte needed by checkout is
+    # already readable from this source object database without lazy fetch or
+    # alternates. Count/size caps bound the proof; the digest binds the exact
+    # object/type/size inventory across preflight and mutation.
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", target_sha):
+        raise PlanError("target checkout uses an invalid commit object id")
+    revalidate_source_object_admission(source_git_dir, transaction)
+    revalidate_source_completeness_receipt(source_git_dir, completeness)
+    tree_result = read_git_bounded(
+        [
+            *source_object_repo_args(source_git_dir),
+            "ls-tree",
+            "-r",
+            "-t",
+            "-z",
+            "--full-tree",
+            target_sha,
+        ]
+    )
+    expected_types: dict[str, str] = {target_sha: "commit"}
+    for record in bounded_records(
+        tree_result.stdout,
+        "target checkout object closure",
+        maximum_records=MAX_CHECKOUT_OBJECTS,
+    ):
+        try:
+            header, raw_path = record.split(b"\t", 1)
+        except ValueError as exc:
+            raise PlanError(
+                "target checkout object closure has an invalid record"
+            ) from exc
+        validate_checkout_path(raw_path, "target checkout object closure")
+        fields = header.split()
+        if len(fields) != 3:
+            raise PlanError("target checkout object closure has an invalid header")
+        mode, raw_type, raw_object_id = fields
+        object_type = os.fsdecode(raw_type)
+        object_id = os.fsdecode(raw_object_id)
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", object_id):
+            raise PlanError(
+                "target checkout object closure returned an invalid object id"
+            )
+        if object_type not in {"blob", "tree", "commit"}:
+            raise PlanError(
+                "target checkout object closure returned an unsupported type: "
+                f"{object_type}"
+            )
+        if mode == b"160000" and object_type == "commit":
+            # A gitlink is metadata for a separately planned nested source. The
+            # parent checkout does not require the child commit object.
+            continue
+        if object_type not in {"blob", "tree"}:
+            raise PlanError(
+                "target checkout tree contains an unexpected non-gitlink commit"
+            )
+        prior = expected_types.setdefault(object_id, object_type)
+        if prior != object_type:
+            raise PlanError("target checkout object id appeared with conflicting types")
+
+    root_tree_result = read_git_bounded(
+        [
+            *source_object_repo_args(source_git_dir),
+            "rev-parse",
+            "--verify",
+            f"{target_sha}^{{tree}}",
+        ],
+        stdout_limit=256,
+    )
+    root_tree = os.fsdecode(root_tree_result.stdout).strip()
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", root_tree):
+        raise PlanError("target checkout returned an invalid root tree id")
+    prior_root = expected_types.setdefault(root_tree, "tree")
+    if prior_root != "tree":
+        raise PlanError("target root tree id appeared with a conflicting type")
+    if len(expected_types) > MAX_CHECKOUT_OBJECTS:
+        raise PlanError(
+            "target checkout object closure exceeds the "
+            f"{MAX_CHECKOUT_OBJECTS}-object safety limit"
+        )
+
+    ordered = sorted(expected_types)
+    receipt = verify_target_object_payloads(
+        source_git_dir,
+        ordered,
+        expected_types,
+    )
+    revalidate_source_completeness_receipt(source_git_dir, completeness)
+    revalidate_source_object_admission(source_git_dir, transaction)
+    return receipt
 
 
 def selected_checkout_filters(
@@ -5481,6 +7345,11 @@ def capture_checkout_preflight(
     index_digest: Optional[str] = None
     index_entry_count: Optional[int] = None
     write_bindings: tuple[AccessBinding, ...] = ()
+    object_closure = target_object_closure(
+        entry.source_git_dir,
+        entry.sha,
+        entry.source_completeness,
+    )
     target_blob_paths = target_tree_blob_paths(
         entry.source_git_dir,
         entry.sha,
@@ -5542,6 +7411,9 @@ def capture_checkout_preflight(
             index_entry_count=index_entry_count,
             path_count=path_count,
             path_digest=path_digest,
+            object_count=object_closure.object_count,
+            object_logical_bytes=object_closure.logical_bytes,
+            object_digest=object_closure.digest,
             changes=changes or (),
         ),
         write_bindings,
@@ -5552,6 +7424,19 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
     receipt = entry.checkout_preflight
     if receipt is None:
         raise PlanError(f"checkout preflight is incomplete for {entry.submodule.path}")
+    object_closure = target_object_closure(
+        entry.source_git_dir,
+        entry.sha,
+        entry.source_completeness,
+    )
+    if (
+        object_closure.object_count != receipt.object_count
+        or object_closure.logical_bytes != receipt.object_logical_bytes
+        or object_closure.digest != receipt.object_digest
+    ):
+        raise PlanError(
+            f"target object closure changed after preflight: {entry.submodule.path}"
+        )
     if receipt.kind != "managed":
         return
     current_head = managed_head(entry.target.path)
@@ -5692,6 +7577,7 @@ def build_sync_plan(
             source_superproject,
             parent_source,
         )
+        source_completeness = capture_source_completeness_receipt(source_git_dir)
         source_fingerprint = filesystem_fingerprint(source_git_dir)
         source_identity = (
             source_fingerprint.device,
@@ -5739,6 +7625,7 @@ def build_sync_plan(
             parent_index=parent_index,
             state=state,
             source_bindings=source_bindings,
+            source_completeness=source_completeness,
             target_bindings=target_bindings,
             checkout_preflight=None,
             transport_receipt=transport_receipt,
@@ -5838,6 +7725,10 @@ def revalidate_runtime_source_access(entry: PlannedWorktree) -> None:
     for binding in entry.source_bindings:
         revalidate_access(binding)
     source_access_bindings(entry.source_git_dir, entry.needs_fetch)
+    revalidate_source_completeness_receipt(
+        entry.source_git_dir,
+        entry.source_completeness,
+    )
     if entry.needs_fetch:
         if entry.transport_receipt is None:
             raise PlanError(
@@ -5868,6 +7759,10 @@ def revalidate_planned_entry(
     for binding in entry.target_bindings:
         revalidate_access(binding)
     source_access_bindings(entry.source_git_dir, entry.needs_fetch)
+    revalidate_source_completeness_receipt(
+        entry.source_git_dir,
+        entry.source_completeness,
+    )
 
     if allow_parent_materialization and entry.parent_index is not None:
         for node in entry.target.existing_nodes:
@@ -5925,6 +7820,51 @@ def validate_sync_plan(plan: SyncPlan) -> None:
         revalidate_planned_entry(plan, entry)
 
 
+def postvalidate_applied_entry(
+    entry: PlannedWorktree,
+    lease: MaterializedTargetLease,
+) -> None:
+    revalidate_materialized_target_lease(lease)
+    for binding in entry.source_bindings:
+        revalidate_access(binding)
+    revalidate_source_completeness_receipt(
+        entry.source_git_dir,
+        entry.source_completeness,
+    )
+    revalidate_source_object_admission(entry.source_git_dir)
+    if managed_head_at_descriptor(lease.target_descriptor) != entry.sha:
+        raise PlanError(
+            "descriptor-bound worktree HEAD does not match the planned target\n"
+            f"  path: {entry.target.path}\n"
+            f"  expected: {entry.sha}"
+        )
+    if common_git_dir_at_descriptor(
+        lease.target_descriptor
+    ) != entry.source_git_dir.resolve(strict=True):
+        raise PlanError(
+            "descriptor-bound worktree common gitdir does not match the source\n"
+            f"  path: {entry.target.path}\n"
+            f"  source: {entry.source_git_dir}"
+        )
+    receipt = entry.checkout_preflight
+    if receipt is None:
+        raise PlanError(f"checkout preflight is incomplete for {entry.submodule.path}")
+    closure = target_object_closure(
+        entry.source_git_dir,
+        entry.sha,
+        entry.source_completeness,
+    )
+    if (
+        closure.object_count != receipt.object_count
+        or closure.logical_bytes != receipt.object_logical_bytes
+        or closure.digest != receipt.object_digest
+    ):
+        raise PlanError(
+            f"target object closure changed during checkout: {entry.submodule.path}"
+        )
+    revalidate_materialized_target_lease(lease)
+
+
 def apply_sync_plan(plan: SyncPlan) -> None:
     validate_sync_plan(plan)
     for entry in plan.entries:
@@ -5940,6 +7880,7 @@ def apply_sync_plan(plan: SyncPlan) -> None:
             plan.depth,
             dry_run=False,
             transport_receipt=getattr(entry, "transport_receipt", None),
+            source_completeness=entry.source_completeness,
             fetch_missing=True,
         )
         entry.needs_fetch = False
@@ -5965,10 +7906,34 @@ def apply_sync_plan(plan: SyncPlan) -> None:
         if first_mutation:
             revalidate_plan_input_receipt(plan)
             first_mutation = False
-        if entry.state == "managed":
-            checkout_existing_worktree(target.path, entry.sha, dry_run=False)
-        else:
-            add_worktree(entry.source_git_dir, target.path, entry.sha, dry_run=False)
+        lease = materialize_bound_target_directory(target)
+        try:
+            # A final entry revalidation happens after the descriptor lease is
+            # acquired and immediately before Git. Git then operates from the
+            # held target/parent objects rather than recreating missing parents
+            # through a replaceable pathname.
+            revalidate_materialized_target_lease(lease)
+            revalidate_source_object_admission(entry.source_git_dir)
+            revalidate_checkout_preflight(entry)
+            if entry.state == "managed":
+                checkout_existing_worktree(
+                    target.path,
+                    entry.sha,
+                    dry_run=False,
+                    target_descriptor=lease.target_descriptor,
+                    source_git_dir=entry.source_git_dir,
+                )
+            else:
+                add_worktree(
+                    entry.source_git_dir,
+                    target.path,
+                    entry.sha,
+                    dry_run=False,
+                    lease=lease,
+                )
+            postvalidate_applied_entry(entry, lease)
+        finally:
+            lease.close()
         applied_indexes.add(index)
 
 

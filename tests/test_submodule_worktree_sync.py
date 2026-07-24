@@ -696,7 +696,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         )
         self.assertEqual(
             dict(receipt.git_environment)["GIT_OBJECT_DIRECTORY"],
-            str(self.named_source_git_dir / "objects"),
+            str((self.named_source_git_dir / "objects").resolve()),
         )
         self.assertEqual(
             receipt.source_shallow_path,
@@ -766,7 +766,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         )
         self.assertEqual(
             bounded_fetch.call_args.kwargs["fixed_env"]["GIT_OBJECT_DIRECTORY"],
-            str(self.named_source_git_dir / "objects"),
+            str((self.named_source_git_dir / "objects").resolve()),
         )
 
     def test_authorized_fetch_uses_the_plan_frozen_closed_environment(self) -> None:
@@ -1354,6 +1354,614 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 dry_run=True,
             )
 
+    def test_apply_rejects_parent_symlink_inserted_after_entry_revalidation(
+        self,
+    ) -> None:
+        target, module, input_receipt = self.make_target_superproject(
+            "late-parent-symlink-target",
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        outside = self.root / "late-parent-symlink-outside"
+        outside.mkdir()
+        original_materialize = MODULE.materialize_bound_target_directory
+
+        def replace_parent(bound_target: MODULE.BoundTarget) -> object:
+            (target / "third_party").symlink_to(outside, target_is_directory=True)
+            return original_materialize(bound_target)
+
+        with mock.patch.object(
+            MODULE,
+            "materialize_bound_target_directory",
+            side_effect=replace_parent,
+        ):
+            with mock.patch.object(MODULE, "add_worktree") as add:
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "appeared during descriptor-relative materialization",
+                ):
+                    MODULE.apply_sync_plan(plan)
+
+        add.assert_not_called()
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_add_rejects_final_target_replacement_before_checkout(self) -> None:
+        target, module, input_receipt = self.make_target_superproject(
+            "late-final-replacement-target",
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        outside = self.root / "late-final-replacement-outside"
+        outside.mkdir()
+        quarantined = self.root / "late-final-original"
+        commands: list[list[str]] = []
+        original_run = MODULE.run_git_at_directory_descriptor
+        replaced = False
+
+        def replace_final(
+            args: list[str],
+            directory_descriptor: int,
+            *,
+            extra_env: dict[str, str] | None = None,
+            directory_identity_leases: tuple[object, ...] = (),
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal replaced
+            commands.append(args)
+            if not replaced:
+                replaced = True
+                worktree_path = target / module.path
+                worktree_path.rename(quarantined)
+                worktree_path.symlink_to(outside, target_is_directory=True)
+            return original_run(
+                args,
+                directory_descriptor,
+                extra_env=extra_env,
+                directory_identity_leases=directory_identity_leases,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "run_git_at_directory_descriptor",
+            side_effect=replace_final,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "path object or access policy changed|entry changed",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertEqual(len(commands), 1)
+        self.assertIn("worktree", commands[0])
+        self.assertEqual(commands[0][-2], ".")
+        self.assertTrue((quarantined / ".git").is_file())
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_managed_checkout_ignores_late_gitfile_admin_redirect(self) -> None:
+        (self.remote / "CONTROL-RACE.md").write_text(
+            "target\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "CONTROL-RACE.md")
+        run_git(self.remote, "commit", "-m", "managed control target")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        source = self.clone_named_source("managed-control-race")
+        target_super = self.root / "managed-control-race-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        self.add_managed_worktree(source, target, self.sha)
+        original_gitfile = (target / ".git").read_bytes()
+        expected_admin = MODULE.gitdir_file_target(target)
+        self.assertIsNotNone(expected_admin)
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "managed-control-race",
+                        "lib",
+                        str(self.remote),
+                    ),
+                    target_sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        external = self.root / "managed-control-external"
+        run_git(self.root, "clone", str(self.remote), str(external))
+        run_git(external, "checkout", "--detach", self.sha)
+        external_head_before = (external / ".git" / "HEAD").read_bytes()
+        external_index_before = (external / ".git" / "index").read_bytes()
+        original_run = MODULE.run_git_at_directory_descriptor
+        redirected = False
+
+        def redirect_gitfile(
+            args: list[str],
+            directory_descriptor: int,
+            *,
+            extra_env: dict[str, str] | None = None,
+            directory_identity_leases: tuple[object, ...] = (),
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal redirected
+            if not redirected and "checkout" in args:
+                redirected = True
+                (target / ".git").write_text(
+                    f"gitdir: {external / '.git'}\n",
+                    encoding="utf-8",
+                )
+            return original_run(
+                args,
+                directory_descriptor,
+                extra_env=extra_env,
+                directory_identity_leases=directory_identity_leases,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "run_git_at_directory_descriptor",
+            side_effect=redirect_gitfile,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "control file",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(redirected)
+        self.assertEqual(
+            (external / ".git" / "HEAD").read_bytes(), external_head_before
+        )
+        self.assertEqual(
+            (external / ".git" / "index").read_bytes(),
+            external_index_before,
+        )
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={expected_admin}",
+                "rev-parse",
+                "HEAD",
+            ),
+            target_sha,
+        )
+        self.assertNotEqual((target / ".git").read_bytes(), original_gitfile)
+
+    def test_managed_checkout_rejects_late_admin_entry_replacement_before_exec(
+        self,
+    ) -> None:
+        (self.remote / "ADMIN-RACE.md").write_text(
+            "target\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "ADMIN-RACE.md")
+        run_git(self.remote, "commit", "-m", "managed admin target")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        source = self.clone_named_source("managed-admin-race")
+        target_super = self.root / "managed-admin-race-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        self.add_managed_worktree(source, target, self.sha)
+        expected_admin = MODULE.gitdir_file_target(target)
+        self.assertIsNotNone(expected_admin)
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "managed-admin-race",
+                        "lib",
+                        str(self.remote),
+                    ),
+                    target_sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        external = self.root / "managed-admin-external"
+        run_git(self.root, "clone", str(self.remote), str(external))
+        run_git(external, "checkout", "--detach", self.sha)
+        external_head_before = (external / ".git" / "HEAD").read_bytes()
+        external_index_before = (external / ".git" / "index").read_bytes()
+        quarantined = self.root / "managed-admin-quarantined"
+        original_run = MODULE.run_git_at_directory_descriptor
+        replaced = False
+
+        def replace_admin(
+            args: list[str],
+            directory_descriptor: int,
+            *,
+            extra_env: dict[str, str] | None = None,
+            directory_identity_leases: tuple[object, ...] = (),
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal replaced
+            if not replaced and "checkout" in args:
+                replaced = True
+                expected_admin.rename(quarantined)
+                expected_admin.symlink_to(
+                    external / ".git",
+                    target_is_directory=True,
+                )
+            return original_run(
+                args,
+                directory_descriptor,
+                extra_env=extra_env,
+                directory_identity_leases=directory_identity_leases,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "run_git_at_directory_descriptor",
+            side_effect=replace_admin,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.GitError,
+                "failed to start",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(replaced)
+        self.assertEqual(
+            (external / ".git" / "HEAD").read_bytes(),
+            external_head_before,
+        )
+        self.assertEqual(
+            (external / ".git" / "index").read_bytes(),
+            external_index_before,
+        )
+        self.assertEqual(
+            (quarantined / "HEAD").read_text(encoding="utf-8").strip(),
+            self.sha,
+        )
+
+    def test_managed_checkout_rejects_cross_worktree_admin_backlink(self) -> None:
+        (self.remote / "CROSS-ADMIN.md").write_text(
+            "target\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "CROSS-ADMIN.md")
+        run_git(self.remote, "commit", "-m", "cross admin target")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        source = self.clone_named_source("cross-admin")
+        target_super = self.root / "cross-admin-target"
+        target_super.mkdir()
+        first = target_super / "first"
+        second = target_super / "second"
+        self.add_managed_worktree(source, first, self.sha)
+        self.add_managed_worktree(source, second, self.sha)
+        first_admin = MODULE.gitdir_file_target(first)
+        second_admin = MODULE.gitdir_file_target(second)
+        self.assertIsNotNone(first_admin)
+        self.assertIsNotNone(second_admin)
+        (first / ".git").write_bytes((second / ".git").read_bytes())
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "cross-admin",
+                        "first",
+                        str(self.remote),
+                    ),
+                    target_sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "backlink points at a different worktree",
+        ):
+            MODULE.apply_sync_plan(plan)
+
+        self.assertEqual(
+            (first_admin / "HEAD").read_text(encoding="utf-8").strip(),
+            self.sha,
+        )
+        self.assertEqual(
+            (second_admin / "HEAD").read_text(encoding="utf-8").strip(),
+            self.sha,
+        )
+        self.assertFalse((first / "CROSS-ADMIN.md").exists())
+        self.assertFalse((second / "CROSS-ADMIN.md").exists())
+
+    def test_source_completeness_rejects_promisor_and_alternate_policy(self) -> None:
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "core.repositoryFormatVersion",
+            "1",
+        )
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "extensions.worktreeConfig",
+            "true",
+        )
+        with self.assertRaisesRegex(MODULE.PlanError, "unsupported"):
+            MODULE.capture_source_completeness_receipt(
+                self.named_source_git_dir,
+            )
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "--unset",
+            "extensions.worktreeConfig",
+        )
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "extensions.partialClone",
+            "origin",
+        )
+        with self.assertRaisesRegex(MODULE.PlanError, "promisor policy"):
+            MODULE.capture_source_completeness_receipt(
+                self.named_source_git_dir,
+            )
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "--unset",
+            "extensions.partialClone",
+        )
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "core.repositoryFormatVersion",
+            "0",
+        )
+        alternates = self.named_source_git_dir / "objects" / "info" / "alternates"
+        alternates.parent.mkdir(parents=True, exist_ok=True)
+        alternates.write_text(
+            str(self.remote / ".git" / "objects") + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(MODULE.PlanError, "alternate object database"):
+            MODULE.capture_source_completeness_receipt(
+                self.named_source_git_dir,
+            )
+        alternates.unlink()
+        promisor = self.named_source_git_dir / "objects" / "pack" / "pack-test.PROMISOR"
+        promisor.parent.mkdir(parents=True, exist_ok=True)
+        promisor.write_text("promisor\n", encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.PlanError, "promisor pack"):
+            MODULE.capture_source_completeness_receipt(
+                self.named_source_git_dir,
+            )
+
+    def test_source_completeness_rejects_commondir_indirection(self) -> None:
+        (self.named_source_git_dir / "commondir").write_text(
+            str(self.remote / ".git") + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(MODULE.PlanError, "commondir indirection"):
+            MODULE.capture_source_completeness_receipt(
+                self.named_source_git_dir,
+            )
+
+    def test_late_commondir_cannot_redirect_worktree_registry_write(self) -> None:
+        target, module, input_receipt = self.make_target_superproject(
+            "late-commondir-target",
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        outside_common = self.root / "late-commondir-outside.git"
+        shutil.copytree(self.named_source_git_dir, outside_common)
+        self.assertFalse((outside_common / "worktrees").exists())
+        original_run = MODULE.run_git_at_directory_descriptor
+        inserted = False
+
+        def insert_commondir(
+            args: list[str],
+            directory_descriptor: int,
+            *,
+            extra_env: dict[str, str] | None = None,
+            directory_identity_leases: tuple[object, ...] = (),
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal inserted
+            if not inserted and "worktree" in args and "add" in args:
+                inserted = True
+                (self.named_source_git_dir / "commondir").write_text(
+                    str(outside_common) + "\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    extra_env,
+                    {"GIT_COMMON_DIR": str(plan.entries[0].source_git_dir)},
+                )
+            return original_run(
+                args,
+                directory_descriptor,
+                extra_env=extra_env,
+                directory_identity_leases=directory_identity_leases,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "run_git_at_directory_descriptor",
+            side_effect=insert_commondir,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "commondir indirection",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(inserted)
+        self.assertFalse((outside_common / "worktrees").exists())
+        self.assertTrue((self.named_source_git_dir / "worktrees").is_dir())
+        gitdir_text = (target / module.path / ".git").read_text(encoding="utf-8")
+        self.assertIn(str(self.named_source_git_dir / "worktrees"), gitdir_text)
+
+    def test_target_object_closure_rejects_missing_blob_and_logical_cap(
+        self,
+    ) -> None:
+        source = self.root / "missing-closure.git"
+        run_git(self.root, "init", "--bare", str(source))
+        missing_blob = "f" * 40
+        tree_result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                f"--git-dir={source}",
+                "mktree",
+                "--missing",
+            ],
+            input=f"100644 blob {missing_blob}\tmissing.txt\n",
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        tree = tree_result.stdout.strip()
+        commit = run_git(
+            self.root,
+            f"--git-dir={source}",
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "commit-tree",
+            tree,
+            "-m",
+            "missing blob",
+        )
+        completeness = MODULE.capture_source_completeness_receipt(source)
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "missing or malformed object",
+        ):
+            MODULE.target_object_closure(
+                source,
+                commit,
+                completeness,
+            )
+
+        normal_completeness = MODULE.capture_source_completeness_receipt(
+            self.named_source_git_dir,
+        )
+        with mock.patch.object(MODULE, "MAX_CHECKOUT_LOGICAL_BYTES", 1):
+            with self.assertRaisesRegex(MODULE.PlanError, "logical-size safety limit"):
+                MODULE.target_object_closure(
+                    self.named_source_git_dir,
+                    self.sha,
+                    normal_completeness,
+                )
+
+    def test_target_object_closure_reads_and_hashes_payload_bytes(self) -> None:
+        source = self.clone_named_source("corrupt-payload")
+        blob_result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                f"--git-dir={source}",
+                "hash-object",
+                "-w",
+                "--stdin",
+            ],
+            input=b"source-specific payload\n",
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        blob = os.fsdecode(blob_result.stdout).strip()
+        tree_result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                f"--git-dir={source}",
+                "mktree",
+            ],
+            input=f"100644 blob {blob}\tpayload.txt\n",
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        tree = tree_result.stdout.strip()
+        commit = run_git(
+            self.root,
+            f"--git-dir={source}",
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "commit-tree",
+            tree,
+            "-m",
+            "corrupt payload",
+        )
+        loose_blob = source / "objects" / blob[:2] / blob[2:]
+        compressed = loose_blob.read_bytes()
+        self.assertGreater(len(compressed), 4)
+        loose_blob.chmod(0o600)
+        loose_blob.write_bytes(compressed[:-4])
+        completeness = MODULE.capture_source_completeness_receipt(source)
+
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "payload|every required object",
+        ):
+            MODULE.target_object_closure(
+                source,
+                commit,
+                completeness,
+            )
+
     def test_expected_sha_rejects_unmerged_index_entries(self) -> None:
         original_git = MODULE.git
 
@@ -1583,25 +2191,40 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
     def test_checkout_existing_worktree_refuses_to_overwrite_ignored_files(
         self,
     ) -> None:
+        self.add_managed_worktree(
+            self.source_git_dir,
+            self.linked,
+            self.sha,
+        )
         completed = subprocess.CompletedProcess(
             ["git"],
             0,
             stdout="",
             stderr="",
         )
-        with mock.patch.object(MODULE, "has_local_changes", return_value=False):
+        target_descriptor = os.open(
+            self.linked,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+        try:
             with mock.patch.object(
                 MODULE,
-                "run",
+                "run_git_at_directory_descriptor",
                 return_value=completed,
             ) as run_command:
                 MODULE.checkout_existing_worktree(
                     self.linked,
                     self.sha,
                     dry_run=False,
+                    target_descriptor=target_descriptor,
+                    source_git_dir=self.source_git_dir,
                 )
+        finally:
+            os.close(target_descriptor)
 
         command = run_command.call_args.args[0]
+        self.assertTrue(any(arg.startswith("--git-dir=") for arg in command))
+        self.assertIn("--work-tree=.", command)
         self.assertIn("--no-overwrite-ignore", command)
         self.assertIn("--no-recurse-submodules", command)
 
@@ -3635,6 +4258,306 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.assertFalse(any("fetch" in command for command in commands))
 
+    def test_commit_fast_path_rejects_stale_shallow_or_fetch_fence(self) -> None:
+        for name in (
+            MODULE.SOURCE_SHALLOW_LOCK_NAME,
+            MODULE.SOURCE_FETCH_TRANSACTION_NAME,
+        ):
+            with self.subTest(name=name):
+                fence = self.named_source_git_dir / name
+                fence.write_text("stale\n", encoding="utf-8")
+                with mock.patch.object(MODULE, "read_git") as read_git:
+                    with self.assertRaisesRegex(
+                        MODULE.PlanError,
+                        "objects are unavailable.*recovered",
+                    ):
+                        MODULE.commit_exists(
+                            self.named_source_git_dir,
+                            self.root / "unused-target",
+                            self.sha,
+                        )
+                read_git.assert_not_called()
+                fence.unlink()
+
+    def test_failed_fetch_retains_persistent_fence_and_blocks_known_commit(
+        self,
+    ) -> None:
+        (self.remote / "FETCH-FAIL.md").write_text(
+            "fetch failure\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "FETCH-FAIL.md")
+        run_git(self.remote, "commit", "-m", "fetch failure")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        original_run_bounded = MODULE.run_bounded_bytes
+
+        def fail_fetch(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            if "fetch" in args:
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    stdout=b"",
+                    stderr=b"simulated fetch failure",
+                )
+            return original_run_bounded(args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "run_bounded_bytes",
+            side_effect=fail_fetch,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "recovery fence was retained",
+            ):
+                MODULE.fetch_missing_commit(
+                    self.named_source_git_dir,
+                    self.root / "unused-target",
+                    submodule,
+                    missing_sha,
+                    1,
+                    dry_run=False,
+                    transport_receipt=receipt,
+                    fetch_missing=True,
+                )
+
+        fence = self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME
+        self.assertTrue(fence.is_file())
+        with self.assertRaisesRegex(MODULE.PlanError, "objects are unavailable"):
+            MODULE.commit_exists(
+                self.named_source_git_dir,
+                self.root / "unused-target",
+                self.sha,
+            )
+
+    def test_fetch_rejects_source_object_directory_replacement_before_git_starts(
+        self,
+    ) -> None:
+        (self.remote / "FETCH-OBJECT-REPLACEMENT.md").write_text(
+            "fetch object replacement\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "FETCH-OBJECT-REPLACEMENT.md")
+        run_git(self.remote, "commit", "-m", "fetch object replacement")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        source_objects = receipt.source_object_directory
+        outside_objects = self.root / "outside-objects"
+        held_source_objects = self.root / "held-source-objects"
+        shutil.copytree(source_objects, outside_objects)
+
+        def directory_snapshot(root: Path) -> list[tuple[str, str, bytes]]:
+            snapshot: list[tuple[str, str, bytes]] = []
+            for path in sorted(root.rglob("*"), key=lambda item: os.fsencode(item)):
+                relative = str(path.relative_to(root))
+                if path.is_symlink():
+                    snapshot.append(
+                        (relative, "symlink", os.fsencode(os.readlink(path)))
+                    )
+                elif path.is_file():
+                    snapshot.append((relative, "file", path.read_bytes()))
+                else:
+                    snapshot.append((relative, "directory", b""))
+            return snapshot
+
+        outside_before = directory_snapshot(outside_objects)
+        original_run_bounded = MODULE.run_bounded_bytes
+        replacement_performed = False
+
+        def replace_objects_before_fetch(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal replacement_performed
+            if "fetch" in args:
+                self.assertFalse(replacement_performed)
+                replacement_performed = True
+                os.rename(source_objects, held_source_objects)
+                source_objects.symlink_to(outside_objects, target_is_directory=True)
+            return original_run_bounded(args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "run_bounded_bytes",
+            side_effect=replace_objects_before_fetch,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "recovery fence was retained",
+                ):
+                    MODULE.fetch_missing_commit(
+                        self.named_source_git_dir,
+                        self.root / "unused-target",
+                        submodule,
+                        missing_sha,
+                        1,
+                        dry_run=False,
+                        transport_receipt=receipt,
+                        fetch_missing=True,
+                    )
+
+        self.assertTrue(replacement_performed)
+        self.assertTrue(source_objects.is_symlink())
+        self.assertTrue(held_source_objects.is_dir())
+        self.assertEqual(directory_snapshot(outside_objects), outside_before)
+        self.assertTrue(
+            (self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME).is_file()
+        )
+
+    def test_successful_fetch_retains_fence_until_full_closure_is_verified(
+        self,
+    ) -> None:
+        (self.remote / "FETCH-CLOSURE.md").write_text(
+            "fetch closure\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "FETCH-CLOSURE.md")
+        run_git(self.remote, "commit", "-m", "fetch closure")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "target_object_closure",
+            side_effect=MODULE.PlanError("simulated corrupt fetched blob"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "recovery fence was retained",
+            ):
+                MODULE.fetch_missing_commit(
+                    self.named_source_git_dir,
+                    self.root / "unused-target",
+                    submodule,
+                    missing_sha,
+                    1,
+                    dry_run=False,
+                    transport_receipt=receipt,
+                    fetch_missing=True,
+                )
+
+        self.assertTrue(
+            (self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME).is_file()
+        )
+
+    def test_cleanup_fsync_failure_restores_recovery_fence(self) -> None:
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        transaction = MODULE.begin_source_fetch_transaction(receipt)
+        real_fsync = MODULE.os.fsync
+        failed = False
+
+        def fail_first_directory_fsync(descriptor: int) -> None:
+            nonlocal failed
+            if descriptor == transaction.directory_descriptor and not failed:
+                failed = True
+                raise OSError("simulated directory fsync failure")
+            real_fsync(descriptor)
+
+        with mock.patch.object(
+            MODULE.os,
+            "fsync",
+            side_effect=fail_first_directory_fsync,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "cleanup durability is unverified",
+            ):
+                MODULE.complete_source_fetch_transaction(transaction)
+
+        self.assertTrue(failed)
+        self.assertTrue(
+            (self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME).is_file()
+        )
+
+    def test_owned_descriptor_cleanup_attempts_both_after_first_error(self) -> None:
+        binding = mock.MagicMock()
+        lease = MODULE.MaterializedTargetLease(
+            target=self.root / "target",
+            target_binding=binding,
+            target_descriptor=101,
+            parent_binding=binding,
+            parent_descriptor=102,
+            entry_name="target",
+        )
+        with mock.patch.object(
+            MODULE.os,
+            "close",
+            side_effect=[OSError("first close failed"), None],
+        ) as close:
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "target lease descriptor cleanup failed",
+            ):
+                lease.close()
+        self.assertEqual(
+            close.call_args_list,
+            [mock.call(101), mock.call(102)],
+        )
+        self.assertEqual(lease.target_descriptor, -1)
+        self.assertEqual(lease.parent_descriptor, -1)
+
+        transaction = MODULE.SourceFetchTransaction(
+            source_git_dir=self.named_source_git_dir,
+            directory_binding=binding,
+            directory_descriptor=201,
+            fence_binding=binding,
+            fence_descriptor=202,
+            transaction_id="test-transaction",
+        )
+        with mock.patch.object(
+            MODULE.os,
+            "close",
+            side_effect=[OSError("first close failed"), None],
+        ) as close:
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "source fetch descriptor cleanup failed",
+            ):
+                transaction.close_descriptors()
+        self.assertEqual(
+            close.call_args_list,
+            [mock.call(202), mock.call(201)],
+        )
+        self.assertEqual(transaction.fence_descriptor, -1)
+        self.assertEqual(transaction.directory_descriptor, -1)
+
     def test_authorized_missing_commit_fetches_shallow_target(self) -> None:
         (self.remote / "SECOND.md").write_text("second\n", encoding="utf-8")
         run_git(self.remote, "add", "SECOND.md")
@@ -3735,12 +4658,22 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         receipt.fetch_guard.cleanup()
         self.assertFalse(receipt.fetch_git_dir.exists())
-        MODULE.add_worktree(
-            shallow_source,
-            self.root / "shallow-fetched-worktree",
-            third_sha,
-            dry_run=False,
+        target = MODULE.bind_target_path(
+            self.root,
+            ("shallow-fetched-worktree",),
+            "test shallow fetched worktree",
         )
+        lease = MODULE.materialize_bound_target_directory(target)
+        try:
+            MODULE.add_worktree(
+                shallow_source,
+                target.path,
+                third_sha,
+                dry_run=False,
+                lease=lease,
+            )
+        finally:
+            lease.close()
         run_git(
             self.root,
             f"--git-dir={shallow_source}",
@@ -4330,6 +5263,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 SimpleNamespace(
                     needs_fetch=True,
                     source_git_dir=self.root / f"source-{index}",
+                    source_completeness=mock.sentinel.source_completeness,
                     target=SimpleNamespace(path=self.root / f"target-{index}"),
                     submodule=MODULE.Submodule(
                         f"module-{index}",
@@ -4376,10 +5310,14 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             target: Path,
             _sha: str,
             dry_run: bool,
+            *,
+            lease: object | None = None,
         ) -> None:
             self.assertFalse(dry_run)
+            self.assertIsNotNone(lease)
             events.append(f"add:{target.name}")
 
+        lease = mock.MagicMock()
         with mock.patch.object(MODULE, "validate_sync_plan", side_effect=validate):
             with mock.patch.object(
                 MODULE,
@@ -4403,10 +5341,31 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         ):
                             with mock.patch.object(
                                 MODULE,
-                                "add_worktree",
-                                side_effect=add,
+                                "materialize_bound_target_directory",
+                                return_value=lease,
                             ):
-                                MODULE.apply_sync_plan(plan)
+                                with mock.patch.object(
+                                    MODULE,
+                                    "revalidate_materialized_target_lease",
+                                ):
+                                    with mock.patch.object(
+                                        MODULE,
+                                        "revalidate_source_object_admission",
+                                    ):
+                                        with mock.patch.object(
+                                            MODULE,
+                                            "revalidate_checkout_preflight",
+                                        ):
+                                            with mock.patch.object(
+                                                MODULE,
+                                                "postvalidate_applied_entry",
+                                            ):
+                                                with mock.patch.object(
+                                                    MODULE,
+                                                    "add_worktree",
+                                                    side_effect=add,
+                                                ):
+                                                    MODULE.apply_sync_plan(plan)
 
         self.assertEqual(events.count("full"), 2)
         second_full = len(events) - 1 - events[::-1].index("full")
