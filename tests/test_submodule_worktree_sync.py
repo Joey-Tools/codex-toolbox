@@ -156,6 +156,80 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             str(self.root / standard_name),
         )
 
+    def make_grouped_recursive_plan(
+        self,
+        scenario: str,
+        child_paths: tuple[str, str],
+        *,
+        regular_paths: tuple[str, ...] = (),
+    ) -> tuple[
+        MODULE.SyncPlan,
+        Path,
+        Path,
+        tuple[tuple[Path, str], ...],
+    ]:
+        children: list[tuple[str, str, Path, str]] = []
+        child_results: list[tuple[Path, str]] = []
+        for child_name, child_path in zip(
+            ("left", "right"),
+            child_paths,
+            strict=True,
+        ):
+            remote, sha = self.create_gitlink_remote(
+                f"{scenario}-{child_name}",
+            )
+            children.append((child_name, child_path, remote, sha))
+            child_results.append((remote, sha))
+        parent_remote, parent_sha = self.create_gitlink_remote(
+            f"{scenario}-parent",
+            tuple(children),
+        )
+        for relative_path in regular_paths:
+            regular = parent_remote / relative_path
+            regular.parent.mkdir(parents=True, exist_ok=True)
+            regular.write_text(f"{scenario}\n", encoding="utf-8")
+            run_git(parent_remote, "add", relative_path)
+        if regular_paths:
+            run_git(parent_remote, "commit", "-m", "add regular paths")
+            parent_sha = run_git(parent_remote, "rev-parse", "HEAD")
+
+        source_common = self.root / f"{scenario}-source" / ".git"
+        parent_source = source_common / "modules" / "parent"
+        self.clone_recursive_source(
+            parent_source,
+            parent_remote,
+            f"{scenario}-parent-standard",
+        )
+        for child_name, _child_path, child_remote, _child_sha in children:
+            self.clone_recursive_source(
+                parent_source / "modules" / child_name,
+                child_remote,
+                f"{scenario}-{child_name}-standard",
+            )
+
+        target_super = self.root / f"{scenario}-target"
+        target_super.mkdir()
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=source_common,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "parent",
+                        "parent",
+                        str(parent_remote),
+                    ),
+                    parent_sha,
+                )
+            ],
+            depth=1,
+            recursive=True,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        return plan, target_super, parent_source, tuple(child_results)
+
     def fetch_source(self, source_git_dir: Path) -> None:
         run_git(
             self.root,
@@ -4778,6 +4852,345 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertEqual(
             shared_vendor.materialized_node.fingerprint,
             MODULE.filesystem_fingerprint(plan.root / "vendor"),
+        )
+
+    def test_recursive_parent_checkout_binds_shared_child_prefix(self) -> None:
+        plan, target_super, _parent_source, child_results = (
+            self.make_grouped_recursive_plan(
+                "checkout-shared-prefix",
+                ("group/left", "group/right"),
+            )
+        )
+
+        self.assertEqual(
+            set(plan.shared_missing_ancestors),
+            {("parent", "group")},
+        )
+        with redirect_stdout(io.StringIO()):
+            MODULE.apply_sync_plan(plan)
+
+        for child_path, (_remote, child_sha) in zip(
+            ("group/left", "group/right"),
+            child_results,
+            strict=True,
+        ):
+            with self.subTest(child_path=child_path):
+                self.assertEqual(
+                    run_git(target_super / "parent" / child_path, "rev-parse", "HEAD"),
+                    child_sha,
+                )
+        shared = plan.shared_missing_ancestors[("parent", "group")]
+        self.assertIsNotNone(shared.materialized_node)
+        assert shared.materialized_node is not None
+        self.assertEqual(
+            shared.materialized_node.path,
+            (target_super / "parent/group").resolve(),
+        )
+        self.assertEqual(
+            shared.materialized_node.fingerprint,
+            MODULE.filesystem_fingerprint(target_super / "parent/group"),
+        )
+
+    def test_recursive_parent_checkout_binds_each_deep_shared_prefix(self) -> None:
+        plan, target_super, _parent_source, child_results = (
+            self.make_grouped_recursive_plan(
+                "checkout-deep-prefix",
+                ("group/deep/left", "group/deep/right"),
+            )
+        )
+
+        self.assertEqual(
+            set(plan.shared_missing_ancestors),
+            {
+                ("parent", "group"),
+                ("parent", "group", "deep"),
+            },
+        )
+        with redirect_stdout(io.StringIO()):
+            MODULE.apply_sync_plan(plan)
+
+        for relative_parts in (
+            ("parent", "group"),
+            ("parent", "group", "deep"),
+        ):
+            shared = plan.shared_missing_ancestors[relative_parts]
+            self.assertIsNotNone(shared.materialized_node)
+            assert shared.materialized_node is not None
+            self.assertEqual(
+                shared.materialized_node.fingerprint,
+                MODULE.filesystem_fingerprint(target_super.joinpath(*relative_parts)),
+            )
+        for child_path, (_remote, child_sha) in zip(
+            ("group/deep/left", "group/deep/right"),
+            child_results,
+            strict=True,
+        ):
+            self.assertEqual(
+                run_git(target_super / "parent" / child_path, "rev-parse", "HEAD"),
+                child_sha,
+            )
+
+    def test_recursive_parent_checkout_does_not_bless_unrelated_sibling(
+        self,
+    ) -> None:
+        plan, target_super, _parent_source, _child_results = (
+            self.make_grouped_recursive_plan(
+                "checkout-unrelated-sibling",
+                ("group/left", "group/right"),
+                regular_paths=("unrelated/nested.txt",),
+            )
+        )
+        self.assertNotIn(
+            ("parent", "unrelated"),
+            plan.shared_missing_ancestors,
+        )
+
+        with redirect_stdout(io.StringIO()):
+            MODULE.apply_sync_plan(plan)
+
+        self.assertEqual(
+            (target_super / "parent/unrelated/nested.txt").read_text(encoding="utf-8"),
+            "checkout-unrelated-sibling\n",
+        )
+        self.assertEqual(
+            set(plan.shared_missing_ancestors),
+            {("parent", "group")},
+        )
+
+    def test_recursive_parent_checkout_rejects_shared_prefix_replacement(
+        self,
+    ) -> None:
+        for boundary in ("group", "deep"):
+            with self.subTest(boundary=boundary):
+                scenario = f"checkout-replace-{boundary}"
+                plan, target_super, parent_source, _child_results = (
+                    self.make_grouped_recursive_plan(
+                        scenario,
+                        ("group/deep/left", "group/deep/right"),
+                    )
+                )
+                registry_before = run_git(
+                    self.root,
+                    f"--git-dir={parent_source}",
+                    "worktree",
+                    "list",
+                    "--porcelain",
+                )
+                original_capture = MODULE.capture_checkout_materialized_shared_ancestors
+                original_open = os.open
+                replaced = False
+                quarantine = self.root / f"{scenario}-quarantine"
+
+                def capture_with_replacement(
+                    current_plan: object,
+                    owner_index: int,
+                    entry: object,
+                    lease: object,
+                ) -> object:
+                    def replace_before_open(
+                        path: object,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        nonlocal replaced
+                        if (
+                            not replaced
+                            and path == boundary
+                            and dir_fd is not None
+                            and flags & os.O_DIRECTORY
+                        ):
+                            replaced = True
+                            prefix = (
+                                target_super / "parent/group"
+                                if boundary == "group"
+                                else target_super / "parent/group/deep"
+                            )
+                            prefix.rename(quarantine)
+                            prefix.mkdir()
+                        return original_open(
+                            path,
+                            flags,
+                            mode,
+                            dir_fd=dir_fd,
+                        )
+
+                    with mock.patch.object(
+                        MODULE.os,
+                        "open",
+                        side_effect=replace_before_open,
+                    ):
+                        return original_capture(
+                            current_plan,
+                            owner_index,
+                            entry,
+                            lease,
+                        )
+
+                with mock.patch.object(
+                    MODULE,
+                    "capture_checkout_materialized_shared_ancestors",
+                    side_effect=capture_with_replacement,
+                ):
+                    with redirect_stdout(io.StringIO()):
+                        with self.assertRaisesRegex(
+                            MODULE.PlanError,
+                            "changed during descriptor binding",
+                        ):
+                            MODULE.apply_sync_plan(plan)
+
+                self.assertTrue(replaced)
+                self.assertFalse((target_super / "parent").exists())
+                self.assertEqual(
+                    run_git(
+                        self.root,
+                        f"--git-dir={parent_source}",
+                        "worktree",
+                        "list",
+                        "--porcelain",
+                    ),
+                    registry_before,
+                )
+                self.assertFalse(plan.applied_target_roots)
+                self.assertTrue(
+                    all(
+                        ancestor.materialized_node is None
+                        for ancestor in plan.shared_missing_ancestors.values()
+                    )
+                )
+
+    def test_recursive_parent_checkout_rejects_unsafe_shared_prefix_policy(
+        self,
+    ) -> None:
+        for policy in ("wrong-owner", "non-writable", "symlink"):
+            with self.subTest(policy=policy):
+                scenario = f"checkout-policy-{policy}"
+                plan, target_super, parent_source, _child_results = (
+                    self.make_grouped_recursive_plan(
+                        scenario,
+                        ("group/left", "group/right"),
+                    )
+                )
+                registry_before = run_git(
+                    self.root,
+                    f"--git-dir={parent_source}",
+                    "worktree",
+                    "list",
+                    "--porcelain",
+                )
+                original_capture = MODULE.capture_checkout_materialized_shared_ancestors
+                outside = self.root / f"{scenario}-outside"
+                outside.mkdir()
+
+                def capture_with_policy_change(
+                    current_plan: object,
+                    owner_index: int,
+                    entry: object,
+                    lease: object,
+                ) -> object:
+                    group = target_super / "parent/group"
+                    if policy == "wrong-owner":
+                        with mock.patch.object(
+                            MODULE.os,
+                            "geteuid",
+                            return_value=os.geteuid() + 1,
+                        ):
+                            return original_capture(
+                                current_plan,
+                                owner_index,
+                                entry,
+                                lease,
+                            )
+                    if policy == "non-writable":
+                        group.chmod(0o555)
+                    else:
+                        shutil.rmtree(group)
+                        group.symlink_to(outside, target_is_directory=True)
+                    return original_capture(
+                        current_plan,
+                        owner_index,
+                        entry,
+                        lease,
+                    )
+
+                expected = {
+                    "wrong-owner": "wrong owner",
+                    "non-writable": "does not permit descendant materialization",
+                    "symlink": "is not a directory",
+                }[policy]
+                with mock.patch.object(
+                    MODULE,
+                    "capture_checkout_materialized_shared_ancestors",
+                    side_effect=capture_with_policy_change,
+                ):
+                    with redirect_stdout(io.StringIO()):
+                        with self.assertRaisesRegex(
+                            MODULE.PlanError,
+                            expected,
+                        ) as raised:
+                            MODULE.apply_sync_plan(plan)
+
+                self.assertNotIn("worktree rollback failed", str(raised.exception))
+                self.assertFalse((target_super / "parent").exists())
+                self.assertEqual(
+                    run_git(
+                        self.root,
+                        f"--git-dir={parent_source}",
+                        "worktree",
+                        "list",
+                        "--porcelain",
+                    ),
+                    registry_before,
+                )
+                self.assertEqual(list(outside.iterdir()), [])
+
+    def test_recursive_parent_checkout_binding_failure_rolls_back_registration(
+        self,
+    ) -> None:
+        plan, target_super, parent_source, _child_results = (
+            self.make_grouped_recursive_plan(
+                "checkout-binding-rollback",
+                ("group/left", "group/right"),
+            )
+        )
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={parent_source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "capture_checkout_materialized_shared_ancestors",
+            side_effect=MODULE.PlanError("injected shared-prefix binding failure"),
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "injected shared-prefix binding failure",
+                ):
+                    MODULE.apply_sync_plan(plan)
+
+        self.assertFalse((target_super / "parent").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={parent_source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+        self.assertFalse(plan.applied_target_roots)
+        self.assertTrue(
+            all(
+                ancestor.materialized_node is None
+                for ancestor in plan.shared_missing_ancestors.values()
+            )
         )
 
     def test_recursive_apply_two_level_chain_uses_each_parent_receipt(

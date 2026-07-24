@@ -22,7 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 import unicodedata
 
 
@@ -2541,8 +2541,13 @@ def revalidate_materialized_shared_node(node: BoundNode) -> None:
         )
 
 
-def revalidate_shared_missing_ancestors(plan: SyncPlan) -> None:
+def revalidate_shared_missing_ancestors(
+    plan: SyncPlan,
+    *,
+    materialized_overrides: Optional[dict[tuple[str, ...], BoundNode]] = None,
+) -> None:
     ancestors = getattr(plan, "shared_missing_ancestors", {})
+    overrides = materialized_overrides or {}
     for relative_parts, ancestor in sorted(
         ancestors.items(),
         key=lambda item: (len(item[0]), item[0]),
@@ -2550,10 +2555,14 @@ def revalidate_shared_missing_ancestors(plan: SyncPlan) -> None:
         if ancestor.relative_parts != relative_parts:
             raise PlanError("shared target ancestor receipt has an invalid key")
         path = plan.root.joinpath(*relative_parts)
-        if ancestor.materialized_node is not None:
-            if ancestor.materialized_node.path != path:
+        materialized_node = overrides.get(
+            relative_parts,
+            ancestor.materialized_node,
+        )
+        if materialized_node is not None:
+            if materialized_node.path != path:
                 raise PlanError("shared target ancestor receipt names the wrong path")
-            revalidate_materialized_shared_node(ancestor.materialized_node)
+            revalidate_materialized_shared_node(materialized_node)
             continue
         try:
             os.stat(path, follow_symlinks=False)
@@ -2618,35 +2627,303 @@ def target_with_materialized_shared_ancestors(
     )
 
 
+def prepare_materialized_shared_ancestor_updates(
+    plan: SyncPlan,
+    created_nodes: tuple[CreatedTargetNode, ...],
+    *,
+    authorized_targets: frozenset[tuple[str, ...]],
+    require_all_participants_authorized: bool,
+    existing_updates: Optional[dict[tuple[str, ...], BoundNode]] = None,
+) -> dict[tuple[str, ...], BoundNode]:
+    ancestors = getattr(plan, "shared_missing_ancestors", {})
+    updates = dict(existing_updates or {})
+    for created in created_nodes:
+        ancestor = ancestors.get(created.relative_parts)
+        if ancestor is None:
+            continue
+        if require_all_participants_authorized:
+            authorized = (
+                bool(ancestor.participant_targets)
+                and ancestor.participant_targets <= authorized_targets
+            )
+        else:
+            authorized = bool(ancestor.participant_targets & authorized_targets)
+        if not authorized:
+            raise PlanError(
+                "planned target created an unowned shared target ancestor\n"
+                f"  authorized targets: {sorted(authorized_targets)}\n"
+                f"  ancestor: {created.node.path}"
+            )
+        if created.relative_parts in authorized_targets:
+            raise PlanError(
+                "a final worktree target cannot become a shared ancestor receipt"
+            )
+        revalidate_materialized_shared_node(created.node)
+        prior = updates.get(
+            created.relative_parts,
+            ancestor.materialized_node,
+        )
+        if prior is None:
+            updates[created.relative_parts] = created.node
+        elif prior != created.node:
+            raise PlanError(
+                "plan-owned shared target ancestor identity changed during "
+                f"materialization: {created.node.path}"
+            )
+    return updates
+
+
+def commit_materialized_shared_ancestor_updates(
+    plan: SyncPlan,
+    updates: dict[tuple[str, ...], BoundNode],
+) -> None:
+    ancestors = getattr(plan, "shared_missing_ancestors", {})
+    revalidate_shared_missing_ancestors(
+        plan,
+        materialized_overrides=updates,
+    )
+    for relative_parts, node in updates.items():
+        ancestors[relative_parts].materialized_node = node
+
+
 def record_materialized_shared_ancestors(
     plan: SyncPlan,
     entry: PlannedWorktree,
     created_nodes: tuple[CreatedTargetNode, ...],
 ) -> None:
     ancestors = getattr(plan, "shared_missing_ancestors", {})
-    for created in created_nodes:
-        ancestor = ancestors.get(created.relative_parts)
-        if ancestor is None:
+    relevant_nodes = tuple(
+        created for created in created_nodes if created.relative_parts in ancestors
+    )
+    if not relevant_nodes:
+        revalidate_shared_missing_ancestors(plan)
+        return
+    updates = prepare_materialized_shared_ancestor_updates(
+        plan,
+        relevant_nodes,
+        authorized_targets=frozenset((entry.target.relative_parts,)),
+        require_all_participants_authorized=False,
+    )
+    commit_materialized_shared_ancestor_updates(plan, updates)
+
+
+def direct_child_target_parts(
+    plan: SyncPlan,
+    owner_index: int,
+) -> frozenset[tuple[str, ...]]:
+    if owner_index < 0 or owner_index >= len(plan.entries):
+        raise PlanError("checkout-created shared ancestor has an invalid owner index")
+    return frozenset(
+        candidate.target.relative_parts
+        for candidate in plan.entries
+        if candidate.parent_index == owner_index
+    )
+
+
+def capture_checkout_materialized_shared_ancestors(
+    plan: SyncPlan,
+    owner_index: int,
+    entry: PlannedWorktree,
+    lease: MaterializedTargetLease,
+) -> tuple[CreatedTargetNode, ...]:
+    """Bind plan-owned shared prefixes created by a recursive parent checkout.
+
+    Protected properties are the exact directory-entry/object identity, owner,
+    group, permission mode, and effective write/search access of every shared
+    prefix component. Traversal starts at the held parent-target descriptor and
+    never follows a symlink. Path checks only prove that the descriptor-bound
+    object is still published at the planned entry; they do not replace the
+    descriptor identity checks.
+    """
+
+    if plan.entries[owner_index] is not entry:
+        raise PlanError("checkout-created shared ancestor has the wrong owner entry")
+    revalidate_materialized_target_lease(lease)
+    target_fingerprint = fingerprint_from_stat(os.fstat(lease.target_descriptor))
+    if (
+        lease.target != entry.target.path
+        or lease.target_binding.path != entry.target.path
+        or target_fingerprint != lease.target_binding.fingerprint
+    ):
+        raise PlanError(
+            "checkout-created shared ancestor lease does not match its parent target"
+        )
+
+    child_targets = direct_child_target_parts(plan, owner_index)
+    parent_parts = entry.target.relative_parts
+    eligible: list[tuple[str, ...]] = []
+    for relative_parts, ancestor in getattr(
+        plan,
+        "shared_missing_ancestors",
+        {},
+    ).items():
+        if ancestor.materialized_node is not None:
             continue
-        if entry.target.relative_parts not in ancestor.participant_targets:
+        if (
+            len(relative_parts) <= len(parent_parts)
+            or relative_parts[: len(parent_parts)] != parent_parts
+        ):
+            continue
+        if not ancestor.participant_targets:
+            raise PlanError("checkout-created shared ancestor has no plan participants")
+        if not ancestor.participant_targets <= child_targets:
+            continue
+        if any(
+            len(target_parts) <= len(relative_parts)
+            or target_parts[: len(relative_parts)] != relative_parts
+            for target_parts in ancestor.participant_targets
+        ):
             raise PlanError(
-                "planned target created an unowned shared target ancestor\n"
-                f"  target: {entry.target.path}\n"
-                f"  ancestor: {created.node.path}"
+                "checkout-created shared ancestor is not a strict prefix of "
+                "its plan-authorized descendants"
             )
-        if created.relative_parts == entry.target.relative_parts:
-            raise PlanError(
-                "a final worktree target cannot become a shared ancestor receipt"
-            )
+        eligible.append(relative_parts)
+
+    captured: list[CreatedTargetNode] = []
+    for relative_parts in sorted(eligible, key=lambda parts: (len(parts), parts)):
+        suffix = relative_parts[len(parent_parts) :]
+        current_descriptor = os.dup(lease.target_descriptor)
+        current_path = entry.target.path
+        current_fingerprint = target_fingerprint
+        missing = False
+        try:
+            for part in suffix:
+                validate_descriptor_entry_name(part)
+                current_binding = AccessBinding(
+                    path=current_path,
+                    fingerprint=current_fingerprint,
+                    mode=os.W_OK | os.X_OK,
+                    purpose="checkout-created shared ancestor parent",
+                )
+                revalidate_directory_descriptor(
+                    current_binding,
+                    current_descriptor,
+                )
+                child_path = current_path / part
+                try:
+                    entry_before = fingerprint_from_stat(
+                        os.stat(
+                            part,
+                            dir_fd=current_descriptor,
+                            follow_symlinks=False,
+                        )
+                    )
+                except FileNotFoundError:
+                    missing = True
+                    break
+                except OSError as exc:
+                    raise PlanError(
+                        "cannot inspect checkout-created shared target ancestor\n"
+                        f"  path: {child_path}\n"
+                        f"  error: {exc}"
+                    ) from exc
+                if entry_before.kind != stat.S_IFDIR:
+                    raise PlanError(
+                        "checkout-created shared target ancestor is not a directory\n"
+                        f"  path: {child_path}"
+                    )
+                try:
+                    child_descriptor = os.open(
+                        part,
+                        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                        dir_fd=current_descriptor,
+                    )
+                except OSError as exc:
+                    raise PlanError(
+                        "cannot bind checkout-created shared target ancestor\n"
+                        f"  path: {child_path}\n"
+                        f"  error: {exc}"
+                    ) from exc
+                try:
+                    child_fingerprint = fingerprint_from_stat(
+                        os.fstat(child_descriptor)
+                    )
+                    entry_after = fingerprint_from_stat(
+                        os.stat(
+                            part,
+                            dir_fd=current_descriptor,
+                            follow_symlinks=False,
+                        )
+                    )
+                    path_fingerprint = filesystem_fingerprint(child_path)
+                    if (
+                        child_fingerprint != entry_before
+                        or child_fingerprint != entry_after
+                        or child_fingerprint != path_fingerprint
+                    ):
+                        raise PlanError(
+                            "checkout-created shared target ancestor changed "
+                            "during descriptor binding\n"
+                            f"  path: {child_path}"
+                        )
+                    if child_fingerprint.owner != os.geteuid():
+                        raise PlanError(
+                            "checkout-created shared target ancestor has the "
+                            "wrong owner\n"
+                            f"  path: {child_path}"
+                        )
+                    if not probe_access_at(
+                        child_descriptor,
+                        ".",
+                        os.W_OK | os.X_OK,
+                    ):
+                        # This prefix was created inside the newly registered,
+                        # transaction-owned parent checkout. Restore only its
+                        # owner access so the enclosing rollback can remove the
+                        # rejected worktree without following a pathname.
+                        try:
+                            os.fchmod(
+                                child_descriptor,
+                                child_fingerprint.permissions | 0o700,
+                            )
+                        except OSError as exc:
+                            raise PlanError(
+                                "checkout-created shared target ancestor does "
+                                "not permit descendant materialization and "
+                                "cannot be prepared for rollback\n"
+                                f"  path: {child_path}\n"
+                                f"  error: {exc}"
+                            ) from exc
+                        raise PlanError(
+                            "checkout-created shared target ancestor does not "
+                            "permit descendant materialization\n"
+                            f"  path: {child_path}"
+                        )
+                except BaseException:
+                    os.close(child_descriptor)
+                    raise
+                os.close(current_descriptor)
+                current_descriptor = child_descriptor
+                current_path = child_path
+                current_fingerprint = child_fingerprint
+            if not missing:
+                captured.append(
+                    CreatedTargetNode(
+                        relative_parts=relative_parts,
+                        node=BoundNode(current_path, current_fingerprint),
+                    )
+                )
+        finally:
+            os.close(current_descriptor)
+
+    revalidate_materialized_target_lease(lease)
+    for created in captured:
         revalidate_materialized_shared_node(created.node)
-        if ancestor.materialized_node is None:
-            ancestor.materialized_node = created.node
-        elif ancestor.materialized_node != created.node:
-            raise PlanError(
-                "plan-owned shared target ancestor identity changed during "
-                f"materialization: {created.node.path}"
-            )
-    revalidate_shared_missing_ancestors(plan)
+    return tuple(captured)
+
+
+def record_checkout_materialized_shared_ancestors(
+    plan: SyncPlan,
+    owner_index: int,
+    created_nodes: tuple[CreatedTargetNode, ...],
+) -> None:
+    updates = prepare_materialized_shared_ancestor_updates(
+        plan,
+        created_nodes,
+        authorized_targets=direct_child_target_parts(plan, owner_index),
+        require_all_participants_authorized=True,
+    )
+    commit_materialized_shared_ancestor_updates(plan, updates)
 
 
 def revalidate_applied_target_root(
@@ -6697,6 +6974,59 @@ def checkout_existing_worktree(
             source_lease.close()
 
 
+def rollback_added_worktree(
+    source_git_dir: Path,
+    lease: MaterializedTargetLease,
+    source_lease: DirectoryEntryLease,
+) -> None:
+    """Remove one just-registered worktree through its held parent object."""
+
+    validate_descriptor_entry_name(lease.entry_name)
+    revalidate_materialized_target_lease(lease)
+    revalidate_directory_entry_lease(source_lease)
+    run_git_at_directory_descriptor(
+        [
+            "git",
+            f"--git-dir={source_git_dir}",
+            "worktree",
+            "remove",
+            "--force",
+            "--",
+            lease.entry_name,
+        ],
+        lease.parent_descriptor,
+        directory_identity_leases=(source_lease,),
+    )
+    revalidate_directory_descriptor(
+        lease.parent_binding,
+        lease.parent_descriptor,
+    )
+    revalidate_directory_entry_lease(source_lease)
+    try:
+        os.stat(
+            lease.entry_name,
+            dir_fd=lease.parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise PlanError(
+            "cannot verify rolled-back worktree target absence\n"
+            f"  path: {lease.target}\n"
+            f"  error: {exc}"
+        ) from exc
+    else:
+        raise PlanError(
+            f"rolled-back worktree target still exists\n  path: {lease.target}"
+        )
+    if registered_target_path(source_git_dir, lease.target) is not None:
+        raise PlanError(
+            "rolled-back worktree remains in the source registry\n"
+            f"  path: {lease.target}"
+        )
+
+
 def add_worktree(
     source_git_dir: Path,
     worktree_path: Path,
@@ -6704,6 +7034,7 @@ def add_worktree(
     dry_run: bool,
     *,
     lease: Optional[MaterializedTargetLease] = None,
+    finalize_checkout: Optional[Callable[[], None]] = None,
 ) -> None:
     command = [
         "git",
@@ -6726,6 +7057,8 @@ def add_worktree(
         "selected source common gitdir",
     )
     control: Optional[ManagedControlReceipt] = None
+    registration_attempted = False
+    registered = False
     try:
         revalidate_materialized_target_lease(lease)
         revalidate_directory_entry_lease(source_lease)
@@ -6733,6 +7066,7 @@ def add_worktree(
         # Passing the final pathname from its parent would let Git follow a
         # same-UID symlink replacement after our precheck and write outside the
         # planned target before postvalidation could detect the race.
+        registration_attempted = True
         run_git_at_directory_descriptor(
             [
                 "git",
@@ -6748,6 +7082,7 @@ def add_worktree(
             extra_env={"GIT_COMMON_DIR": str(source_git_dir)},
             directory_identity_leases=(source_lease,),
         )
+        registered = True
         revalidate_materialized_target_lease(lease)
         revalidate_directory_entry_lease(source_lease)
         control = capture_managed_control_receipt(
@@ -6780,6 +7115,46 @@ def add_worktree(
         revalidate_managed_control_receipt(control, lease.target_descriptor)
         revalidate_directory_entry_lease(source_lease)
         revalidate_materialized_target_lease(lease)
+        if finalize_checkout is not None:
+            finalize_checkout()
+    except BaseException as exc:
+        control_cleanup_error: Optional[BaseException] = None
+        if control is not None:
+            try:
+                control.close()
+            except BaseException as cleanup_exc:
+                control_cleanup_error = cleanup_exc
+            control = None
+
+        rollback_error: Optional[BaseException] = None
+        should_rollback = registered
+        if registration_attempted and not should_rollback:
+            try:
+                should_rollback = (
+                    registered_target_path(source_git_dir, worktree_path) is not None
+                )
+            except BaseException as registry_exc:
+                rollback_error = registry_exc
+        if should_rollback:
+            try:
+                rollback_added_worktree(
+                    source_git_dir,
+                    lease,
+                    source_lease,
+                )
+            except BaseException as cleanup_exc:
+                rollback_error = cleanup_exc
+
+        cleanup_details = []
+        if control_cleanup_error is not None:
+            cleanup_details.append(
+                f"control receipt cleanup failed: {control_cleanup_error}"
+            )
+        if rollback_error is not None:
+            cleanup_details.append(f"worktree rollback failed: {rollback_error}")
+        if cleanup_details:
+            raise PlanError(f"{exc}\n" + "\n".join(cleanup_details)) from exc
+        raise
     finally:
         try:
             if control is not None:
@@ -8596,6 +8971,57 @@ def postvalidate_applied_entry(
     revalidate_materialized_target_lease(lease)
 
 
+def finalize_recursive_parent_checkout(
+    plan: SyncPlan,
+    owner_index: int,
+    entry: PlannedWorktree,
+    lease: MaterializedTargetLease,
+) -> None:
+    """Commit parent-checkout receipts only after every binding validates."""
+
+    ancestors = getattr(plan, "shared_missing_ancestors", {})
+    prior_shared_nodes = {
+        relative_parts: ancestor.materialized_node
+        for relative_parts, ancestor in ancestors.items()
+    }
+    receipts = getattr(plan, "applied_target_roots", {})
+    prior_target_roots = dict(receipts)
+    try:
+        postvalidate_applied_entry(entry, lease)
+        checkout_created = capture_checkout_materialized_shared_ancestors(
+            plan,
+            owner_index,
+            entry,
+            lease,
+        )
+        updates = prepare_materialized_shared_ancestor_updates(
+            plan,
+            checkout_created,
+            authorized_targets=direct_child_target_parts(plan, owner_index),
+            require_all_participants_authorized=True,
+        )
+        updates = prepare_materialized_shared_ancestor_updates(
+            plan,
+            lease.created_nodes,
+            authorized_targets=frozenset((entry.target.relative_parts,)),
+            require_all_participants_authorized=False,
+            existing_updates=updates,
+        )
+        commit_materialized_shared_ancestor_updates(plan, updates)
+        record_applied_target_root(
+            plan,
+            owner_index,
+            entry,
+            lease,
+        )
+    except BaseException:
+        for relative_parts, materialized_node in prior_shared_nodes.items():
+            ancestors[relative_parts].materialized_node = materialized_node
+        receipts.clear()
+        receipts.update(prior_target_roots)
+        raise
+
+
 def apply_sync_plan(plan: SyncPlan) -> None:
     validate_sync_plan(plan)
     plan_state_changed = False
@@ -8661,27 +9087,49 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                     target_descriptor=lease.target_descriptor,
                     source_git_dir=entry.source_git_dir,
                 )
+                if index in recursive_parent_indexes:
+                    finalize_recursive_parent_checkout(
+                        plan,
+                        index,
+                        entry,
+                        lease,
+                    )
+                else:
+                    postvalidate_applied_entry(entry, lease)
+                    record_materialized_shared_ancestors(
+                        plan,
+                        entry,
+                        lease.created_nodes,
+                    )
             else:
-                add_worktree(
-                    entry.source_git_dir,
-                    target.path,
-                    entry.sha,
-                    dry_run=False,
-                    lease=lease,
-                )
-            postvalidate_applied_entry(entry, lease)
-            record_materialized_shared_ancestors(
-                plan,
-                entry,
-                lease.created_nodes,
-            )
-            if index in recursive_parent_indexes:
-                record_applied_target_root(
-                    plan,
-                    index,
-                    entry,
-                    lease,
-                )
+                if index in recursive_parent_indexes:
+                    add_worktree(
+                        entry.source_git_dir,
+                        target.path,
+                        entry.sha,
+                        dry_run=False,
+                        lease=lease,
+                        finalize_checkout=lambda: finalize_recursive_parent_checkout(
+                            plan,
+                            index,
+                            entry,
+                            lease,
+                        ),
+                    )
+                else:
+                    add_worktree(
+                        entry.source_git_dir,
+                        target.path,
+                        entry.sha,
+                        dry_run=False,
+                        lease=lease,
+                    )
+                    postvalidate_applied_entry(entry, lease)
+                    record_materialized_shared_ancestors(
+                        plan,
+                        entry,
+                        lease.created_nodes,
+                    )
         finally:
             lease.close()
 
