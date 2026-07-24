@@ -27,6 +27,8 @@ superseded_by:
 - New leaf and recursive-parent registrations remain provisional through final source, HEAD, common-gitdir, object-closure, and receipt validation.
 - Registration failures remove the exact worktree through the held parent descriptor, verify target and registry cleanup, and remove only still-matching transaction-created parent directories.
 - Pre-registration materialization failures remove exact created directory identities in reverse order; replacement, access drift, and non-empty state are preserved with a structured recovery location.
+- The target `.git` marker and admin backlink now retain their original descriptors through postvalidation and receipt publication; final HEAD, `commondir`, and index bindings are read only through that retained admin descriptor and are revalidated immediately before and after publication.
+- A same-source, same-HEAD redirect to another worktree admin cannot satisfy finalization. New-target rollback atomically preserves each unexpected marker/backlink entry while temporarily restoring the retained original bytes for Git unregister, then verifies target, registry, materialized-parent, and plan-receipt restoration.
 
 ## Next Steps
 
@@ -42,4 +44,5 @@ superseded_by:
 - The complete helper suite passed 153 tests in 153.742 seconds.
 - Fresh-review follow-up: 16 shared-prefix/finalization/materialization regressions passed in 53.219 seconds, plus the access-policy drift regression passed independently.
 - The updated complete helper suite passed 160 tests in 147.698 seconds.
+- Final control-transaction follow-up: the complete helper suite passed 165 tests in 157.442 seconds, including same-source/same-HEAD marker retargeting at every finalization phase, admin-backlink retargeting, HEAD/common-dir/index replacement, managed-target coverage, and recursive receipt rollback.
 - Ruff lint/format, Python compilation, helper `--help`, skill validation, project-journal validation, and `git diff --check` passed.

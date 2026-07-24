@@ -381,13 +381,95 @@ class DirectoryEntryLease:
 
 @dataclass
 class ManagedControlReceipt:
+    git_file_descriptor: int
     git_file_binding: FileContentBinding
+    git_file_content: bytes
     admin_git_dir: Path
     admin_lease: DirectoryEntryLease
+    admin_gitdir_descriptor: int
     admin_gitdir_binding: FileContentBinding
+    admin_gitdir_content: bytes
 
     def close(self) -> None:
-        self.admin_lease.close()
+        descriptors = (
+            self.git_file_descriptor,
+            self.admin_gitdir_descriptor,
+        )
+        self.git_file_descriptor = -1
+        self.admin_gitdir_descriptor = -1
+        first_error: Optional[BaseException] = None
+        for descriptor in descriptors:
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        try:
+            self.admin_lease.close()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        if first_error is not None:
+            raise PlanError(
+                f"managed control receipt cleanup failed: {first_error}"
+            ) from first_error
+
+
+@dataclass
+class ManagedFinalStateReceipt:
+    head_descriptor: int
+    head_binding: FileContentBinding
+    common_descriptor: int
+    common_binding: FileContentBinding
+    index_descriptor: int
+    index_binding: FileContentBinding
+
+    def close(self) -> None:
+        descriptors = (
+            self.head_descriptor,
+            self.common_descriptor,
+            self.index_descriptor,
+        )
+        self.head_descriptor = -1
+        self.common_descriptor = -1
+        self.index_descriptor = -1
+        first_error: Optional[OSError] = None
+        for descriptor in descriptors:
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise PlanError(
+                f"managed final-state receipt cleanup failed: {first_error}"
+            ) from first_error
+
+
+@dataclass
+class ManagedControlRollbackSwap:
+    directory_descriptor: int
+    entry_name: str
+    display_path: Path
+    temporary_name: str
+    unexpected_descriptor: int
+    unexpected_binding: FileContentBinding
+
+    def close(self) -> None:
+        descriptor = self.unexpected_descriptor
+        self.unexpected_descriptor = -1
+        if descriptor < 0:
+            return
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            raise PlanError(
+                f"managed control rollback receipt cleanup failed: {exc}"
+            ) from exc
 
 
 @dataclass
@@ -7012,44 +7094,31 @@ def capture_managed_control_receipt(
     source_git_dir: Path,
     target_descriptor: int,
 ) -> ManagedControlReceipt:
-    descriptor = -1
+    descriptor, git_file_binding, content = open_bound_regular_file_at(
+        target_descriptor,
+        ".git",
+        worktree_path / ".git",
+        maximum_bytes=MAX_GITDIR_FILE_BYTES,
+        mode=os.R_OK,
+        purpose="descriptor-bound managed worktree control file",
+        retain_content=True,
+    )
     try:
-        descriptor = os.open(
-            ".git",
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
-            dir_fd=target_descriptor,
+        if content is None:
+            raise PlanError("managed worktree control-file binding returned no content")
+        admin_git_dir = parse_managed_gitdir_content(
+            worktree_path,
+            source_git_dir,
+            content,
         )
-        git_file_binding, content = bind_regular_file_descriptor_at(
-            descriptor,
-            target_descriptor,
-            ".git",
-            worktree_path / ".git",
-            maximum_bytes=MAX_GITDIR_FILE_BYTES,
-            mode=os.R_OK,
-            purpose="descriptor-bound managed worktree control file",
-            retain_content=True,
+        admin_lease = capture_directory_entry_lease(
+            admin_git_dir,
+            os.R_OK | os.W_OK | os.X_OK,
+            "managed worktree administration",
         )
-    except OSError as exc:
-        raise PlanError(
-            "cannot bind the managed worktree control file\n"
-            f"  worktree: {worktree_path}\n"
-            f"  error: {exc}"
-        ) from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    if content is None:
-        raise PlanError("managed worktree control-file binding returned no content")
-    admin_git_dir = parse_managed_gitdir_content(
-        worktree_path,
-        source_git_dir,
-        content,
-    )
-    admin_lease = capture_directory_entry_lease(
-        admin_git_dir,
-        os.R_OK | os.W_OK | os.X_OK,
-        "managed worktree administration",
-    )
+    except BaseException:
+        os.close(descriptor)
+        raise
     backlink_descriptor = -1
     try:
         backlink_descriptor = os.open(
@@ -7067,9 +7136,6 @@ def capture_managed_control_receipt(
             purpose="managed worktree admin backlink",
             retain_content=True,
         )
-        descriptor_to_close = backlink_descriptor
-        backlink_descriptor = -1
-        os.close(descriptor_to_close)
         if backlink_content is None:
             raise PlanError("managed worktree admin backlink returned no content")
         raw_backlink = backlink_content.rstrip(b"\r\n")
@@ -7093,86 +7159,70 @@ def capture_managed_control_receipt(
                 f"  expected: {expected_gitfile}"
             )
         return ManagedControlReceipt(
+            git_file_descriptor=descriptor,
             git_file_binding=git_file_binding,
+            git_file_content=content,
             admin_git_dir=admin_git_dir,
             admin_lease=admin_lease,
+            admin_gitdir_descriptor=backlink_descriptor,
             admin_gitdir_binding=admin_gitdir_binding,
+            admin_gitdir_content=backlink_content,
         )
     except BaseException:
-        admin_lease.close()
+        try:
+            if backlink_descriptor >= 0:
+                os.close(backlink_descriptor)
+        finally:
+            try:
+                admin_lease.close()
+            finally:
+                os.close(descriptor)
         raise
-    finally:
-        if backlink_descriptor >= 0:
-            os.close(backlink_descriptor)
 
 
-def revalidate_managed_control_receipt(
+def revalidate_managed_admin_backlink(
     receipt: ManagedControlReceipt,
-    target_descriptor: int,
 ) -> None:
-    descriptor = -1
-    try:
-        descriptor = os.open(
-            ".git",
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
-            dir_fd=target_descriptor,
-        )
-        current_binding, _ = bind_regular_file_descriptor_at(
-            descriptor,
-            target_descriptor,
-            ".git",
-            receipt.git_file_binding.path,
-            maximum_bytes=MAX_GITDIR_FILE_BYTES,
-            mode=os.R_OK,
-            purpose="descriptor-bound managed worktree control file",
-            retain_content=False,
-        )
-    except OSError as exc:
-        raise PlanError(
-            "cannot revalidate the managed worktree control file\n"
-            f"  path: {receipt.git_file_binding.path}\n"
-            f"  error: {exc}"
-        ) from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    require_matching_file_binding(
-        receipt.git_file_binding,
-        current_binding,
-        "descriptor-bound managed worktree control file",
+    revalidate_directory_entry_lease(receipt.admin_lease)
+    current_backlink, _ = bind_regular_file_descriptor_at(
+        receipt.admin_gitdir_descriptor,
+        receipt.admin_lease.descriptor,
+        "gitdir",
+        receipt.admin_gitdir_binding.path,
+        maximum_bytes=MAX_GITDIR_FILE_BYTES,
+        mode=os.R_OK,
+        purpose="managed worktree admin backlink",
+        retain_content=False,
     )
-    backlink_descriptor = -1
-    try:
-        backlink_descriptor = os.open(
-            "gitdir",
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
-            dir_fd=receipt.admin_lease.descriptor,
-        )
-        current_backlink, _ = bind_regular_file_descriptor_at(
-            backlink_descriptor,
-            receipt.admin_lease.descriptor,
-            "gitdir",
-            receipt.admin_gitdir_binding.path,
-            maximum_bytes=MAX_GITDIR_FILE_BYTES,
-            mode=os.R_OK,
-            purpose="managed worktree admin backlink",
-            retain_content=False,
-        )
-    except OSError as exc:
-        raise PlanError(
-            "cannot revalidate the managed worktree admin backlink\n"
-            f"  path: {receipt.admin_gitdir_binding.path}\n"
-            f"  error: {exc}"
-        ) from exc
-    finally:
-        if backlink_descriptor >= 0:
-            os.close(backlink_descriptor)
     require_matching_file_binding(
         receipt.admin_gitdir_binding,
         current_backlink,
         "managed worktree admin backlink",
     )
     revalidate_directory_entry_lease(receipt.admin_lease)
+
+
+def revalidate_managed_control_receipt(
+    receipt: ManagedControlReceipt,
+    target_descriptor: int,
+) -> None:
+    revalidate_managed_admin_backlink(receipt)
+    current_binding, _ = bind_regular_file_descriptor_at(
+        receipt.git_file_descriptor,
+        target_descriptor,
+        ".git",
+        receipt.git_file_binding.path,
+        maximum_bytes=MAX_GITDIR_FILE_BYTES,
+        mode=os.R_OK,
+        purpose="descriptor-bound managed worktree control file",
+        retain_content=False,
+    )
+    require_matching_file_binding(
+        receipt.git_file_binding,
+        current_binding,
+        "descriptor-bound managed worktree control file",
+    )
+    revalidate_managed_admin_backlink(receipt)
 
 
 def worktree_common_git_dir(worktree_path: Path) -> Optional[Path]:
@@ -7334,6 +7384,9 @@ def checkout_existing_worktree(
     *,
     target_descriptor: Optional[int] = None,
     source_git_dir: Optional[Path] = None,
+    finalize_checkout: Optional[
+        Callable[[ManagedControlReceipt, DirectoryEntryLease], None]
+    ] = None,
 ) -> None:
     command = [
         "git",
@@ -7392,6 +7445,8 @@ def checkout_existing_worktree(
         )
         revalidate_managed_control_receipt(control, target_descriptor)
         revalidate_directory_entry_lease(source_lease)
+        if finalize_checkout is not None:
+            finalize_checkout(control, source_lease)
     finally:
         try:
             control.close()
@@ -7399,29 +7454,332 @@ def checkout_existing_worktree(
             source_lease.close()
 
 
+def stage_retained_control_file_for_rollback(
+    *,
+    directory_descriptor: int,
+    entry_name: str,
+    display_path: Path,
+    original_descriptor: int,
+    original_binding: FileContentBinding,
+    original_content: bytes,
+    purpose: str,
+) -> Optional[ManagedControlRollbackSwap]:
+    """Expose retained control bytes while preserving an unexpected replacement."""
+
+    try:
+        observed, _ = bind_regular_file_descriptor_at(
+            original_descriptor,
+            directory_descriptor,
+            entry_name,
+            display_path,
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose=purpose,
+            retain_content=False,
+        )
+        require_matching_file_binding(
+            original_binding,
+            observed,
+            purpose,
+        )
+        return None
+    except PlanError:
+        pass
+
+    temporary_name = f".codex-control-rollback-{secrets.token_hex(16)}"
+    temporary_descriptor = -1
+    unexpected_descriptor = -1
+    exchanged = False
+    try:
+        (
+            unexpected_descriptor,
+            unexpected_binding,
+            _unexpected_content,
+        ) = open_bound_regular_file_at(
+            directory_descriptor,
+            entry_name,
+            display_path,
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose=f"unexpected {purpose} replacement",
+            retain_content=False,
+        )
+        temporary_descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            original_binding.fingerprint.permissions,
+            dir_fd=directory_descriptor,
+        )
+        os.fchmod(
+            temporary_descriptor,
+            original_binding.fingerprint.permissions,
+        )
+        remaining = memoryview(original_content)
+        while remaining:
+            written = os.write(temporary_descriptor, remaining)
+            if written <= 0:
+                raise PlanError(f"cannot write the retained {purpose} for rollback")
+            remaining = remaining[written:]
+        os.fsync(temporary_descriptor)
+        os.close(temporary_descriptor)
+        temporary_descriptor = -1
+        descriptor_atomic_rename_exchange(
+            directory_descriptor,
+            temporary_name,
+            entry_name,
+        )
+        exchanged = True
+        observed_unexpected, _ = bind_regular_file_descriptor_at(
+            unexpected_descriptor,
+            directory_descriptor,
+            temporary_name,
+            display_path.parent / temporary_name,
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose=f"preserved unexpected {purpose}",
+            retain_content=False,
+        )
+        require_matching_file_binding(
+            unexpected_binding,
+            observed_unexpected,
+            f"preserved unexpected {purpose}",
+        )
+        restored_descriptor, restored_binding, _ = open_bound_regular_file_at(
+            directory_descriptor,
+            entry_name,
+            display_path,
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose=f"rollback-restored {purpose}",
+            retain_content=False,
+        )
+        os.close(restored_descriptor)
+        if (
+            restored_binding.size != original_binding.size
+            or restored_binding.content_sha256 != original_binding.content_sha256
+            or restored_binding.fingerprint.owner != original_binding.fingerprint.owner
+            or restored_binding.fingerprint.group != original_binding.fingerprint.group
+            or restored_binding.fingerprint.permissions
+            != original_binding.fingerprint.permissions
+        ):
+            raise PlanError(
+                f"rollback-restored {purpose} does not match the retained "
+                "content or access policy"
+            )
+        os.fsync(directory_descriptor)
+        swap = ManagedControlRollbackSwap(
+            directory_descriptor=directory_descriptor,
+            entry_name=entry_name,
+            display_path=display_path,
+            temporary_name=temporary_name,
+            unexpected_descriptor=unexpected_descriptor,
+            unexpected_binding=unexpected_binding,
+        )
+        unexpected_descriptor = -1
+        return swap
+    except BaseException as exc:
+        cleanup_error: Optional[BaseException] = None
+        if exchanged:
+            try:
+                descriptor_atomic_rename_exchange(
+                    directory_descriptor,
+                    temporary_name,
+                    entry_name,
+                )
+                os.unlink(
+                    temporary_name,
+                    dir_fd=directory_descriptor,
+                )
+                os.fsync(directory_descriptor)
+            except BaseException as restore_exc:
+                cleanup_error = restore_exc
+        elif temporary_name:
+            try:
+                os.unlink(
+                    temporary_name,
+                    dir_fd=directory_descriptor,
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_exc:
+                cleanup_error = cleanup_exc
+        if cleanup_error is not None:
+            raise PlanError(
+                f"{exc}\n{purpose} rollback staging cleanup failed: {cleanup_error}"
+            ) from exc
+        raise
+    finally:
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        if unexpected_descriptor >= 0:
+            os.close(unexpected_descriptor)
+
+
+def restore_control_file_after_failed_rollback(
+    swap: ManagedControlRollbackSwap,
+) -> None:
+    """Restore one unexpected control object when Git cannot finish rollback."""
+
+    descriptor_atomic_rename_exchange(
+        swap.directory_descriptor,
+        swap.temporary_name,
+        swap.entry_name,
+    )
+    observed, _ = bind_regular_file_descriptor_at(
+        swap.unexpected_descriptor,
+        swap.directory_descriptor,
+        swap.entry_name,
+        swap.display_path,
+        maximum_bytes=MAX_GITDIR_FILE_BYTES,
+        mode=os.R_OK,
+        purpose="restored unexpected managed control file",
+        retain_content=False,
+    )
+    require_matching_file_binding(
+        swap.unexpected_binding,
+        observed,
+        "restored unexpected managed worktree control file",
+    )
+    os.unlink(
+        swap.temporary_name,
+        dir_fd=swap.directory_descriptor,
+    )
+    os.fsync(swap.directory_descriptor)
+
+
+def stage_managed_control_files_for_added_worktree_rollback(
+    receipt: ManagedControlReceipt,
+    lease: MaterializedTargetLease,
+) -> tuple[ManagedControlRollbackSwap, ...]:
+    """Make both sides of our retained control pair visible for unregister."""
+
+    revalidate_materialized_target_lease(lease)
+    revalidate_directory_entry_lease(receipt.admin_lease)
+    swaps: list[ManagedControlRollbackSwap] = []
+    try:
+        marker_swap = stage_retained_control_file_for_rollback(
+            directory_descriptor=lease.target_descriptor,
+            entry_name=".git",
+            display_path=receipt.git_file_binding.path,
+            original_descriptor=receipt.git_file_descriptor,
+            original_binding=receipt.git_file_binding,
+            original_content=receipt.git_file_content,
+            purpose="managed worktree control file",
+        )
+        if marker_swap is not None:
+            swaps.append(marker_swap)
+        backlink_swap = stage_retained_control_file_for_rollback(
+            directory_descriptor=receipt.admin_lease.descriptor,
+            entry_name="gitdir",
+            display_path=receipt.admin_gitdir_binding.path,
+            original_descriptor=receipt.admin_gitdir_descriptor,
+            original_binding=receipt.admin_gitdir_binding,
+            original_content=receipt.admin_gitdir_content,
+            purpose="managed worktree admin backlink",
+        )
+        if backlink_swap is not None:
+            swaps.append(backlink_swap)
+        revalidate_materialized_target_lease(lease)
+        revalidate_directory_entry_lease(receipt.admin_lease)
+        return tuple(swaps)
+    except BaseException as exc:
+        restoration_errors: list[str] = []
+        for swap in reversed(swaps):
+            try:
+                restore_control_file_after_failed_rollback(swap)
+            except BaseException as restore_exc:
+                restoration_errors.append(str(restore_exc))
+            try:
+                swap.close()
+            except BaseException as close_exc:
+                restoration_errors.append(str(close_exc))
+        if restoration_errors:
+            raise PlanError(
+                f"{exc}\n"
+                "managed control rollback staging restoration failed: "
+                + "; ".join(restoration_errors)
+            ) from exc
+        raise
+
+
 def rollback_added_worktree(
     source_git_dir: Path,
     lease: MaterializedTargetLease,
     source_lease: DirectoryEntryLease,
+    control: Optional[ManagedControlReceipt] = None,
 ) -> None:
     """Remove one just-registered worktree through its held parent object."""
 
     validate_descriptor_entry_name(lease.entry_name)
     revalidate_materialized_target_lease(lease)
     revalidate_directory_entry_lease(source_lease)
-    run_git_at_directory_descriptor(
-        [
-            "git",
-            f"--git-dir={source_git_dir}",
-            "worktree",
-            "remove",
-            "--force",
-            "--",
-            lease.entry_name,
-        ],
-        lease.parent_descriptor,
-        directory_identity_leases=(source_lease,),
+    rollback_swaps = (
+        stage_managed_control_files_for_added_worktree_rollback(
+            control,
+            lease,
+        )
+        if control is not None
+        else ()
     )
+    revalidate_materialized_target_lease(lease)
+    revalidate_directory_entry_lease(source_lease)
+    if control is not None:
+        revalidate_directory_entry_lease(control.admin_lease)
+    try:
+        run_git_at_directory_descriptor(
+            [
+                "git",
+                f"--git-dir={source_git_dir}",
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                lease.entry_name,
+            ],
+            lease.parent_descriptor,
+            directory_identity_leases=(
+                (source_lease, control.admin_lease)
+                if control is not None
+                else (source_lease,)
+            ),
+        )
+    except BaseException as exc:
+        restoration_errors: list[str] = []
+        if rollback_swaps:
+            try:
+                revalidate_materialized_target_lease(lease)
+                if control is not None:
+                    revalidate_directory_entry_lease(control.admin_lease)
+            except BaseException as restore_preflight_exc:
+                restoration_errors.append(str(restore_preflight_exc))
+            for swap in reversed(rollback_swaps):
+                try:
+                    restore_control_file_after_failed_rollback(swap)
+                except BaseException as restore_exc:
+                    restoration_errors.append(str(restore_exc))
+        for swap in rollback_swaps:
+            try:
+                swap.close()
+            except BaseException as close_exc:
+                restoration_errors.append(str(close_exc))
+        if restoration_errors:
+            raise PlanError(
+                f"{exc}\n"
+                "worktree control-file rollback restoration failed: "
+                + "; ".join(restoration_errors)
+            ) from exc
+        raise
+    close_errors: list[str] = []
+    for swap in rollback_swaps:
+        try:
+            swap.close()
+        except BaseException as close_exc:
+            close_errors.append(str(close_exc))
+    if close_errors:
+        raise PlanError(
+            "worktree control-file rollback receipt cleanup failed: "
+            + "; ".join(close_errors)
+        )
     revalidate_directory_descriptor(
         lease.parent_binding,
         lease.parent_descriptor,
@@ -7459,7 +7817,9 @@ def add_worktree(
     dry_run: bool,
     *,
     lease: Optional[MaterializedTargetLease] = None,
-    finalize_checkout: Optional[Callable[[], None]] = None,
+    finalize_checkout: Optional[
+        Callable[[ManagedControlReceipt, DirectoryEntryLease], None]
+    ] = None,
 ) -> None:
     command = [
         "git",
@@ -7541,16 +7901,8 @@ def add_worktree(
         revalidate_directory_entry_lease(source_lease)
         revalidate_materialized_target_lease(lease)
         if finalize_checkout is not None:
-            finalize_checkout()
+            finalize_checkout(control, source_lease)
     except BaseException as exc:
-        control_cleanup_error: Optional[BaseException] = None
-        if control is not None:
-            try:
-                control.close()
-            except BaseException as cleanup_exc:
-                control_cleanup_error = cleanup_exc
-            control = None
-
         rollback_error: Optional[BaseException] = None
         should_rollback = registered
         registry_known_clean = not registration_attempted
@@ -7572,6 +7924,7 @@ def add_worktree(
                     source_git_dir,
                     lease,
                     source_lease,
+                    control,
                 )
                 registry_known_clean = True
             except BaseException as cleanup_exc:
@@ -7589,6 +7942,14 @@ def add_worktree(
                 )
             except BaseException as cleanup_exc:
                 rollback_error = cleanup_exc
+
+        control_cleanup_error: Optional[BaseException] = None
+        if control is not None:
+            try:
+                control.close()
+            except BaseException as cleanup_exc:
+                control_cleanup_error = cleanup_exc
+            control = None
 
         cleanup_details = []
         if control_cleanup_error is not None:
@@ -7833,33 +8194,6 @@ def managed_head(worktree_path: Path) -> str:
     if not value or any(character not in "0123456789abcdef" for character in value):
         raise PlanError(f"managed worktree returned an invalid HEAD: {worktree_path}")
     return value
-
-
-def managed_head_at_descriptor(directory_descriptor: int) -> str:
-    result = run_git_at_directory_descriptor(
-        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
-        directory_descriptor,
-    )
-    value = result.stdout.strip()
-    if not value or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
-        raise PlanError("descriptor-bound worktree returned an invalid HEAD")
-    return value
-
-
-def common_git_dir_at_descriptor(directory_descriptor: int) -> Path:
-    result = run_git_at_directory_descriptor(
-        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        directory_descriptor,
-    )
-    value = result.stdout.strip()
-    if not value:
-        raise PlanError("descriptor-bound worktree returned an empty common gitdir")
-    common = Path(value)
-    if not common.is_absolute():
-        raise PlanError(
-            "descriptor-bound worktree returned a non-absolute common gitdir"
-        )
-    return common.resolve(strict=True)
 
 
 def managed_index_snapshot(
@@ -9373,11 +9707,184 @@ def validate_sync_plan(plan: SyncPlan) -> None:
         revalidate_planned_entry(plan, entry)
 
 
+def capture_managed_final_state_receipt(
+    entry: PlannedWorktree,
+    lease: MaterializedTargetLease,
+    control: ManagedControlReceipt,
+    source_lease: DirectoryEntryLease,
+) -> ManagedFinalStateReceipt:
+    """Bind the exact admin files that define the published checkout state."""
+
+    revalidate_managed_control_receipt(control, lease.target_descriptor)
+    revalidate_materialized_target_lease(lease)
+    revalidate_directory_entry_lease(source_lease)
+    head_descriptor = -1
+    common_descriptor = -1
+    index_descriptor = -1
+    common_target_descriptor = -1
+    try:
+        (
+            head_descriptor,
+            head_binding,
+            head_content,
+        ) = open_bound_regular_file_at(
+            control.admin_lease.descriptor,
+            "HEAD",
+            control.admin_git_dir / "HEAD",
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose="managed worktree final HEAD",
+            retain_content=True,
+        )
+        if head_content is None:
+            raise PlanError("managed worktree final HEAD binding returned no content")
+        raw_head = head_content.rstrip(b"\r\n")
+        if (
+            not re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", raw_head)
+            or os.fsdecode(raw_head) != entry.sha
+        ):
+            raise PlanError(
+                "descriptor-bound worktree HEAD does not match the planned target\n"
+                f"  path: {entry.target.path}\n"
+                f"  expected: {entry.sha}"
+            )
+
+        (
+            common_descriptor,
+            common_binding,
+            common_content,
+        ) = open_bound_regular_file_at(
+            control.admin_lease.descriptor,
+            "commondir",
+            control.admin_git_dir / "commondir",
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose="managed worktree common-gitdir pointer",
+            retain_content=True,
+        )
+        if common_content is None:
+            raise PlanError(
+                "managed worktree common-gitdir binding returned no content"
+            )
+        raw_common = common_content.rstrip(b"\r\n")
+        if (
+            not raw_common
+            or b"\n" in raw_common
+            or b"\r" in raw_common
+            or b"\0" in raw_common
+            or len(raw_common) > MAX_CHECKOUT_PATH_BYTES
+        ):
+            raise PlanError("managed worktree common-gitdir pointer is malformed")
+        common_target_descriptor = os.open(
+            os.fsdecode(raw_common),
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+            dir_fd=control.admin_lease.descriptor,
+        )
+        common_fingerprint = fingerprint_from_stat(os.fstat(common_target_descriptor))
+        if common_fingerprint != source_lease.binding.fingerprint:
+            raise PlanError(
+                "descriptor-bound worktree common gitdir does not match the source\n"
+                f"  path: {entry.target.path}\n"
+                f"  source: {entry.source_git_dir}"
+            )
+
+        (
+            index_descriptor,
+            index_binding,
+            _index_content,
+        ) = open_bound_regular_file_at(
+            control.admin_lease.descriptor,
+            "index",
+            control.admin_git_dir / "index",
+            maximum_bytes=MAX_SUPERPROJECT_INDEX_BYTES,
+            mode=os.R_OK,
+            purpose="managed worktree final index",
+            retain_content=False,
+        )
+        revalidate_managed_control_receipt(control, lease.target_descriptor)
+        revalidate_directory_entry_lease(source_lease)
+        revalidate_materialized_target_lease(lease)
+        return ManagedFinalStateReceipt(
+            head_descriptor=head_descriptor,
+            head_binding=head_binding,
+            common_descriptor=common_descriptor,
+            common_binding=common_binding,
+            index_descriptor=index_descriptor,
+            index_binding=index_binding,
+        )
+    except BaseException:
+        for descriptor in (
+            head_descriptor,
+            common_descriptor,
+            index_descriptor,
+        ):
+            if descriptor >= 0:
+                os.close(descriptor)
+        raise
+    finally:
+        if common_target_descriptor >= 0:
+            os.close(common_target_descriptor)
+
+
+def revalidate_managed_final_state_receipt(
+    receipt: ManagedFinalStateReceipt,
+    lease: MaterializedTargetLease,
+    control: ManagedControlReceipt,
+    source_lease: DirectoryEntryLease,
+) -> None:
+    """Revalidate final state only through retained target/admin descriptors."""
+
+    revalidate_managed_control_receipt(control, lease.target_descriptor)
+    revalidate_materialized_target_lease(lease)
+    revalidate_directory_entry_lease(source_lease)
+    for descriptor, expected, name, maximum_bytes, purpose in (
+        (
+            receipt.head_descriptor,
+            receipt.head_binding,
+            "HEAD",
+            MAX_GITDIR_FILE_BYTES,
+            "managed worktree final HEAD",
+        ),
+        (
+            receipt.common_descriptor,
+            receipt.common_binding,
+            "commondir",
+            MAX_GITDIR_FILE_BYTES,
+            "managed worktree common-gitdir pointer",
+        ),
+        (
+            receipt.index_descriptor,
+            receipt.index_binding,
+            "index",
+            MAX_SUPERPROJECT_INDEX_BYTES,
+            "managed worktree final index",
+        ),
+    ):
+        observed, _ = bind_regular_file_descriptor_at(
+            descriptor,
+            control.admin_lease.descriptor,
+            name,
+            expected.path,
+            maximum_bytes=maximum_bytes,
+            mode=os.R_OK,
+            purpose=purpose,
+            retain_content=False,
+        )
+        require_matching_file_binding(expected, observed, purpose)
+    revalidate_directory_entry_lease(source_lease)
+    revalidate_materialized_target_lease(lease)
+    revalidate_managed_control_receipt(control, lease.target_descriptor)
+
+
 def postvalidate_applied_entry(
     entry: PlannedWorktree,
     lease: MaterializedTargetLease,
-) -> None:
+    control: ManagedControlReceipt,
+    source_lease: DirectoryEntryLease,
+) -> ManagedFinalStateReceipt:
+    revalidate_managed_control_receipt(control, lease.target_descriptor)
     revalidate_materialized_target_lease(lease)
+    revalidate_directory_entry_lease(source_lease)
     for binding in entry.source_bindings:
         revalidate_access(binding)
     revalidate_source_completeness_receipt(
@@ -9385,43 +9892,48 @@ def postvalidate_applied_entry(
         entry.source_completeness,
     )
     revalidate_source_object_admission(entry.source_git_dir)
-    if managed_head_at_descriptor(lease.target_descriptor) != entry.sha:
-        raise PlanError(
-            "descriptor-bound worktree HEAD does not match the planned target\n"
-            f"  path: {entry.target.path}\n"
-            f"  expected: {entry.sha}"
-        )
-    if common_git_dir_at_descriptor(
-        lease.target_descriptor
-    ) != entry.source_git_dir.resolve(strict=True):
-        raise PlanError(
-            "descriptor-bound worktree common gitdir does not match the source\n"
-            f"  path: {entry.target.path}\n"
-            f"  source: {entry.source_git_dir}"
-        )
+    final_state = capture_managed_final_state_receipt(
+        entry,
+        lease,
+        control,
+        source_lease,
+    )
     receipt = entry.checkout_preflight
     if receipt is None:
+        final_state.close()
         raise PlanError(f"checkout preflight is incomplete for {entry.submodule.path}")
-    closure = target_object_closure(
-        entry.source_git_dir,
-        entry.sha,
-        entry.source_completeness,
-    )
-    if (
-        closure.object_count != receipt.object_count
-        or closure.logical_bytes != receipt.object_logical_bytes
-        or closure.digest != receipt.object_digest
-    ):
-        raise PlanError(
-            f"target object closure changed during checkout: {entry.submodule.path}"
+    try:
+        closure = target_object_closure(
+            entry.source_git_dir,
+            entry.sha,
+            entry.source_completeness,
         )
-    revalidate_materialized_target_lease(lease)
+        if (
+            closure.object_count != receipt.object_count
+            or closure.logical_bytes != receipt.object_logical_bytes
+            or closure.digest != receipt.object_digest
+        ):
+            raise PlanError(
+                f"target object closure changed during checkout: {entry.submodule.path}"
+            )
+        revalidate_managed_final_state_receipt(
+            final_state,
+            lease,
+            control,
+            source_lease,
+        )
+        return final_state
+    except BaseException:
+        final_state.close()
+        raise
 
 
 def finalize_leaf_checkout(
     plan: SyncPlan,
     entry: PlannedWorktree,
     lease: MaterializedTargetLease,
+    control: ManagedControlReceipt,
+    source_lease: DirectoryEntryLease,
 ) -> None:
     """Commit leaf receipts only after every final checkout check passes."""
 
@@ -9430,17 +9942,38 @@ def finalize_leaf_checkout(
         relative_parts: ancestor.materialized_node
         for relative_parts, ancestor in ancestors.items()
     }
+    final_state: Optional[ManagedFinalStateReceipt] = None
     try:
-        postvalidate_applied_entry(entry, lease)
+        final_state = postvalidate_applied_entry(
+            entry,
+            lease,
+            control,
+            source_lease,
+        )
+        revalidate_managed_final_state_receipt(
+            final_state,
+            lease,
+            control,
+            source_lease,
+        )
         record_materialized_shared_ancestors(
             plan,
             entry,
             lease.created_nodes,
         )
+        revalidate_managed_final_state_receipt(
+            final_state,
+            lease,
+            control,
+            source_lease,
+        )
     except BaseException:
         for relative_parts, materialized_node in prior_shared_nodes.items():
             ancestors[relative_parts].materialized_node = materialized_node
         raise
+    finally:
+        if final_state is not None:
+            final_state.close()
 
 
 def finalize_recursive_parent_checkout(
@@ -9448,6 +9981,8 @@ def finalize_recursive_parent_checkout(
     owner_index: int,
     entry: PlannedWorktree,
     lease: MaterializedTargetLease,
+    control: ManagedControlReceipt,
+    source_lease: DirectoryEntryLease,
 ) -> None:
     """Commit parent-checkout receipts only after every binding validates."""
 
@@ -9458,8 +9993,14 @@ def finalize_recursive_parent_checkout(
     }
     receipts = getattr(plan, "applied_target_roots", {})
     prior_target_roots = dict(receipts)
+    final_state: Optional[ManagedFinalStateReceipt] = None
     try:
-        postvalidate_applied_entry(entry, lease)
+        final_state = postvalidate_applied_entry(
+            entry,
+            lease,
+            control,
+            source_lease,
+        )
         checkout_created = capture_checkout_materialized_shared_ancestors(
             plan,
             owner_index,
@@ -9482,6 +10023,12 @@ def finalize_recursive_parent_checkout(
             require_all_participants_authorized=False,
             existing_updates=updates,
         )
+        revalidate_managed_final_state_receipt(
+            final_state,
+            lease,
+            control,
+            source_lease,
+        )
         commit_materialized_shared_ancestor_updates(plan, updates)
         record_applied_target_root(
             plan,
@@ -9489,12 +10036,21 @@ def finalize_recursive_parent_checkout(
             entry,
             lease,
         )
+        revalidate_managed_final_state_receipt(
+            final_state,
+            lease,
+            control,
+            source_lease,
+        )
     except BaseException:
         for relative_parts, materialized_node in prior_shared_nodes.items():
             ancestors[relative_parts].materialized_node = materialized_node
         receipts.clear()
         receipts.update(prior_target_roots)
         raise
+    finally:
+        if final_state is not None:
+            final_state.close()
 
 
 def apply_sync_plan(plan: SyncPlan) -> None:
@@ -9554,6 +10110,44 @@ def apply_sync_plan(plan: SyncPlan) -> None:
             revalidate_materialized_target_lease(lease)
             revalidate_source_object_admission(entry.source_git_dir)
             revalidate_checkout_preflight(entry)
+            if index in recursive_parent_indexes:
+
+                def finalize_recursive_current_checkout(
+                    control: ManagedControlReceipt,
+                    source_lease: DirectoryEntryLease,
+                    current_plan: SyncPlan = plan,
+                    current_index: int = index,
+                    current_entry: PlannedWorktree = entry,
+                    current_lease: MaterializedTargetLease = lease,
+                ) -> None:
+                    finalize_recursive_parent_checkout(
+                        current_plan,
+                        current_index,
+                        current_entry,
+                        current_lease,
+                        control,
+                        source_lease,
+                    )
+
+                finalize_current_checkout = finalize_recursive_current_checkout
+            else:
+
+                def finalize_leaf_current_checkout(
+                    control: ManagedControlReceipt,
+                    source_lease: DirectoryEntryLease,
+                    current_plan: SyncPlan = plan,
+                    current_entry: PlannedWorktree = entry,
+                    current_lease: MaterializedTargetLease = lease,
+                ) -> None:
+                    finalize_leaf_checkout(
+                        current_plan,
+                        current_entry,
+                        current_lease,
+                        control,
+                        source_lease,
+                    )
+
+                finalize_current_checkout = finalize_leaf_current_checkout
             if entry.state == "managed":
                 checkout_existing_worktree(
                     target.path,
@@ -9561,53 +10155,17 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                     dry_run=False,
                     target_descriptor=lease.target_descriptor,
                     source_git_dir=entry.source_git_dir,
+                    finalize_checkout=finalize_current_checkout,
                 )
-                if index in recursive_parent_indexes:
-                    finalize_recursive_parent_checkout(
-                        plan,
-                        index,
-                        entry,
-                        lease,
-                    )
-                else:
-                    finalize_leaf_checkout(
-                        plan,
-                        entry,
-                        lease,
-                    )
             else:
-                if index in recursive_parent_indexes:
-                    add_worktree(
-                        entry.source_git_dir,
-                        target.path,
-                        entry.sha,
-                        dry_run=False,
-                        lease=lease,
-                        finalize_checkout=lambda current_plan=plan,
-                        current_index=index,
-                        current_entry=entry,
-                        current_lease=lease: finalize_recursive_parent_checkout(
-                            current_plan,
-                            current_index,
-                            current_entry,
-                            current_lease,
-                        ),
-                    )
-                else:
-                    add_worktree(
-                        entry.source_git_dir,
-                        target.path,
-                        entry.sha,
-                        dry_run=False,
-                        lease=lease,
-                        finalize_checkout=lambda current_plan=plan,
-                        current_entry=entry,
-                        current_lease=lease: finalize_leaf_checkout(
-                            current_plan,
-                            current_entry,
-                            current_lease,
-                        ),
-                    )
+                add_worktree(
+                    entry.source_git_dir,
+                    target.path,
+                    entry.sha,
+                    dry_run=False,
+                    lease=lease,
+                    finalize_checkout=finalize_current_checkout,
+                )
         finally:
             lease.close()
 

@@ -1951,11 +1951,15 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 MODULE.PlanError,
-                "plan-owned shared target ancestor changed",
-            ):
+                "descriptor-bound target parent",
+            ) as raised:
                 MODULE.apply_sync_plan(plan)
 
         self.assertTrue(replaced)
+        self.assertIn(
+            "worktree/materialization rollback failed",
+            str(raised.exception),
+        )
         self.assertEqual(
             (target_super / "vendor" / "sentinel").read_text(encoding="utf-8"),
             "replacement\n",
@@ -1970,6 +1974,12 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 "--porcelain",
             ),
             second_registry_before,
+        )
+        self.assertTrue(
+            all(
+                ancestor.materialized_node is None
+                for ancestor in plan.shared_missing_ancestors.values()
+            )
         )
 
     def test_shared_parent_external_state_blocks_before_first_mutation(
@@ -5519,23 +5529,41 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                             )
                         )
                     elif stage == "head":
+                        original = MODULE.open_bound_regular_file_at
+
+                        def fail_final_head(
+                            *args: object,
+                            **kwargs: object,
+                        ) -> object:
+                            if registration_exists() and args[1] == "HEAD":
+                                raise MODULE.PlanError("injected final HEAD failure")
+                            return original(*args, **kwargs)
+
                         patches.enter_context(
                             mock.patch.object(
                                 MODULE,
-                                "managed_head_at_descriptor",
-                                side_effect=MODULE.PlanError(
-                                    "injected final HEAD failure"
-                                ),
+                                "open_bound_regular_file_at",
+                                side_effect=fail_final_head,
                             )
                         )
                     elif stage == "common-gitdir":
+                        original = MODULE.open_bound_regular_file_at
+
+                        def fail_final_common_gitdir(
+                            *args: object,
+                            **kwargs: object,
+                        ) -> object:
+                            if registration_exists() and args[1] == "commondir":
+                                raise MODULE.PlanError(
+                                    "injected final common-gitdir failure"
+                                )
+                            return original(*args, **kwargs)
+
                         patches.enter_context(
                             mock.patch.object(
                                 MODULE,
-                                "common_git_dir_at_descriptor",
-                                side_effect=MODULE.PlanError(
-                                    "injected final common-gitdir failure"
-                                ),
+                                "open_bound_regular_file_at",
+                                side_effect=fail_final_common_gitdir,
                             )
                         )
                     elif stage == "object-closure":
@@ -5595,6 +5623,560 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         for ancestor in plan.shared_missing_ancestors.values()
                     )
                 )
+
+    def test_new_leaf_finalization_rejects_same_source_admin_retarget(
+        self,
+    ) -> None:
+        phases = (
+            "before-final-state-capture",
+            "during-postvalidation",
+            "before-receipt-publication",
+            "during-receipt-publication",
+            "after-receipt-publication",
+        )
+        for phase in phases:
+            with self.subTest(phase=phase):
+                target, module, input_receipt = self.make_target_superproject(
+                    f"leaf-control-retarget-{phase}",
+                    self.sha,
+                )
+                plan = MODULE.build_sync_plan(
+                    root=target,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[(module, self.sha)],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    fetch_missing=False,
+                    input_receipt=input_receipt,
+                )
+                entry = plan.entries[0]
+                peer = self.root / f"leaf-control-peer-{phase}"
+                self.add_managed_worktree(
+                    entry.source_git_dir,
+                    peer,
+                    entry.sha,
+                )
+                peer_admin = MODULE.gitdir_file_target(peer)
+                self.assertIsNotNone(peer_admin)
+                registry_before = run_git(
+                    self.root,
+                    f"--git-dir={entry.source_git_dir}",
+                    "worktree",
+                    "list",
+                    "--porcelain",
+                )
+                shared_before = {
+                    parts: ancestor.materialized_node
+                    for parts, ancestor in plan.shared_missing_ancestors.items()
+                }
+                roots_before = dict(plan.applied_target_roots)
+                final_target = target / module.path
+                replaced = False
+
+                def retarget_control_file() -> None:
+                    nonlocal replaced
+                    if replaced:
+                        return
+                    replaced = True
+                    replacement = final_target / ".git.control-replacement"
+                    replacement.write_text(
+                        f"gitdir: {peer_admin}\n",
+                        encoding="utf-8",
+                    )
+                    os.replace(replacement, final_target / ".git")
+
+                original_capture = MODULE.capture_managed_final_state_receipt
+                original_revalidate = MODULE.revalidate_managed_final_state_receipt
+                original_closure = MODULE.target_object_closure
+                original_record = MODULE.record_materialized_shared_ancestors
+                final_state_captured = False
+                final_revalidation_count = 0
+
+                def capture_final_state(*args: object, **kwargs: object) -> object:
+                    nonlocal final_state_captured
+                    if phase == "before-final-state-capture":
+                        retarget_control_file()
+                    result = original_capture(*args, **kwargs)
+                    final_state_captured = True
+                    return result
+
+                def close_over_final_state(
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    result = original_closure(*args, **kwargs)
+                    if phase == "during-postvalidation" and final_state_captured:
+                        retarget_control_file()
+                    return result
+
+                def revalidate_final_state(
+                    *args: object,
+                    **kwargs: object,
+                ) -> None:
+                    nonlocal final_revalidation_count
+                    final_revalidation_count += 1
+                    if (
+                        phase == "before-receipt-publication"
+                        and final_revalidation_count == 2
+                    ) or (
+                        phase == "after-receipt-publication"
+                        and final_revalidation_count == 3
+                    ):
+                        retarget_control_file()
+                    original_revalidate(*args, **kwargs)
+
+                def publish_shared_receipts(
+                    *args: object,
+                    **kwargs: object,
+                ) -> None:
+                    original_record(*args, **kwargs)
+                    if phase == "during-receipt-publication":
+                        retarget_control_file()
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "capture_managed_final_state_receipt",
+                        side_effect=capture_final_state,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "target_object_closure",
+                        side_effect=close_over_final_state,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "revalidate_managed_final_state_receipt",
+                        side_effect=revalidate_final_state,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "record_materialized_shared_ancestors",
+                        side_effect=publish_shared_receipts,
+                    ),
+                ):
+                    with redirect_stdout(io.StringIO()):
+                        with self.assertRaises(MODULE.PlanError) as raised:
+                            MODULE.apply_sync_plan(plan)
+
+                self.assertTrue(replaced)
+                self.assertIn("control file", str(raised.exception))
+                self.assertNotIn(
+                    "worktree/materialization rollback failed",
+                    str(raised.exception),
+                )
+                self.assertFalse(final_target.exists())
+                self.assertFalse((target / "third_party").exists())
+                self.assertEqual(
+                    run_git(
+                        self.root,
+                        f"--git-dir={entry.source_git_dir}",
+                        "worktree",
+                        "list",
+                        "--porcelain",
+                    ),
+                    registry_before,
+                )
+                self.assertEqual(
+                    run_git(
+                        self.root,
+                        f"--git-dir={peer_admin}",
+                        "rev-parse",
+                        "HEAD",
+                    ),
+                    entry.sha,
+                )
+                self.assertEqual(plan.applied_target_roots, roots_before)
+                self.assertEqual(
+                    {
+                        parts: ancestor.materialized_node
+                        for parts, ancestor in plan.shared_missing_ancestors.items()
+                    },
+                    shared_before,
+                )
+
+    def test_new_leaf_finalization_rejects_admin_backlink_retarget(
+        self,
+    ) -> None:
+        target, module, input_receipt = self.make_target_superproject(
+            "leaf-backlink-retarget",
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        entry = plan.entries[0]
+        peer = self.root / "leaf-backlink-peer"
+        self.add_managed_worktree(
+            entry.source_git_dir,
+            peer,
+            entry.sha,
+        )
+        peer_admin = MODULE.gitdir_file_target(peer)
+        self.assertIsNotNone(peer_admin)
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={entry.source_git_dir}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        final_target = target / module.path
+        original_record = MODULE.record_materialized_shared_ancestors
+        replaced = False
+
+        def replace_backlink_during_publication(
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal replaced
+            original_record(*args, **kwargs)
+            target_admin = MODULE.gitdir_file_target(final_target)
+            self.assertIsNotNone(target_admin)
+            assert target_admin is not None
+            replacement = target_admin / "gitdir.control-replacement"
+            replacement.write_text(
+                f"{peer / '.git'}\n",
+                encoding="utf-8",
+            )
+            os.replace(replacement, target_admin / "gitdir")
+            replaced = True
+
+        with mock.patch.object(
+            MODULE,
+            "record_materialized_shared_ancestors",
+            side_effect=replace_backlink_during_publication,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "admin backlink",
+                ) as raised:
+                    MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(replaced)
+        self.assertNotIn(
+            "worktree/materialization rollback failed",
+            str(raised.exception),
+        )
+        self.assertFalse(final_target.exists())
+        self.assertFalse((target / "third_party").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={entry.source_git_dir}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={peer_admin}",
+                "rev-parse",
+                "HEAD",
+            ),
+            entry.sha,
+        )
+        self.assertEqual(plan.applied_target_roots, {})
+        self.assertTrue(
+            all(
+                ancestor.materialized_node is None
+                for ancestor in plan.shared_missing_ancestors.values()
+            )
+        )
+
+    def test_new_leaf_finalization_binds_each_admin_state_file(
+        self,
+    ) -> None:
+        for admin_name in ("HEAD", "commondir", "index"):
+            with self.subTest(admin_name=admin_name):
+                target, module, input_receipt = self.make_target_superproject(
+                    f"leaf-admin-state-{admin_name}",
+                    self.sha,
+                )
+                plan = MODULE.build_sync_plan(
+                    root=target,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[(module, self.sha)],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    fetch_missing=False,
+                    input_receipt=input_receipt,
+                )
+                entry = plan.entries[0]
+                final_target = target / module.path
+                registry_before = run_git(
+                    self.root,
+                    f"--git-dir={entry.source_git_dir}",
+                    "worktree",
+                    "list",
+                    "--porcelain",
+                )
+                original_record = MODULE.record_materialized_shared_ancestors
+                replaced = False
+
+                def replace_admin_state_file(
+                    *args: object,
+                    **kwargs: object,
+                ) -> None:
+                    nonlocal replaced
+                    original_record(*args, **kwargs)
+                    target_admin = MODULE.gitdir_file_target(final_target)
+                    self.assertIsNotNone(target_admin)
+                    assert target_admin is not None
+                    admin_path = target_admin / admin_name
+                    admin_stat = admin_path.stat()
+                    replacement = target_admin / f"{admin_name}.replacement"
+                    replacement.write_bytes(admin_path.read_bytes())
+                    replacement.chmod(stat.S_IMODE(admin_stat.st_mode))
+                    os.replace(replacement, admin_path)
+                    replaced = True
+
+                with mock.patch.object(
+                    MODULE,
+                    "record_materialized_shared_ancestors",
+                    side_effect=replace_admin_state_file,
+                ):
+                    with redirect_stdout(io.StringIO()):
+                        with self.assertRaises(MODULE.PlanError) as raised:
+                            MODULE.apply_sync_plan(plan)
+
+                self.assertTrue(replaced)
+                self.assertIn(
+                    {
+                        "HEAD": "final HEAD",
+                        "commondir": "common-gitdir pointer",
+                        "index": "final index",
+                    }[admin_name],
+                    str(raised.exception),
+                )
+                self.assertNotIn(
+                    "worktree/materialization rollback failed",
+                    str(raised.exception),
+                )
+                self.assertFalse(final_target.exists())
+                self.assertFalse((target / "third_party").exists())
+                self.assertEqual(
+                    run_git(
+                        self.root,
+                        f"--git-dir={entry.source_git_dir}",
+                        "worktree",
+                        "list",
+                        "--porcelain",
+                    ),
+                    registry_before,
+                )
+                self.assertTrue(
+                    all(
+                        ancestor.materialized_node is None
+                        for ancestor in plan.shared_missing_ancestors.values()
+                    )
+                )
+
+    def test_managed_leaf_finalization_retains_original_admin_identity(
+        self,
+    ) -> None:
+        source = self.clone_named_source("managed-final-control")
+        target_super = self.root / "managed-final-control-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        peer = self.root / "managed-final-control-peer"
+        self.add_managed_worktree(source, target, self.sha)
+        self.add_managed_worktree(source, peer, self.sha)
+        original_admin = MODULE.gitdir_file_target(target)
+        peer_admin = MODULE.gitdir_file_target(peer)
+        self.assertIsNotNone(original_admin)
+        self.assertIsNotNone(peer_admin)
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "managed-final-control",
+                        "lib",
+                        str(self.remote),
+                    ),
+                    self.sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        original_record = MODULE.record_materialized_shared_ancestors
+        replaced = False
+
+        def replace_during_publication(*args: object, **kwargs: object) -> None:
+            nonlocal replaced
+            original_record(*args, **kwargs)
+            replacement = target / ".git.control-replacement"
+            replacement.write_text(
+                f"gitdir: {peer_admin}\n",
+                encoding="utf-8",
+            )
+            os.replace(replacement, target / ".git")
+            replaced = True
+
+        with mock.patch.object(
+            MODULE,
+            "record_materialized_shared_ancestors",
+            side_effect=replace_during_publication,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "control file",
+                ):
+                    MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(replaced)
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={original_admin}",
+                "rev-parse",
+                "HEAD",
+            ),
+            self.sha,
+        )
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={peer_admin}",
+                "rev-parse",
+                "HEAD",
+            ),
+            self.sha,
+        )
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+        self.assertEqual(plan.applied_target_roots, {})
+
+    def test_recursive_parent_control_retarget_restores_all_receipts(
+        self,
+    ) -> None:
+        plan, target_super, parent_source, _children = self.make_grouped_recursive_plan(
+            "recursive-final-control",
+            ("group/left", "group/right"),
+        )
+        parent_entry = plan.entries[0]
+        peer = self.root / "recursive-final-control-peer"
+        self.add_managed_worktree(
+            parent_source,
+            peer,
+            parent_entry.sha,
+        )
+        peer_admin = MODULE.gitdir_file_target(peer)
+        self.assertIsNotNone(peer_admin)
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={parent_source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        shared_before = {
+            parts: ancestor.materialized_node
+            for parts, ancestor in plan.shared_missing_ancestors.items()
+        }
+        roots_before = dict(plan.applied_target_roots)
+        original_record = MODULE.record_applied_target_root
+        parent_target = parent_entry.target.path
+        replaced = False
+
+        def replace_after_root_receipt(
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal replaced
+            original_record(*args, **kwargs)
+            replacement = parent_target / ".git.control-replacement"
+            replacement.write_text(
+                f"gitdir: {peer_admin}\n",
+                encoding="utf-8",
+            )
+            os.replace(replacement, parent_target / ".git")
+            replaced = True
+
+        with mock.patch.object(
+            MODULE,
+            "record_applied_target_root",
+            side_effect=replace_after_root_receipt,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "control file",
+                ) as raised:
+                    MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(replaced)
+        self.assertNotIn(
+            "worktree/materialization rollback failed",
+            str(raised.exception),
+        )
+        self.assertFalse(parent_target.exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={parent_source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={peer_admin}",
+                "rev-parse",
+                "HEAD",
+            ),
+            parent_entry.sha,
+        )
+        self.assertEqual(plan.applied_target_roots, roots_before)
+        self.assertEqual(
+            {
+                parts: ancestor.materialized_node
+                for parts, ancestor in plan.shared_missing_ancestors.items()
+            },
+            shared_before,
+        )
+        self.assertEqual(list(target_super.iterdir()), [])
 
     def test_materialization_open_failure_cleans_created_parent_chain(self) -> None:
         target_root = self.root / "materialize-open-cleanup"
@@ -5987,11 +6569,15 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(
                     MODULE.PlanError,
-                    "applied recursive parent root changed",
-                ):
+                    "descriptor-bound target worktree",
+                ) as raised:
                     MODULE.apply_sync_plan(race_plan)
 
         self.assertTrue(replaced)
+        self.assertIn(
+            "worktree/materialization rollback failed",
+            str(raised.exception),
+        )
         self.assertEqual(
             (race_target / "parent" / "sentinel").read_text(encoding="utf-8"),
             "replacement\n",
@@ -6007,6 +6593,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             ),
             child_registry_before,
         )
+        self.assertEqual(race_plan.applied_target_roots, {})
 
     def test_sync_uses_submodule_name_for_source_gitdir(self) -> None:
         submodule = MODULE.Submodule(
@@ -7237,7 +7824,10 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             self.assertIsNotNone(lease)
             events.append(f"add:{target.name}")
             if callable(finalize_checkout):
-                finalize_checkout()
+                finalize_checkout(
+                    mock.sentinel.control,
+                    mock.sentinel.source_lease,
+                )
 
         lease = mock.MagicMock()
         with mock.patch.object(MODULE, "validate_sync_plan", side_effect=validate):
@@ -7284,10 +7874,14 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                                             ):
                                                 with mock.patch.object(
                                                     MODULE,
-                                                    "add_worktree",
-                                                    side_effect=add,
+                                                    "revalidate_managed_final_state_receipt",
                                                 ):
-                                                    MODULE.apply_sync_plan(plan)
+                                                    with mock.patch.object(
+                                                        MODULE,
+                                                        "add_worktree",
+                                                        side_effect=add,
+                                                    ):
+                                                        MODULE.apply_sync_plan(plan)
 
         self.assertEqual(events.count("full"), 2)
         second_full = len(events) - 1 - events[::-1].index("full")
