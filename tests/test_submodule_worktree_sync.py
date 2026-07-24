@@ -103,6 +103,59 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         )
         return source_git_dir
 
+    def create_gitlink_remote(
+        self,
+        name: str,
+        children: tuple[tuple[str, str, Path, str], ...] = (),
+    ) -> tuple[Path, str]:
+        remote = self.root / f"{name}-remote"
+        run_git(self.root, "init", str(remote))
+        run_git(remote, "config", "user.email", "test@example.com")
+        run_git(remote, "config", "user.name", "Test User")
+        (remote / "README.md").write_text(f"{name}\n", encoding="utf-8")
+        run_git(remote, "add", "README.md")
+        if children:
+            gitmodules_lines: list[str] = []
+            for child_name, child_path, child_remote, child_sha in children:
+                gitmodules_lines.extend(
+                    [
+                        f'[submodule "{child_name}"]',
+                        f"    path = {child_path}",
+                        f"    url = {child_remote}",
+                        "",
+                    ]
+                )
+                run_git(
+                    remote,
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"160000,{child_sha},{child_path}",
+                )
+            (remote / ".gitmodules").write_text(
+                "\n".join(gitmodules_lines),
+                encoding="utf-8",
+            )
+            run_git(remote, "add", ".gitmodules")
+        run_git(remote, "commit", "-m", f"create {name}")
+        return remote, run_git(remote, "rev-parse", "HEAD")
+
+    def clone_recursive_source(
+        self,
+        source_git_dir: Path,
+        remote: Path,
+        standard_name: str,
+    ) -> None:
+        source_git_dir.parent.mkdir(parents=True, exist_ok=True)
+        run_git(
+            self.root,
+            "clone",
+            "--separate-git-dir",
+            str(source_git_dir),
+            str(remote),
+            str(self.root / standard_name),
+        )
+
     def fetch_source(self, source_git_dir: Path) -> None:
         run_git(
             self.root,
@@ -4638,6 +4691,186 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             run_git(target / "third_party" / "libexample", "rev-parse", "HEAD"),
             target_sha,
         )
+
+    def test_recursive_apply_parent_with_two_children_uses_parent_receipt(
+        self,
+    ) -> None:
+        left_remote, left_sha = self.create_gitlink_remote("direct-left")
+        right_remote, right_sha = self.create_gitlink_remote("direct-right")
+        parent_remote, parent_sha = self.create_gitlink_remote(
+            "direct-parent",
+            (
+                ("left", "left", left_remote, left_sha),
+                ("right", "right", right_remote, right_sha),
+            ),
+        )
+
+        source_common = self.root / "direct-recursive-source" / ".git"
+        parent_source = source_common / "modules" / "parent"
+        self.clone_recursive_source(
+            parent_source,
+            parent_remote,
+            "direct-parent-standard",
+        )
+        self.clone_recursive_source(
+            parent_source / "modules" / "left",
+            left_remote,
+            "direct-left-standard",
+        )
+        self.clone_recursive_source(
+            parent_source / "modules" / "right",
+            right_remote,
+            "direct-right-standard",
+        )
+        target_super = self.root / "direct-recursive-target"
+        target_super.mkdir()
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=source_common,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "parent",
+                        "vendor/parent",
+                        str(parent_remote),
+                    ),
+                    parent_sha,
+                )
+            ],
+            depth=1,
+            recursive=True,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+
+        self.assertEqual(
+            [entry.parent_index for entry in plan.entries],
+            [None, 0, 0],
+        )
+        final_target_roots = {entry.target.relative_parts for entry in plan.entries}
+        self.assertTrue(final_target_roots.isdisjoint(plan.shared_missing_ancestors))
+        self.assertEqual(set(plan.shared_missing_ancestors), {("vendor",)})
+        with redirect_stdout(io.StringIO()):
+            MODULE.apply_sync_plan(plan)
+
+        expected_targets = (
+            (target_super / "vendor" / "parent", parent_sha),
+            (target_super / "vendor" / "parent" / "left", left_sha),
+            (target_super / "vendor" / "parent" / "right", right_sha),
+        )
+        for target, expected_sha in expected_targets:
+            with self.subTest(target=target):
+                self.assertEqual(run_git(target, "rev-parse", "HEAD"), expected_sha)
+        self.assertEqual(set(plan.applied_target_roots), {0})
+        parent_receipt = MODULE.revalidate_applied_target_root(plan, 0)
+        parent_target = plan.entries[0].target.path
+        self.assertEqual(parent_receipt.relative_parts, ("vendor", "parent"))
+        self.assertEqual(parent_receipt.node.path, parent_target)
+        self.assertEqual(
+            parent_receipt.node.fingerprint,
+            MODULE.filesystem_fingerprint(parent_target),
+        )
+        shared_vendor = plan.shared_missing_ancestors[("vendor",)]
+        self.assertIsNotNone(shared_vendor.materialized_node)
+        assert shared_vendor.materialized_node is not None
+        self.assertEqual(shared_vendor.materialized_node.path, plan.root / "vendor")
+        self.assertEqual(
+            shared_vendor.materialized_node.fingerprint,
+            MODULE.filesystem_fingerprint(plan.root / "vendor"),
+        )
+
+    def test_recursive_apply_two_level_chain_uses_each_parent_receipt(
+        self,
+    ) -> None:
+        grandchild_remote, grandchild_sha = self.create_gitlink_remote(
+            "chain-grandchild"
+        )
+        child_remote, child_sha = self.create_gitlink_remote(
+            "chain-child",
+            (
+                (
+                    "grandchild",
+                    "grandchild",
+                    grandchild_remote,
+                    grandchild_sha,
+                ),
+            ),
+        )
+        parent_remote, parent_sha = self.create_gitlink_remote(
+            "chain-parent",
+            (("child", "child", child_remote, child_sha),),
+        )
+
+        source_common = self.root / "chain-recursive-source" / ".git"
+        parent_source = source_common / "modules" / "parent"
+        child_source = parent_source / "modules" / "child"
+        self.clone_recursive_source(
+            parent_source,
+            parent_remote,
+            "chain-parent-standard",
+        )
+        self.clone_recursive_source(
+            child_source,
+            child_remote,
+            "chain-child-standard",
+        )
+        self.clone_recursive_source(
+            child_source / "modules" / "grandchild",
+            grandchild_remote,
+            "chain-grandchild-standard",
+        )
+        target_super = self.root / "chain-recursive-target"
+        target_super.mkdir()
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=source_common,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule("parent", "parent", str(parent_remote)),
+                    parent_sha,
+                )
+            ],
+            depth=1,
+            recursive=True,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+
+        self.assertEqual(
+            [entry.parent_index for entry in plan.entries],
+            [None, 0, 1],
+        )
+        final_target_roots = {entry.target.relative_parts for entry in plan.entries}
+        self.assertTrue(final_target_roots.isdisjoint(plan.shared_missing_ancestors))
+        with redirect_stdout(io.StringIO()):
+            MODULE.apply_sync_plan(plan)
+
+        expected_targets = (
+            (target_super / "parent", parent_sha),
+            (target_super / "parent" / "child", child_sha),
+            (
+                target_super / "parent" / "child" / "grandchild",
+                grandchild_sha,
+            ),
+        )
+        for target, expected_sha in expected_targets:
+            with self.subTest(target=target):
+                self.assertEqual(run_git(target, "rev-parse", "HEAD"), expected_sha)
+        self.assertEqual(set(plan.applied_target_roots), {0, 1})
+        for owner_index, relative_parts in (
+            (0, ("parent",)),
+            (1, ("parent", "child")),
+        ):
+            receipt = MODULE.revalidate_applied_target_root(plan, owner_index)
+            target = plan.entries[owner_index].target.path
+            self.assertEqual(receipt.relative_parts, relative_parts)
+            self.assertEqual(receipt.node.path, target)
+            self.assertEqual(
+                receipt.node.fingerprint,
+                MODULE.filesystem_fingerprint(target),
+            )
 
     def test_recursive_apply_binds_parent_root_for_descendants(self) -> None:
         child_remote = self.root / "nested-child-remote"

@@ -2497,20 +2497,23 @@ def revalidate_bound_target(target: BoundTarget) -> None:
 def capture_shared_missing_ancestors(
     entries: list[PlannedWorktree],
 ) -> dict[tuple[str, ...], SharedMissingAncestor]:
+    final_target_roots = {entry.target.relative_parts for entry in entries}
     participants: dict[tuple[str, ...], set[tuple[str, ...]]] = {}
     for entry in entries:
         target = entry.target
         existing_component_count = len(target.relative_parts) - len(
             target.missing_parts
         )
-        # The final worktree root belongs only to its own entry. Sharing is
-        # limited to strict ancestors that at least two planned targets proved
-        # absent during the complete preflight.
+        # Every final worktree root belongs only to its own entry, including
+        # when another target sees it as a missing strict ancestor. Recursive
+        # parent roots are bound separately through AppliedTargetRoot receipts.
         for component_count in range(
             existing_component_count + 1,
             len(target.relative_parts),
         ):
             prefix = target.relative_parts[:component_count]
+            if prefix in final_target_roots:
+                continue
             participants.setdefault(prefix, set()).add(target.relative_parts)
     return {
         prefix: SharedMissingAncestor(
