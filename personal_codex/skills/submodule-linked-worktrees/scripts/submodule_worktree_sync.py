@@ -1456,6 +1456,7 @@ def read_git_bounded(
     extra_env: Optional[dict[str, str]] = None,
     fixed_env: Optional[dict[str, str]] = None,
     timeout_seconds: float = GIT_ENUMERATION_TIMEOUT_SECONDS,
+    directory_identity_leases: tuple[DirectoryEntryLease, ...] = (),
 ) -> subprocess.CompletedProcess[bytes]:
     return run_bounded_bytes(
         ["git", "--no-optional-locks", *args],
@@ -1466,6 +1467,7 @@ def read_git_bounded(
         extra_env=extra_env,
         fixed_env=fixed_env,
         timeout_seconds=timeout_seconds,
+        directory_identity_leases=directory_identity_leases,
     )
 
 
@@ -3019,23 +3021,24 @@ def capture_checkout_materialized_shared_ancestors(
                         ".",
                         os.W_OK | os.X_OK,
                     ):
-                        # This prefix was created inside the newly registered,
-                        # transaction-owned parent checkout. Restore only its
-                        # owner access so the enclosing rollback can remove the
-                        # rejected worktree without following a pathname.
-                        try:
-                            os.fchmod(
-                                child_descriptor,
-                                child_fingerprint.permissions | 0o700,
-                            )
-                        except OSError as exc:
-                            raise PlanError(
-                                "checkout-created shared target ancestor does "
-                                "not permit descendant materialization and "
-                                "cannot be prepared for rollback\n"
-                                f"  path: {child_path}\n"
-                                f"  error: {exc}"
-                            ) from exc
+                        if entry.state != "managed":
+                            # Only a newly registered, transaction-owned parent
+                            # is removed by the enclosing rollback. A managed
+                            # checkout survives this failure, so changing its
+                            # access policy here would be a permanent mutation.
+                            try:
+                                os.fchmod(
+                                    child_descriptor,
+                                    child_fingerprint.permissions | 0o700,
+                                )
+                            except OSError as exc:
+                                raise PlanError(
+                                    "checkout-created shared target ancestor "
+                                    "does not permit descendant materialization "
+                                    "and cannot be prepared for rollback\n"
+                                    f"  path: {child_path}\n"
+                                    f"  error: {exc}"
+                                ) from exc
                         raise PlanError(
                             "checkout-created shared target ancestor does not "
                             "permit descendant materialization\n"
@@ -7522,16 +7525,63 @@ def has_local_changes(worktree_path: Path, current_head: str) -> bool:
     return bool(records)
 
 
-def registered_worktree_paths(source_git_dir: Path) -> list[Path]:
-    result = read_git_bounded(
-        [
-            *source_object_repo_args(source_git_dir),
-            "worktree",
-            "list",
-            "--porcelain",
-            "-z",
-        ]
-    )
+def revalidate_source_registry_lease(
+    source_git_dir: Path,
+    source_lease: DirectoryEntryLease,
+) -> None:
+    """Prove that a registry query still names the held source directory."""
+
+    try:
+        resolved_source = source_git_dir.resolve(strict=True)
+    except OSError as exc:
+        raise PlanError(
+            "cannot resolve the source worktree registry while its lease is held\n"
+            f"  source gitdir: {source_git_dir}\n"
+            f"  error: {exc}"
+        ) from exc
+    if source_lease.path != resolved_source:
+        raise PlanError(
+            "source worktree registry query does not match its held lease\n"
+            f"  source gitdir: {source_git_dir}\n"
+            f"  leased source: {source_lease.path}"
+        )
+    revalidate_directory_entry_lease(source_lease)
+
+
+def registered_worktree_paths(
+    source_git_dir: Path,
+    *,
+    source_lease: Optional[DirectoryEntryLease] = None,
+) -> list[Path]:
+    identity_leases: tuple[DirectoryEntryLease, ...] = ()
+    if source_lease is not None:
+        revalidate_source_registry_lease(source_git_dir, source_lease)
+        identity_leases = (source_lease,)
+    try:
+        result = read_git_bounded(
+            [
+                *source_object_repo_args(source_git_dir),
+                "worktree",
+                "list",
+                "--porcelain",
+                "-z",
+            ],
+            directory_identity_leases=identity_leases,
+        )
+    except BaseException as query_exc:
+        if source_lease is not None:
+            try:
+                revalidate_source_registry_lease(source_git_dir, source_lease)
+            except BaseException as lease_exc:
+                raise PlanError(
+                    f"{query_exc}\n"
+                    "source worktree registry query lease changed while the "
+                    f"query failed: {lease_exc}"
+                ) from query_exc
+        raise
+    if source_lease is not None:
+        # Close the subprocess identity gate before trusting any query bytes.
+        revalidate_source_registry_lease(source_git_dir, source_lease)
     paths: list[Path] = []
     for field in bounded_records(
         result.stdout,
@@ -7546,14 +7596,29 @@ def registered_worktree_paths(source_git_dir: Path) -> list[Path]:
                 "source worktree registry contains an empty or oversized path"
             )
         paths.append(Path(os.fsdecode(raw_path)).resolve(strict=False))
+    if source_lease is not None:
+        # Parsing can be bounded but non-trivial; close that interval as well.
+        revalidate_source_registry_lease(source_git_dir, source_lease)
     return paths
 
 
-def registered_target_path(source_git_dir: Path, target_path: Path) -> Optional[Path]:
+def registered_target_path(
+    source_git_dir: Path,
+    target_path: Path,
+    *,
+    source_lease: Optional[DirectoryEntryLease] = None,
+) -> Optional[Path]:
     resolved_target = target_path.resolve(strict=False)
-    for registered_path in registered_worktree_paths(source_git_dir):
+    for registered_path in registered_worktree_paths(
+        source_git_dir,
+        source_lease=source_lease,
+    ):
         if registered_path == resolved_target:
+            if source_lease is not None:
+                revalidate_source_registry_lease(source_git_dir, source_lease)
             return registered_path
+    if source_lease is not None:
+        revalidate_source_registry_lease(source_git_dir, source_lease)
     return None
 
 
@@ -8036,7 +8101,21 @@ def rollback_added_worktree(
         raise PlanError(
             f"rolled-back worktree target still exists\n  path: {lease.target}"
         )
-    if registered_target_path(source_git_dir, lease.target) is not None:
+    try:
+        registered_path = registered_target_path(
+            source_git_dir,
+            lease.target,
+            source_lease=source_lease,
+        )
+    except BaseException as registry_exc:
+        raise PlanError(
+            "rolled-back worktree registry state is uncertain; preserving "
+            "transaction-created target parents for recovery\n"
+            f"  source gitdir: {source_git_dir}\n"
+            f"  target: {lease.target}\n"
+            f"  registry error: {registry_exc}"
+        ) from registry_exc
+    if registered_path is not None:
         raise PlanError(
             "rolled-back worktree remains in the source registry\n"
             f"  path: {lease.target}"
@@ -8143,12 +8222,19 @@ def add_worktree(
                     registered_target_path(
                         source_git_dir,
                         worktree_path,
+                        source_lease=source_lease,
                     )
                     is not None
                 )
                 registry_known_clean = not should_rollback
             except BaseException as registry_exc:
-                rollback_error = registry_exc
+                rollback_error = PlanError(
+                    "worktree registration state is uncertain; preserving the "
+                    "target for recovery\n"
+                    f"  source gitdir: {source_git_dir}\n"
+                    f"  target: {worktree_path}\n"
+                    f"  registry error: {registry_exc}"
+                )
         if should_rollback:
             try:
                 rollback_added_worktree(

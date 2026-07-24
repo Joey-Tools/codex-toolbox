@@ -5302,6 +5302,113 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 )
                 self.assertEqual(list(outside.iterdir()), [])
 
+    def test_managed_recursive_parent_failure_preserves_shared_prefix_mode(
+        self,
+    ) -> None:
+        plan, target_super, parent_source, _child_results = (
+            self.make_grouped_recursive_plan(
+                "managed-checkout-policy",
+                ("group/left", "group/right"),
+            )
+        )
+        parent_entry = plan.entries[0]
+        target_sha = parent_entry.sha
+        parent_remote = Path(parent_entry.submodule.url)
+        run_git(
+            parent_remote,
+            "update-index",
+            "--force-remove",
+            "--",
+            "group/left",
+            "group/right",
+        )
+        run_git(parent_remote, "rm", "-f", ".gitmodules")
+        run_git(parent_remote, "commit", "-m", "remove recursive children")
+        no_group_sha = run_git(parent_remote, "rev-parse", "HEAD")
+        self.fetch_source(parent_source)
+
+        parent_target = target_super / "parent"
+        self.add_managed_worktree(
+            parent_source,
+            parent_target,
+            no_group_sha,
+        )
+        managed_plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=parent_source.parent.parent,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    parent_entry.submodule,
+                    target_sha,
+                )
+            ],
+            depth=1,
+            recursive=True,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        self.assertEqual(managed_plan.entries[0].state, "managed")
+        self.assertIn(
+            ("parent", "group"),
+            managed_plan.shared_missing_ancestors,
+        )
+        registry_paths_before = MODULE.registered_worktree_paths(parent_source)
+        original_capture = MODULE.capture_checkout_materialized_shared_ancestors
+        made_read_only = False
+
+        def capture_after_policy_change(
+            current_plan: object,
+            owner_index: int,
+            entry: object,
+            lease: object,
+        ) -> object:
+            nonlocal made_read_only
+            shared_prefix = target_super / "parent/group"
+            self.assertTrue(shared_prefix.is_dir())
+            shared_prefix.chmod(0o555)
+            made_read_only = True
+            return original_capture(
+                current_plan,
+                owner_index,
+                entry,
+                lease,
+            )
+
+        prior_umask = os.umask(0o077)
+        shared_prefix = target_super / "parent/group"
+        try:
+            with mock.patch.object(
+                MODULE,
+                "capture_checkout_materialized_shared_ancestors",
+                side_effect=capture_after_policy_change,
+            ):
+                with redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        MODULE.PlanError,
+                        "does not permit descendant materialization",
+                    ):
+                        MODULE.apply_sync_plan(managed_plan)
+
+            self.assertTrue(made_read_only)
+            self.assertTrue(parent_target.is_dir())
+            self.assertEqual(
+                stat.S_IMODE(shared_prefix.stat().st_mode),
+                0o555,
+            )
+            self.assertEqual(
+                MODULE.registered_worktree_paths(parent_source),
+                registry_paths_before,
+            )
+            self.assertEqual(
+                run_git(parent_target, "rev-parse", "HEAD"),
+                target_sha,
+            )
+        finally:
+            os.umask(prior_umask)
+            if shared_prefix.exists():
+                shared_prefix.chmod(0o755)
+
     def test_recursive_parent_checkout_binding_failure_rolls_back_registration(
         self,
     ) -> None:
@@ -6390,6 +6497,162 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     if replaced:
                         shutil.rmtree(source)
                         original_source.rename(source)
+
+    def test_partial_registration_source_replacement_preserves_target(
+        self,
+    ) -> None:
+        target, module, input_receipt = self.make_target_superproject(
+            "partial-registration-source-replacement",
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        entry = plan.entries[0]
+        final_target = target / module.path
+        replacement_source = self.root / "partial-registration-replacement"
+        original_source = self.root / "partial-registration-original"
+        shutil.copytree(entry.source_git_dir, replacement_source)
+        original_run = MODULE.run_git_at_directory_descriptor
+        replaced = False
+
+        def fail_after_registration(
+            args: list[str],
+            directory_descriptor: int,
+            *,
+            extra_env: dict[str, str] | None = None,
+            directory_identity_leases: tuple[object, ...] = (),
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal replaced
+            result = original_run(
+                args,
+                directory_descriptor,
+                extra_env=extra_env,
+                directory_identity_leases=directory_identity_leases,
+            )
+            if not replaced and "worktree" in args and "add" in args:
+                entry.source_git_dir.rename(original_source)
+                replacement_source.rename(entry.source_git_dir)
+                replaced = True
+                raise MODULE.GitError(
+                    "injected failure after partial worktree registration"
+                )
+            return result
+
+        with mock.patch.object(
+            MODULE,
+            "run_git_at_directory_descriptor",
+            side_effect=fail_after_registration,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "registration state is uncertain; preserving the target",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(replaced)
+        self.assertTrue(final_target.is_dir())
+        self.assertTrue((final_target / ".git").is_file())
+        self.assertEqual(
+            MODULE.registered_target_path(
+                original_source,
+                final_target,
+            ),
+            final_target.resolve(),
+        )
+        self.assertIsNone(
+            MODULE.registered_target_path(
+                entry.source_git_dir,
+                final_target,
+            )
+        )
+
+    def test_final_rollback_registry_query_drift_preserves_target_parent(
+        self,
+    ) -> None:
+        target, module, input_receipt = self.make_target_superproject(
+            "rollback-registry-query-drift",
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        entry = plan.entries[0]
+        final_target = target / module.path
+        created_parent = final_target.parent
+        replacement_source = self.root / "rollback-query-replacement"
+        original_source = self.root / "rollback-query-original"
+        shutil.copytree(entry.source_git_dir, replacement_source)
+        original_read_git_bounded = MODULE.read_git_bounded
+        replaced = False
+
+        def replace_after_final_registry_query(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal replaced
+            result = original_read_git_bounded(args, **kwargs)
+            if (
+                not replaced
+                and "worktree" in args
+                and "list" in args
+                and kwargs.get("directory_identity_leases")
+                and not final_target.exists()
+            ):
+                entry.source_git_dir.rename(original_source)
+                replacement_source.rename(entry.source_git_dir)
+                replaced = True
+            return result
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "postvalidate_applied_entry",
+                side_effect=MODULE.PlanError("injected finalization failure"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "read_git_bounded",
+                side_effect=replace_after_final_registry_query,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "rolled-back worktree registry state is uncertain",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(replaced)
+        self.assertFalse(final_target.exists())
+        self.assertTrue(created_parent.is_dir())
+        self.assertIsNone(
+            MODULE.registered_target_path(
+                original_source,
+                final_target,
+            )
+        )
+        self.assertIsNone(
+            MODULE.registered_target_path(
+                entry.source_git_dir,
+                final_target,
+            )
+        )
 
     def test_captured_index_rejects_conflict_and_hidden_entry_flags(self) -> None:
         source = self.clone_named_source("captured-index-flags")
