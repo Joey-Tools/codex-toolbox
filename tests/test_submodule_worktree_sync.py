@@ -407,6 +407,178 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         ):
             MODULE.revalidate_transport_receipt(receipt, submodule)
 
+    def test_shared_repository_normalizes_git_native_values(self) -> None:
+        cases = (
+            ("0", "umask"),
+            ("false", "umask"),
+            ("umask", "umask"),
+            ("1", "group"),
+            ("true", "group"),
+            ("group", "group"),
+            ("2", "all"),
+            ("all", "all"),
+            ("world", "all"),
+            ("everybody", "all"),
+            ("0640", "0640"),
+            ("0660", "0660"),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(
+                    MODULE.normalize_shared_repository(
+                        value,
+                        self.named_source_git_dir / "config",
+                    ),
+                    expected,
+                )
+
+    def test_git_init_shared_enums_round_trip_through_policy_capture(self) -> None:
+        cases = (
+            ("group", "1", "group"),
+            ("all", "2", "all"),
+        )
+        for shared, persisted, expected in cases:
+            with self.subTest(shared=shared):
+                repository = self.root / f"git-init-shared-{shared}.git"
+                run_git(
+                    self.root,
+                    "init",
+                    "--bare",
+                    f"--shared={shared}",
+                    str(repository),
+                )
+                observed = run_git(
+                    self.root,
+                    f"--git-dir={repository}",
+                    "config",
+                    "--get",
+                    "core.sharedRepository",
+                )
+                self.assertEqual(observed, persisted)
+                config_path = repository / "config"
+                entries = MODULE.parse_bound_git_config(
+                    config_path.read_bytes(),
+                    config_path,
+                )
+                self.assertEqual(
+                    MODULE.capture_fetch_object_policy(
+                        entries,
+                        config_path,
+                    ),
+                    (("core.sharedRepository", expected),),
+                )
+
+    def test_ssh_fetch_uses_private_snapshot_after_source_mutation(self) -> None:
+        trusted_content = "#!/bin/sh\nprintf 'trusted-ssh\\n' >&2\nexit 1\n"
+        mutated_content = "#!/bin/sh\nprintf 'mutated-ssh\\n' >&2\nexit 1\n"
+        self.assertEqual(len(trusted_content), len(mutated_content))
+        original_which = shutil.which
+
+        for mutation in ("replace", "in-place"):
+            with self.subTest(mutation=mutation):
+                source = self.clone_named_source(f"ssh-snapshot-{mutation}")
+                approved_url = f"ssh://example.invalid/ssh-snapshot-{mutation}.git"
+                run_git(
+                    self.root,
+                    f"--git-dir={source}",
+                    "config",
+                    "remote.origin.url",
+                    approved_url,
+                )
+                ssh_source = self.root / f"ssh-{mutation}"
+                ssh_source.write_text(trusted_content, encoding="utf-8")
+                ssh_source.chmod(0o700)
+                source_inode = ssh_source.stat().st_ino
+                submodule = MODULE.Submodule(
+                    f"ssh-snapshot-{mutation}",
+                    f"third_party/ssh-snapshot-{mutation}",
+                    approved_url,
+                )
+
+                with mock.patch.object(
+                    MODULE.shutil,
+                    "which",
+                    side_effect=lambda name: (
+                        str(ssh_source) if name == "ssh" else original_which(name)
+                    ),
+                ):
+                    receipt = MODULE.capture_transport_receipt(
+                        source,
+                        submodule,
+                    )
+                self.addCleanup(receipt.fetch_guard.cleanup)
+                ssh_snapshot = receipt.ssh_executable_snapshot
+                self.assertIsNotNone(ssh_snapshot)
+                self.assertNotEqual(
+                    ssh_snapshot.executable,
+                    ssh_source.resolve(),
+                )
+                self.assertEqual(
+                    ssh_snapshot.executable.read_text(encoding="utf-8"),
+                    trusted_content,
+                )
+                self.assertEqual(
+                    stat.S_IMODE(ssh_snapshot.executable.stat().st_mode),
+                    0o500,
+                )
+                MODULE.revalidate_transport_receipt(receipt, submodule)
+
+                if mutation == "replace":
+                    prior_source = ssh_source.with_name(f"{ssh_source.name}-original")
+                    ssh_source.rename(prior_source)
+                    ssh_source.write_text(mutated_content, encoding="utf-8")
+                    ssh_source.chmod(0o700)
+                    self.assertNotEqual(ssh_source.stat().st_ino, source_inode)
+                else:
+                    ssh_source.write_text(mutated_content, encoding="utf-8")
+                    self.assertEqual(ssh_source.stat().st_ino, source_inode)
+
+                command = MODULE.transport_fetch_command(
+                    source,
+                    receipt,
+                    "f" * 40,
+                    1,
+                )
+                self.assertIn(
+                    f"core.sshCommand={receipt.ssh_command}",
+                    command,
+                )
+                self.assertNotIn(str(ssh_source), receipt.ssh_command)
+                result = MODULE.run_bounded_bytes(
+                    command,
+                    check=False,
+                    timeout_seconds=5,
+                    stdout_limit=4096,
+                    stderr_limit=4096,
+                    fixed_env=dict(receipt.git_environment),
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"trusted-ssh", result.stderr)
+                self.assertNotIn(b"mutated-ssh", result.stderr)
+
+                if mutation == "replace":
+                    ssh_source.unlink()
+                    prior_source.rename(ssh_source)
+                else:
+                    ssh_source.write_text(trusted_content, encoding="utf-8")
+                MODULE.revalidate_transport_receipt(receipt, submodule)
+                ssh_snapshot.executable.chmod(0o700)
+                ssh_snapshot.executable.write_text(
+                    mutated_content,
+                    encoding="utf-8",
+                )
+                ssh_snapshot.executable.chmod(0o500)
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "snapshot content changed",
+                ):
+                    MODULE.revalidate_transport_receipt(receipt, submodule)
+
+                snapshot_root = ssh_snapshot.executable.parent
+                receipt.fetch_guard.cleanup()
+                self.assertFalse(snapshot_root.exists())
+                self.assertFalse(receipt.fetch_git_dir.exists())
+
     def test_source_shallow_creation_policy_matches_shared_repository_modes(
         self,
     ) -> None:
@@ -428,9 +600,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 shared_repository=shared_repository,
                 process_umask=oct(process_umask),
             ):
-                policy = (
-                    ("core.sharedRepository", shared_repository),
-                )
+                policy = (("core.sharedRepository", shared_repository),)
                 with mock.patch.object(
                     MODULE,
                     "capture_process_umask",
@@ -1654,9 +1824,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.assertFalse((target_super / "vendor" / "a").exists())
         self.assertEqual(
-            (target_super / "vendor" / "b" / "sentinel").read_text(
-                encoding="utf-8"
-            ),
+            (target_super / "vendor" / "b" / "sentinel").read_text(encoding="utf-8"),
             "external\n",
         )
         self.assertEqual(
@@ -4471,7 +4639,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             target_sha,
         )
 
-    def test_recursive_apply_uses_complete_parent_first_plan(self) -> None:
+    def test_recursive_apply_binds_parent_root_for_descendants(self) -> None:
         child_remote = self.root / "nested-child-remote"
         run_git(self.root, "init", str(child_remote))
         run_git(child_remote, "config", "user.email", "test@example.com")
@@ -4556,6 +4724,82 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertEqual(
             run_git(target_super / "parent" / "nested", "rev-parse", "HEAD"),
             child_sha,
+        )
+
+        race_target = self.root / "recursive-parent-replacement-target"
+        race_target.mkdir()
+        race_plan = MODULE.build_sync_plan(
+            root=race_target,
+            common_git_dir=source_common,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule("parent", "parent", str(parent_remote)),
+                    parent_sha,
+                )
+            ],
+            depth=1,
+            recursive=True,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        self.assertEqual(race_plan.entries[1].parent_index, 0)
+        child_registry_before = run_git(
+            self.root,
+            f"--git-dir={child_source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        quarantined_parent = self.root / "recursive-parent-quarantined"
+        original_record = MODULE.record_applied_target_root
+        replaced = False
+
+        def replace_parent_after_receipt(
+            plan: object,
+            owner_index: int,
+            entry: object,
+            lease: object,
+        ) -> None:
+            nonlocal replaced
+            original_record(plan, owner_index, entry, lease)
+            if owner_index == 0:
+                replaced = True
+                parent_target = race_target / "parent"
+                parent_target.rename(quarantined_parent)
+                parent_target.mkdir()
+                (parent_target / "sentinel").write_text(
+                    "replacement\n",
+                    encoding="utf-8",
+                )
+
+        with mock.patch.object(
+            MODULE,
+            "record_applied_target_root",
+            side_effect=replace_parent_after_receipt,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "applied recursive parent root changed",
+                ):
+                    MODULE.apply_sync_plan(race_plan)
+
+        self.assertTrue(replaced)
+        self.assertEqual(
+            (race_target / "parent" / "sentinel").read_text(encoding="utf-8"),
+            "replacement\n",
+        )
+        self.assertFalse((race_target / "parent" / "nested").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={child_source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            child_registry_before,
         )
 
     def test_sync_uses_submodule_name_for_source_gitdir(self) -> None:

@@ -201,6 +201,15 @@ class GitRuntime:
 
 
 @dataclass(frozen=True)
+class ExecutableSnapshotReceipt:
+    source_executable: Path
+    source_state: ExecutableState
+    executable: Path
+    executable_state: ExecutableState
+    content_sha256: str
+
+
+@dataclass(frozen=True)
 class BoundNode:
     path: Path
     fingerprint: FsFingerprint
@@ -412,7 +421,7 @@ class TransportReceipt:
     fetch_object_policy: tuple[tuple[str, str], ...]
     approved_url: str
     origin_url: str
-    ssh_executable_binding: Optional[FileContentBinding]
+    ssh_executable_snapshot: Optional[ExecutableSnapshotReceipt]
     ssh_command: Optional[str]
     source_object_directory: Path
     source_shallow_path: Path
@@ -454,6 +463,13 @@ class SharedMissingAncestor:
     relative_parts: tuple[str, ...]
     participant_targets: frozenset[tuple[str, ...]]
     materialized_node: Optional[BoundNode] = None
+
+
+@dataclass(frozen=True)
+class AppliedTargetRoot:
+    owner_index: int
+    relative_parts: tuple[str, ...]
+    node: BoundNode
 
 
 @dataclass
@@ -521,6 +537,9 @@ class SyncPlan:
         tuple[str, ...],
         SharedMissingAncestor,
     ] = dataclass_field(default_factory=dict)
+    applied_target_roots: dict[int, AppliedTargetRoot] = dataclass_field(
+        default_factory=dict
+    )
 
 
 class TargetCollisionNode:
@@ -656,9 +675,14 @@ def read_fd_digest(
     return digest.hexdigest()
 
 
-def copy_git_executable_snapshot(
+def copy_executable_snapshot(
     source: Path,
     expected_fingerprint: FsFingerprint,
+    *,
+    prefix: str,
+    filename: str,
+    maximum_bytes: int,
+    description: str,
 ) -> tuple[
     object,
     Path,
@@ -666,9 +690,9 @@ def copy_git_executable_snapshot(
     ExecutableState,
     str,
 ]:
-    snapshot_guard = tempfile.TemporaryDirectory(prefix="submodule-worktree-git.")
+    snapshot_guard = tempfile.TemporaryDirectory(prefix=prefix)
     snapshot_root = Path(snapshot_guard.name)
-    snapshot = snapshot_root / "git"
+    snapshot = snapshot_root / filename
     source_descriptor = -1
     snapshot_descriptor = -1
     try:
@@ -679,7 +703,7 @@ def copy_git_executable_snapshot(
             or root_state.permissions & 0o077
         ):
             raise PlanError(
-                "Git executable snapshot directory is not owner-private\n"
+                f"{description} snapshot directory is not owner-private\n"
                 f"  directory: {snapshot_root}"
             )
         source_descriptor = os.open(
@@ -689,17 +713,17 @@ def copy_git_executable_snapshot(
         source_before = executable_state_from_stat(os.fstat(source_descriptor))
         if source_before.fingerprint != expected_fingerprint:
             raise PlanError(
-                "the resolved Git executable changed before content binding\n"
+                f"the resolved {description} changed before content binding\n"
                 f"  executable: {source}"
             )
         if source_before.fingerprint.kind != stat.S_IFREG:
-            raise PlanError(f"resolved Git executable is not a regular file: {source}")
-        if source_before.size <= 0 or source_before.size > MAX_GIT_EXECUTABLE_BYTES:
+            raise PlanError(f"resolved {description} is not a regular file: {source}")
+        if source_before.size <= 0 or source_before.size > maximum_bytes:
             raise PlanError(
-                "resolved Git executable exceeds the content-binding size limit\n"
+                f"resolved {description} exceeds the content-binding size limit\n"
                 f"  executable: {source}\n"
                 f"  size: {source_before.size}\n"
-                f"  limit: {MAX_GIT_EXECUTABLE_BYTES}"
+                f"  limit: {maximum_bytes}"
             )
         snapshot_descriptor = os.open(
             snapshot,
@@ -716,7 +740,7 @@ def copy_git_executable_snapshot(
         while copied < source_before.size:
             if time.monotonic() >= deadline:
                 raise PlanError(
-                    "Git executable snapshot exceeded the content-copy deadline"
+                    f"{description} snapshot exceeded the content-copy deadline"
                 )
             chunk = os.read(
                 source_descriptor,
@@ -724,7 +748,7 @@ def copy_git_executable_snapshot(
             )
             if not chunk:
                 raise PlanError(
-                    "the resolved Git executable changed size during content binding"
+                    f"the resolved {description} changed size during content binding"
                 )
             copied += len(chunk)
             digest.update(chunk)
@@ -732,16 +756,16 @@ def copy_git_executable_snapshot(
             while pending:
                 written = os.write(snapshot_descriptor, pending)
                 if written <= 0:
-                    raise PlanError("failed to write the Git executable snapshot")
+                    raise PlanError(f"failed to write the {description} snapshot")
                 pending = pending[written:]
         if os.read(source_descriptor, 1):
             raise PlanError(
-                "the resolved Git executable changed size during content binding"
+                f"the resolved {description} changed size during content binding"
             )
         source_after = executable_state_from_stat(os.fstat(source_descriptor))
         if source_after != source_before:
             raise PlanError(
-                "the resolved Git executable changed during content binding\n"
+                f"the resolved {description} changed during content binding\n"
                 f"  executable: {source}"
             )
         os.fchmod(snapshot_descriptor, 0o500)
@@ -750,10 +774,10 @@ def copy_git_executable_snapshot(
             snapshot_descriptor,
             copied,
             deadline=deadline,
-            description="Git executable snapshot",
+            description=f"{description} snapshot",
         )
         if snapshot_digest != digest.hexdigest():
-            raise PlanError("Git executable snapshot content verification failed")
+            raise PlanError(f"{description} snapshot content verification failed")
         snapshot_state = executable_state_from_stat(os.fstat(snapshot_descriptor))
         if (
             snapshot_state.fingerprint.kind != stat.S_IFREG
@@ -762,7 +786,7 @@ def copy_git_executable_snapshot(
             or snapshot_state.size != source_before.size
         ):
             raise PlanError(
-                "Git executable snapshot does not satisfy its owner-private "
+                f"{description} snapshot does not satisfy its owner-private "
                 "regular-file policy"
             )
         snapshot = snapshot.resolve(strict=True)
@@ -776,7 +800,7 @@ def copy_git_executable_snapshot(
     except OSError as exc:
         snapshot_guard.cleanup()
         raise PlanError(
-            f"cannot create a verified Git executable snapshot: {exc}"
+            f"cannot create a verified {description} snapshot: {exc}"
         ) from exc
     except BaseException:
         snapshot_guard.cleanup()
@@ -786,6 +810,26 @@ def copy_git_executable_snapshot(
             os.close(snapshot_descriptor)
         if source_descriptor >= 0:
             os.close(source_descriptor)
+
+
+def copy_git_executable_snapshot(
+    source: Path,
+    expected_fingerprint: FsFingerprint,
+) -> tuple[
+    object,
+    Path,
+    ExecutableState,
+    ExecutableState,
+    str,
+]:
+    return copy_executable_snapshot(
+        source,
+        expected_fingerprint,
+        prefix="submodule-worktree-git.",
+        filename="git",
+        maximum_bytes=MAX_GIT_EXECUTABLE_BYTES,
+        description="Git executable",
+    )
 
 
 def revalidate_executable_content(
@@ -2486,9 +2530,7 @@ def revalidate_materialized_shared_node(node: BoundNode) -> None:
             f"plan-owned shared target ancestor changed: {node.path}"
         ) from exc
     if current != node.fingerprint or current.kind != stat.S_IFDIR:
-        raise PlanError(
-            f"plan-owned shared target ancestor changed: {node.path}"
-        )
+        raise PlanError(f"plan-owned shared target ancestor changed: {node.path}")
     if not probe_access(node.path, os.W_OK | os.X_OK):
         raise PlanError(
             "plan-owned shared target ancestor no longer permits "
@@ -2507,9 +2549,7 @@ def revalidate_shared_missing_ancestors(plan: SyncPlan) -> None:
         path = plan.root.joinpath(*relative_parts)
         if ancestor.materialized_node is not None:
             if ancestor.materialized_node.path != path:
-                raise PlanError(
-                    "shared target ancestor receipt names the wrong path"
-                )
+                raise PlanError("shared target ancestor receipt names the wrong path")
             revalidate_materialized_shared_node(ancestor.materialized_node)
             continue
         try:
@@ -2543,9 +2583,7 @@ def target_with_materialized_shared_ancestors(
     )
     consumed = 0
     for offset, _part in enumerate(entry.target.missing_parts, start=1):
-        prefix = entry.target.relative_parts[
-            : existing_component_count + offset
-        ]
+        prefix = entry.target.relative_parts[: existing_component_count + offset]
         ancestor = ancestors.get(prefix)
         if ancestor is None or ancestor.materialized_node is None:
             break
@@ -2606,6 +2644,83 @@ def record_materialized_shared_ancestors(
                 f"materialization: {created.node.path}"
             )
     revalidate_shared_missing_ancestors(plan)
+
+
+def revalidate_applied_target_root(
+    plan: SyncPlan,
+    owner_index: int,
+) -> AppliedTargetRoot:
+    receipts = getattr(plan, "applied_target_roots", {})
+    receipt = receipts.get(owner_index)
+    if receipt is None:
+        raise PlanError(
+            "recursive target lacks its applied parent-root identity receipt"
+        )
+    if (
+        owner_index < 0
+        or owner_index >= len(plan.entries)
+        or receipt.owner_index != owner_index
+    ):
+        raise PlanError("applied target-root receipt has an invalid owner index")
+    owner = plan.entries[owner_index]
+    if (
+        receipt.relative_parts != owner.target.relative_parts
+        or receipt.node.path != owner.target.path
+    ):
+        raise PlanError(
+            "applied target-root receipt does not match its owning plan entry"
+        )
+    try:
+        current = filesystem_fingerprint(receipt.node.path)
+    except PlanError as exc:
+        raise PlanError(
+            f"applied recursive parent root changed: {receipt.node.path}"
+        ) from exc
+    if current != receipt.node.fingerprint or current.kind != stat.S_IFDIR:
+        raise PlanError(f"applied recursive parent root changed: {receipt.node.path}")
+    if not probe_access(receipt.node.path, os.R_OK | os.W_OK | os.X_OK):
+        raise PlanError(
+            "applied recursive parent root no longer permits descendant "
+            f"materialization: {receipt.node.path}"
+        )
+    return receipt
+
+
+def record_applied_target_root(
+    plan: SyncPlan,
+    owner_index: int,
+    entry: PlannedWorktree,
+    lease: MaterializedTargetLease,
+) -> None:
+    receipts = getattr(plan, "applied_target_roots", None)
+    if receipts is None:
+        raise PlanError("sync plan cannot retain applied target-root receipts")
+    if (
+        owner_index < 0
+        or owner_index >= len(plan.entries)
+        or plan.entries[owner_index] is not entry
+    ):
+        raise PlanError("applied target-root receipt has an invalid owner entry")
+    revalidate_materialized_target_lease(lease)
+    target_fingerprint = fingerprint_from_stat(os.fstat(lease.target_descriptor))
+    if (
+        lease.target != entry.target.path
+        or lease.target_binding.path != entry.target.path
+        or target_fingerprint != lease.target_binding.fingerprint
+    ):
+        raise PlanError(
+            "applied target-root lease does not match its owning plan entry"
+        )
+    receipt = AppliedTargetRoot(
+        owner_index=owner_index,
+        relative_parts=entry.target.relative_parts,
+        node=BoundNode(entry.target.path, target_fingerprint),
+    )
+    prior = receipts.get(owner_index)
+    if prior is not None and prior != receipt:
+        raise PlanError(f"applied target-root identity changed: {entry.target.path}")
+    receipts[owner_index] = receipt
+    revalidate_applied_target_root(plan, owner_index)
 
 
 def materialize_bound_target_directory(
@@ -3967,10 +4082,13 @@ def normalize_fetch_policy_boolean(value: str, key: str, source: Path) -> str:
 def normalize_shared_repository(value: str, source: Path) -> str:
     normalized = value.strip().casefold()
     aliases = {
+        "0": "umask",
         "false": "umask",
         "umask": "umask",
+        "1": "group",
         "true": "group",
         "group": "group",
+        "2": "all",
         "all": "all",
         "world": "all",
         "everybody": "all",
@@ -4030,10 +4148,14 @@ def terminate_forked_child(child_pid: int) -> None:
 
 
 def capture_process_umask() -> int:
-    if os.name != "posix" or not all(
-        hasattr(os, name)
-        for name in ("fork", "pipe", "set_blocking", "umask", "waitpid")
-    ) or not hasattr(os, "WNOHANG"):
+    if (
+        os.name != "posix"
+        or not all(
+            hasattr(os, name)
+            for name in ("fork", "pipe", "set_blocking", "umask", "waitpid")
+        )
+        or not hasattr(os, "WNOHANG")
+    ):
         raise PlanError(
             "cannot safely capture the process umask for source shallow creation"
         )
@@ -4118,9 +4240,7 @@ def capture_process_umask() -> int:
             raise PlanError("captured process umask is outside the POSIX mode range")
         return process_umask
     except OSError as exc:
-        raise PlanError(
-            f"cannot safely capture the process umask: {exc}"
-        ) from exc
+        raise PlanError(f"cannot safely capture the process umask: {exc}") from exc
     finally:
         if read_descriptor >= 0:
             os.close(read_descriptor)
@@ -5361,6 +5481,37 @@ def capture_owner_private_directory(path: Path, purpose: str) -> AccessBinding:
     return binding
 
 
+class CleanupGuardGroup:
+    def __init__(self, *guards: object) -> None:
+        self._guards = guards
+        self._active = True
+
+    def cleanup(self) -> None:
+        if not self._active:
+            return
+        self._active = False
+        first_error: Optional[BaseException] = None
+        for guard in reversed(self._guards):
+            cleanup = getattr(guard, "cleanup", None)
+            if cleanup is None:
+                continue
+            try:
+                cleanup()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise PlanError(
+                f"temporary executable/control cleanup failed: {first_error}"
+            ) from first_error
+
+    def __del__(self) -> None:
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
+
 class OwnerPrivateTemporaryDirectory:
     def __init__(self, prefix: str) -> None:
         self.name = tempfile.mkdtemp(prefix=prefix)
@@ -5497,6 +5648,24 @@ def transport_uses_ssh(url: str) -> bool:
     return bool(re.fullmatch(r"(?:[^@/:]+@)?[^/:]+:.+", url))
 
 
+def ssh_command_for_executable(executable: Path) -> str:
+    return " ".join(
+        [
+            shlex.quote(str(executable)),
+            "-F",
+            shlex.quote(os.devnull),
+            "-o",
+            "CanonicalizeHostname=no",
+            "-o",
+            "PermitLocalCommand=no",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "ProxyJump=none",
+        ]
+    )
+
+
 def validate_approved_fetch_url(url: str, submodule_path: str) -> None:
     if not url or "\x00" in url or "\n" in url or "\r" in url:
         raise PlanError(f"submodule {submodule_path} has an invalid approved fetch URL")
@@ -5557,8 +5726,7 @@ def capture_transport_receipt(
             f"  .gitmodules: {submodule.url}\n"
             f"  remote.origin.url: {origin_url}"
         )
-    ssh_binding: Optional[FileContentBinding] = None
-    ssh_command: Optional[str] = None
+    ssh_source: Optional[tuple[Path, FsFingerprint]] = None
     if transport_uses_ssh(origin_url):
         candidate = shutil.which("ssh")
         if not candidate:
@@ -5566,28 +5734,16 @@ def capture_transport_receipt(
                 f"cannot resolve SSH for the approved fetch transport: {origin_url}"
             )
         ssh_path = Path(candidate).resolve(strict=True)
-        ssh_binding, _ = read_bound_regular_file(
+        ssh_fingerprint = filesystem_fingerprint(ssh_path)
+        if ssh_fingerprint.kind != stat.S_IFREG or not probe_access(
             ssh_path,
-            maximum_bytes=MAX_TRANSPORT_EXECUTABLE_BYTES,
-            mode=os.R_OK | os.X_OK,
-            purpose=f"SSH executable for {submodule.path}",
-            retain_content=False,
-        )
-        ssh_command = " ".join(
-            [
-                shlex.quote(str(ssh_path)),
-                "-F",
-                shlex.quote(os.devnull),
-                "-o",
-                "CanonicalizeHostname=no",
-                "-o",
-                "PermitLocalCommand=no",
-                "-o",
-                "ProxyCommand=none",
-                "-o",
-                "ProxyJump=none",
-            ]
-        )
+            os.R_OK | os.X_OK,
+        ):
+            raise PlanError(
+                "resolved SSH executable is not an executable regular file\n"
+                f"  executable: {ssh_path}"
+            )
+        ssh_source = (ssh_path, ssh_fingerprint)
     source_object_directory = (source_git_dir / "objects").resolve(strict=True)
     source_object_bindings = [
         capture_typed_access(
@@ -5632,30 +5788,64 @@ def capture_transport_receipt(
         source_shallow_content,
         fetch_object_policy,
     )
-    environment = git_environment()
-    environment["GIT_OBJECT_DIRECTORY"] = str(source_object_directory)
-    revalidate_file_content_binding(config_binding)
-    return TransportReceipt(
-        config_binding=config_binding,
-        fetch_object_policy=fetch_object_policy,
-        approved_url=submodule.url,
-        origin_url=origin_url,
-        ssh_executable_binding=ssh_binding,
-        ssh_command=ssh_command,
-        source_object_directory=source_object_directory,
-        source_shallow_path=source_shallow_path,
-        source_shallow_parent_binding=source_shallow_parent_binding,
-        source_shallow_binding=source_shallow_binding,
-        source_shallow_creation_policy=source_shallow_creation_policy,
-        fetch_git_dir=fetch_git_dir,
-        fetch_access_bindings=(
-            *source_object_bindings,
-            *private_access_bindings,
-        ),
-        fetch_file_bindings=fetch_file_bindings,
-        git_environment=tuple(sorted(environment.items())),
-        fetch_guard=fetch_guard,
-    )
+    ssh_executable_snapshot: Optional[ExecutableSnapshotReceipt] = None
+    ssh_command: Optional[str] = None
+    combined_guard: object = fetch_guard
+    try:
+        if ssh_source is not None:
+            ssh_path, ssh_fingerprint = ssh_source
+            (
+                ssh_guard,
+                ssh_snapshot,
+                ssh_source_state,
+                ssh_snapshot_state,
+                ssh_digest,
+            ) = copy_executable_snapshot(
+                ssh_path,
+                ssh_fingerprint,
+                prefix="submodule-worktree-ssh.",
+                filename="ssh",
+                maximum_bytes=MAX_TRANSPORT_EXECUTABLE_BYTES,
+                description="SSH executable",
+            )
+            combined_guard = CleanupGuardGroup(fetch_guard, ssh_guard)
+            ssh_executable_snapshot = ExecutableSnapshotReceipt(
+                source_executable=ssh_path,
+                source_state=ssh_source_state,
+                executable=ssh_snapshot,
+                executable_state=ssh_snapshot_state,
+                content_sha256=ssh_digest,
+            )
+            ssh_command = ssh_command_for_executable(ssh_snapshot)
+        environment = git_environment()
+        environment["GIT_OBJECT_DIRECTORY"] = str(source_object_directory)
+        revalidate_file_content_binding(config_binding)
+        return TransportReceipt(
+            config_binding=config_binding,
+            fetch_object_policy=fetch_object_policy,
+            approved_url=submodule.url,
+            origin_url=origin_url,
+            ssh_executable_snapshot=ssh_executable_snapshot,
+            ssh_command=ssh_command,
+            source_object_directory=source_object_directory,
+            source_shallow_path=source_shallow_path,
+            source_shallow_parent_binding=source_shallow_parent_binding,
+            source_shallow_binding=source_shallow_binding,
+            source_shallow_creation_policy=source_shallow_creation_policy,
+            fetch_git_dir=fetch_git_dir,
+            fetch_access_bindings=(
+                *source_object_bindings,
+                *private_access_bindings,
+            ),
+            fetch_file_bindings=fetch_file_bindings,
+            git_environment=tuple(sorted(environment.items())),
+            fetch_guard=combined_guard,
+        )
+    except BaseException:
+        cleanup = getattr(combined_guard, "cleanup", None)
+        if cleanup is not None:
+            cleanup()
+        raise
 
 
 def validate_frozen_git_environment(
@@ -5724,8 +5914,26 @@ def revalidate_transport_receipt(
     )
     if current_fetch_object_policy != receipt.fetch_object_policy:
         raise PlanError("fetch object policy changed after preflight")
-    if receipt.ssh_executable_binding is not None:
-        revalidate_file_content_binding(receipt.ssh_executable_binding)
+    ssh_snapshot = receipt.ssh_executable_snapshot
+    if (ssh_snapshot is None) != (receipt.ssh_command is None):
+        raise PlanError("fetch transport has an incomplete SSH executable receipt")
+    if ssh_snapshot is not None:
+        if receipt.ssh_command != ssh_command_for_executable(ssh_snapshot.executable):
+            raise PlanError(
+                "fetch transport SSH command no longer names the bound snapshot"
+            )
+        revalidate_executable_content(
+            ssh_snapshot.source_executable,
+            ssh_snapshot.source_state,
+            ssh_snapshot.content_sha256,
+            "source SSH executable",
+        )
+        revalidate_executable_content(
+            ssh_snapshot.executable,
+            ssh_snapshot.executable_state,
+            ssh_snapshot.content_sha256,
+            "owner-private SSH executable snapshot",
+        )
     revalidate_source_shallow_state(receipt)
     revalidate_source_shallow_creation_policy(receipt)
     for binding in receipt.fetch_access_bindings:
@@ -8250,6 +8458,18 @@ def revalidate_planned_entry(
 
     shared_target = target_with_materialized_shared_ancestors(plan, entry)
     if allow_parent_materialization and entry.parent_index is not None:
+        parent_receipt = revalidate_applied_target_root(
+            plan,
+            entry.parent_index,
+        )
+        parent_parts = parent_receipt.relative_parts
+        if (
+            len(entry.target.relative_parts) <= len(parent_parts)
+            or entry.target.relative_parts[: len(parent_parts)] != parent_parts
+        ):
+            raise PlanError(
+                "recursive target is not nested under its receipt-bound parent"
+            )
         for node in shared_target.existing_nodes:
             current = filesystem_fingerprint(node.path)
             if current != node.fingerprint:
@@ -8259,6 +8479,22 @@ def revalidate_planned_entry(
             entry.target.relative_parts,
             f"worktree path for submodule {entry.submodule.path}",
         )
+        observed_parent = next(
+            (
+                node
+                for node in current_target.existing_nodes
+                if node.path == parent_receipt.node.path
+            ),
+            None,
+        )
+        if (
+            observed_parent is None
+            or observed_parent.fingerprint != parent_receipt.node.fingerprint
+        ):
+            raise PlanError(
+                "recursive target no longer traverses its applied parent root\n"
+                f"  parent: {parent_receipt.node.path}"
+            )
         current_state = classify_planned_target(
             current_target,
             entry.source_git_dir,
@@ -8389,14 +8625,17 @@ def apply_sync_plan(plan: SyncPlan) -> None:
 
     if plan_state_changed:
         validate_sync_plan(plan)
-    applied_indexes: set[int] = set()
+    recursive_parent_indexes = {
+        entry.parent_index for entry in plan.entries if entry.parent_index is not None
+    }
     first_mutation = True
     for index, entry in enumerate(plan.entries):
         target = revalidate_planned_entry(
             plan,
             entry,
             allow_parent_materialization=(
-                entry.parent_index is not None and entry.parent_index in applied_indexes
+                entry.parent_index is not None
+                and entry.parent_index in getattr(plan, "applied_target_roots", {})
             ),
         )
         if first_mutation:
@@ -8433,9 +8672,15 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                 entry,
                 lease.created_nodes,
             )
+            if index in recursive_parent_indexes:
+                record_applied_target_root(
+                    plan,
+                    index,
+                    entry,
+                    lease,
+                )
         finally:
             lease.close()
-        applied_indexes.add(index)
 
 
 def sync_one(
