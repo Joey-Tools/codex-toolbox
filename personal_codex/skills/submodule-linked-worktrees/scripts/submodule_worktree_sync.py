@@ -8,6 +8,7 @@ import ctypes
 from dataclasses import dataclass, field as dataclass_field, replace
 import errno
 import hashlib
+import json
 import os
 from pathlib import Path, PureWindowsPath
 import re
@@ -45,6 +46,34 @@ MAX_GIT_PATHSPECS_PER_BATCH = 1024
 MAX_GIT_PATHSPEC_BATCHES = 4096
 MAX_GITMODULES_FILE_BYTES = 4 * 1024 * 1024
 MAX_GITMODULES_RETAINED_BYTES = 64 * 1024 * 1024
+MAX_SOURCE_CONFIG_BYTES = 4 * 1024 * 1024
+MAX_SOURCE_SHALLOW_BYTES = 64 * 1024 * 1024
+MAX_SUPERPROJECT_INDEX_BYTES = 512 * 1024 * 1024
+MAX_TRANSPORT_EXECUTABLE_BYTES = 128 * 1024 * 1024
+MAX_CONFIG_ENTRIES = 100_000
+SOURCE_SHALLOW_NAME = "shallow"
+SOURCE_SHALLOW_LOCK_NAME = "shallow.lock"
+LINUX_RENAME_NOREPLACE = 0x00000001
+LINUX_RENAME_EXCHANGE = 0x00000002
+DARWIN_RENAME_SWAP = 0x00000002
+DARWIN_RENAME_EXCL = 0x00000004
+ATOMIC_RENAME_UNSUPPORTED_ERRNOS = frozenset(
+    {
+        errno.ENOSYS,
+        errno.EINVAL,
+        errno.EOPNOTSUPP,
+        errno.EXDEV,
+    }
+)
+
+LINUX_CASE_SENSITIVE_FILESYSTEM_MAGICS = frozenset(
+    {
+        0x01021994,  # tmpfs
+        0x9123683E,  # Btrfs
+        0xEF53,  # ext2/ext3/ext4
+    }
+)
+LINUX_OVERLAYFS_MAGIC = 0x794C7630
 
 GIT_ENV_PASSTHROUGH = (
     "HOME",
@@ -102,6 +131,21 @@ class PlanError(RuntimeError):
     pass
 
 
+class AtomicRenameError(PlanError):
+    def __init__(self, operation: str, error_number: int) -> None:
+        self.operation = operation
+        self.error_number = error_number
+        capability = (
+            " is unsupported for this runtime or filesystem"
+            if error_number in ATOMIC_RENAME_UNSUPPORTED_ERRNOS
+            else " failed"
+        )
+        super().__init__(
+            f"descriptor-relative atomic {operation}{capability}: "
+            f"{os.strerror(error_number)}"
+        )
+
+
 class Submodule:
     def __init__(self, name: str, path: str, url: str) -> None:
         self.name = name
@@ -151,6 +195,17 @@ class AccessBinding:
     fingerprint: FsFingerprint
     mode: int
     purpose: str
+
+
+@dataclass(frozen=True)
+class FileContentBinding:
+    path: Path
+    fingerprint: FsFingerprint
+    size: int
+    content_sha256: str
+    mode: int
+    purpose: str
+    maximum_bytes: int
 
 
 @dataclass(frozen=True)
@@ -221,6 +276,42 @@ class CheckoutPreflight:
 
 
 @dataclass(frozen=True)
+class SuperprojectIndexReceipt:
+    index_bindings: tuple[FileContentBinding, ...]
+    selected_gitlinks: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class PlanInputReceipt:
+    gitmodules_binding: FileContentBinding
+    superproject_index: SuperprojectIndexReceipt
+
+
+@dataclass(frozen=True)
+class TransportReceipt:
+    config_binding: FileContentBinding
+    approved_url: str
+    origin_url: str
+    ssh_executable_binding: Optional[FileContentBinding]
+    ssh_command: Optional[str]
+    source_object_directory: Path
+    source_shallow_path: Path
+    source_shallow_parent_binding: AccessBinding
+    source_shallow_binding: Optional[FileContentBinding]
+    fetch_git_dir: Path
+    fetch_access_bindings: tuple[AccessBinding, ...]
+    fetch_file_bindings: tuple[FileContentBinding, ...]
+    git_environment: tuple[tuple[str, str], ...]
+    fetch_guard: object = dataclass_field(repr=False, compare=False)
+
+    def __del__(self) -> None:
+        guard = getattr(self, "fetch_guard", None)
+        cleanup = getattr(guard, "cleanup", None)
+        if cleanup is not None:
+            cleanup()
+
+
+@dataclass(frozen=True)
 class BoundTarget:
     path: Path
     relative_parts: tuple[str, ...]
@@ -243,6 +334,7 @@ class PlannedWorktree:
     source_bindings: tuple[AccessBinding, ...]
     target_bindings: tuple[AccessBinding, ...]
     checkout_preflight: Optional[CheckoutPreflight]
+    transport_receipt: Optional[TransportReceipt]
     needs_fetch: bool
 
 
@@ -254,6 +346,7 @@ class SyncPlan:
     depth: int
     force_replace_empty: bool
     fetch_missing: bool
+    input_receipt: Optional[PlanInputReceipt]
 
 
 class TargetCollisionNode:
@@ -752,13 +845,21 @@ def run_bounded_bytes(
     stdout_limit: int = GIT_ENUMERATION_OUTPUT_LIMIT_BYTES,
     stderr_limit: int = GIT_ERROR_OUTPUT_LIMIT_BYTES,
     extra_env: Optional[dict[str, str]] = None,
+    fixed_env: Optional[dict[str, str]] = None,
     prepare_git_command: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
     if input_bytes is not None and len(input_bytes) > GIT_INPUT_LIMIT_BYTES:
         raise PlanError(
             f"Git command input exceeds the {GIT_INPUT_LIMIT_BYTES}-byte safety limit"
         )
+    if fixed_env is not None and extra_env is not None:
+        raise PlanError(
+            "fixed and incremental command environments are mutually exclusive"
+        )
     command = safe_command(args) if prepare_git_command else args
+    environment = (
+        dict(fixed_env) if fixed_env is not None else git_environment(extra_env)
+    )
     input_file = tempfile.TemporaryFile()
     if input_bytes is not None:
         input_file.write(input_bytes)
@@ -767,7 +868,7 @@ def run_bounded_bytes(
         process = subprocess.Popen(
             command,
             cwd=str(cwd) if cwd else None,
-            env=git_environment(extra_env),
+            env=environment,
             stdin=input_file,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -861,6 +962,7 @@ def read_git_bounded(
     input_bytes: Optional[bytes] = None,
     stdout_limit: int = GIT_ENUMERATION_OUTPUT_LIMIT_BYTES,
     extra_env: Optional[dict[str, str]] = None,
+    fixed_env: Optional[dict[str, str]] = None,
     timeout_seconds: float = GIT_ENUMERATION_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[bytes]:
     return run_bounded_bytes(
@@ -870,6 +972,7 @@ def read_git_bounded(
         input_bytes=input_bytes,
         stdout_limit=stdout_limit,
         extra_env=extra_env,
+        fixed_env=fixed_env,
         timeout_seconds=timeout_seconds,
     )
 
@@ -978,6 +1081,23 @@ def probe_access(path: Path, mode: int) -> bool:
         return os.access(path, mode)
 
 
+def probe_access_at(directory_descriptor: int, name: str, mode: int) -> bool:
+    if os.access not in os.supports_dir_fd:
+        raise PlanError("descriptor-relative effective-access checks are unavailable")
+    try:
+        return os.access(
+            name,
+            mode,
+            dir_fd=directory_descriptor,
+            effective_ids=True,
+            follow_symlinks=False,
+        )
+    except (NotImplementedError, TypeError) as exc:
+        raise PlanError(
+            "descriptor-relative effective-access checks are unavailable"
+        ) from exc
+
+
 def access_mode_text(mode: int) -> str:
     labels: list[str] = []
     if mode & os.R_OK:
@@ -1033,6 +1153,324 @@ def revalidate_access(binding: AccessBinding) -> None:
             f"access policy now denies {binding.purpose}\n"
             f"  path: {binding.path}\n"
             f"  required: {access_mode_text(binding.mode)}"
+        )
+
+
+def read_bound_regular_file(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    mode: int,
+    purpose: str,
+    retain_content: bool,
+    deadline: Optional[float] = None,
+) -> tuple[FileContentBinding, Optional[bytes]]:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
+        raise PlanError(
+            f"cannot safely bind {purpose}: O_NOFOLLOW and O_NONBLOCK are required"
+        )
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        before_stat = os.fstat(descriptor)
+        fingerprint = fingerprint_from_stat(before_stat)
+        if fingerprint.kind != stat.S_IFREG:
+            raise PlanError(f"{purpose} is not a regular file\n  path: {path}")
+        if before_stat.st_size < 0 or before_stat.st_size > maximum_bytes:
+            raise PlanError(
+                f"{purpose} exceeds the {maximum_bytes}-byte safety limit\n"
+                f"  path: {path}\n"
+                f"  size: {before_stat.st_size}"
+            )
+        if not probe_access(path, mode):
+            raise PlanError(
+                f"access policy denies {purpose}\n"
+                f"  path: {path}\n"
+                f"  required: {access_mode_text(mode)}"
+            )
+        effective_deadline = deadline or (
+            time.monotonic() + GIT_ENUMERATION_TIMEOUT_SECONDS
+        )
+
+        def read_pass(keep: bool) -> tuple[str, Optional[bytes]]:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            digest = hashlib.sha256()
+            content = bytearray() if keep else None
+            consumed = 0
+            while consumed < before_stat.st_size:
+                if time.monotonic() >= effective_deadline:
+                    raise PlanError(f"{purpose} exceeded the content-read deadline")
+                try:
+                    chunk = os.read(
+                        descriptor,
+                        min(64 * 1024, before_stat.st_size - consumed),
+                    )
+                except BlockingIOError as exc:
+                    raise PlanError(
+                        f"{purpose} did not provide bounded regular-file I/O"
+                    ) from exc
+                if not chunk:
+                    raise PlanError(f"{purpose} changed size during content binding")
+                consumed += len(chunk)
+                digest.update(chunk)
+                if content is not None:
+                    content.extend(chunk)
+            if os.read(descriptor, 1):
+                raise PlanError(f"{purpose} changed size during content binding")
+            return digest.hexdigest(), bytes(content) if content is not None else None
+
+        first_digest, first_content = read_pass(retain_content)
+        middle_stat = os.fstat(descriptor)
+        second_digest, _ = read_pass(False)
+        after_stat = os.fstat(descriptor)
+        path_fingerprint = filesystem_fingerprint(path)
+        for observed in (middle_stat, after_stat):
+            if (
+                fingerprint_from_stat(observed) != fingerprint
+                or observed.st_size != before_stat.st_size
+            ):
+                raise PlanError(f"{purpose} object or size changed during binding")
+        if path_fingerprint != fingerprint:
+            raise PlanError(
+                f"{purpose} path object changed during binding\n  path: {path}"
+            )
+        if first_digest != second_digest:
+            raise PlanError(f"{purpose} content changed during binding\n  path: {path}")
+        return (
+            FileContentBinding(
+                path=path,
+                fingerprint=fingerprint,
+                size=before_stat.st_size,
+                content_sha256=first_digest,
+                mode=mode,
+                purpose=purpose,
+                maximum_bytes=maximum_bytes,
+            ),
+            first_content,
+        )
+    except FileNotFoundError as exc:
+        raise PlanError(f"{purpose} is missing\n  path: {path}") from exc
+    except OSError as exc:
+        raise PlanError(
+            f"cannot bind {purpose}\n  path: {path}\n  error: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _bind_regular_file_descriptor_at(
+    descriptor: int,
+    directory_descriptor: int,
+    name: str,
+    display_path: Path,
+    *,
+    maximum_bytes: int,
+    mode: int,
+    purpose: str,
+    retain_content: bool,
+    deadline: Optional[float] = None,
+) -> tuple[FileContentBinding, Optional[bytes]]:
+    before_stat = os.fstat(descriptor)
+    fingerprint = fingerprint_from_stat(before_stat)
+    if fingerprint.kind != stat.S_IFREG:
+        raise PlanError(f"{purpose} is not a regular file\n  path: {display_path}")
+    if before_stat.st_size < 0 or before_stat.st_size > maximum_bytes:
+        raise PlanError(
+            f"{purpose} exceeds the {maximum_bytes}-byte safety limit\n"
+            f"  path: {display_path}\n"
+            f"  size: {before_stat.st_size}"
+        )
+    if not probe_access_at(directory_descriptor, name, mode):
+        raise PlanError(
+            f"access policy denies {purpose}\n"
+            f"  path: {display_path}\n"
+            f"  required: {access_mode_text(mode)}"
+        )
+    effective_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + GIT_ENUMERATION_TIMEOUT_SECONDS
+    )
+
+    def read_pass(keep: bool) -> tuple[str, Optional[bytes]]:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        content = bytearray() if keep else None
+        consumed = 0
+        while consumed < before_stat.st_size:
+            if time.monotonic() >= effective_deadline:
+                raise PlanError(f"{purpose} exceeded the content-read deadline")
+            try:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, before_stat.st_size - consumed),
+                )
+            except BlockingIOError as exc:
+                raise PlanError(
+                    f"{purpose} did not provide bounded regular-file I/O"
+                ) from exc
+            if not chunk:
+                raise PlanError(f"{purpose} changed size during content binding")
+            consumed += len(chunk)
+            digest.update(chunk)
+            if content is not None:
+                content.extend(chunk)
+        if os.read(descriptor, 1):
+            raise PlanError(f"{purpose} changed size during content binding")
+        return digest.hexdigest(), bytes(content) if content is not None else None
+
+    first_digest, first_content = read_pass(retain_content)
+    middle_stat = os.fstat(descriptor)
+    second_digest, _ = read_pass(False)
+    after_stat = os.fstat(descriptor)
+    try:
+        path_stat = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise PlanError(f"{purpose} path disappeared during binding") from exc
+    except PermissionError as exc:
+        raise PlanError(f"{purpose} path became unreadable during binding") from exc
+    path_fingerprint = fingerprint_from_stat(path_stat)
+    for observed in (middle_stat, after_stat):
+        if (
+            fingerprint_from_stat(observed) != fingerprint
+            or observed.st_size != before_stat.st_size
+        ):
+            raise PlanError(f"{purpose} object or size changed during binding")
+    if path_fingerprint != fingerprint:
+        raise PlanError(
+            f"{purpose} path object changed during binding\n  path: {display_path}"
+        )
+    if first_digest != second_digest:
+        raise PlanError(
+            f"{purpose} content changed during binding\n  path: {display_path}"
+        )
+    return (
+        FileContentBinding(
+            path=display_path,
+            fingerprint=fingerprint,
+            size=before_stat.st_size,
+            content_sha256=first_digest,
+            mode=mode,
+            purpose=purpose,
+            maximum_bytes=maximum_bytes,
+        ),
+        first_content,
+    )
+
+
+def bind_regular_file_descriptor_at(
+    descriptor: int,
+    directory_descriptor: int,
+    name: str,
+    display_path: Path,
+    *,
+    maximum_bytes: int,
+    mode: int,
+    purpose: str,
+    retain_content: bool,
+    deadline: Optional[float] = None,
+) -> tuple[FileContentBinding, Optional[bytes]]:
+    try:
+        return _bind_regular_file_descriptor_at(
+            descriptor,
+            directory_descriptor,
+            name,
+            display_path,
+            maximum_bytes=maximum_bytes,
+            mode=mode,
+            purpose=purpose,
+            retain_content=retain_content,
+            deadline=deadline,
+        )
+    except OSError as exc:
+        raise PlanError(
+            f"cannot bind descriptor-relative {purpose}\n"
+            f"  path: {display_path}\n"
+            f"  error: {exc}"
+        ) from exc
+
+
+def open_bound_regular_file_at(
+    directory_descriptor: int,
+    name: str,
+    display_path: Path,
+    *,
+    maximum_bytes: int,
+    mode: int,
+    purpose: str,
+    retain_content: bool,
+) -> tuple[int, FileContentBinding, Optional[bytes]]:
+    if (
+        not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_NONBLOCK")
+        or os.open not in os.supports_dir_fd
+    ):
+        raise PlanError(
+            f"cannot safely bind {purpose}: descriptor-relative O_NOFOLLOW and "
+            "O_NONBLOCK are required"
+        )
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_descriptor,
+        )
+        binding, content = bind_regular_file_descriptor_at(
+            descriptor,
+            directory_descriptor,
+            name,
+            display_path,
+            maximum_bytes=maximum_bytes,
+            mode=mode,
+            purpose=purpose,
+            retain_content=retain_content,
+        )
+        return descriptor, binding, content
+    except FileNotFoundError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise PlanError(f"{purpose} is missing\n  path: {display_path}") from exc
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise PlanError(
+            f"cannot bind {purpose}\n  path: {display_path}\n  error: {exc}"
+        ) from exc
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def revalidate_file_content_binding(binding: FileContentBinding) -> None:
+    # Protected properties are object identity, byte content, and effective access.
+    # dev/ino/type/uid/gid/mode bind identity and POSIX policy; the digest binds
+    # content; effective access rechecks ACL/current-credential effects. Timestamps
+    # are deliberately excluded, so mtime-only bookkeeping does not cause a mismatch.
+    current, _ = read_bound_regular_file(
+        binding.path,
+        maximum_bytes=binding.maximum_bytes,
+        mode=binding.mode,
+        purpose=binding.purpose,
+        retain_content=False,
+    )
+    if current.fingerprint != binding.fingerprint:
+        raise PlanError(
+            f"{binding.purpose} object or access policy changed after preflight\n"
+            f"  path: {binding.path}"
+        )
+    if current.size != binding.size or current.content_sha256 != binding.content_sha256:
+        raise PlanError(
+            f"{binding.purpose} content changed after preflight\n  path: {binding.path}"
         )
 
 
@@ -1122,42 +1560,267 @@ def alternate_case_name(name: str) -> Optional[str]:
     return None
 
 
-def probe_directory_case_sensitive(path: Path) -> Optional[bool]:
+def open_directory_descriptor(path: Path, purpose: str) -> int:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise PlanError(
+            f"cannot safely bind {purpose}: O_NOFOLLOW and O_DIRECTORY are required"
+        )
     try:
-        with os.scandir(path) as entries:
+        return os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+    except OSError as exc:
+        raise PlanError(f"cannot open {purpose}: {path}\n  error: {exc}") from exc
+
+
+def revalidate_directory_descriptor(
+    binding: AccessBinding,
+    directory_descriptor: int,
+) -> None:
+    # Protected property: all later relative operations stay anchored to the
+    # exact directory object and access policy captured by the receipt. The
+    # pathname check detects replacement, while fstat keeps a rename from
+    # redirecting operations to a different object.
+    current_descriptor = fingerprint_from_stat(os.fstat(directory_descriptor))
+    if current_descriptor != binding.fingerprint:
+        raise PlanError(
+            f"descriptor object or access policy changed for {binding.purpose}\n"
+            f"  path: {binding.path}"
+        )
+    if not probe_access_at(directory_descriptor, ".", binding.mode):
+        raise PlanError(
+            f"descriptor access policy now denies {binding.purpose}\n"
+            f"  path: {binding.path}\n"
+            f"  required: {access_mode_text(binding.mode)}"
+        )
+    try:
+        current_path = filesystem_fingerprint(binding.path)
+    except PlanError as exc:
+        raise PlanError(
+            f"path revalidation failed for descriptor-bound {binding.purpose}: {exc}"
+        ) from exc
+    if current_path != binding.fingerprint:
+        raise PlanError(
+            f"path object or access policy changed for descriptor-bound "
+            f"{binding.purpose}\n"
+            f"  path: {binding.path}"
+        )
+
+
+def validate_descriptor_entry_name(name: str) -> bytes:
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\x00" in name
+        or os.fsdecode(os.fsencode(name)) != name
+    ):
+        raise PlanError(f"unsafe descriptor-relative entry name: {name!r}")
+    return os.fsencode(name)
+
+
+def descriptor_atomic_rename(
+    source_directory_descriptor: int,
+    source_name: str,
+    target_directory_descriptor: int,
+    target_name: str,
+    *,
+    operation: str,
+) -> None:
+    source_bytes = validate_descriptor_entry_name(source_name)
+    target_bytes = validate_descriptor_entry_name(target_name)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        flags = (
+            DARWIN_RENAME_EXCL
+            if operation == "noreplace"
+            else DARWIN_RENAME_SWAP
+            if operation == "exchange"
+            else None
+        )
+        if flags is None:
+            raise PlanError(f"unknown atomic rename operation: {operation}")
+        try:
+            rename_function = libc.renameatx_np
+        except AttributeError as exc:
+            raise AtomicRenameError(operation, errno.ENOSYS) from exc
+        rename_function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_function.restype = ctypes.c_int
+    elif sys.platform.startswith("linux"):
+        flags = (
+            LINUX_RENAME_NOREPLACE
+            if operation == "noreplace"
+            else LINUX_RENAME_EXCHANGE
+            if operation == "exchange"
+            else None
+        )
+        if flags is None:
+            raise PlanError(f"unknown atomic rename operation: {operation}")
+        try:
+            rename_function = libc.renameat2
+        except AttributeError as exc:
+            raise AtomicRenameError(operation, errno.ENOSYS) from exc
+        rename_function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_function.restype = ctypes.c_int
+    else:
+        raise AtomicRenameError(operation, errno.ENOSYS)
+
+    ctypes.set_errno(0)
+    result = rename_function(
+        source_directory_descriptor,
+        source_bytes,
+        target_directory_descriptor,
+        target_bytes,
+        flags,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno() or errno.EIO
+        raise AtomicRenameError(operation, error_number)
+
+
+def descriptor_atomic_rename_noreplace(
+    directory_descriptor: int,
+    source_name: str,
+    target_name: str,
+) -> None:
+    descriptor_atomic_rename(
+        directory_descriptor,
+        source_name,
+        directory_descriptor,
+        target_name,
+        operation="noreplace",
+    )
+
+
+def descriptor_atomic_rename_exchange(
+    directory_descriptor: int,
+    first_name: str,
+    second_name: str,
+) -> None:
+    descriptor_atomic_rename(
+        directory_descriptor,
+        first_name,
+        directory_descriptor,
+        second_name,
+        operation="exchange",
+    )
+
+
+def probe_directory_case_sensitive(
+    path: Path,
+    descriptor: Optional[int] = None,
+) -> Optional[bool]:
+    owned_descriptor = descriptor is None
+    directory_descriptor = (
+        open_directory_descriptor(path, "target name-policy directory")
+        if descriptor is None
+        else descriptor
+    )
+    try:
+        with os.scandir(directory_descriptor) as entries:
+            entry_names: list[str] = []
+            enumeration_truncated = False
             for index, entry in enumerate(entries):
                 if index >= MAX_NAME_POLICY_PROBE_ENTRIES:
+                    enumeration_truncated = True
                     break
-                alternate_name = alternate_case_name(entry.name)
+                entry_names.append(entry.name)
+            exact_entry_names = set(entry_names)
+            for entry_name in entry_names:
+                alternate_name = alternate_case_name(entry_name)
                 if alternate_name is None:
                     continue
-                original_path = path / entry.name
-                alternate_path = path / alternate_name
-                original = filesystem_fingerprint(original_path)
                 try:
-                    alternate_stat = os.stat(
-                        alternate_path,
+                    original_before_stat = os.stat(
+                        entry_name,
+                        dir_fd=directory_descriptor,
                         follow_symlinks=False,
                     )
                 except FileNotFoundError:
-                    return True
+                    # Entry churn before the proof starts is benign. Try another
+                    # bounded entry rather than treating disappearance as case evidence.
+                    continue
                 except PermissionError as exc:
                     raise PlanError(
-                        f"cannot inspect target name semantics: {alternate_path}"
+                        f"cannot inspect target name semantics: {path / entry_name}"
                     ) from exc
-                alternate = fingerprint_from_stat(alternate_stat)
+                original_before = fingerprint_from_stat(original_before_stat)
+                alternate: Optional[FsFingerprint]
+                try:
+                    alternate_stat = os.stat(
+                        alternate_name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    alternate = None
+                except PermissionError as exc:
+                    raise PlanError(
+                        f"cannot inspect target name semantics: {path / alternate_name}"
+                    ) from exc
+                else:
+                    alternate = fingerprint_from_stat(alternate_stat)
+                try:
+                    original_after = fingerprint_from_stat(
+                        os.stat(
+                            entry_name,
+                            dir_fd=directory_descriptor,
+                            follow_symlinks=False,
+                        )
+                    )
+                except (FileNotFoundError, PermissionError) as exc:
+                    raise PlanError(
+                        "target name-policy probe entry became unavailable during "
+                        f"revalidation: {path / entry_name}"
+                    ) from exc
+                if original_after != original_before:
+                    raise PlanError(
+                        "target name-policy probe entry changed identity or access "
+                        f"policy during revalidation: {path / entry_name}"
+                    )
+                if alternate is None:
+                    return True
                 if (
-                    original.device == alternate.device
-                    and original.inode == alternate.inode
+                    original_before.device == alternate.device
+                    and original_before.inode == alternate.inode
+                    and original_before.kind == alternate.kind
                 ):
+                    if alternate_name in exact_entry_names:
+                        # Two separately enumerated spellings that resolve to the
+                        # same inode are hardlinks on a case-sensitive directory,
+                        # not evidence of case-insensitive lookup.
+                        return True
+                    if enumeration_truncated:
+                        # The alternate spelling may be a distinct dirent outside
+                        # the bounded inventory, so this probe is inconclusive.
+                        continue
                     return False
                 return True
     except PermissionError as exc:
         raise PlanError(f"cannot inspect target name semantics: {path}") from exc
+    finally:
+        if owned_descriptor:
+            os.close(directory_descriptor)
     return None
 
 
-def linux_directory_casefold(path: Path) -> Optional[bool]:
+def linux_directory_casefold(
+    path: Path,
+    descriptor: Optional[int] = None,
+) -> Optional[bool]:
     if not sys.platform.startswith("linux"):
         return None
     import array
@@ -1166,23 +1829,56 @@ def linux_directory_casefold(path: Path) -> Optional[bool]:
     fs_ioc_getflags = 0x80086601
     fs_casefold_fl = 0x40000000
     flags = array.array("I", [0])
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+    owned_descriptor = descriptor is None
+    directory_descriptor = (
+        open_directory_descriptor(path, "target directory casefold probe")
+        if descriptor is None
+        else descriptor
     )
     try:
         try:
-            fcntl.ioctl(descriptor, fs_ioc_getflags, flags, True)
+            fcntl.ioctl(directory_descriptor, fs_ioc_getflags, flags, True)
         except OSError:
             return None
     finally:
-        os.close(descriptor)
+        if owned_descriptor:
+            os.close(directory_descriptor)
     return bool(flags[0] & fs_casefold_fl)
+
+
+def linux_filesystem_magic(
+    path: Path,
+    descriptor: Optional[int] = None,
+) -> Optional[int]:
+    if not sys.platform.startswith("linux"):
+        return None
+    buffer = ctypes.create_string_buffer(256)
+    libc = ctypes.CDLL(None, use_errno=True)
+    owned_descriptor = descriptor is None
+    directory_descriptor = (
+        open_directory_descriptor(path, "target filesystem-type probe")
+        if descriptor is None
+        else descriptor
+    )
+    try:
+        libc.fstatfs.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        libc.fstatfs.restype = ctypes.c_int
+        result = libc.fstatfs(directory_descriptor, ctypes.byref(buffer))
+        if result != 0:
+            error = ctypes.get_errno()
+            raise PlanError(
+                f"cannot determine target filesystem type for {path}: "
+                f"{os.strerror(error)}"
+            )
+    finally:
+        if owned_descriptor:
+            os.close(directory_descriptor)
+    value = ctypes.c_long.from_buffer(buffer).value
+    return value & ((1 << (ctypes.sizeof(ctypes.c_long) * 8)) - 1)
 
 
 def filesystem_name_policy(root: Path) -> FilesystemNamePolicy:
     root = root.resolve(strict=True)
-    configured_case_insensitive = local_git_bool(root, "core.ignoreCase")
     configured_precompose = local_git_bool(root, "core.precomposeUnicode")
 
     if sys.platform == "darwin":
@@ -1194,23 +1890,94 @@ def filesystem_name_policy(root: Path) -> FilesystemNamePolicy:
         )
 
     if os.name == "nt":
+        raise PlanError("native Windows filesystem name semantics are unsupported")
+
+    directory_descriptor: Optional[int] = None
+    directory_fingerprint: Optional[FsFingerprint] = None
+    if sys.platform.startswith("linux"):
+        directory_descriptor = open_directory_descriptor(
+            root,
+            "target name-policy directory",
+        )
+        directory_fingerprint = fingerprint_from_stat(os.fstat(directory_descriptor))
+        if directory_fingerprint.kind != stat.S_IFDIR:
+            os.close(directory_descriptor)
+            raise PlanError(f"target name-policy path is not a directory: {root}")
+        if filesystem_fingerprint(root) != directory_fingerprint:
+            os.close(directory_descriptor)
+            raise PlanError(
+                f"target name-policy directory changed during descriptor binding: {root}"
+            )
+    try:
+        probed_case_sensitive = probe_directory_case_sensitive(
+            root,
+            descriptor=directory_descriptor,
+        )
+        directory_casefold = linux_directory_casefold(
+            root,
+            descriptor=directory_descriptor,
+        )
+        filesystem_magic = (
+            linux_filesystem_magic(root, descriptor=directory_descriptor)
+            if sys.platform.startswith("linux")
+            else None
+        )
+        if directory_descriptor is not None:
+            current_descriptor_fingerprint = fingerprint_from_stat(
+                os.fstat(directory_descriptor)
+            )
+            current_path_fingerprint = filesystem_fingerprint(root)
+            if (
+                current_descriptor_fingerprint != directory_fingerprint
+                or current_path_fingerprint != directory_fingerprint
+            ):
+                raise PlanError(
+                    "target name-policy directory changed identity or access policy "
+                    f"during revalidation: {root}"
+                )
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+    if filesystem_magic == LINUX_OVERLAYFS_MAGIC:
+        raise PlanError(
+            "cannot determine target directory case semantics without mutation\n"
+            f"  directory: {root}\n"
+            "  OverlayFS merged-directory lookup is not authoritative for every layer\n"
+            "  no target worktree or source object was changed"
+        )
+    if directory_casefold is True:
         case_sensitive = False
-    else:
-        probed_case_sensitive = probe_directory_case_sensitive(root)
-        if probed_case_sensitive is not None:
-            case_sensitive = probed_case_sensitive
-        elif configured_case_insensitive is None:
+        source = "linux-directory-casefold-flag"
+    elif probed_case_sensitive is not None:
+        case_sensitive = probed_case_sensitive
+        source = "directory-lookup-probe"
+    elif sys.platform.startswith("linux"):
+        if (
+            directory_casefold is False
+            and filesystem_magic in LINUX_CASE_SENSITIVE_FILESYSTEM_MAGICS
+        ):
             case_sensitive = True
+            source = f"linux-statfs-and-directory-flags:{filesystem_magic:#x}"
         else:
-            case_sensitive = not configured_case_insensitive
-    directory_casefold = linux_directory_casefold(root)
-    if directory_casefold:
-        case_sensitive = False
+            raise PlanError(
+                "cannot determine target directory case semantics without mutation\n"
+                f"  directory: {root}\n"
+                "  no existing entry supports an authoritative lookup probe, and "
+                "the filesystem/flags combination is not a known case-sensitive policy\n"
+                "  no target worktree or source object was changed"
+            )
+    else:
+        raise PlanError(
+            "cannot determine target directory case semantics without mutation\n"
+            f"  directory: {root}\n"
+            "  no existing entry supports an authoritative lookup probe\n"
+            "  no target worktree or source object was changed"
+        )
     normalization = "NFD" if directory_casefold or configured_precompose else "exact"
     return FilesystemNamePolicy(
         case_sensitive=case_sensitive,
         normalization=normalization,
-        source="directory-filesystem-probe",
+        source=source,
     )
 
 
@@ -1333,7 +2100,10 @@ def revalidate_bound_target(target: BoundTarget) -> None:
                 f"target path became a symlink alias/collision: {node.path}"
             )
     current_policy = filesystem_name_policy(target.name_policy_anchor.path)
-    if current_policy != target.name_policy:
+    if (
+        current_policy.case_sensitive != target.name_policy.case_sensitive
+        or current_policy.normalization != target.name_policy.normalization
+    ):
         raise PlanError(
             "target directory name semantics changed after preflight\n"
             f"  anchor: {target.name_policy_anchor.path}"
@@ -1417,66 +2187,41 @@ def decode_gitmodules(content: bytes, origin: str) -> list[Submodule]:
     return parse_gitmodules(decoded, origin)
 
 
+def capture_worktree_gitmodules(
+    root: Path,
+    budget: Optional[GitmodulesReadBudget] = None,
+) -> tuple[list[Submodule], Optional[FileContentBinding]]:
+    budget = budget or GitmodulesReadBudget.start()
+    path = root.resolve(strict=True) / ".gitmodules"
+    try:
+        path_stat = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return [], None
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return [], None
+        raise PlanError(f"cannot inspect {path} safely: {exc}") from exc
+    budget.check_capacity(path_stat.st_size, str(path))
+    binding, content = read_bound_regular_file(
+        path,
+        maximum_bytes=MAX_GITMODULES_FILE_BYTES,
+        mode=os.R_OK,
+        purpose="top-level .gitmodules",
+        retain_content=True,
+        deadline=time.monotonic() + budget.remaining_seconds("top-level .gitmodules"),
+    )
+    if content is None:
+        raise PlanError("top-level .gitmodules content binding returned no content")
+    budget.retain(len(content), str(path))
+    return decode_gitmodules(content, str(path)), binding
+
+
 def read_worktree_gitmodules(
     root: Path,
     budget: Optional[GitmodulesReadBudget] = None,
 ) -> list[Submodule]:
-    budget = budget or GitmodulesReadBudget.start()
-    path = root / ".gitmodules"
-    budget.remaining_seconds(str(path))
-    descriptor = -1
-    try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY
-            | os.O_CLOEXEC
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0),
-        )
-    except FileNotFoundError:
-        return []
-    except OSError as exc:
-        if exc.errno == errno.ENOENT:
-            return []
-        raise PlanError(f"cannot open {path} safely: {exc}") from exc
-    try:
-        before_stat = os.fstat(descriptor)
-        before_fingerprint = fingerprint_from_stat(before_stat)
-        if before_fingerprint.kind != stat.S_IFREG:
-            raise PlanError(f"{path} is not a regular file")
-        budget.check_capacity(before_stat.st_size, str(path))
-        content = bytearray()
-        while len(content) < before_stat.st_size:
-            budget.remaining_seconds(str(path))
-            try:
-                chunk = os.read(
-                    descriptor,
-                    min(64 * 1024, before_stat.st_size - len(content)),
-                )
-            except BlockingIOError as exc:
-                raise PlanError(
-                    f"{path} did not provide bounded regular-file I/O"
-                ) from exc
-            if not chunk:
-                raise PlanError(f"{path} changed size during bounded read")
-            content.extend(chunk)
-        if os.read(descriptor, 1):
-            raise PlanError(f"{path} changed size during bounded read")
-        after_stat = os.fstat(descriptor)
-        after_fingerprint = fingerprint_from_stat(after_stat)
-        if (
-            after_fingerprint != before_fingerprint
-            or after_stat.st_size != before_stat.st_size
-            or after_stat.st_mtime_ns != before_stat.st_mtime_ns
-            or after_stat.st_ctime_ns != before_stat.st_ctime_ns
-        ):
-            raise PlanError(f"{path} changed during bounded read")
-        budget.retain(len(content), str(path))
-        return decode_gitmodules(bytes(content), str(path))
-    except OSError as exc:
-        raise PlanError(f"cannot read {path} safely: {exc}") from exc
-    finally:
-        os.close(descriptor)
+    modules, _ = capture_worktree_gitmodules(root, budget)
+    return modules
 
 
 def read_commit_gitmodules(
@@ -1569,6 +2314,201 @@ def expected_sha(root: Path, rel_path: str) -> str:
             f"{rel_path} has unresolved index stage {fields[2]}; resolve conflicts before syncing"
         )
     return fields[1]
+
+
+def superproject_index_paths(root: Path) -> tuple[Path, ...]:
+    root = root.resolve(strict=True)
+    index_result = read_git_bounded(
+        [
+            "-C",
+            str(root),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        ],
+        stdout_limit=MAX_CHECKOUT_PATH_BYTES + 1,
+    )
+    index_output = os.fsdecode(index_result.stdout).strip()
+    index_path = Path(index_output)
+    if not index_path.is_absolute():
+        index_path = (root / index_path).absolute()
+    shared_result = read_git_bounded(
+        [
+            "-C",
+            str(root),
+            "rev-parse",
+            "--path-format=absolute",
+            "--shared-index-path",
+        ],
+        stdout_limit=MAX_CHECKOUT_PATH_BYTES + 1,
+    )
+    shared_text = os.fsdecode(shared_result.stdout).strip()
+    if not shared_text:
+        return (index_path,)
+    shared_path = Path(shared_text)
+    if not shared_path.is_absolute():
+        shared_path = (root / shared_path).absolute()
+    if shared_path == index_path:
+        raise PlanError("superproject shared index aliases the primary index")
+    return index_path, shared_path
+
+
+def selected_gitlink_rows(
+    root: Path,
+    selected_paths: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    if not selected_paths:
+        raise PlanError("cannot bind an empty selected-gitlink set")
+    expected_raw: dict[bytes, str] = {}
+    batches: list[list[str]] = []
+    batch: list[str] = []
+    batch_bytes = 0
+    for path in selected_paths:
+        raw_path = os.fsencode(path)
+        if raw_path in expected_raw:
+            raise PlanError(f"duplicate selected gitlink path: {path}")
+        expected_raw[raw_path] = path
+        path_bytes = len(raw_path) + 1
+        if path_bytes > MAX_GIT_PATHSPEC_ARG_BYTES:
+            raise PlanError(f"selected gitlink pathspec is too large: {path}")
+        if batch and (
+            batch_bytes + path_bytes > MAX_GIT_PATHSPEC_ARG_BYTES
+            or len(batch) >= MAX_GIT_PATHSPECS_PER_BATCH
+        ):
+            batches.append(batch)
+            batch = []
+            batch_bytes = 0
+        batch.append(path)
+        batch_bytes += path_bytes
+    if batch:
+        batches.append(batch)
+    if len(batches) > MAX_GIT_PATHSPEC_BATCHES:
+        raise PlanError(
+            "selected gitlink lookup exceeds the "
+            f"{MAX_GIT_PATHSPEC_BATCHES}-batch safety limit"
+        )
+    rows: dict[str, str] = {}
+    retained_bytes = 0
+    deadline = time.monotonic() + GIT_ENUMERATION_TIMEOUT_SECONDS
+    for batch_paths in batches:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PlanError("selected gitlink lookup exceeded its deadline")
+        retained_limit = GIT_ENUMERATION_OUTPUT_LIMIT_BYTES - retained_bytes
+        if retained_limit <= 0:
+            raise PlanError(
+                "selected gitlink rows exceed the "
+                f"{GIT_ENUMERATION_OUTPUT_LIMIT_BYTES}-byte aggregate limit"
+            )
+        result = read_git_bounded(
+            [
+                "-C",
+                str(root),
+                "ls-files",
+                "-s",
+                "--full-name",
+                "-z",
+                "--",
+                *batch_paths,
+            ],
+            stdout_limit=retained_limit,
+            timeout_seconds=remaining,
+        )
+        retained_bytes += len(result.stdout)
+        for record in bounded_records(
+            result.stdout,
+            "selected superproject gitlink rows",
+            maximum_records=len(batch_paths) * 4,
+        ):
+            try:
+                metadata, raw_path = record.split(b"\t", 1)
+            except ValueError as exc:
+                raise PlanError(
+                    "superproject index returned an invalid gitlink row"
+                ) from exc
+            fields = metadata.split()
+            if len(fields) != 3:
+                raise PlanError("superproject index returned invalid gitlink metadata")
+            mode, raw_object_id, raw_stage = fields
+            selected_path = expected_raw.get(raw_path)
+            if selected_path is None:
+                raise PlanError(
+                    "superproject index returned an unrequested gitlink path"
+                )
+            if selected_path in rows:
+                raise PlanError(
+                    f"{selected_path} has unresolved index entries; "
+                    "resolve conflicts before syncing"
+                )
+            object_id = os.fsdecode(raw_object_id)
+            stage = os.fsdecode(raw_stage)
+            if mode != b"160000":
+                raise PlanError(
+                    f"{selected_path} is not a gitlink in the current index"
+                )
+            if stage != "0":
+                raise PlanError(
+                    f"{selected_path} has unresolved index stage {stage}; "
+                    "resolve conflicts before syncing"
+                )
+            if not re.fullmatch(r"[0-9a-f]+", object_id):
+                raise PlanError(
+                    f"{selected_path} has an invalid gitlink object id in the index"
+                )
+            rows[selected_path] = object_id
+    missing = [path for path in selected_paths if path not in rows]
+    if missing:
+        raise PlanError(f"{missing[0]} is not a gitlink in the current index")
+    return tuple((path, rows[path]) for path in selected_paths)
+
+
+def capture_superproject_index_receipt(
+    root: Path,
+    selected_paths: tuple[str, ...],
+) -> SuperprojectIndexReceipt:
+    bindings = tuple(
+        read_bound_regular_file(
+            path,
+            maximum_bytes=MAX_SUPERPROJECT_INDEX_BYTES,
+            mode=os.R_OK,
+            purpose="superproject index",
+            retain_content=False,
+        )[0]
+        for path in superproject_index_paths(root)
+    )
+    selected_rows = selected_gitlink_rows(root, selected_paths)
+    for binding in bindings:
+        revalidate_file_content_binding(binding)
+    if superproject_index_paths(root) != tuple(binding.path for binding in bindings):
+        raise PlanError("superproject index path set changed during preflight")
+    repeated_rows = selected_gitlink_rows(root, selected_paths)
+    if repeated_rows != selected_rows:
+        raise PlanError("selected superproject gitlink rows changed during preflight")
+    for binding in bindings:
+        revalidate_file_content_binding(binding)
+    return SuperprojectIndexReceipt(
+        index_bindings=bindings,
+        selected_gitlinks=selected_rows,
+    )
+
+
+def revalidate_superproject_index_receipt(
+    root: Path,
+    receipt: SuperprojectIndexReceipt,
+) -> None:
+    for binding in receipt.index_bindings:
+        revalidate_file_content_binding(binding)
+    current_paths = superproject_index_paths(root)
+    expected_paths = tuple(binding.path for binding in receipt.index_bindings)
+    if current_paths != expected_paths:
+        raise PlanError("superproject index path set changed after preflight")
+    selected_paths = tuple(path for path, _ in receipt.selected_gitlinks)
+    current_rows = selected_gitlink_rows(root, selected_paths)
+    if current_rows != receipt.selected_gitlinks:
+        raise PlanError("selected superproject gitlink rows changed after preflight")
+    for binding in receipt.index_bindings:
+        revalidate_file_content_binding(binding)
 
 
 def expected_sha_from_tree(
@@ -1670,6 +2610,1344 @@ def commit_exists(source_git_dir: Path, work_tree: Path, sha: str) -> bool:
     return result.returncode == 0
 
 
+def parse_bound_git_config(
+    content: bytes,
+    source: Path,
+) -> tuple[tuple[str, str], ...]:
+    result = read_git_bounded(
+        [
+            "config",
+            "--file",
+            "-",
+            "--no-includes",
+            "--null",
+            "--list",
+        ],
+        input_bytes=content,
+        stdout_limit=MAX_SOURCE_CONFIG_BYTES * 2,
+    )
+    entries: list[tuple[str, str]] = []
+    for record in bounded_records(
+        result.stdout,
+        f"source Git config entries from {source}",
+        maximum_records=MAX_CONFIG_ENTRIES,
+    ):
+        try:
+            raw_key, raw_value = record.split(b"\n", 1)
+        except ValueError as exc:
+            raise PlanError(
+                f"source Git config returned an invalid entry\n  path: {source}"
+            ) from exc
+        key = os.fsdecode(raw_key)
+        value = os.fsdecode(raw_value)
+        entries.append((key, value))
+    return tuple(entries)
+
+
+def reject_unsafe_fetch_config(
+    entries: tuple[tuple[str, str], ...],
+    source: Path,
+) -> str:
+    origin_urls: list[str] = []
+    allowed_origin_keys = {"remote.origin.url", "remote.origin.fetch"}
+    for key, value in entries:
+        lowered = key.casefold()
+        if lowered == "remote.origin.url":
+            origin_urls.append(value)
+            continue
+        unsafe = (
+            lowered.startswith("include.")
+            or lowered.startswith("includeif.")
+            or lowered
+            in {
+                "core.alternaterefscommand",
+                "core.sshcommand",
+                "core.gitproxy",
+                "extensions.worktreeconfig",
+                "ssh.variant",
+            }
+            or lowered.startswith("fetch.bundle")
+            or lowered.startswith("transfer.bundle")
+            or lowered.startswith("credential.")
+            or lowered.startswith("http.")
+            or lowered.startswith("url.")
+            or lowered.startswith("protocol.")
+            or (
+                lowered.startswith("remote.origin.")
+                and lowered not in allowed_origin_keys
+            )
+        )
+        if unsafe:
+            raise PlanError(
+                "source Git config contains fetch-executable, credential, proxy, "
+                "include, or URL-redirection policy\n"
+                f"  path: {source}\n"
+                f"  key: {key}"
+            )
+    if len(origin_urls) != 1:
+        raise PlanError(
+            "source Git config must contain exactly one remote.origin.url\n"
+            f"  path: {source}\n"
+            f"  count: {len(origin_urls)}"
+        )
+    return origin_urls[0]
+
+
+def source_object_format(
+    entries: tuple[tuple[str, str], ...],
+    source: Path,
+) -> str:
+    values = [
+        value.casefold()
+        for key, value in entries
+        if key.casefold() == "extensions.objectformat"
+    ]
+    if len(values) > 1:
+        raise PlanError(
+            "source Git config contains duplicate object-format declarations\n"
+            f"  path: {source}"
+        )
+    object_format = values[0] if values else "sha1"
+    if object_format not in {"sha1", "sha256"}:
+        raise PlanError(
+            "source Git config contains an unsupported object format\n"
+            f"  path: {source}\n"
+            f"  format: {object_format}"
+        )
+    return object_format
+
+
+def require_absent_entry_at(
+    directory_descriptor: int,
+    name: str,
+    display_path: Path,
+    purpose: str,
+) -> None:
+    try:
+        os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    except PermissionError as exc:
+        raise PlanError(f"cannot verify absent {purpose}: {display_path}") from exc
+    except OSError as exc:
+        raise PlanError(
+            f"cannot verify absent {purpose}: {display_path}\n  error: {exc}"
+        ) from exc
+    raise PlanError(f"{purpose} appeared after preflight\n  path: {display_path}")
+
+
+def require_matching_file_binding(
+    expected: FileContentBinding,
+    observed: FileContentBinding,
+    description: str,
+) -> None:
+    if observed.fingerprint != expected.fingerprint:
+        raise PlanError(
+            f"{description} object or access policy changed after preflight"
+        )
+    if (
+        observed.size != expected.size
+        or observed.content_sha256 != expected.content_sha256
+    ):
+        raise PlanError(f"{description} content changed after preflight")
+
+
+def access_binding_for_path(
+    bindings: tuple[AccessBinding, ...],
+    path: Path,
+    purpose: str,
+) -> AccessBinding:
+    matches = [binding for binding in bindings if binding.path == path]
+    if len(matches) != 1:
+        raise PlanError(
+            f"{purpose} lacks one exact access binding\n"
+            f"  path: {path}\n"
+            f"  matches: {len(matches)}"
+        )
+    return matches[0]
+
+
+def fingerprint_recovery_payload(
+    fingerprint: FsFingerprint,
+) -> dict[str, object]:
+    return {
+        "device": fingerprint.device,
+        "group": fingerprint.group,
+        "inode": fingerprint.inode,
+        "kind": fingerprint.kind,
+        "owner": fingerprint.owner,
+        "permissions": fingerprint.permissions,
+    }
+
+
+def file_binding_recovery_payload(
+    binding: Optional[FileContentBinding],
+) -> dict[str, object]:
+    if binding is None:
+        return {"state": "absent"}
+    return {
+        "content_sha256": binding.content_sha256,
+        "fingerprint": fingerprint_recovery_payload(binding.fingerprint),
+        "size": binding.size,
+        "state": "present",
+    }
+
+
+def inspect_shallow_entry_for_recovery(
+    directory_descriptor: int,
+    name: str,
+    display_path: Path,
+) -> dict[str, object]:
+    try:
+        path_stat = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return {"state": "absent"}
+    except OSError as exc:
+        return {
+            "error": f"{type(exc).__name__}: {exc}",
+            "state": "unavailable",
+        }
+    fingerprint = fingerprint_from_stat(path_stat)
+    payload: dict[str, object] = {
+        "fingerprint": fingerprint_recovery_payload(fingerprint),
+        "size": path_stat.st_size,
+        "state": "present",
+    }
+    if fingerprint.kind != stat.S_IFREG:
+        return payload
+    descriptor = -1
+    try:
+        descriptor, binding, _ = open_bound_regular_file_at(
+            directory_descriptor,
+            name,
+            display_path,
+            maximum_bytes=MAX_SOURCE_SHALLOW_BYTES,
+            mode=os.R_OK,
+            purpose=f"recovery inspection for {display_path.name}",
+            retain_content=False,
+        )
+        payload["content_sha256"] = binding.content_sha256
+    except PlanError as exc:
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return payload
+
+
+def shallow_recovery_identity(
+    receipt: TransportReceipt,
+    source_directory_descriptor: int,
+    state: str,
+    detail: str,
+) -> str:
+    descriptor_fingerprint = fingerprint_from_stat(
+        os.fstat(source_directory_descriptor)
+    )
+    try:
+        path_fingerprint = fingerprint_recovery_payload(
+            filesystem_fingerprint(receipt.source_shallow_parent_binding.path)
+        )
+    except PlanError as exc:
+        path_fingerprint = {
+            "error": f"{type(exc).__name__}: {exc}",
+            "state": "unavailable",
+        }
+    payload = {
+        "detail": detail,
+        "expected_shallow": file_binding_recovery_payload(
+            receipt.source_shallow_binding
+        ),
+        "profile": "source-shallow-cas-v1",
+        "shallow": inspect_shallow_entry_for_recovery(
+            source_directory_descriptor,
+            SOURCE_SHALLOW_NAME,
+            receipt.source_shallow_path,
+        ),
+        "shallow_lock": inspect_shallow_entry_for_recovery(
+            source_directory_descriptor,
+            SOURCE_SHALLOW_LOCK_NAME,
+            receipt.source_shallow_path.with_name(SOURCE_SHALLOW_LOCK_NAME),
+        ),
+        "source_git_dir": str(receipt.source_shallow_parent_binding.path),
+        "source_git_dir_descriptor": fingerprint_recovery_payload(
+            descriptor_fingerprint
+        ),
+        "source_git_dir_path": path_fingerprint,
+        "state": state,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def source_shallow_recovery_error(
+    receipt: TransportReceipt,
+    source_directory_descriptor: int,
+    state: str,
+    detail: str,
+) -> PlanError:
+    return PlanError(
+        f"source shallow CAS did not reach a clean terminal state: {detail}\n"
+        f"  recovery_identity: "
+        f"{shallow_recovery_identity(receipt, source_directory_descriptor, state, detail)}"
+    )
+
+
+def open_revalidated_source_shallow_at(
+    receipt: TransportReceipt,
+    source_directory_descriptor: int,
+) -> int:
+    revalidate_directory_descriptor(
+        receipt.source_shallow_parent_binding,
+        source_directory_descriptor,
+    )
+    if receipt.source_shallow_binding is None:
+        require_absent_entry_at(
+            source_directory_descriptor,
+            SOURCE_SHALLOW_NAME,
+            receipt.source_shallow_path,
+            "source shallow boundary",
+        )
+        return -1
+    descriptor = -1
+    try:
+        descriptor, observed, _ = open_bound_regular_file_at(
+            source_directory_descriptor,
+            SOURCE_SHALLOW_NAME,
+            receipt.source_shallow_path,
+            maximum_bytes=receipt.source_shallow_binding.maximum_bytes,
+            mode=receipt.source_shallow_binding.mode,
+            purpose=receipt.source_shallow_binding.purpose,
+            retain_content=False,
+        )
+        require_matching_file_binding(
+            receipt.source_shallow_binding,
+            observed,
+            "source shallow boundary",
+        )
+        revalidate_directory_descriptor(
+            receipt.source_shallow_parent_binding,
+            source_directory_descriptor,
+        )
+        return descriptor
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def capture_source_shallow_state(
+    source_git_dir: Path,
+    submodule_path: str,
+) -> tuple[
+    Path,
+    AccessBinding,
+    Optional[FileContentBinding],
+    Optional[bytes],
+]:
+    shallow_path = source_git_dir / SOURCE_SHALLOW_NAME
+    parent_binding = capture_typed_access(
+        source_git_dir,
+        os.R_OK | os.W_OK | os.X_OK,
+        f"source shallow-file parent for {submodule_path}",
+        stat.S_IFDIR,
+    )
+    shallow_binding: Optional[FileContentBinding] = None
+    shallow_content: Optional[bytes] = None
+    source_directory_descriptor = open_directory_descriptor(
+        source_git_dir,
+        f"source shallow-file parent for {submodule_path}",
+    )
+    shallow_descriptor = -1
+    try:
+        revalidate_directory_descriptor(parent_binding, source_directory_descriptor)
+        try:
+            os.stat(
+                SOURCE_SHALLOW_NAME,
+                dir_fd=source_directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            require_absent_entry_at(
+                source_directory_descriptor,
+                SOURCE_SHALLOW_NAME,
+                shallow_path,
+                f"source shallow boundary for {submodule_path}",
+            )
+        except OSError as exc:
+            raise PlanError(
+                f"cannot inspect source shallow boundary for {submodule_path}\n"
+                f"  path: {shallow_path}\n"
+                f"  error: {exc}"
+            ) from exc
+        else:
+            (
+                shallow_descriptor,
+                shallow_binding,
+                shallow_content,
+            ) = open_bound_regular_file_at(
+                source_directory_descriptor,
+                SOURCE_SHALLOW_NAME,
+                shallow_path,
+                maximum_bytes=MAX_SOURCE_SHALLOW_BYTES,
+                mode=os.R_OK | os.W_OK,
+                purpose=f"source shallow boundary for {submodule_path}",
+                retain_content=True,
+            )
+            observed, _ = bind_regular_file_descriptor_at(
+                shallow_descriptor,
+                source_directory_descriptor,
+                SOURCE_SHALLOW_NAME,
+                shallow_path,
+                maximum_bytes=MAX_SOURCE_SHALLOW_BYTES,
+                mode=os.R_OK | os.W_OK,
+                purpose=f"source shallow boundary for {submodule_path}",
+                retain_content=False,
+            )
+            require_matching_file_binding(
+                shallow_binding,
+                observed,
+                "source shallow boundary",
+            )
+        revalidate_directory_descriptor(parent_binding, source_directory_descriptor)
+    finally:
+        if shallow_descriptor >= 0:
+            os.close(shallow_descriptor)
+        os.close(source_directory_descriptor)
+    return shallow_path, parent_binding, shallow_binding, shallow_content
+
+
+def revalidate_source_shallow_state(receipt: TransportReceipt) -> None:
+    source_directory_descriptor = open_directory_descriptor(
+        receipt.source_shallow_parent_binding.path,
+        "source shallow-file parent",
+    )
+    shallow_descriptor = -1
+    try:
+        shallow_descriptor = open_revalidated_source_shallow_at(
+            receipt,
+            source_directory_descriptor,
+        )
+    finally:
+        if shallow_descriptor >= 0:
+            os.close(shallow_descriptor)
+        os.close(source_directory_descriptor)
+
+
+def _cleanup_owned_source_shallow_lock(
+    source_directory_descriptor: int,
+    lock_descriptor: int,
+    lock_fingerprint: FsFingerprint,
+) -> None:
+    descriptor_fingerprint = fingerprint_from_stat(os.fstat(lock_descriptor))
+    try:
+        path_fingerprint = fingerprint_from_stat(
+            os.stat(
+                SOURCE_SHALLOW_LOCK_NAME,
+                dir_fd=source_directory_descriptor,
+                follow_symlinks=False,
+            )
+        )
+    except FileNotFoundError as exc:
+        raise PlanError("owned source shallow lock disappeared before cleanup") from exc
+    if (
+        descriptor_fingerprint != lock_fingerprint
+        or path_fingerprint != lock_fingerprint
+    ):
+        raise PlanError(
+            "source shallow lock ownership changed before cleanup; "
+            "the stale fence was retained"
+        )
+    os.unlink(
+        SOURCE_SHALLOW_LOCK_NAME,
+        dir_fd=source_directory_descriptor,
+    )
+    os.fsync(source_directory_descriptor)
+
+
+def cleanup_owned_source_shallow_lock(
+    source_directory_descriptor: int,
+    lock_descriptor: int,
+    lock_fingerprint: FsFingerprint,
+) -> None:
+    try:
+        _cleanup_owned_source_shallow_lock(
+            source_directory_descriptor,
+            lock_descriptor,
+            lock_fingerprint,
+        )
+    except OSError as exc:
+        raise PlanError(
+            "cannot safely clean the owned source shallow lock; "
+            f"the stale fence was retained: {exc}"
+        ) from exc
+
+
+def rollback_source_shallow_exchange(
+    receipt: TransportReceipt,
+    source_directory_descriptor: int,
+    new_shallow_descriptor: int,
+    new_shallow_binding: FileContentBinding,
+) -> tuple[str, Optional[str]]:
+    try:
+        descriptor_atomic_rename_exchange(
+            source_directory_descriptor,
+            SOURCE_SHALLOW_LOCK_NAME,
+            SOURCE_SHALLOW_NAME,
+        )
+    except PlanError as exc:
+        return "rollback-failed-fence-retained", str(exc)
+    try:
+        restored_lock, _ = bind_regular_file_descriptor_at(
+            new_shallow_descriptor,
+            source_directory_descriptor,
+            SOURCE_SHALLOW_LOCK_NAME,
+            receipt.source_shallow_path.with_name(SOURCE_SHALLOW_LOCK_NAME),
+            maximum_bytes=MAX_SOURCE_SHALLOW_BYTES,
+            mode=os.R_OK | os.W_OK,
+            purpose="rolled-back source shallow stale fence",
+            retain_content=False,
+        )
+        require_matching_file_binding(
+            new_shallow_binding,
+            restored_lock,
+            "rolled-back source shallow stale fence",
+        )
+        revalidate_directory_descriptor(
+            receipt.source_shallow_parent_binding,
+            source_directory_descriptor,
+        )
+        os.fsync(source_directory_descriptor)
+    except (OSError, PlanError) as exc:
+        return "rollback-unverified-fence-retained", str(exc)
+    return "rolled-back-fence-retained", None
+
+
+def rollback_absent_source_shallow_publish(
+    receipt: TransportReceipt,
+    source_directory_descriptor: int,
+    new_shallow_descriptor: int,
+    new_shallow_binding: FileContentBinding,
+) -> tuple[str, Optional[str]]:
+    try:
+        descriptor_atomic_rename_noreplace(
+            source_directory_descriptor,
+            SOURCE_SHALLOW_NAME,
+            SOURCE_SHALLOW_LOCK_NAME,
+        )
+    except PlanError as exc:
+        return "rollback-failed", str(exc)
+    try:
+        restored_lock, _ = bind_regular_file_descriptor_at(
+            new_shallow_descriptor,
+            source_directory_descriptor,
+            SOURCE_SHALLOW_LOCK_NAME,
+            receipt.source_shallow_path.with_name(SOURCE_SHALLOW_LOCK_NAME),
+            maximum_bytes=MAX_SOURCE_SHALLOW_BYTES,
+            mode=os.R_OK | os.W_OK,
+            purpose="rolled-back source shallow stale fence",
+            retain_content=False,
+        )
+        require_matching_file_binding(
+            new_shallow_binding,
+            restored_lock,
+            "rolled-back source shallow stale fence",
+        )
+        revalidate_directory_descriptor(
+            receipt.source_shallow_parent_binding,
+            source_directory_descriptor,
+        )
+        os.fsync(source_directory_descriptor)
+    except (OSError, PlanError) as exc:
+        return "rollback-unverified-fence-retained", str(exc)
+    return "rolled-back-fence-retained", None
+
+
+def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
+    private_shallow_path = receipt.fetch_git_dir / SOURCE_SHALLOW_NAME
+    private_directory_binding = access_binding_for_path(
+        receipt.fetch_access_bindings,
+        receipt.fetch_git_dir,
+        "post-fetch private shallow-file parent",
+    )
+    private_directory_descriptor = open_directory_descriptor(
+        receipt.fetch_git_dir,
+        "post-fetch private shallow-file parent",
+    )
+    private_descriptor = -1
+    source_directory_descriptor = -1
+    lock_descriptor = -1
+    expected_shallow_descriptor = -1
+    lock_binding: Optional[FileContentBinding] = None
+    lock_fingerprint: Optional[FsFingerprint] = None
+    cleanup_owned_lock = False
+    preserve_fence = False
+    try:
+        revalidate_directory_descriptor(
+            private_directory_binding,
+            private_directory_descriptor,
+        )
+        (
+            private_descriptor,
+            private_binding,
+            private_content,
+        ) = open_bound_regular_file_at(
+            private_directory_descriptor,
+            SOURCE_SHALLOW_NAME,
+            private_shallow_path,
+            maximum_bytes=MAX_SOURCE_SHALLOW_BYTES,
+            mode=os.R_OK | os.W_OK,
+            purpose="post-fetch private shallow boundary",
+            retain_content=True,
+        )
+        if private_content is None:
+            raise PlanError("post-fetch private shallow boundary returned no content")
+        revalidate_directory_descriptor(
+            private_directory_binding,
+            private_directory_descriptor,
+        )
+
+        source_directory_descriptor = open_directory_descriptor(
+            receipt.source_shallow_parent_binding.path,
+            "source shallow-file parent",
+        )
+        revalidate_directory_descriptor(
+            receipt.source_shallow_parent_binding,
+            source_directory_descriptor,
+        )
+        mode = (
+            receipt.source_shallow_binding.fingerprint.permissions
+            if receipt.source_shallow_binding is not None
+            else 0o600
+        )
+        try:
+            lock_descriptor = os.open(
+                SOURCE_SHALLOW_LOCK_NAME,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | os.O_NONBLOCK
+                | os.O_NOFOLLOW,
+                mode,
+                dir_fd=source_directory_descriptor,
+            )
+        except FileExistsError as exc:
+            raise PlanError(
+                "source shallow lock already exists; refusing to overlap another "
+                "Git shallow-boundary writer\n"
+                f"  path: "
+                f"{receipt.source_shallow_path.with_name(SOURCE_SHALLOW_LOCK_NAME)}"
+            ) from exc
+        except OSError as exc:
+            raise PlanError(
+                "cannot create descriptor-relative source shallow lock\n"
+                f"  path: "
+                f"{receipt.source_shallow_path.with_name(SOURCE_SHALLOW_LOCK_NAME)}\n"
+                f"  error: {exc}"
+            ) from exc
+        lock_fingerprint = fingerprint_from_stat(os.fstat(lock_descriptor))
+        cleanup_owned_lock = True
+        os.fchmod(lock_descriptor, mode)
+        lock_fingerprint = fingerprint_from_stat(os.fstat(lock_descriptor))
+        pending = memoryview(private_content)
+        while pending:
+            written = os.write(lock_descriptor, pending)
+            if written <= 0:
+                raise PlanError(
+                    "cannot write descriptor-relative source shallow lock file"
+                )
+            pending = pending[written:]
+        os.fsync(lock_descriptor)
+        lock_binding, _ = bind_regular_file_descriptor_at(
+            lock_descriptor,
+            source_directory_descriptor,
+            SOURCE_SHALLOW_LOCK_NAME,
+            receipt.source_shallow_path.with_name(SOURCE_SHALLOW_LOCK_NAME),
+            maximum_bytes=MAX_SOURCE_SHALLOW_BYTES,
+            mode=os.R_OK | os.W_OK,
+            purpose="pending source shallow boundary",
+            retain_content=False,
+        )
+        os.fsync(source_directory_descriptor)
+
+        private_observed, _ = bind_regular_file_descriptor_at(
+            private_descriptor,
+            private_directory_descriptor,
+            SOURCE_SHALLOW_NAME,
+            private_shallow_path,
+            maximum_bytes=private_binding.maximum_bytes,
+            mode=private_binding.mode,
+            purpose=private_binding.purpose,
+            retain_content=False,
+        )
+        require_matching_file_binding(
+            private_binding,
+            private_observed,
+            "post-fetch private shallow boundary",
+        )
+        expected_shallow_descriptor = open_revalidated_source_shallow_at(
+            receipt,
+            source_directory_descriptor,
+        )
+
+        if receipt.source_shallow_binding is None:
+            try:
+                descriptor_atomic_rename_noreplace(
+                    source_directory_descriptor,
+                    SOURCE_SHALLOW_LOCK_NAME,
+                    SOURCE_SHALLOW_NAME,
+                )
+            except AtomicRenameError as exc:
+                if exc.error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+                    cleanup_owned_lock = False
+                    preserve_fence = True
+                    raise source_shallow_recovery_error(
+                        receipt,
+                        source_directory_descriptor,
+                        "cas-conflict-fence-retained",
+                        "source shallow boundary appeared before no-replace publish",
+                    ) from exc
+                raise
+            cleanup_owned_lock = False
+            try:
+                installed, _ = bind_regular_file_descriptor_at(
+                    lock_descriptor,
+                    source_directory_descriptor,
+                    SOURCE_SHALLOW_NAME,
+                    receipt.source_shallow_path,
+                    maximum_bytes=MAX_SOURCE_SHALLOW_BYTES,
+                    mode=os.R_OK | os.W_OK,
+                    purpose="installed source shallow boundary",
+                    retain_content=False,
+                )
+                require_matching_file_binding(
+                    lock_binding,
+                    installed,
+                    "installed source shallow boundary",
+                )
+                if (
+                    installed.size != private_binding.size
+                    or installed.content_sha256 != private_binding.content_sha256
+                ):
+                    raise PlanError(
+                        "installed source shallow boundary does not match the "
+                        "fetched receipt"
+                    )
+                revalidate_directory_descriptor(
+                    receipt.source_shallow_parent_binding,
+                    source_directory_descriptor,
+                )
+                os.fsync(source_directory_descriptor)
+            except PlanError as exc:
+                rollback_state, rollback_error = rollback_absent_source_shallow_publish(
+                    receipt,
+                    source_directory_descriptor,
+                    lock_descriptor,
+                    lock_binding,
+                )
+                preserve_fence = rollback_state.endswith("fence-retained")
+                detail = str(exc)
+                if rollback_error is not None:
+                    detail += f"; rollback: {rollback_error}"
+                raise source_shallow_recovery_error(
+                    receipt,
+                    source_directory_descriptor,
+                    rollback_state,
+                    detail,
+                ) from exc
+            return
+
+        try:
+            descriptor_atomic_rename_exchange(
+                source_directory_descriptor,
+                SOURCE_SHALLOW_LOCK_NAME,
+                SOURCE_SHALLOW_NAME,
+            )
+        except AtomicRenameError as exc:
+            if exc.error_number not in ATOMIC_RENAME_UNSUPPORTED_ERRNOS:
+                cleanup_owned_lock = False
+                preserve_fence = True
+                raise source_shallow_recovery_error(
+                    receipt,
+                    source_directory_descriptor,
+                    "exchange-failed-fence-retained",
+                    str(exc),
+                ) from exc
+            raise
+        cleanup_owned_lock = False
+        try:
+            observed_old, _ = bind_regular_file_descriptor_at(
+                expected_shallow_descriptor,
+                source_directory_descriptor,
+                SOURCE_SHALLOW_LOCK_NAME,
+                receipt.source_shallow_path.with_name(SOURCE_SHALLOW_LOCK_NAME),
+                maximum_bytes=receipt.source_shallow_binding.maximum_bytes,
+                mode=receipt.source_shallow_binding.mode,
+                purpose="exchanged source shallow receipt boundary",
+                retain_content=False,
+            )
+            require_matching_file_binding(
+                receipt.source_shallow_binding,
+                observed_old,
+                "exchanged source shallow receipt boundary",
+            )
+            installed, _ = bind_regular_file_descriptor_at(
+                lock_descriptor,
+                source_directory_descriptor,
+                SOURCE_SHALLOW_NAME,
+                receipt.source_shallow_path,
+                maximum_bytes=MAX_SOURCE_SHALLOW_BYTES,
+                mode=os.R_OK | os.W_OK,
+                purpose="installed source shallow boundary",
+                retain_content=False,
+            )
+            require_matching_file_binding(
+                lock_binding,
+                installed,
+                "installed source shallow boundary",
+            )
+            if (
+                installed.size != private_binding.size
+                or installed.content_sha256 != private_binding.content_sha256
+            ):
+                raise PlanError(
+                    "installed source shallow boundary does not match the fetched "
+                    "receipt"
+                )
+            revalidate_directory_descriptor(
+                receipt.source_shallow_parent_binding,
+                source_directory_descriptor,
+            )
+        except PlanError as exc:
+            rollback_state, rollback_error = rollback_source_shallow_exchange(
+                receipt,
+                source_directory_descriptor,
+                lock_descriptor,
+                lock_binding,
+            )
+            preserve_fence = True
+            detail = str(exc)
+            if rollback_error is not None:
+                detail += f"; rollback: {rollback_error}"
+            raise source_shallow_recovery_error(
+                receipt,
+                source_directory_descriptor,
+                rollback_state,
+                detail,
+            ) from exc
+
+        try:
+            old_path_fingerprint = fingerprint_from_stat(
+                os.stat(
+                    SOURCE_SHALLOW_LOCK_NAME,
+                    dir_fd=source_directory_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            if old_path_fingerprint != receipt.source_shallow_binding.fingerprint:
+                raise PlanError(
+                    "exchanged source shallow lock identity changed before unlink"
+                )
+            os.unlink(
+                SOURCE_SHALLOW_LOCK_NAME,
+                dir_fd=source_directory_descriptor,
+            )
+            os.fsync(source_directory_descriptor)
+        except (OSError, PlanError) as exc:
+            try:
+                os.stat(
+                    SOURCE_SHALLOW_LOCK_NAME,
+                    dir_fd=source_directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                rollback_state = "commit-durability-unverified"
+                rollback_error = "exchanged old shallow was already unlinked"
+            else:
+                rollback_state, rollback_error = rollback_source_shallow_exchange(
+                    receipt,
+                    source_directory_descriptor,
+                    lock_descriptor,
+                    lock_binding,
+                )
+                preserve_fence = True
+            detail = str(exc)
+            if rollback_error is not None:
+                detail += f"; rollback: {rollback_error}"
+            raise source_shallow_recovery_error(
+                receipt,
+                source_directory_descriptor,
+                rollback_state,
+                detail,
+            ) from exc
+    except Exception as exc:
+        if (
+            cleanup_owned_lock
+            and not preserve_fence
+            and lock_fingerprint is not None
+            and source_directory_descriptor >= 0
+            and lock_descriptor >= 0
+        ):
+            try:
+                cleanup_owned_source_shallow_lock(
+                    source_directory_descriptor,
+                    lock_descriptor,
+                    lock_fingerprint,
+                )
+            except PlanError as cleanup_exc:
+                raise source_shallow_recovery_error(
+                    receipt,
+                    source_directory_descriptor,
+                    "cleanup-unverified-fence-retained",
+                    f"{exc}; cleanup: {cleanup_exc}",
+                ) from exc
+        if isinstance(exc, OSError):
+            raise PlanError(
+                f"source shallow installation failed before a clean terminal state: "
+                f"{exc}"
+            ) from exc
+        raise
+    finally:
+        if expected_shallow_descriptor >= 0:
+            os.close(expected_shallow_descriptor)
+        if lock_descriptor >= 0:
+            os.close(lock_descriptor)
+        if source_directory_descriptor >= 0:
+            os.close(source_directory_descriptor)
+        if private_descriptor >= 0:
+            os.close(private_descriptor)
+        os.close(private_directory_descriptor)
+
+
+def write_owner_private_file(path: Path, content: bytes, purpose: str) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise PlanError(f"cannot write {purpose}: {path}")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise PlanError(f"cannot create {purpose}: {path}\n  error: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def capture_owner_private_directory(path: Path, purpose: str) -> AccessBinding:
+    binding = capture_typed_access(
+        path,
+        os.R_OK | os.W_OK | os.X_OK,
+        purpose,
+        stat.S_IFDIR,
+    )
+    if binding.fingerprint.owner != os.geteuid() or (
+        binding.fingerprint.permissions & 0o077
+    ):
+        raise PlanError(
+            f"{purpose} is not owner-private\n"
+            f"  path: {path}\n"
+            f"  mode: {binding.fingerprint.permissions:#o}"
+        )
+    return binding
+
+
+class OwnerPrivateTemporaryDirectory:
+    def __init__(self, prefix: str) -> None:
+        self.name = tempfile.mkdtemp(prefix=prefix)
+        self._path = Path(self.name)
+        self._fingerprint = filesystem_fingerprint(self._path)
+        self._active = True
+
+    def cleanup(self) -> None:
+        if not self._active:
+            return
+        self._active = False
+        try:
+            current = filesystem_fingerprint(self._path)
+        except PlanError:
+            return
+        if current != self._fingerprint:
+            # Fail safe on replacement: never recursively remove an object that
+            # is no longer the owner-private directory created by this guard.
+            return
+        shutil.rmtree(self._path)
+
+    def __del__(self) -> None:
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
+
+def capture_fetch_control_gitdir(
+    object_format: str,
+    submodule_path: str,
+    initial_shallow_content: Optional[bytes],
+) -> tuple[
+    object,
+    Path,
+    tuple[AccessBinding, ...],
+    tuple[FileContentBinding, ...],
+]:
+    guard = OwnerPrivateTemporaryDirectory(prefix="submodule-worktree-fetch.")
+    fetch_git_dir = Path(guard.name)
+    try:
+        objects_dir = fetch_git_dir / "objects"
+        refs_dir = fetch_git_dir / "refs"
+        heads_dir = refs_dir / "heads"
+        for directory in (objects_dir, refs_dir, heads_dir):
+            os.mkdir(directory, mode=0o700)
+
+        repository_version = "1" if object_format == "sha256" else "0"
+        config_content = (
+            f"[core]\n\trepositoryformatversion = {repository_version}\n\tbare = true\n"
+        )
+        if object_format == "sha256":
+            config_content += "[extensions]\n\tobjectformat = sha256\n"
+        config_path = fetch_git_dir / "config"
+        head_path = fetch_git_dir / "HEAD"
+        write_owner_private_file(
+            config_path,
+            config_content.encode("ascii"),
+            f"isolated fetch config for {submodule_path}",
+        )
+        write_owner_private_file(
+            head_path,
+            b"ref: refs/heads/fetch-isolated\n",
+            f"isolated fetch HEAD for {submodule_path}",
+        )
+        private_shallow_path = fetch_git_dir / "shallow"
+        if initial_shallow_content is not None:
+            write_owner_private_file(
+                private_shallow_path,
+                initial_shallow_content,
+                f"isolated fetch shallow boundary for {submodule_path}",
+            )
+
+        access_bindings = tuple(
+            capture_owner_private_directory(path, purpose)
+            for path, purpose in (
+                (
+                    fetch_git_dir,
+                    f"isolated fetch gitdir for {submodule_path}",
+                ),
+                (
+                    objects_dir,
+                    f"isolated fetch placeholder object directory for {submodule_path}",
+                ),
+                (
+                    refs_dir,
+                    f"isolated fetch refs directory for {submodule_path}",
+                ),
+                (
+                    heads_dir,
+                    f"isolated fetch heads directory for {submodule_path}",
+                ),
+            )
+        )
+        file_specs = [
+            (
+                config_path,
+                f"isolated fetch config for {submodule_path}",
+            ),
+            (
+                head_path,
+                f"isolated fetch HEAD for {submodule_path}",
+            ),
+        ]
+        if initial_shallow_content is not None:
+            file_specs.append(
+                (
+                    private_shallow_path,
+                    f"isolated fetch shallow boundary for {submodule_path}",
+                )
+            )
+        file_bindings = tuple(
+            read_bound_regular_file(
+                path,
+                maximum_bytes=MAX_SOURCE_CONFIG_BYTES,
+                mode=os.R_OK,
+                purpose=purpose,
+                retain_content=False,
+            )[0]
+            for path, purpose in file_specs
+        )
+        return guard, fetch_git_dir, access_bindings, file_bindings
+    except Exception:
+        guard.cleanup()
+        raise
+
+
+def transport_uses_ssh(url: str) -> bool:
+    scheme_match = re.match(r"([A-Za-z][A-Za-z0-9+.-]*):", url)
+    if scheme_match:
+        return scheme_match.group(1).casefold() == "ssh"
+    return bool(re.fullmatch(r"(?:[^@/:]+@)?[^/:]+:.+", url))
+
+
+def validate_approved_fetch_url(url: str, submodule_path: str) -> None:
+    if not url or "\x00" in url or "\n" in url or "\r" in url:
+        raise PlanError(f"submodule {submodule_path} has an invalid approved fetch URL")
+    if url.startswith("-") or "::" in url:
+        raise PlanError(
+            f"submodule {submodule_path} uses an unsupported fetch transport: {url}"
+        )
+    if Path(url).is_absolute():
+        return
+    scheme_match = re.match(r"([A-Za-z][A-Za-z0-9+.-]*):", url)
+    if scheme_match:
+        if scheme_match.group(1).casefold() not in {
+            "file",
+            "git",
+            "http",
+            "https",
+            "ssh",
+        }:
+            raise PlanError(
+                f"submodule {submodule_path} uses an unsupported fetch URL scheme: "
+                f"{scheme_match.group(1)}"
+            )
+        return
+    if transport_uses_ssh(url):
+        return
+    raise PlanError(
+        f"submodule {submodule_path} uses a relative or ambiguous fetch URL\n"
+        f"  url: {url}\n"
+        "  bind the source repository and .gitmodules to one exact absolute or "
+        "standard-protocol URL before using --fetch-missing"
+    )
+
+
+def capture_transport_receipt(
+    source_git_dir: Path,
+    submodule: Submodule,
+) -> TransportReceipt:
+    config_path = source_git_dir / "config"
+    config_binding, config_content = read_bound_regular_file(
+        config_path,
+        maximum_bytes=MAX_SOURCE_CONFIG_BYTES,
+        mode=os.R_OK,
+        purpose=f"source Git config for {submodule.path}",
+        retain_content=True,
+    )
+    if config_content is None:
+        raise PlanError("source Git config content binding returned no content")
+    entries = parse_bound_git_config(config_content, config_path)
+    origin_url = reject_unsafe_fetch_config(entries, config_path)
+    object_format = source_object_format(entries, config_path)
+    validate_approved_fetch_url(submodule.url, submodule.path)
+    if origin_url != submodule.url:
+        raise PlanError(
+            "source remote.origin.url does not match the task-approved "
+            ".gitmodules URL\n"
+            f"  submodule: {submodule.path}\n"
+            f"  .gitmodules: {submodule.url}\n"
+            f"  remote.origin.url: {origin_url}"
+        )
+    ssh_binding: Optional[FileContentBinding] = None
+    ssh_command: Optional[str] = None
+    if transport_uses_ssh(origin_url):
+        candidate = shutil.which("ssh")
+        if not candidate:
+            raise PlanError(
+                f"cannot resolve SSH for the approved fetch transport: {origin_url}"
+            )
+        ssh_path = Path(candidate).resolve(strict=True)
+        ssh_binding, _ = read_bound_regular_file(
+            ssh_path,
+            maximum_bytes=MAX_TRANSPORT_EXECUTABLE_BYTES,
+            mode=os.R_OK | os.X_OK,
+            purpose=f"SSH executable for {submodule.path}",
+            retain_content=False,
+        )
+        ssh_command = " ".join(
+            [
+                shlex.quote(str(ssh_path)),
+                "-F",
+                shlex.quote(os.devnull),
+                "-o",
+                "CanonicalizeHostname=no",
+                "-o",
+                "PermitLocalCommand=no",
+                "-o",
+                "ProxyCommand=none",
+                "-o",
+                "ProxyJump=none",
+            ]
+        )
+    source_object_directory = source_git_dir / "objects"
+    source_object_bindings = [
+        capture_typed_access(
+            source_object_directory,
+            os.R_OK | os.W_OK | os.X_OK,
+            f"authorized fetch object database for {submodule.path}",
+            stat.S_IFDIR,
+        )
+    ]
+    source_pack_directory = source_object_directory / "pack"
+    if path_entry_exists(source_pack_directory):
+        source_object_bindings.append(
+            capture_typed_access(
+                source_pack_directory,
+                os.R_OK | os.W_OK | os.X_OK,
+                f"authorized fetch pack directory for {submodule.path}",
+                stat.S_IFDIR,
+            )
+        )
+    (
+        source_shallow_path,
+        source_shallow_parent_binding,
+        source_shallow_binding,
+        source_shallow_content,
+    ) = capture_source_shallow_state(source_git_dir, submodule.path)
+    (
+        fetch_guard,
+        fetch_git_dir,
+        private_access_bindings,
+        fetch_file_bindings,
+    ) = capture_fetch_control_gitdir(
+        object_format,
+        submodule.path,
+        source_shallow_content,
+    )
+    environment = git_environment()
+    environment["GIT_OBJECT_DIRECTORY"] = str(source_object_directory)
+    revalidate_file_content_binding(config_binding)
+    return TransportReceipt(
+        config_binding=config_binding,
+        approved_url=submodule.url,
+        origin_url=origin_url,
+        ssh_executable_binding=ssh_binding,
+        ssh_command=ssh_command,
+        source_object_directory=source_object_directory,
+        source_shallow_path=source_shallow_path,
+        source_shallow_parent_binding=source_shallow_parent_binding,
+        source_shallow_binding=source_shallow_binding,
+        fetch_git_dir=fetch_git_dir,
+        fetch_access_bindings=(
+            *source_object_bindings,
+            *private_access_bindings,
+        ),
+        fetch_file_bindings=fetch_file_bindings,
+        git_environment=tuple(sorted(environment.items())),
+        fetch_guard=fetch_guard,
+    )
+
+
+def validate_frozen_git_environment(
+    environment_items: tuple[tuple[str, str], ...],
+    expected_object_directory: Path,
+) -> None:
+    environment = dict(environment_items)
+    if len(environment) != len(environment_items):
+        raise PlanError("fetch transport environment contains duplicate keys")
+    allowed = (
+        set(GIT_ENV_PASSTHROUGH)
+        | set(SAFE_GIT_ENV)
+        | {
+            "GIT_OBJECT_DIRECTORY",
+        }
+    )
+    unexpected = set(environment) - allowed
+    if unexpected:
+        raise PlanError(
+            "fetch transport environment contains unapproved keys: "
+            + ", ".join(sorted(unexpected))
+        )
+    for key, expected in SAFE_GIT_ENV.items():
+        if environment.get(key) != expected:
+            raise PlanError(
+                f"fetch transport environment changed required policy: {key}"
+            )
+    if environment.get("GIT_OBJECT_DIRECTORY") != str(expected_object_directory):
+        raise PlanError(
+            "fetch transport environment changed the bound source object directory"
+        )
+    if not expected_object_directory.is_absolute():
+        raise PlanError("fetch transport object directory is not absolute")
+
+
+def revalidate_transport_receipt(
+    receipt: TransportReceipt,
+    submodule: Submodule,
+) -> None:
+    if (
+        receipt.approved_url != submodule.url
+        or receipt.origin_url != receipt.approved_url
+    ):
+        raise PlanError(f"fetch transport receipt no longer matches {submodule.path}")
+    revalidate_file_content_binding(receipt.config_binding)
+    if receipt.ssh_executable_binding is not None:
+        revalidate_file_content_binding(receipt.ssh_executable_binding)
+    revalidate_source_shallow_state(receipt)
+    for binding in receipt.fetch_access_bindings:
+        revalidate_access(binding)
+    for binding in receipt.fetch_file_bindings:
+        revalidate_file_content_binding(binding)
+    validate_frozen_git_environment(
+        receipt.git_environment,
+        receipt.source_object_directory,
+    )
+
+
+def transport_fetch_command(
+    source_git_dir: Path,
+    receipt: TransportReceipt,
+    sha: str,
+    depth: int,
+) -> list[str]:
+    if source_git_dir != receipt.config_binding.path.parent:
+        raise PlanError("fetch transport receipt does not match the source gitdir")
+    config: list[str] = [
+        "-c",
+        "http.proxy=",
+        "-c",
+        "http.extraHeader=",
+        "-c",
+        "http.followRedirects=false",
+        "-c",
+        "core.gitProxy=",
+    ]
+    if receipt.ssh_command is not None:
+        config.extend(["-c", f"core.sshCommand={receipt.ssh_command}"])
+    return [
+        "git",
+        *config,
+        f"--git-dir={receipt.fetch_git_dir}",
+        "fetch",
+        "--depth",
+        str(depth),
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--no-write-fetch-head",
+        "--no-auto-maintenance",
+        "--no-write-commit-graph",
+        "--",
+        receipt.origin_url,
+        sha,
+    ]
+
+
 def fetch_missing_commit(
     source_git_dir: Path,
     work_tree: Path,
@@ -1677,19 +3955,30 @@ def fetch_missing_commit(
     sha: str,
     depth: int,
     dry_run: bool,
+    transport_receipt: Optional[TransportReceipt] = None,
     fetch_missing: bool = False,
 ) -> bool:
     if commit_exists(source_git_dir, work_tree, sha):
         return True
-    command = [
-        "git",
-        *source_object_repo_args(source_git_dir),
-        "fetch",
-        "--depth",
-        str(depth),
-        "origin",
-        sha,
-    ]
+    receipt = transport_receipt
+    if receipt is None and fetch_missing:
+        raise PlanError(
+            f"authorized fetch for {submodule.path} lacks a bound transport receipt"
+        )
+    command = (
+        transport_fetch_command(source_git_dir, receipt, sha, depth)
+        if receipt is not None
+        else [
+            "git",
+            *source_object_repo_args(source_git_dir),
+            "fetch",
+            "--depth",
+            str(depth),
+            "--",
+            submodule.url,
+            sha,
+        ]
+    )
     if not fetch_missing:
         raise PlanError(
             "\n".join(
@@ -1709,22 +3998,38 @@ def fetch_missing_commit(
     if dry_run:
         print(f"would fetch missing commit for {submodule.path}: {shell_join(command)}")
         return False
+    if receipt is None:
+        raise PlanError(
+            f"authorized fetch for {submodule.path} lacks a bound transport receipt"
+        )
+    revalidate_transport_receipt(receipt, submodule)
     print(
         f"fetch missing commit for {submodule.path}: {shell_join(command)}", flush=True
     )
-    result = run(command, check=False)
+    bounded_result = run_bounded_bytes(
+        command,
+        check=False,
+        timeout_seconds=GIT_ENUMERATION_TIMEOUT_SECONDS,
+        stdout_limit=GIT_ERROR_OUTPUT_LIMIT_BYTES,
+        stderr_limit=GIT_ERROR_OUTPUT_LIMIT_BYTES,
+        fixed_env=dict(receipt.git_environment),
+    )
+    result = subprocess.CompletedProcess(
+        args=bounded_result.args,
+        returncode=bounded_result.returncode,
+        stdout=os.fsdecode(bounded_result.stdout),
+        stderr=os.fsdecode(bounded_result.stderr),
+    )
     if result.returncode == 0 and commit_exists(source_git_dir, work_tree, sha):
+        install_post_fetch_shallow_state(receipt)
         return True
     stderr = (result.stderr or "").strip()
-    branch_fetch_command = [
-        "git",
-        *source_object_repo_args(source_git_dir),
-        "fetch",
-        "--depth",
-        "100",
-        "origin",
+    branch_fetch_command = transport_fetch_command(
+        source_git_dir,
+        receipt,
         "<branch-or-tag>",
-    ]
+        100,
+    )
     raise PlanError(
         "\n".join(
             [
@@ -2926,7 +5231,8 @@ def missing_commit_error(
         "fetch",
         "--depth",
         str(depth),
-        "origin",
+        "--",
+        submodule.url,
         sha,
     ]
     return PlanError(
@@ -2960,6 +5266,7 @@ def build_sync_plan(
     parent_source_git_dir: Optional[Path] = None,
     display_root: Optional[Path] = None,
     gitmodules_budget: Optional[GitmodulesReadBudget] = None,
+    input_receipt: Optional[PlanInputReceipt] = None,
 ) -> SyncPlan:
     root = root.resolve(strict=True)
     gitmodules_budget = gitmodules_budget or GitmodulesReadBudget.start()
@@ -3041,6 +5348,11 @@ def build_sync_plan(
             )
 
         needs_fetch = not commit_available
+        transport_receipt = (
+            capture_transport_receipt(source_git_dir, submodule)
+            if needs_fetch
+            else None
+        )
         source_bindings = tuple(source_access_bindings(source_git_dir, needs_fetch))
         target_bindings = tuple(target_access_bindings(target, state, source_git_dir))
         entry = PlannedWorktree(
@@ -3054,6 +5366,7 @@ def build_sync_plan(
             source_bindings=source_bindings,
             target_bindings=target_bindings,
             checkout_preflight=None,
+            transport_receipt=transport_receipt,
             needs_fetch=needs_fetch,
         )
         if commit_available:
@@ -3110,19 +5423,21 @@ def build_sync_plan(
         depth=depth,
         force_replace_empty=force_replace_empty,
         fetch_missing=fetch_missing,
+        input_receipt=input_receipt,
     )
 
 
 def fetch_command(entry: PlannedWorktree, depth: int) -> list[str]:
-    return [
-        "git",
-        *source_object_repo_args(entry.source_git_dir),
-        "fetch",
-        "--depth",
-        str(depth),
-        "origin",
+    if entry.transport_receipt is None:
+        raise PlanError(
+            f"planned fetch for {entry.submodule.path} lacks a transport receipt"
+        )
+    return transport_fetch_command(
+        entry.source_git_dir,
+        entry.transport_receipt,
         entry.sha,
-    ]
+        depth,
+    )
 
 
 def print_sync_plan(plan: SyncPlan) -> None:
@@ -3148,6 +5463,23 @@ def revalidate_runtime_source_access(entry: PlannedWorktree) -> None:
     for binding in entry.source_bindings:
         revalidate_access(binding)
     source_access_bindings(entry.source_git_dir, entry.needs_fetch)
+    if entry.needs_fetch:
+        if entry.transport_receipt is None:
+            raise PlanError(
+                f"planned fetch for {entry.submodule.path} lacks a transport receipt"
+            )
+        revalidate_transport_receipt(entry.transport_receipt, entry.submodule)
+
+
+def revalidate_plan_input_receipt(plan: SyncPlan) -> None:
+    receipt = getattr(plan, "input_receipt", None)
+    if receipt is None:
+        return
+    revalidate_file_content_binding(receipt.gitmodules_binding)
+    revalidate_superproject_index_receipt(
+        plan.root,
+        receipt.superproject_index,
+    )
 
 
 def revalidate_planned_entry(
@@ -3213,6 +5545,7 @@ def revalidate_planned_entry(
 
 
 def validate_sync_plan(plan: SyncPlan) -> None:
+    revalidate_plan_input_receipt(plan)
     for entry in plan.entries:
         revalidate_planned_entry(plan, entry)
 
@@ -3222,6 +5555,7 @@ def apply_sync_plan(plan: SyncPlan) -> None:
     for entry in plan.entries:
         if not entry.needs_fetch:
             continue
+        revalidate_plan_input_receipt(plan)
         revalidate_runtime_source_access(entry)
         fetch_missing_commit(
             entry.source_git_dir,
@@ -3230,6 +5564,7 @@ def apply_sync_plan(plan: SyncPlan) -> None:
             entry.sha,
             plan.depth,
             dry_run=False,
+            transport_receipt=getattr(entry, "transport_receipt", None),
             fetch_missing=True,
         )
         entry.needs_fetch = False
@@ -3243,6 +5578,7 @@ def apply_sync_plan(plan: SyncPlan) -> None:
 
     validate_sync_plan(plan)
     applied_indexes: set[int] = set()
+    first_mutation = True
     for index, entry in enumerate(plan.entries):
         target = revalidate_planned_entry(
             plan,
@@ -3251,6 +5587,9 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                 entry.parent_index is not None and entry.parent_index in applied_indexes
             ),
         )
+        if first_mutation:
+            revalidate_plan_input_receipt(plan)
+            first_mutation = False
         if entry.state == "managed":
             checkout_existing_worktree(target.path, entry.sha, dry_run=False)
         else:
@@ -3310,6 +5649,7 @@ def execute_sync_plan(
     dry_run: bool,
     fetch_missing: bool,
     gitmodules_budget: Optional[GitmodulesReadBudget] = None,
+    input_receipt: Optional[PlanInputReceipt] = None,
 ) -> None:
     print(f"preflight {len(planned_modules)} top-level submodule path(s)", flush=True)
     plan = build_sync_plan(
@@ -3323,6 +5663,7 @@ def execute_sync_plan(
         fetch_missing=fetch_missing,
         display_root=root,
         gitmodules_budget=gitmodules_budget,
+        input_receipt=input_receipt,
     )
     print_sync_plan(plan)
 
@@ -3480,12 +5821,28 @@ def main() -> int:
         args, root
     )
     gitmodules_budget = GitmodulesReadBudget.start()
+    all_modules, gitmodules_binding = capture_worktree_gitmodules(
+        root,
+        gitmodules_budget,
+    )
     modules = filter_submodules(
-        read_worktree_gitmodules(root, gitmodules_budget),
+        all_modules,
         args.paths,
         all_paths=args.all_paths,
     )
-    planned_modules = [(module, expected_sha(root, module.path)) for module in modules]
+    if gitmodules_binding is None:
+        raise PlanError("selected submodules require a bound top-level .gitmodules")
+    index_receipt = capture_superproject_index_receipt(
+        root,
+        tuple(module.path for module in modules),
+    )
+    sha_by_path = dict(index_receipt.selected_gitlinks)
+    planned_modules = [(module, sha_by_path[module.path]) for module in modules]
+    input_receipt = PlanInputReceipt(
+        gitmodules_binding=gitmodules_binding,
+        superproject_index=index_receipt,
+    )
+    revalidate_file_content_binding(gitmodules_binding)
     execute_sync_plan(
         root=root,
         common_git_dir=source_common_git_dir,
@@ -3497,6 +5854,7 @@ def main() -> int:
         dry_run=args.dry_run,
         fetch_missing=args.fetch_missing,
         gitmodules_budget=gitmodules_budget,
+        input_receipt=input_receipt,
     )
     return 0
 

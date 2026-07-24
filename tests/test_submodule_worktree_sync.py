@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import errno
 import os
 from pathlib import Path
 import shutil
@@ -110,6 +111,102 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             "origin",
         )
 
+    def make_shallow_install_receipt(
+        self,
+        *,
+        initial_content: bytes | None,
+        fetched_content: bytes,
+    ) -> MODULE.TransportReceipt:
+        source_shallow = self.named_source_git_dir / MODULE.SOURCE_SHALLOW_NAME
+        if initial_content is not None:
+            source_shallow.write_bytes(initial_content)
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        (receipt.fetch_git_dir / MODULE.SOURCE_SHALLOW_NAME).write_bytes(
+            fetched_content
+        )
+        self.addCleanup(receipt.fetch_guard.cleanup)
+        return receipt
+
+    def write_descriptor_relative_file(
+        self,
+        directory_descriptor: int,
+        name: str,
+        content: bytes,
+    ) -> None:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        try:
+            self.assertEqual(os.write(descriptor, content), len(content))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def make_target_superproject(
+        self,
+        name: str,
+        sha: str,
+        *,
+        module_name: str = "custom-lib",
+        module_path: str = "third_party/libexample",
+        url: str | None = None,
+    ) -> tuple[
+        Path,
+        MODULE.Submodule,
+        MODULE.PlanInputReceipt,
+    ]:
+        target = self.root / name
+        run_git(self.root, "init", str(target))
+        module = MODULE.Submodule(
+            module_name,
+            module_path,
+            url or str(self.remote),
+        )
+        (target / ".gitmodules").write_text(
+            "\n".join(
+                [
+                    f'[submodule "{module.name}"]',
+                    f"    path = {module.path}",
+                    f"    url = {module.url}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        run_git(target, "add", ".gitmodules")
+        run_git(
+            target,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{sha},{module.path}",
+        )
+        _, gitmodules_binding = MODULE.capture_worktree_gitmodules(target)
+        self.assertIsNotNone(gitmodules_binding)
+        index_receipt = MODULE.capture_superproject_index_receipt(
+            target,
+            (module.path,),
+        )
+        return (
+            target,
+            module,
+            MODULE.PlanInputReceipt(
+                gitmodules_binding=gitmodules_binding,
+                superproject_index=index_receipt,
+            ),
+        )
+
     def add_managed_worktree(
         self,
         source_git_dir: Path,
@@ -204,6 +301,363 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertIn("core.hooksPath=/dev/null", command)
         self.assertIn("credential.helper=", command)
         self.assertIn("core.excludesFile=/dev/null", command)
+
+    def test_fetch_transport_rejects_adversarial_source_config(self) -> None:
+        cases = (
+            ("include.path", str(self.root / "included-config")),
+            ("includeIf.gitdir:/tmp/.path", str(self.root / "conditional-config")),
+            ("core.sshCommand", "sh -c 'touch attacker-marker'"),
+            ("core.gitProxy", "sh -c 'touch attacker-marker'"),
+            ("http.proxy", "https://proxy.example.invalid"),
+            ("http.extraHeader", "Authorization: attacker"),
+            ("credential.helper", "!sh -c 'touch attacker-marker'"),
+            (
+                "url.https://attacker.example.invalid/.insteadOf",
+                str(self.remote),
+            ),
+            ("remote.origin.uploadpack", "sh -c 'touch attacker-marker'"),
+            ("protocol.ext.allow", "always"),
+            ("extensions.worktreeConfig", "true"),
+            ("fetch.bundleURI", "https://attacker.example.invalid/bundle"),
+            ("fetch.bundleCreationToken", "attacker-token"),
+            ("transfer.bundleURI", "https://attacker.example.invalid/bundle"),
+            ("core.alternateRefsCommand", "sh -c 'touch attacker-marker'"),
+            ("ssh.variant", "simple"),
+        )
+        for index, (key, value) in enumerate(cases):
+            with self.subTest(key=key):
+                source = self.clone_named_source(f"unsafe-config-{index}")
+                run_git(
+                    self.root,
+                    f"--git-dir={source}",
+                    "config",
+                    "--add",
+                    key,
+                    value,
+                )
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "fetch-executable, credential, proxy, include, or URL-redirection",
+                ):
+                    MODULE.capture_transport_receipt(
+                        source,
+                        MODULE.Submodule(
+                            f"unsafe-config-{index}",
+                            f"third_party/unsafe-{index}",
+                            str(self.remote),
+                        ),
+                    )
+
+    def test_fetch_transport_requires_one_exact_approved_url(self) -> None:
+        source = self.clone_named_source("mismatched-origin")
+        run_git(
+            self.root,
+            f"--git-dir={source}",
+            "config",
+            "remote.origin.url",
+            str(self.root / "other-remote"),
+        )
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "does not match the task-approved",
+        ):
+            MODULE.capture_transport_receipt(
+                source,
+                MODULE.Submodule(
+                    "mismatched-origin",
+                    "third_party/mismatched-origin",
+                    str(self.remote),
+                ),
+            )
+
+        duplicate_source = self.clone_named_source("duplicate-origin")
+        run_git(
+            self.root,
+            f"--git-dir={duplicate_source}",
+            "config",
+            "--add",
+            "remote.origin.url",
+            str(self.remote),
+        )
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "exactly one remote.origin.url",
+        ):
+            MODULE.capture_transport_receipt(
+                duplicate_source,
+                MODULE.Submodule(
+                    "duplicate-origin",
+                    "third_party/duplicate-origin",
+                    str(self.remote),
+                ),
+            )
+
+    def test_fetch_transport_binding_allows_mtime_only_but_rejects_content_change(
+        self,
+    ) -> None:
+        source = self.clone_named_source("transport-content")
+        submodule = MODULE.Submodule(
+            "transport-content",
+            "third_party/transport-content",
+            str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(source, submodule)
+        config_path = source / "config"
+        config_stat = config_path.stat()
+        os.utime(
+            config_path,
+            ns=(
+                config_stat.st_atime_ns,
+                config_stat.st_mtime_ns + 1_000_000_000,
+            ),
+        )
+        MODULE.revalidate_transport_receipt(receipt, submodule)
+
+        content = config_path.read_bytes()
+        old = os.fsencode(str(self.remote))
+        replacement = old[:-1] + bytes([old[-1] ^ 1])
+        self.assertEqual(len(old), len(replacement))
+        self.assertIn(old, content)
+        config_path.write_bytes(content.replace(old, replacement, 1))
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "content changed after preflight",
+        ):
+            MODULE.revalidate_transport_receipt(receipt, submodule)
+
+    def test_fetch_transport_binding_rejects_config_object_replacement(self) -> None:
+        source = self.clone_named_source("transport-object")
+        submodule = MODULE.Submodule(
+            "transport-object",
+            "third_party/transport-object",
+            str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(source, submodule)
+        config_path = source / "config"
+        replacement = source / "config.replacement"
+        replacement.write_bytes(config_path.read_bytes())
+        replacement.chmod(config_path.stat().st_mode & 0o777)
+        os.replace(replacement, config_path)
+
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "object or access policy changed",
+        ):
+            MODULE.revalidate_transport_receipt(receipt, submodule)
+
+    def test_fetch_transport_binds_existing_and_absent_source_shallow_state(
+        self,
+    ) -> None:
+        existing_source = self.clone_named_source("transport-existing-shallow")
+        existing_shallow = existing_source / "shallow"
+        existing_shallow.write_text(f"{self.sha}\n", encoding="ascii")
+        existing_submodule = MODULE.Submodule(
+            "transport-existing-shallow",
+            "third_party/transport-existing-shallow",
+            str(self.remote),
+        )
+        existing_receipt = MODULE.capture_transport_receipt(
+            existing_source,
+            existing_submodule,
+        )
+        existing_shallow.write_text(f"{'f' * 40}\n", encoding="ascii")
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "content changed after preflight",
+        ):
+            MODULE.revalidate_transport_receipt(
+                existing_receipt,
+                existing_submodule,
+            )
+
+        absent_source = self.clone_named_source("transport-absent-shallow")
+        absent_submodule = MODULE.Submodule(
+            "transport-absent-shallow",
+            "third_party/transport-absent-shallow",
+            str(self.remote),
+        )
+        absent_receipt = MODULE.capture_transport_receipt(
+            absent_source,
+            absent_submodule,
+        )
+        (absent_source / "shallow").write_text(f"{self.sha}\n", encoding="ascii")
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "appeared after preflight",
+        ):
+            MODULE.revalidate_transport_receipt(
+                absent_receipt,
+                absent_submodule,
+            )
+
+    def test_fetch_command_uses_exact_url_and_closed_transport_overrides(self) -> None:
+        submodule = MODULE.Submodule(
+            "custom-lib",
+            "third_party/libexample",
+            str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        command = MODULE.transport_fetch_command(
+            self.named_source_git_dir,
+            receipt,
+            self.sha,
+            1,
+        )
+
+        self.assertNotIn("origin", command)
+        self.assertEqual(command[-2:], [str(self.remote), self.sha])
+        self.assertIn("http.proxy=", command)
+        self.assertIn("http.extraHeader=", command)
+        self.assertIn("http.followRedirects=false", command)
+        self.assertIn("core.gitProxy=", command)
+        self.assertIn("--no-recurse-submodules", command)
+        self.assertIn("--no-write-fetch-head", command)
+        self.assertIn("--no-auto-maintenance", command)
+        self.assertIn("--no-write-commit-graph", command)
+        self.assertIn(f"--git-dir={receipt.fetch_git_dir}", command)
+        self.assertNotIn(
+            f"--git-dir={self.named_source_git_dir}",
+            command,
+        )
+        self.assertEqual(
+            dict(receipt.git_environment)["GIT_OBJECT_DIRECTORY"],
+            str(self.named_source_git_dir / "objects"),
+        )
+        self.assertEqual(
+            receipt.source_shallow_path,
+            self.named_source_git_dir / "shallow",
+        )
+        self.assertNotIn("GIT_SHALLOW_FILE", dict(receipt.git_environment))
+
+    def test_fetch_child_never_rereads_source_config_after_final_revalidation(
+        self,
+    ) -> None:
+        submodule = MODULE.Submodule(
+            "custom-lib",
+            "third_party/libexample",
+            str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        config_path = self.named_source_git_dir / "config"
+        original_revalidate = MODULE.revalidate_transport_receipt
+
+        def revalidate_then_poison(*args: object, **kwargs: object) -> None:
+            original_revalidate(*args, **kwargs)
+            with config_path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    "\n[fetch]\n\tbundleURI = https://attacker.example.invalid/bundle\n"
+                )
+
+        failed_fetch = subprocess.CompletedProcess(
+            ["git"],
+            1,
+            stdout=b"",
+            stderr=b"blocked test fetch",
+        )
+        with mock.patch.object(
+            MODULE,
+            "revalidate_transport_receipt",
+            side_effect=revalidate_then_poison,
+        ):
+            with mock.patch.object(
+                MODULE,
+                "run_bounded_bytes",
+                return_value=failed_fetch,
+            ) as bounded_fetch:
+                with redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        MODULE.PlanError,
+                        "failed to shallow-fetch",
+                    ):
+                        MODULE.fetch_missing_commit(
+                            self.named_source_git_dir,
+                            self.root / "target",
+                            submodule,
+                            "f" * 40,
+                            1,
+                            dry_run=False,
+                            transport_receipt=receipt,
+                            fetch_missing=True,
+                        )
+
+        command = bounded_fetch.call_args.args[0]
+        self.assertIn(f"--git-dir={receipt.fetch_git_dir}", command)
+        self.assertNotIn(
+            f"--git-dir={self.named_source_git_dir}",
+            command,
+        )
+        self.assertEqual(
+            bounded_fetch.call_args.kwargs["fixed_env"]["GIT_OBJECT_DIRECTORY"],
+            str(self.named_source_git_dir / "objects"),
+        )
+
+    def test_authorized_fetch_uses_the_plan_frozen_closed_environment(self) -> None:
+        submodule = MODULE.Submodule(
+            "custom-lib",
+            "third_party/libexample",
+            str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        failed_fetch = subprocess.CompletedProcess(
+            ["git"],
+            1,
+            stdout=b"",
+            stderr=b"blocked test fetch",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(self.root / "attacker-home"),
+                "GIT_SSH_COMMAND": "sh -c 'touch attacker-marker'",
+                "HTTPS_PROXY": "https://attacker.example.invalid",
+            },
+            clear=False,
+        ):
+            with mock.patch.object(
+                MODULE,
+                "run_bounded_bytes",
+                return_value=failed_fetch,
+            ) as bounded_fetch:
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "failed to shallow-fetch",
+                ):
+                    MODULE.fetch_missing_commit(
+                        self.named_source_git_dir,
+                        self.root / "target",
+                        submodule,
+                        "f" * 40,
+                        1,
+                        dry_run=False,
+                        transport_receipt=receipt,
+                        fetch_missing=True,
+                    )
+
+        self.assertEqual(
+            bounded_fetch.call_args.kwargs["fixed_env"],
+            dict(receipt.git_environment),
+        )
+        self.assertNotEqual(
+            bounded_fetch.call_args.kwargs["fixed_env"].get("HOME"),
+            str(self.root / "attacker-home"),
+        )
+        self.assertNotIn(
+            "GIT_SSH_COMMAND",
+            bounded_fetch.call_args.kwargs["fixed_env"],
+        )
+        self.assertNotIn(
+            "HTTPS_PROXY",
+            bounded_fetch.call_args.kwargs["fixed_env"],
+        )
 
     def test_old_git_is_rejected_before_the_first_repository_command(self) -> None:
         actual_git = MODULE.git_runtime().executable
@@ -770,6 +1224,141 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         finally:
             MODULE.git = original_git
 
+    def test_superproject_index_receipt_binds_identity_content_and_gitlink_rows(
+        self,
+    ) -> None:
+        target, module, receipt = self.make_target_superproject(
+            "index-receipt-target",
+            self.sha,
+        )
+        index_receipt = receipt.superproject_index
+        self.assertEqual(
+            index_receipt.selected_gitlinks,
+            ((module.path, self.sha),),
+        )
+        index_path = index_receipt.index_bindings[0].path
+        index_stat = index_path.stat()
+        os.utime(
+            index_path,
+            ns=(
+                index_stat.st_atime_ns,
+                index_stat.st_mtime_ns + 1_000_000_000,
+            ),
+        )
+        MODULE.revalidate_superproject_index_receipt(
+            target,
+            index_receipt,
+        )
+
+        run_git(
+            target,
+            "update-index",
+            "--cacheinfo",
+            f"160000,{'f' * 40},{module.path}",
+        )
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "superproject index.*changed|selected superproject gitlink rows changed",
+        ):
+            MODULE.revalidate_superproject_index_receipt(
+                target,
+                index_receipt,
+            )
+
+    def test_superproject_index_receipt_rejects_same_content_object_replacement(
+        self,
+    ) -> None:
+        target, _, receipt = self.make_target_superproject(
+            "index-replacement-target",
+            self.sha,
+        )
+        index_binding = receipt.superproject_index.index_bindings[0]
+        replacement = index_binding.path.with_name("index.replacement")
+        replacement.write_bytes(index_binding.path.read_bytes())
+        replacement.chmod(index_binding.fingerprint.permissions)
+        os.replace(replacement, index_binding.path)
+
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "object or access policy changed",
+        ):
+            MODULE.revalidate_superproject_index_receipt(
+                target,
+                receipt.superproject_index,
+            )
+
+    def test_index_drift_blocks_authorized_fetch_before_source_mutation(self) -> None:
+        (self.remote / "INDEX-FETCH.md").write_text(
+            "index fetch\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "INDEX-FETCH.md")
+        run_git(self.remote, "commit", "-m", "index fetch")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        target, module, input_receipt = self.make_target_superproject(
+            "index-fetch-target",
+            missing_sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, missing_sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=True,
+            input_receipt=input_receipt,
+        )
+        run_git(
+            target,
+            "update-index",
+            "--cacheinfo",
+            f"160000,{self.sha},{module.path}",
+        )
+        with mock.patch.object(MODULE, "fetch_missing_commit") as fetch:
+            with mock.patch.object(MODULE, "add_worktree") as add:
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "superproject index.*changed|selected superproject gitlink rows changed",
+                ):
+                    MODULE.apply_sync_plan(plan)
+        fetch.assert_not_called()
+        add.assert_not_called()
+        self.assertFalse(
+            MODULE.commit_exists(
+                self.named_source_git_dir,
+                target / module.path,
+                missing_sha,
+            )
+        )
+
+    def test_index_drift_blocks_first_worktree_mutation(self) -> None:
+        target, module, input_receipt = self.make_target_superproject(
+            "index-mutation-target",
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        (target / "unrelated.txt").write_text("drift\n", encoding="utf-8")
+        run_git(target, "add", "unrelated.txt")
+        with mock.patch.object(MODULE, "add_worktree") as add:
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "superproject index.*changed",
+            ):
+                MODULE.apply_sync_plan(plan)
+        add.assert_not_called()
+
     def test_default_common_git_dir_does_not_suggest_target_submodule_update(
         self,
     ) -> None:
@@ -904,7 +1493,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             with mock.patch.object(
                 MODULE,
                 "local_git_bool",
-                side_effect=[True, False],
+                return_value=False,
             ):
                 with mock.patch.object(
                     MODULE,
@@ -916,7 +1505,12 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         "linux_directory_casefold",
                         return_value=False,
                     ):
-                        policy = MODULE.filesystem_name_policy(target_root)
+                        with mock.patch.object(
+                            MODULE,
+                            "linux_filesystem_magic",
+                            return_value=0xEF53,
+                        ):
+                            policy = MODULE.filesystem_name_policy(target_root)
 
         self.assertTrue(policy.case_sensitive)
         self.assertEqual(policy.normalization, "exact")
@@ -929,7 +1523,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             with mock.patch.object(
                 MODULE,
                 "local_git_bool",
-                side_effect=[False, False],
+                return_value=False,
             ):
                 with mock.patch.object(
                     MODULE,
@@ -941,7 +1535,12 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         "linux_directory_casefold",
                         return_value=False,
                     ):
-                        policy = MODULE.filesystem_name_policy(target_root)
+                        with mock.patch.object(
+                            MODULE,
+                            "linux_filesystem_magic",
+                            return_value=0xEF53,
+                        ):
+                            policy = MODULE.filesystem_name_policy(target_root)
 
         self.assertFalse(policy.case_sensitive)
         self.assertEqual(policy.normalization, "exact")
@@ -1011,7 +1610,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             with mock.patch.object(
                 MODULE,
                 "local_git_bool",
-                side_effect=[False, False],
+                return_value=False,
             ):
                 with mock.patch.object(
                     MODULE,
@@ -1023,10 +1622,334 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         "linux_directory_casefold",
                         return_value=True,
                     ):
-                        policy = MODULE.filesystem_name_policy(target_root)
+                        with mock.patch.object(
+                            MODULE,
+                            "linux_filesystem_magic",
+                            return_value=0xEF53,
+                        ):
+                            policy = MODULE.filesystem_name_policy(target_root)
 
         self.assertFalse(policy.case_sensitive)
         self.assertEqual(policy.normalization, "NFD")
+
+    def test_empty_linux_known_sensitive_filesystem_uses_statfs_and_flags(
+        self,
+    ) -> None:
+        target_root = self.root / "empty-linux-ext4-target"
+        target_root.mkdir()
+        with mock.patch.object(MODULE.sys, "platform", "linux"):
+            with mock.patch.object(
+                MODULE,
+                "local_git_bool",
+                return_value=False,
+            ):
+                with mock.patch.object(
+                    MODULE,
+                    "probe_directory_case_sensitive",
+                    return_value=None,
+                ):
+                    with mock.patch.object(
+                        MODULE,
+                        "linux_directory_casefold",
+                        return_value=False,
+                    ):
+                        with mock.patch.object(
+                            MODULE,
+                            "linux_filesystem_magic",
+                            return_value=0xEF53,
+                        ):
+                            policy = MODULE.filesystem_name_policy(target_root)
+
+        self.assertTrue(policy.case_sensitive)
+        self.assertIn("linux-statfs-and-directory-flags", policy.source)
+
+    def test_empty_linux_overlayfs_case_policy_fails_closed(self) -> None:
+        target_root = self.root / "empty-linux-overlay-target"
+        target_root.mkdir()
+        with mock.patch.object(MODULE.sys, "platform", "linux"):
+            with mock.patch.object(
+                MODULE,
+                "local_git_bool",
+                return_value=False,
+            ):
+                with mock.patch.object(
+                    MODULE,
+                    "probe_directory_case_sensitive",
+                    return_value=None,
+                ):
+                    with mock.patch.object(
+                        MODULE,
+                        "linux_directory_casefold",
+                        return_value=False,
+                    ):
+                        with mock.patch.object(
+                            MODULE,
+                            "linux_filesystem_magic",
+                            return_value=0x794C7630,
+                        ):
+                            with self.assertRaisesRegex(
+                                MODULE.PlanError,
+                                "cannot determine target directory case semantics",
+                            ):
+                                MODULE.filesystem_name_policy(target_root)
+
+    def test_nonempty_linux_overlayfs_ignores_positive_lookup_probe(self) -> None:
+        target_root = self.root / "nonempty-linux-overlay-target"
+        target_root.mkdir()
+        (target_root / "Alpha").write_text("alpha\n", encoding="utf-8")
+        with mock.patch.object(MODULE.sys, "platform", "linux"):
+            with mock.patch.object(MODULE, "local_git_bool", return_value=False):
+                with mock.patch.object(
+                    MODULE,
+                    "probe_directory_case_sensitive",
+                    return_value=True,
+                ):
+                    with mock.patch.object(
+                        MODULE,
+                        "linux_directory_casefold",
+                        return_value=False,
+                    ):
+                        with mock.patch.object(
+                            MODULE,
+                            "linux_filesystem_magic",
+                            return_value=MODULE.LINUX_OVERLAYFS_MAGIC,
+                        ):
+                            with self.assertRaisesRegex(
+                                MODULE.PlanError,
+                                "OverlayFS merged-directory lookup",
+                            ):
+                                MODULE.filesystem_name_policy(target_root)
+
+    def test_empty_linux_xfs_case_policy_fails_closed(self) -> None:
+        target_root = self.root / "empty-linux-xfs-target"
+        target_root.mkdir()
+        with mock.patch.object(MODULE.sys, "platform", "linux"):
+            with mock.patch.object(MODULE, "local_git_bool", return_value=False):
+                with mock.patch.object(
+                    MODULE,
+                    "probe_directory_case_sensitive",
+                    return_value=None,
+                ):
+                    with mock.patch.object(
+                        MODULE,
+                        "linux_directory_casefold",
+                        return_value=False,
+                    ):
+                        with mock.patch.object(
+                            MODULE,
+                            "linux_filesystem_magic",
+                            return_value=0x58465342,
+                        ):
+                            with self.assertRaisesRegex(
+                                MODULE.PlanError,
+                                "cannot determine target directory case semantics",
+                            ):
+                                MODULE.filesystem_name_policy(target_root)
+
+    def test_linux_name_policy_uses_one_bound_directory_descriptor(self) -> None:
+        target_root = self.root / "single-descriptor-linux-target"
+        target_root.mkdir()
+        descriptors: list[int] = []
+
+        def record_probe(path: Path, descriptor: object = None) -> None:
+            self.assertEqual(path, target_root.resolve())
+            self.assertIsInstance(descriptor, int)
+            descriptors.append(descriptor)
+            return None
+
+        def record_casefold(path: Path, descriptor: object = None) -> bool:
+            self.assertEqual(path, target_root.resolve())
+            self.assertIsInstance(descriptor, int)
+            descriptors.append(descriptor)
+            return False
+
+        def record_magic(path: Path, descriptor: object = None) -> int:
+            self.assertEqual(path, target_root.resolve())
+            self.assertIsInstance(descriptor, int)
+            descriptors.append(descriptor)
+            return 0xEF53
+
+        with mock.patch.object(MODULE.sys, "platform", "linux"):
+            with mock.patch.object(MODULE, "local_git_bool", return_value=False):
+                with mock.patch.object(
+                    MODULE,
+                    "probe_directory_case_sensitive",
+                    side_effect=record_probe,
+                ):
+                    with mock.patch.object(
+                        MODULE,
+                        "linux_directory_casefold",
+                        side_effect=record_casefold,
+                    ):
+                        with mock.patch.object(
+                            MODULE,
+                            "linux_filesystem_magic",
+                            side_effect=record_magic,
+                        ):
+                            MODULE.filesystem_name_policy(target_root)
+
+        self.assertEqual(len(descriptors), 3)
+        self.assertEqual(len(set(descriptors)), 1)
+
+    def test_case_probe_fails_closed_when_bound_entry_disappears(self) -> None:
+        target_root = self.root / "case-probe-entry-deleted"
+        target_root.mkdir()
+        (target_root / "Alpha").write_text("alpha\n", encoding="utf-8")
+        real_stat = MODULE.os.stat
+        original_reads = 0
+
+        def unstable_stat(path: object, *args: object, **kwargs: object) -> object:
+            nonlocal original_reads
+            if path == "Alpha" and kwargs.get("dir_fd") is not None:
+                original_reads += 1
+                if original_reads == 2:
+                    raise FileNotFoundError(path)
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(MODULE.os, "stat", side_effect=unstable_stat):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "probe entry became unavailable",
+            ):
+                MODULE.probe_directory_case_sensitive(target_root)
+
+    def test_case_probe_fails_closed_when_bound_entry_is_replaced(self) -> None:
+        target_root = self.root / "case-probe-entry-replaced"
+        target_root.mkdir()
+        (target_root / "Alpha").write_text("alpha\n", encoding="utf-8")
+        replacement = self.root / "case-probe-replacement-object"
+        replacement.write_text("replacement\n", encoding="utf-8")
+        real_stat = MODULE.os.stat
+        replacement_stat = real_stat(replacement, follow_symlinks=False)
+        original_reads = 0
+
+        def unstable_stat(path: object, *args: object, **kwargs: object) -> object:
+            nonlocal original_reads
+            if path == "Alpha" and kwargs.get("dir_fd") is not None:
+                original_reads += 1
+                if original_reads == 2:
+                    return replacement_stat
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(MODULE.os, "stat", side_effect=unstable_stat):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "probe entry changed identity",
+            ):
+                MODULE.probe_directory_case_sensitive(target_root)
+
+    def test_case_probe_treats_distinct_same_inode_dirents_as_hardlinks(self) -> None:
+        target_root = self.root / "case-probe-hardlinks"
+        target_root.mkdir()
+        backing = target_root / "backing"
+        backing.write_text("same inode\n", encoding="utf-8")
+        backing_stat = os.stat(backing, follow_symlinks=False)
+        scanned = mock.MagicMock()
+        scanned.__enter__.return_value = iter(
+            [
+                SimpleNamespace(name="Alpha"),
+                SimpleNamespace(name="alpha"),
+            ]
+        )
+        scanned.__exit__.return_value = False
+
+        with mock.patch.object(MODULE.os, "scandir", return_value=scanned):
+            with mock.patch.object(MODULE.os, "stat", return_value=backing_stat):
+                self.assertTrue(MODULE.probe_directory_case_sensitive(target_root))
+
+    def test_name_policy_evidence_source_change_preserves_same_semantics(
+        self,
+    ) -> None:
+        target_root = self.root / "policy-source-transition"
+        target_root.mkdir()
+        bound = MODULE.bind_target_path(
+            target_root,
+            ("missing",),
+            "policy source transition",
+            MODULE.FilesystemNamePolicy(
+                case_sensitive=True,
+                normalization="exact",
+                source="initial-statfs-evidence",
+            ),
+        )
+        with mock.patch.object(
+            MODULE,
+            "filesystem_name_policy",
+            return_value=MODULE.FilesystemNamePolicy(
+                case_sensitive=True,
+                normalization="exact",
+                source="later-directory-entry-evidence",
+            ),
+        ):
+            MODULE.revalidate_bound_target(bound)
+
+    def test_empty_linux_unknown_case_policy_blocks_before_any_mutation(self) -> None:
+        target_root = self.root / "empty-linux-cifs-like-target"
+        target_root.mkdir()
+        with mock.patch.object(MODULE.sys, "platform", "linux"):
+            with mock.patch.object(
+                MODULE,
+                "local_git_bool",
+                return_value=False,
+            ):
+                with mock.patch.object(
+                    MODULE,
+                    "probe_directory_case_sensitive",
+                    return_value=None,
+                ):
+                    with mock.patch.object(
+                        MODULE,
+                        "linux_directory_casefold",
+                        return_value=None,
+                    ):
+                        with mock.patch.object(
+                            MODULE,
+                            "linux_filesystem_magic",
+                            return_value=0xFF534D42,
+                        ):
+                            with mock.patch.object(
+                                MODULE,
+                                "fetch_missing_commit",
+                            ) as fetch:
+                                with mock.patch.object(
+                                    MODULE,
+                                    "add_worktree",
+                                ) as add:
+                                    with self.assertRaisesRegex(
+                                        MODULE.PlanError,
+                                        "cannot determine target directory case "
+                                        "semantics without mutation",
+                                    ):
+                                        MODULE.execute_sync_plan(
+                                            root=target_root,
+                                            common_git_dir=self.named_common_git_dir,
+                                            source_superproject=None,
+                                            planned_modules=[
+                                                (
+                                                    MODULE.Submodule(
+                                                        "custom-lib",
+                                                        "Foo",
+                                                        str(self.remote),
+                                                    ),
+                                                    self.sha,
+                                                ),
+                                                (
+                                                    MODULE.Submodule(
+                                                        "case-second",
+                                                        "foo",
+                                                        str(self.remote),
+                                                    ),
+                                                    self.sha,
+                                                ),
+                                            ],
+                                            depth=1,
+                                            recursive=False,
+                                            force_replace_empty=False,
+                                            dry_run=False,
+                                            fetch_missing=False,
+                                        )
+        fetch.assert_not_called()
+        add.assert_not_called()
 
     def test_darwin_canonical_unicode_is_filesystem_derived_when_precompose_false(
         self,
@@ -1038,7 +1961,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             with mock.patch.object(
                 MODULE,
                 "local_git_bool",
-                side_effect=[False, False],
+                return_value=False,
             ):
                 with mock.patch.object(
                     MODULE,
@@ -2498,6 +3421,10 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             path="third_party/libexample",
             url=str(self.remote),
         )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
 
         with redirect_stdout(io.StringIO()):
             self.assertTrue(
@@ -2508,6 +3435,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     second_sha,
                     1,
                     dry_run=False,
+                    transport_receipt=receipt,
                     fetch_missing=True,
                 )
             )
@@ -2517,6 +3445,391 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 self.root / "target-super" / "third_party" / "libexample",
                 second_sha,
             )
+        )
+
+    def test_authorized_fetch_updates_source_shallow_boundary_before_control_cleanup(
+        self,
+    ) -> None:
+        (self.remote / "SECOND.md").write_text("second\n", encoding="utf-8")
+        run_git(self.remote, "add", "SECOND.md")
+        run_git(self.remote, "commit", "-m", "second")
+        second_sha = run_git(self.remote, "rev-parse", "HEAD")
+
+        shallow_source = self.named_common_git_dir / "modules" / "shallow-custom-lib"
+        shallow_source.parent.mkdir(parents=True, exist_ok=True)
+        remote_url = self.remote.as_uri()
+        run_git(
+            self.root,
+            "clone",
+            "--depth",
+            "1",
+            "--separate-git-dir",
+            str(shallow_source),
+            remote_url,
+            str(self.root / "shallow-standard"),
+        )
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={shallow_source}",
+                "rev-parse",
+                "--is-shallow-repository",
+            ),
+            "true",
+        )
+        self.assertIn(second_sha, (shallow_source / "shallow").read_text())
+
+        (self.remote / "THIRD.md").write_text("third\n", encoding="utf-8")
+        run_git(self.remote, "add", "THIRD.md")
+        run_git(self.remote, "commit", "-m", "third")
+        third_sha = run_git(self.remote, "rev-parse", "HEAD")
+        submodule = MODULE.Submodule(
+            name="shallow-custom-lib",
+            path="third_party/shallow-libexample",
+            url=remote_url,
+        )
+        receipt = MODULE.capture_transport_receipt(
+            shallow_source,
+            submodule,
+        )
+        self.assertIsNone(receipt.ssh_command)
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(
+                MODULE.fetch_missing_commit(
+                    shallow_source,
+                    self.root / "shallow-fetched-worktree",
+                    submodule,
+                    third_sha,
+                    1,
+                    dry_run=False,
+                    transport_receipt=receipt,
+                    fetch_missing=True,
+                )
+            )
+        self.assertIn(third_sha, (shallow_source / "shallow").read_text())
+
+        receipt.fetch_guard.cleanup()
+        self.assertFalse(receipt.fetch_git_dir.exists())
+        MODULE.add_worktree(
+            shallow_source,
+            self.root / "shallow-fetched-worktree",
+            third_sha,
+            dry_run=False,
+        )
+        run_git(
+            self.root,
+            f"--git-dir={shallow_source}",
+            "fsck",
+            "--full",
+        )
+
+    def test_shallow_install_holds_parent_descriptor_across_path_replace_restore(
+        self,
+    ) -> None:
+        fetched = b"f" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=None,
+            fetched_content=fetched,
+        )
+        source_git_dir = receipt.source_shallow_parent_binding.path
+        moved_git_dir = source_git_dir.with_name(f"{source_git_dir.name}-moved")
+        substitute_entries: set[str] = set()
+        original_noreplace = MODULE.descriptor_atomic_rename_noreplace
+
+        def replace_restore_then_publish(
+            directory_descriptor: int,
+            source_name: str,
+            target_name: str,
+        ) -> None:
+            nonlocal substitute_entries
+            os.rename(source_git_dir, moved_git_dir)
+            source_git_dir.mkdir()
+            (source_git_dir / "substitute-sentinel").write_text(
+                "substitute\n",
+                encoding="utf-8",
+            )
+            try:
+                original_noreplace(
+                    directory_descriptor,
+                    source_name,
+                    target_name,
+                )
+                substitute_entries = {entry.name for entry in source_git_dir.iterdir()}
+            finally:
+                shutil.rmtree(source_git_dir)
+                os.rename(moved_git_dir, source_git_dir)
+
+        with mock.patch.object(
+            MODULE,
+            "descriptor_atomic_rename_noreplace",
+            side_effect=replace_restore_then_publish,
+        ):
+            MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertEqual(substitute_entries, {"substitute-sentinel"})
+        self.assertEqual(
+            (source_git_dir / MODULE.SOURCE_SHALLOW_NAME).read_bytes(),
+            fetched,
+        )
+        self.assertFalse((source_git_dir / MODULE.SOURCE_SHALLOW_LOCK_NAME).exists())
+
+    def test_shallow_install_existing_racer_is_swapped_back_with_fence(
+        self,
+    ) -> None:
+        initial = b"1" * 40 + b"\n"
+        fetched = b"2" * 40 + b"\n"
+        racer = b"3" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=initial,
+            fetched_content=fetched,
+        )
+        original_exchange = MODULE.descriptor_atomic_rename_exchange
+        exchange_calls = 0
+
+        def race_then_exchange(
+            directory_descriptor: int,
+            first_name: str,
+            second_name: str,
+        ) -> None:
+            nonlocal exchange_calls
+            exchange_calls += 1
+            if exchange_calls == 1:
+                self.write_descriptor_relative_file(
+                    directory_descriptor,
+                    "racing-shallow",
+                    racer,
+                )
+                os.rename(
+                    "racing-shallow",
+                    MODULE.SOURCE_SHALLOW_NAME,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                )
+            original_exchange(
+                directory_descriptor,
+                first_name,
+                second_name,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "descriptor_atomic_rename_exchange",
+            side_effect=race_then_exchange,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                '"state":"rolled-back-fence-retained"',
+            ):
+                MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertEqual(exchange_calls, 2)
+        self.assertEqual(receipt.source_shallow_path.read_bytes(), racer)
+        self.assertEqual(
+            receipt.source_shallow_path.with_name(
+                MODULE.SOURCE_SHALLOW_LOCK_NAME
+            ).read_bytes(),
+            fetched,
+        )
+
+    def test_shallow_install_absent_racer_uses_no_replace_and_retains_fence(
+        self,
+    ) -> None:
+        fetched = b"4" * 40 + b"\n"
+        racer = b"5" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=None,
+            fetched_content=fetched,
+        )
+        original_noreplace = MODULE.descriptor_atomic_rename_noreplace
+
+        def race_then_publish(
+            directory_descriptor: int,
+            source_name: str,
+            target_name: str,
+        ) -> None:
+            self.write_descriptor_relative_file(
+                directory_descriptor,
+                MODULE.SOURCE_SHALLOW_NAME,
+                racer,
+            )
+            original_noreplace(
+                directory_descriptor,
+                source_name,
+                target_name,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "descriptor_atomic_rename_noreplace",
+            side_effect=race_then_publish,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                '"state":"cas-conflict-fence-retained"',
+            ):
+                MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertEqual(receipt.source_shallow_path.read_bytes(), racer)
+        self.assertEqual(
+            receipt.source_shallow_path.with_name(
+                MODULE.SOURCE_SHALLOW_LOCK_NAME
+            ).read_bytes(),
+            fetched,
+        )
+
+    def test_shallow_install_rollback_failure_retains_both_recovery_objects(
+        self,
+    ) -> None:
+        initial = b"6" * 40 + b"\n"
+        fetched = b"7" * 40 + b"\n"
+        racer = b"8" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=initial,
+            fetched_content=fetched,
+        )
+        original_exchange = MODULE.descriptor_atomic_rename_exchange
+        exchange_calls = 0
+
+        def fail_rollback(
+            directory_descriptor: int,
+            first_name: str,
+            second_name: str,
+        ) -> None:
+            nonlocal exchange_calls
+            exchange_calls += 1
+            if exchange_calls == 1:
+                self.write_descriptor_relative_file(
+                    directory_descriptor,
+                    "racing-shallow",
+                    racer,
+                )
+                os.rename(
+                    "racing-shallow",
+                    MODULE.SOURCE_SHALLOW_NAME,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                )
+                original_exchange(
+                    directory_descriptor,
+                    first_name,
+                    second_name,
+                )
+                return
+            raise MODULE.AtomicRenameError("exchange", errno.EIO)
+
+        with mock.patch.object(
+            MODULE,
+            "descriptor_atomic_rename_exchange",
+            side_effect=fail_rollback,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                '"state":"rollback-failed-fence-retained"',
+            ):
+                MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertEqual(exchange_calls, 2)
+        self.assertEqual(receipt.source_shallow_path.read_bytes(), fetched)
+        self.assertEqual(
+            receipt.source_shallow_path.with_name(
+                MODULE.SOURCE_SHALLOW_LOCK_NAME
+            ).read_bytes(),
+            racer,
+        )
+
+    def test_shallow_install_unsupported_atomic_primitive_fails_closed(
+        self,
+    ) -> None:
+        fetched = b"9" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=None,
+            fetched_content=fetched,
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "descriptor_atomic_rename_noreplace",
+            side_effect=MODULE.AtomicRenameError("noreplace", errno.ENOSYS),
+        ):
+            with self.assertRaisesRegex(MODULE.PlanError, "unsupported"):
+                MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertFalse(receipt.source_shallow_path.exists())
+        self.assertFalse(
+            receipt.source_shallow_path.with_name(
+                MODULE.SOURCE_SHALLOW_LOCK_NAME
+            ).exists()
+        )
+
+    def test_shallow_install_unsupported_exchange_preserves_original(self) -> None:
+        initial = b"0" * 40 + b"\n"
+        fetched = b"e" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=initial,
+            fetched_content=fetched,
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "descriptor_atomic_rename_exchange",
+            side_effect=MODULE.AtomicRenameError(
+                "exchange",
+                errno.EOPNOTSUPP,
+            ),
+        ):
+            with self.assertRaisesRegex(MODULE.PlanError, "unsupported"):
+                MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertEqual(receipt.source_shallow_path.read_bytes(), initial)
+        self.assertFalse(
+            receipt.source_shallow_path.with_name(
+                MODULE.SOURCE_SHALLOW_LOCK_NAME
+            ).exists()
+        )
+
+    def test_shallow_install_preexisting_lock_blocks_without_mutation(self) -> None:
+        initial = b"a" * 40 + b"\n"
+        fetched = b"b" * 40 + b"\n"
+        preexisting_lock = b"existing-lock\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=initial,
+            fetched_content=fetched,
+        )
+        lock_path = receipt.source_shallow_path.with_name(
+            MODULE.SOURCE_SHALLOW_LOCK_NAME
+        )
+        lock_path.write_bytes(preexisting_lock)
+
+        with self.assertRaisesRegex(MODULE.PlanError, "lock already exists"):
+            MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertEqual(receipt.source_shallow_path.read_bytes(), initial)
+        self.assertEqual(lock_path.read_bytes(), preexisting_lock)
+
+    def test_shallow_install_accepts_mtime_only_source_change(self) -> None:
+        initial = b"c" * 40 + b"\n"
+        fetched = b"d" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=initial,
+            fetched_content=fetched,
+        )
+        before = receipt.source_shallow_path.stat()
+        os.utime(
+            receipt.source_shallow_path,
+            ns=(
+                before.st_atime_ns,
+                before.st_mtime_ns + 1_000_000_000,
+            ),
+        )
+
+        MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertEqual(receipt.source_shallow_path.read_bytes(), fetched)
+        self.assertFalse(
+            receipt.source_shallow_path.with_name(
+                MODULE.SOURCE_SHALLOW_LOCK_NAME
+            ).exists()
         )
 
     def test_recursive_missing_commit_never_fetches_before_complete_plan(self) -> None:
