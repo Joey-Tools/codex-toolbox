@@ -6575,6 +6575,339 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             )
         )
 
+    def assert_partial_admin_gitdir_preserved(
+        self,
+        scenario: str,
+        gitdir_content: bytes | None,
+    ) -> None:
+        target, module, input_receipt = self.make_target_superproject(
+            f"partial-admin-{scenario}",
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        entry = plan.entries[0]
+        final_target = target / module.path
+        created_parent = final_target.parent
+        partial_admin = entry.source_git_dir / "worktrees" / "half-created"
+        original_run = MODULE.run_git_at_directory_descriptor
+
+        def interrupt_with_partial_admin(
+            args: list[str],
+            directory_descriptor: int,
+            *,
+            extra_env: dict[str, str] | None = None,
+            directory_identity_leases: tuple[object, ...] = (),
+        ) -> subprocess.CompletedProcess[str]:
+            if "worktree" in args and "add" in args:
+                partial_admin.mkdir(parents=True)
+                (partial_admin / "HEAD").write_text(
+                    f"{self.sha}\n",
+                    encoding="ascii",
+                )
+                (partial_admin / "commondir").write_text(
+                    "../..\n",
+                    encoding="ascii",
+                )
+                if gitdir_content is not None:
+                    (partial_admin / "gitdir").write_bytes(gitdir_content)
+                raise MODULE.GitError(f"injected {scenario} gitdir interruption")
+            return original_run(
+                args,
+                directory_descriptor,
+                extra_env=extra_env,
+                directory_identity_leases=directory_identity_leases,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "run_git_at_directory_descriptor",
+            side_effect=interrupt_with_partial_admin,
+        ):
+            with self.assertRaises(MODULE.PlanError) as raised:
+                MODULE.apply_sync_plan(plan)
+
+        error = str(raised.exception)
+        self.assertIn(
+            "registration state is uncertain; preserving the target",
+            error,
+        )
+        self.assertIn("recovery_status: admin-entry-added", error)
+        self.assertIn(f"recovery_location: {partial_admin}", error)
+        self.assertTrue(final_target.is_dir())
+        self.assertTrue(created_parent.is_dir())
+        self.assertTrue(partial_admin.is_dir())
+        if gitdir_content is None:
+            self.assertFalse((partial_admin / "gitdir").exists())
+        else:
+            self.assertEqual(
+                (partial_admin / "gitdir").read_bytes(),
+                gitdir_content,
+            )
+        self.assertIsNone(
+            MODULE.registered_target_path(
+                entry.source_git_dir,
+                final_target,
+            )
+        )
+
+    def test_partial_admin_missing_gitdir_preserves_recovery_locator(
+        self,
+    ) -> None:
+        self.assert_partial_admin_gitdir_preserved("missing", None)
+
+    def test_partial_admin_invalid_gitdir_preserves_recovery_locator(
+        self,
+    ) -> None:
+        self.assert_partial_admin_gitdir_preserved("invalid", b"")
+
+    def test_known_admin_rollback_requires_exact_entry_absence(
+        self,
+    ) -> None:
+        target, module, input_receipt = self.make_target_superproject(
+            "rollback-admin-entry-reappears",
+            self.sha,
+        )
+        peer = self.root / "rollback-admin-entry-peer"
+        self.add_managed_worktree(
+            self.named_source_git_dir,
+            peer,
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        final_target = target / module.path
+        created_parent = final_target.parent
+        original_run = MODULE.run_git_at_directory_descriptor
+        recreated_admin: Path | None = None
+
+        def recreate_admin_after_remove(
+            args: list[str],
+            directory_descriptor: int,
+            *,
+            extra_env: dict[str, str] | None = None,
+            directory_identity_leases: tuple[object, ...] = (),
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal recreated_admin
+            if "worktree" in args and "remove" in args:
+                recreated_admin = MODULE.gitdir_file_target(final_target)
+                self.assertIsNotNone(recreated_admin)
+                result = original_run(
+                    args,
+                    directory_descriptor,
+                    extra_env=extra_env,
+                    directory_identity_leases=directory_identity_leases,
+                )
+                assert recreated_admin is not None
+                recreated_admin.mkdir()
+                return result
+            return original_run(
+                args,
+                directory_descriptor,
+                extra_env=extra_env,
+                directory_identity_leases=directory_identity_leases,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "postvalidate_applied_entry",
+                side_effect=MODULE.PlanError("injected finalization failure"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "run_git_at_directory_descriptor",
+                side_effect=recreate_admin_after_remove,
+            ),
+        ):
+            with self.assertRaises(MODULE.PlanError) as raised:
+                MODULE.apply_sync_plan(plan)
+
+        self.assertIsNotNone(recreated_admin)
+        assert recreated_admin is not None
+        error = str(raised.exception)
+        self.assertIn("recovery_status: admin-entry-still-present", error)
+        self.assertIn(f"recovery_location: {recreated_admin}", error)
+        self.assertFalse(final_target.exists())
+        self.assertTrue(created_parent.is_dir())
+        self.assertTrue(recreated_admin.is_dir())
+
+    def assert_unproven_admin_ownership_preserved(
+        self,
+        scenario: str,
+        *,
+        interrupt_after_add: bool,
+        expected_status: str,
+    ) -> None:
+        target, module, input_receipt = self.make_target_superproject(
+            f"{scenario}-control-unproven",
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        entry = plan.entries[0]
+        final_target = target / module.path
+        original_run = MODULE.run_git_at_directory_descriptor
+        remove_attempted = False
+
+        def interrupt_after_successful_add(
+            args: list[str],
+            directory_descriptor: int,
+            *,
+            extra_env: dict[str, str] | None = None,
+            directory_identity_leases: tuple[object, ...] = (),
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal remove_attempted
+            if "worktree" in args and "remove" in args:
+                remove_attempted = True
+            result = original_run(
+                args,
+                directory_descriptor,
+                extra_env=extra_env,
+                directory_identity_leases=directory_identity_leases,
+            )
+            if interrupt_after_add and "worktree" in args and "add" in args:
+                raise MODULE.GitError("injected post-add interruption")
+            return result
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "run_git_at_directory_descriptor",
+                side_effect=interrupt_after_successful_add,
+            ),
+            mock.patch.object(
+                MODULE,
+                "validate_expected_worktree_admin_add",
+                side_effect=MODULE.PlanError(
+                    "injected administration ownership proof failure"
+                ),
+            ) as validate_add,
+        ):
+            with self.assertRaises(MODULE.PlanError) as raised:
+                MODULE.apply_sync_plan(plan)
+
+        error = str(raised.exception)
+        self.assertIn(
+            "registration state is uncertain; preserving the target",
+            error,
+        )
+        self.assertIn(f"recovery_status: {expected_status}", error)
+        self.assertEqual(validate_add.call_count, 1)
+        self.assertFalse(remove_attempted)
+        self.assertTrue(final_target.is_dir())
+        self.assertTrue((final_target / ".git").is_file())
+        self.assertEqual(
+            MODULE.registered_target_path(
+                entry.source_git_dir,
+                final_target,
+            ),
+            final_target.resolve(strict=True),
+        )
+
+    def test_primary_control_without_admin_ownership_proof_is_preserved(
+        self,
+    ) -> None:
+        self.assert_unproven_admin_ownership_preserved(
+            "primary",
+            interrupt_after_add=False,
+            expected_status="admin-ownership-unproven",
+        )
+
+    def test_recovered_control_without_admin_ownership_proof_is_preserved(
+        self,
+    ) -> None:
+        self.assert_unproven_admin_ownership_preserved(
+            "recovered",
+            interrupt_after_add=True,
+            expected_status="admin-entry-added",
+        )
+
+    def test_expected_admin_add_binds_inventory_to_control_parent(
+        self,
+    ) -> None:
+        source = self.clone_named_source("admin-parent-binding")
+        target = self.root / "admin-parent-binding-target"
+        source_lease = MODULE.capture_directory_entry_lease(
+            source,
+            os.R_OK | os.W_OK | os.X_OK,
+            "selected source common gitdir",
+        )
+        target_descriptor = -1
+        control = None
+        try:
+            before = MODULE.capture_worktree_admin_inventory(
+                source,
+                source_lease,
+            )
+            self.add_managed_worktree(source, target, self.sha)
+            after = MODULE.capture_worktree_admin_inventory(
+                source,
+                source_lease,
+            )
+            target_descriptor = MODULE.open_directory_descriptor(
+                target,
+                "managed worktree target",
+            )
+            control = MODULE.capture_managed_control_receipt(
+                target,
+                source,
+                target_descriptor,
+            )
+            self.assertNotEqual(
+                after.root_fingerprint,
+                control.admin_lease.binding.fingerprint,
+            )
+            mismatched_after = MODULE.WorktreeAdminInventory(
+                source_fingerprint=after.source_fingerprint,
+                root_fingerprint=control.admin_lease.binding.fingerprint,
+                entries=after.entries,
+            )
+
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "different parent objects",
+            ):
+                MODULE.validate_expected_worktree_admin_add(
+                    source,
+                    before,
+                    mismatched_after,
+                    control,
+                )
+        finally:
+            if control is not None:
+                control.close()
+            if target_descriptor >= 0:
+                os.close(target_descriptor)
+            source_lease.close()
+
     def test_final_rollback_registry_query_drift_preserves_target_parent(
         self,
     ) -> None:

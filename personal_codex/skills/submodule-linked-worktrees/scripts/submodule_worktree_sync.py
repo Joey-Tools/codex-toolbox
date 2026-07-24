@@ -44,6 +44,9 @@ MAX_CHECKOUT_OBJECTS = 500_000
 MAX_CHECKOUT_LOGICAL_BYTES = 64 * 1024 * 1024 * 1024
 MAX_NAME_POLICY_PROBE_ENTRIES = 256
 MAX_REGISTERED_WORKTREE_FIELDS = 1_000_000
+MAX_WORKTREE_ADMIN_ENTRIES = 250_000
+MAX_WORKTREE_ADMIN_NAME_BYTES = 4096
+MAX_WORKTREE_ADMIN_NAMES_BYTES = 64 * 1024 * 1024
 MAX_PLANNED_WORKTREES = 250_000
 MAX_GIT_PATHSPEC_ARG_BYTES = 64 * 1024
 MAX_GIT_PATHSPECS_PER_BATCH = 1024
@@ -223,6 +226,27 @@ class TargetMaterializationCleanupError(PlanError):
         )
 
 
+class WorktreeRegistrationRecoveryError(PlanError):
+    def __init__(
+        self,
+        *,
+        status: str,
+        location: Path,
+        preserved_scope: str,
+        detail: str,
+    ) -> None:
+        self.status = status
+        self.location = location
+        super().__init__(
+            "worktree registration state is uncertain; preserving "
+            f"{preserved_scope} for recovery\n"
+            "  recovery_schema: worktree-registration-recovery-v1\n"
+            f"  recovery_status: {status}\n"
+            f"  recovery_location: {location}\n"
+            f"  recovery_detail: {detail}"
+        )
+
+
 @dataclass(frozen=True)
 class ExecutableState:
     fingerprint: FsFingerprint
@@ -389,6 +413,13 @@ class DirectoryEntryLease:
             raise PlanError(
                 f"directory-entry lease cleanup failed: {first_error}"
             ) from first_error
+
+
+@dataclass(frozen=True)
+class WorktreeAdminInventory:
+    source_fingerprint: FsFingerprint
+    root_fingerprint: Optional[FsFingerprint]
+    entries: tuple[tuple[bytes, FsFingerprint], ...]
 
 
 @dataclass
@@ -7548,6 +7579,324 @@ def revalidate_source_registry_lease(
     revalidate_directory_entry_lease(source_lease)
 
 
+def revalidate_worktree_admin_root_descriptor(
+    source_git_dir: Path,
+    source_lease: DirectoryEntryLease,
+    root_descriptor: int,
+    expected: FsFingerprint,
+) -> None:
+    """Keep raw registry reads on the source-lease-bound worktrees object."""
+
+    revalidate_source_registry_lease(source_git_dir, source_lease)
+    descriptor_fingerprint = fingerprint_from_stat(os.fstat(root_descriptor))
+    if descriptor_fingerprint != expected:
+        raise PlanError(
+            "source worktree administration descriptor object or access policy "
+            "changed\n"
+            f"  path: {source_git_dir / 'worktrees'}"
+        )
+    try:
+        entry_fingerprint = fingerprint_from_stat(
+            os.stat(
+                "worktrees",
+                dir_fd=source_lease.descriptor,
+                follow_symlinks=False,
+            )
+        )
+    except OSError as exc:
+        raise PlanError(
+            "cannot revalidate the source worktree administration directory\n"
+            f"  path: {source_git_dir / 'worktrees'}\n"
+            f"  error: {exc}"
+        ) from exc
+    if entry_fingerprint != expected:
+        raise PlanError(
+            "source worktree administration directory entry changed\n"
+            f"  path: {source_git_dir / 'worktrees'}"
+        )
+    if not probe_access_at(root_descriptor, ".", os.R_OK | os.X_OK):
+        raise PlanError(
+            "source worktree administration access policy now denies inventory "
+            "reads\n"
+            f"  path: {source_git_dir / 'worktrees'}"
+        )
+    revalidate_source_registry_lease(source_git_dir, source_lease)
+
+
+def worktree_admin_entries_at(
+    root_descriptor: int,
+    root_path: Path,
+) -> tuple[tuple[bytes, FsFingerprint], ...]:
+    """Inventory raw direct children without treating their internal churn as drift."""
+
+    entries: list[tuple[bytes, FsFingerprint]] = []
+    retained_name_bytes = 0
+    try:
+        with os.scandir(root_descriptor) as iterator:
+            for entry in iterator:
+                if len(entries) >= MAX_WORKTREE_ADMIN_ENTRIES:
+                    raise PlanError(
+                        "source worktree administration inventory exceeds the "
+                        f"{MAX_WORKTREE_ADMIN_ENTRIES}-entry limit"
+                    )
+                raw_name = validate_descriptor_entry_name(entry.name)
+                if len(raw_name) > MAX_WORKTREE_ADMIN_NAME_BYTES:
+                    raise PlanError(
+                        "source worktree administration inventory contains an "
+                        "oversized entry name"
+                    )
+                retained_name_bytes += len(raw_name)
+                if retained_name_bytes > MAX_WORKTREE_ADMIN_NAMES_BYTES:
+                    raise PlanError(
+                        "source worktree administration inventory exceeds the "
+                        f"{MAX_WORKTREE_ADMIN_NAMES_BYTES}-byte name budget"
+                    )
+                try:
+                    entry_fingerprint = fingerprint_from_stat(
+                        os.stat(
+                            raw_name,
+                            dir_fd=root_descriptor,
+                            follow_symlinks=False,
+                        )
+                    )
+                except OSError as exc:
+                    raise PlanError(
+                        "cannot bind a source worktree administration entry\n"
+                        f"  path: {root_path / os.fsdecode(raw_name)}\n"
+                        f"  error: {exc}"
+                    ) from exc
+                entries.append((raw_name, entry_fingerprint))
+    except OSError as exc:
+        raise PlanError(
+            "cannot inventory the source worktree administration directory\n"
+            f"  path: {root_path}\n"
+            f"  error: {exc}"
+        ) from exc
+    entries.sort(key=lambda item: item[0])
+    return tuple(entries)
+
+
+def capture_worktree_admin_inventory(
+    source_git_dir: Path,
+    source_lease: DirectoryEntryLease,
+) -> WorktreeAdminInventory:
+    """Take a stable, bounded raw worktrees/ snapshot through the source lease."""
+
+    revalidate_source_registry_lease(source_git_dir, source_lease)
+    root_path = source_git_dir / "worktrees"
+    root_descriptor = -1
+    try:
+        root_descriptor = os.open(
+            "worktrees",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+            dir_fd=source_lease.descriptor,
+        )
+    except FileNotFoundError:
+        revalidate_source_registry_lease(source_git_dir, source_lease)
+        try:
+            os.stat(
+                "worktrees",
+                dir_fd=source_lease.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            revalidate_source_registry_lease(source_git_dir, source_lease)
+            return WorktreeAdminInventory(
+                source_fingerprint=source_lease.binding.fingerprint,
+                root_fingerprint=None,
+                entries=(),
+            )
+        except OSError as exc:
+            raise PlanError(
+                "cannot confirm the absent source worktree administration "
+                "directory\n"
+                f"  path: {root_path}\n"
+                f"  error: {exc}"
+            ) from exc
+        raise PlanError(
+            "source worktree administration directory appeared during inventory\n"
+            f"  path: {root_path}"
+        )
+    except OSError as exc:
+        raise PlanError(
+            "cannot descriptor-bind the source worktree administration directory\n"
+            f"  path: {root_path}\n"
+            f"  error: {exc}"
+        ) from exc
+
+    try:
+        root_fingerprint = fingerprint_from_stat(os.fstat(root_descriptor))
+        if root_fingerprint.kind != stat.S_IFDIR:
+            raise PlanError(
+                "source worktree administration entry is not a directory\n"
+                f"  path: {root_path}"
+            )
+        revalidate_worktree_admin_root_descriptor(
+            source_git_dir,
+            source_lease,
+            root_descriptor,
+            root_fingerprint,
+        )
+        first_entries = worktree_admin_entries_at(root_descriptor, root_path)
+        revalidate_worktree_admin_root_descriptor(
+            source_git_dir,
+            source_lease,
+            root_descriptor,
+            root_fingerprint,
+        )
+        second_entries = worktree_admin_entries_at(root_descriptor, root_path)
+        if first_entries != second_entries:
+            raise PlanError(
+                "source worktree administration entries changed during inventory\n"
+                f"  path: {root_path}"
+            )
+        revalidate_worktree_admin_root_descriptor(
+            source_git_dir,
+            source_lease,
+            root_descriptor,
+            root_fingerprint,
+        )
+        return WorktreeAdminInventory(
+            source_fingerprint=source_lease.binding.fingerprint,
+            root_fingerprint=root_fingerprint,
+            entries=second_entries,
+        )
+    finally:
+        os.close(root_descriptor)
+
+
+def worktree_admin_inventory_drift(
+    source_git_dir: Path,
+    before: WorktreeAdminInventory,
+    after: WorktreeAdminInventory,
+) -> Optional[tuple[str, Path, str]]:
+    root_path = source_git_dir / "worktrees"
+    if before.source_fingerprint != after.source_fingerprint:
+        return (
+            "source-object-changed",
+            source_git_dir,
+            "the raw administration inventories were captured from different "
+            "source directory objects",
+        )
+    if before.root_fingerprint is not None:
+        if after.root_fingerprint is None:
+            return (
+                "admin-root-removed",
+                root_path,
+                "the pre-add administration directory disappeared",
+            )
+        if before.root_fingerprint != after.root_fingerprint:
+            return (
+                "admin-root-changed",
+                root_path,
+                "the administration directory object or access policy changed",
+            )
+
+    before_entries = dict(before.entries)
+    after_entries = dict(after.entries)
+    for raw_name in sorted(after_entries.keys() - before_entries.keys()):
+        return (
+            "admin-entry-added",
+            root_path / os.fsdecode(raw_name),
+            "a raw administration entry appeared after the add attempt",
+        )
+    for raw_name in sorted(before_entries.keys() & after_entries.keys()):
+        if before_entries[raw_name] != after_entries[raw_name]:
+            return (
+                "admin-entry-changed",
+                root_path / os.fsdecode(raw_name),
+                "a raw administration entry object or access policy changed "
+                "after the add attempt",
+            )
+    for raw_name in sorted(before_entries.keys() - after_entries.keys()):
+        return (
+            "admin-entry-removed",
+            root_path / os.fsdecode(raw_name),
+            "a pre-existing raw administration entry disappeared after the add attempt",
+        )
+    return None
+
+
+def require_unchanged_worktree_admin_inventory(
+    source_git_dir: Path,
+    before: WorktreeAdminInventory,
+    after: WorktreeAdminInventory,
+    *,
+    preserved_scope: str,
+) -> None:
+    drift = worktree_admin_inventory_drift(source_git_dir, before, after)
+    if drift is None:
+        return
+    status, location, detail = drift
+    raise WorktreeRegistrationRecoveryError(
+        status=status,
+        location=location,
+        preserved_scope=preserved_scope,
+        detail=detail,
+    )
+
+
+def validate_expected_worktree_admin_add(
+    source_git_dir: Path,
+    before: WorktreeAdminInventory,
+    after: WorktreeAdminInventory,
+    control: ManagedControlReceipt,
+) -> None:
+    """Prove that add introduced only the receipt-bound administration entry."""
+
+    root_path = source_git_dir / "worktrees"
+    expected_parent_path = source_git_dir.resolve(strict=True) / "worktrees"
+    expected_name = validate_descriptor_entry_name(control.admin_lease.entry_name)
+    before_entries = dict(before.entries)
+    after_entries = dict(after.entries)
+    if before.source_fingerprint != after.source_fingerprint:
+        raise PlanError("source object changed across worktree administration add")
+    if control.admin_lease.parent_binding.path != expected_parent_path:
+        raise PlanError(
+            "managed worktree control receipt names a different administration "
+            "parent\n"
+            f"  expected: {expected_parent_path}\n"
+            f"  observed: {control.admin_lease.parent_binding.path}"
+        )
+    if after.root_fingerprint is None:
+        raise PlanError(
+            "source worktree administration directory is absent after add\n"
+            f"  path: {root_path}"
+        )
+    if after.root_fingerprint != control.admin_lease.parent_binding.fingerprint:
+        raise PlanError(
+            "post-add administration inventory and managed control receipt "
+            "name different parent objects\n"
+            f"  path: {root_path}"
+        )
+    if (
+        before.root_fingerprint is not None
+        and before.root_fingerprint != after.root_fingerprint
+    ):
+        raise PlanError(
+            "source worktree administration directory changed across add\n"
+            f"  path: {root_path}"
+        )
+    if expected_name in before_entries:
+        raise PlanError(
+            "new managed worktree administration name existed before add\n"
+            f"  path: {control.admin_git_dir}"
+        )
+    expected_fingerprint = after_entries.pop(expected_name, None)
+    if expected_fingerprint != control.admin_lease.binding.fingerprint:
+        raise PlanError(
+            "raw worktree administration inventory does not contain the "
+            "receipt-bound added entry\n"
+            f"  path: {control.admin_git_dir}"
+        )
+    if after_entries != before_entries:
+        raise PlanError(
+            "raw worktree administration inventory changed beyond the "
+            "receipt-bound added entry\n"
+            f"  path: {root_path}"
+        )
+
+
 def registered_worktree_paths(
     source_git_dir: Path,
     *,
@@ -8000,6 +8349,112 @@ def stage_managed_control_files_for_added_worktree_rollback(
         raise
 
 
+def verify_removed_managed_admin_entry(
+    source_git_dir: Path,
+    source_lease: DirectoryEntryLease,
+    control: ManagedControlReceipt,
+) -> None:
+    """Prove the exact receipt-bound admin name vanished from its held parent."""
+
+    location = control.admin_git_dir
+    revalidate_source_registry_lease(source_git_dir, source_lease)
+    if control.admin_lease.parent_binding.path != source_lease.path / "worktrees":
+        raise WorktreeRegistrationRecoveryError(
+            status="admin-parent-mismatch",
+            location=location,
+            preserved_scope="transaction-created target parents",
+            detail="the receipt-bound admin parent is not the selected source "
+            "worktrees directory",
+        )
+    parent_fingerprint = fingerprint_from_stat(
+        os.fstat(control.admin_lease.parent_descriptor)
+    )
+    if parent_fingerprint != control.admin_lease.parent_binding.fingerprint:
+        raise WorktreeRegistrationRecoveryError(
+            status="admin-parent-changed",
+            location=location,
+            preserved_scope="transaction-created target parents",
+            detail="the held administration parent object or access policy changed",
+        )
+    if not probe_access_at(
+        control.admin_lease.parent_descriptor,
+        ".",
+        control.admin_lease.parent_binding.mode,
+    ):
+        raise WorktreeRegistrationRecoveryError(
+            status="admin-parent-access-denied",
+            location=location,
+            preserved_scope="transaction-created target parents",
+            detail="the held administration parent no longer permits the access "
+            "required by its receipt",
+        )
+    admin_fingerprint = fingerprint_from_stat(os.fstat(control.admin_lease.descriptor))
+    if admin_fingerprint != control.admin_lease.binding.fingerprint:
+        raise WorktreeRegistrationRecoveryError(
+            status="removed-admin-object-changed",
+            location=location,
+            preserved_scope="transaction-created target parents",
+            detail="the held administration object or access policy changed during "
+            "rollback",
+        )
+    try:
+        observed_fingerprint = fingerprint_from_stat(
+            os.stat(
+                control.admin_lease.entry_name,
+                dir_fd=control.admin_lease.parent_descriptor,
+                follow_symlinks=False,
+            )
+        )
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise WorktreeRegistrationRecoveryError(
+            status="admin-entry-removal-unreadable",
+            location=location,
+            preserved_scope="transaction-created target parents",
+            detail=str(exc),
+        ) from exc
+    else:
+        raise WorktreeRegistrationRecoveryError(
+            status="admin-entry-still-present",
+            location=location,
+            preserved_scope="transaction-created target parents",
+            detail=(
+                "the exact receipt-bound administration name resolves after "
+                "worktree remove: "
+                f"dev={observed_fingerprint.device},"
+                f"ino={observed_fingerprint.inode},"
+                f"kind={observed_fingerprint.kind},"
+                f"uid={observed_fingerprint.owner},"
+                f"gid={observed_fingerprint.group},"
+                f"mode={observed_fingerprint.permissions:04o}"
+            ),
+        )
+    final_admin_fingerprint = fingerprint_from_stat(
+        os.fstat(control.admin_lease.descriptor)
+    )
+    if final_admin_fingerprint != control.admin_lease.binding.fingerprint:
+        raise WorktreeRegistrationRecoveryError(
+            status="removed-admin-object-changed",
+            location=location,
+            preserved_scope="transaction-created target parents",
+            detail="the detached administration object or access policy changed "
+            "during removal verification",
+        )
+    final_parent_fingerprint = fingerprint_from_stat(
+        os.fstat(control.admin_lease.parent_descriptor)
+    )
+    if final_parent_fingerprint != control.admin_lease.parent_binding.fingerprint:
+        raise WorktreeRegistrationRecoveryError(
+            status="admin-parent-changed",
+            location=location,
+            preserved_scope="transaction-created target parents",
+            detail="the detached administration parent object or access policy "
+            "changed during removal verification",
+        )
+    revalidate_source_registry_lease(source_git_dir, source_lease)
+
+
 def rollback_added_worktree(
     source_git_dir: Path,
     lease: MaterializedTargetLease,
@@ -8078,6 +8533,12 @@ def rollback_added_worktree(
             "worktree control-file rollback receipt cleanup failed: "
             + "; ".join(close_errors)
         )
+    if control is not None:
+        verify_removed_managed_admin_entry(
+            source_git_dir,
+            source_lease,
+            control,
+        )
     revalidate_directory_descriptor(
         lease.parent_binding,
         lease.parent_descriptor,
@@ -8152,11 +8613,17 @@ def add_worktree(
     if source_lease is None or source_lease.path != source_git_dir.resolve(strict=True):
         raise PlanError("new worktree creation requires a matching source gitdir lease")
     control: Optional[ManagedControlReceipt] = None
+    admin_inventory_before: Optional[WorktreeAdminInventory] = None
+    admin_inventory_after: Optional[WorktreeAdminInventory] = None
+    admin_ownership_proven = False
     registration_attempted = False
-    registered = False
     try:
         revalidate_materialized_target_lease(lease)
         revalidate_directory_entry_lease(source_lease)
+        admin_inventory_before = capture_worktree_admin_inventory(
+            source_git_dir,
+            source_lease,
+        )
         # Run from the held target directory and name that exact object as ".".
         # Passing the final pathname from its parent would let Git follow a
         # same-UID symlink replacement after our precheck and write outside the
@@ -8177,15 +8644,25 @@ def add_worktree(
             extra_env={"GIT_COMMON_DIR": str(source_git_dir)},
             directory_identity_leases=(source_lease,),
         )
-        registered = True
         revalidate_materialized_target_lease(lease)
         revalidate_directory_entry_lease(source_lease)
+        admin_inventory_after = capture_worktree_admin_inventory(
+            source_git_dir,
+            source_lease,
+        )
         control = capture_managed_control_receipt(
             worktree_path,
             source_git_dir,
             lease.target_descriptor,
         )
         revalidate_managed_control_receipt(control, lease.target_descriptor)
+        validate_expected_worktree_admin_add(
+            source_git_dir,
+            admin_inventory_before,
+            admin_inventory_after,
+            control,
+        )
+        admin_ownership_proven = True
         run_git_at_directory_descriptor(
             [
                 "git",
@@ -8214,39 +8691,200 @@ def add_worktree(
             finalize_checkout(control, source_lease)
     except BaseException as exc:
         rollback_error: Optional[BaseException] = None
-        should_rollback = registered
+        should_rollback = False
         registry_known_clean = not registration_attempted
-        if registration_attempted and not should_rollback:
+
+        if registration_attempted and admin_inventory_before is None:
+            rollback_error = WorktreeRegistrationRecoveryError(
+                status="missing-pre-add-inventory",
+                location=source_git_dir / "worktrees",
+                preserved_scope="the target",
+                detail="the add attempt started without a retained raw "
+                "administration baseline",
+            )
+
+        if (
+            registration_attempted
+            and control is not None
+            and not admin_ownership_proven
+            and rollback_error is None
+        ):
+            rollback_error = WorktreeRegistrationRecoveryError(
+                status="admin-ownership-unproven",
+                location=source_git_dir / "worktrees",
+                preserved_scope="the target",
+                detail="the managed control receipt was captured, but the raw "
+                f"expected-add ownership proof did not complete: {exc}",
+            )
+
+        if (
+            registration_attempted
+            and admin_inventory_after is None
+            and rollback_error is None
+        ):
             try:
-                should_rollback = (
-                    registered_target_path(
-                        source_git_dir,
-                        worktree_path,
-                        source_lease=source_lease,
-                    )
-                    is not None
-                )
-                registry_known_clean = not should_rollback
-            except BaseException as registry_exc:
-                rollback_error = PlanError(
-                    "worktree registration state is uncertain; preserving the "
-                    "target for recovery\n"
-                    f"  source gitdir: {source_git_dir}\n"
-                    f"  target: {worktree_path}\n"
-                    f"  registry error: {registry_exc}"
-                )
-        if should_rollback:
-            try:
-                rollback_added_worktree(
+                admin_inventory_after = capture_worktree_admin_inventory(
                     source_git_dir,
-                    lease,
                     source_lease,
+                )
+            except BaseException as inventory_exc:
+                rollback_error = WorktreeRegistrationRecoveryError(
+                    status="post-add-inventory-unreadable",
+                    location=source_git_dir / "worktrees",
+                    preserved_scope="the target",
+                    detail=str(inventory_exc),
+                )
+
+        registered_path: Optional[Path] = None
+        if registration_attempted and control is None and rollback_error is None:
+            try:
+                registered_path = registered_target_path(
+                    source_git_dir,
+                    worktree_path,
+                    source_lease=source_lease,
+                )
+            except BaseException as registry_exc:
+                rollback_error = WorktreeRegistrationRecoveryError(
+                    status="registry-query-unreadable",
+                    location=source_git_dir / "worktrees",
+                    preserved_scope="the target",
+                    detail=str(registry_exc),
+                )
+
+        if registered_path is not None and control is None and rollback_error is None:
+            try:
+                control = capture_managed_control_receipt(
+                    worktree_path,
+                    source_git_dir,
+                    lease.target_descriptor,
+                )
+                revalidate_managed_control_receipt(
+                    control,
+                    lease.target_descriptor,
+                )
+                if admin_inventory_before is None or admin_inventory_after is None:
+                    raise PlanError(
+                        "recovered managed control receipt lacks complete raw "
+                        "administration inventories"
+                    )
+                validate_expected_worktree_admin_add(
+                    source_git_dir,
+                    admin_inventory_before,
+                    admin_inventory_after,
                     control,
                 )
-                registry_known_clean = True
-            except BaseException as cleanup_exc:
-                rollback_error = cleanup_exc
-                registry_known_clean = False
+                admin_ownership_proven = True
+            except BaseException as control_exc:
+                drift = (
+                    worktree_admin_inventory_drift(
+                        source_git_dir,
+                        admin_inventory_before,
+                        admin_inventory_after,
+                    )
+                    if (
+                        admin_inventory_before is not None
+                        and admin_inventory_after is not None
+                    )
+                    else None
+                )
+                status, location, drift_detail = drift or (
+                    "managed-control-unreadable",
+                    source_git_dir / "worktrees",
+                    "the target is registered but its descriptor-bound control "
+                    "pair cannot be captured",
+                )
+                rollback_error = WorktreeRegistrationRecoveryError(
+                    status=status,
+                    location=location,
+                    preserved_scope="the target",
+                    detail=f"{drift_detail}; control error: {control_exc}",
+                )
+
+        if registration_attempted and rollback_error is None:
+            if control is not None and admin_ownership_proven:
+                should_rollback = True
+            elif control is not None:
+                rollback_error = WorktreeRegistrationRecoveryError(
+                    status="admin-ownership-unproven",
+                    location=source_git_dir / "worktrees",
+                    preserved_scope="the target",
+                    detail="the managed control receipt is not bound to the raw "
+                    "expected-add inventory transition",
+                )
+            else:
+                if admin_inventory_before is None or admin_inventory_after is None:
+                    rollback_error = WorktreeRegistrationRecoveryError(
+                        status="incomplete-admin-inventory",
+                        location=source_git_dir / "worktrees",
+                        preserved_scope="the target",
+                        detail="the add attempt does not have complete before and "
+                        "after raw administration inventories",
+                    )
+                else:
+                    try:
+                        require_unchanged_worktree_admin_inventory(
+                            source_git_dir,
+                            admin_inventory_before,
+                            admin_inventory_after,
+                            preserved_scope="the target",
+                        )
+                        registry_known_clean = True
+                    except BaseException as inventory_exc:
+                        rollback_error = inventory_exc
+
+        if should_rollback and rollback_error is None:
+            if control is None or admin_inventory_before is None:
+                rollback_error = WorktreeRegistrationRecoveryError(
+                    status="rollback-receipt-incomplete",
+                    location=source_git_dir / "worktrees",
+                    preserved_scope="the target",
+                    detail="the registered worktree does not have both its managed "
+                    "control receipt and raw administration baseline",
+                )
+            else:
+                try:
+                    rollback_added_worktree(
+                        source_git_dir,
+                        lease,
+                        source_lease,
+                        control,
+                    )
+                    final_admin_inventory = capture_worktree_admin_inventory(
+                        source_git_dir,
+                        source_lease,
+                    )
+                    require_unchanged_worktree_admin_inventory(
+                        source_git_dir,
+                        admin_inventory_before,
+                        final_admin_inventory,
+                        preserved_scope="transaction-created target parents",
+                    )
+                    registry_known_clean = True
+                except BaseException as cleanup_exc:
+                    location = (
+                        cleanup_exc.location
+                        if isinstance(
+                            cleanup_exc,
+                            WorktreeRegistrationRecoveryError,
+                        )
+                        else control.admin_git_dir
+                    )
+                    status = (
+                        cleanup_exc.status
+                        if isinstance(
+                            cleanup_exc,
+                            WorktreeRegistrationRecoveryError,
+                        )
+                        else "rollback-incomplete"
+                    )
+                    rollback_error = WorktreeRegistrationRecoveryError(
+                        status=status,
+                        location=location,
+                        preserved_scope="the target or transaction-created target "
+                        "parents",
+                        detail=str(cleanup_exc),
+                    )
+                    registry_known_clean = False
         if (
             registry_known_clean
             and lease.materialization_target is not None
