@@ -130,9 +130,21 @@ SAFE_GIT_CONFIG_ARGS = (
     "-c",
     f"core.hooksPath={os.devnull}",
     "-c",
+    "core.splitIndex=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
     "credential.helper=",
     "-c",
     "credential.interactive=never",
+    "-c",
+    "index.skipHash=false",
+    "-c",
+    "index.recordEndOfIndexEntries=false",
+    "-c",
+    "index.sparse=false",
+    "-c",
+    "index.threads=1",
     "-c",
     "protocol.ext.allow=never",
     "-c",
@@ -423,8 +435,10 @@ class ManagedFinalStateReceipt:
     head_binding: FileContentBinding
     common_descriptor: int
     common_binding: FileContentBinding
+    common_content: bytes
     index_descriptor: int
     index_binding: FileContentBinding
+    index_content: bytes
 
     def close(self) -> None:
         descriptors = (
@@ -6964,13 +6978,9 @@ def gitdir_file_target(worktree_path: Path) -> Optional[Path]:
     return target
 
 
-def parse_managed_gitdir_content(
-    worktree_path: Path,
-    source_git_dir: Path,
-    content: bytes,
-) -> Path:
+def managed_gitdir_pointer_bytes(worktree_path: Path, content: bytes) -> bytes:
     raw = content.rstrip(b"\r\n")
-    if b"\n" in raw or b"\r" in raw or not raw.startswith(b"gitdir: "):
+    if b"\n" in raw or b"\r" in raw or b"\0" in raw or not raw.startswith(b"gitdir: "):
         raise PlanError(
             f"managed worktree has a malformed .git control file: {worktree_path}"
         )
@@ -6979,6 +6989,155 @@ def parse_managed_gitdir_content(
         raise PlanError(
             f"managed worktree has an empty or oversized admin path: {worktree_path}"
         )
+    return raw_path
+
+
+def plain_gitdir_pointer_bytes(content: bytes, purpose: str) -> bytes:
+    raw_path = content.rstrip(b"\r\n")
+    if (
+        not raw_path
+        or b"\n" in raw_path
+        or b"\r" in raw_path
+        or b"\0" in raw_path
+        or len(raw_path) > MAX_CHECKOUT_PATH_BYTES
+    ):
+        raise PlanError(f"{purpose} is malformed")
+    return raw_path
+
+
+def nofollow_descriptor_chain_trace(
+    raw_path: bytes,
+    *,
+    relative_base_descriptor: int,
+    expected_kind: int,
+    purpose: str,
+) -> tuple[FsFingerprint, ...]:
+    """Resolve one pointer with no-follow opens for every pathname component."""
+
+    if (
+        not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+        or os.open not in os.supports_dir_fd
+    ):
+        raise PlanError(
+            f"cannot safely prove {purpose}: descriptor-relative O_NOFOLLOW and "
+            "O_DIRECTORY are required"
+        )
+    if not raw_path or b"\0" in raw_path:
+        raise PlanError(f"cannot safely prove {purpose}: pointer path is malformed")
+    absolute = raw_path.startswith(b"/")
+    if raw_path.startswith(b"//"):
+        raise PlanError(
+            f"cannot safely prove {purpose}: implementation-defined // paths "
+            "are unsupported"
+        )
+    components = tuple(
+        component for component in raw_path.split(b"/") if component not in {b"", b"."}
+    )
+    if expected_kind != stat.S_IFDIR and (not components or components[-1] == b".."):
+        raise PlanError(
+            f"cannot safely prove {purpose}: a regular-file endpoint must have "
+            "an explicit final component"
+        )
+
+    descriptor = -1
+    trace: list[FsFingerprint] = []
+    try:
+        if absolute:
+            descriptor = os.open(
+                b"/",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+            )
+        else:
+            descriptor = os.dup(relative_base_descriptor)
+        start_fingerprint = fingerprint_from_stat(os.fstat(descriptor))
+        if start_fingerprint.kind != stat.S_IFDIR:
+            raise PlanError(
+                f"cannot safely prove {purpose}: pointer base is not a directory"
+            )
+        trace.append(start_fingerprint)
+
+        for index, component in enumerate(components):
+            final_component = index == len(components) - 1
+            component_kind = expected_kind if final_component else stat.S_IFDIR
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            if component_kind == stat.S_IFDIR:
+                flags |= os.O_DIRECTORY
+            else:
+                flags |= os.O_NONBLOCK
+            next_descriptor = os.open(
+                component,
+                flags,
+                dir_fd=descriptor,
+            )
+            try:
+                next_fingerprint = fingerprint_from_stat(os.fstat(next_descriptor))
+                if next_fingerprint.kind != component_kind:
+                    raise PlanError(
+                        f"cannot safely prove {purpose}: descriptor-chain "
+                        "component has an unsafe object type"
+                    )
+            except BaseException:
+                os.close(next_descriptor)
+                raise
+            os.close(descriptor)
+            descriptor = next_descriptor
+            trace.append(next_fingerprint)
+        if trace[-1].kind != expected_kind:
+            raise PlanError(
+                f"cannot safely prove {purpose}: pointer endpoint has an unsafe "
+                "object type"
+            )
+        return tuple(trace)
+    except OSError as exc:
+        raise PlanError(
+            f"cannot prove {purpose} through a no-follow descriptor chain\n"
+            f"  pointer: {os.fsdecode(raw_path)}\n"
+            f"  error: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def revalidate_nofollow_pointer_endpoint(
+    raw_path: bytes,
+    *,
+    relative_base_descriptor: int,
+    expected_fingerprint: FsFingerprint,
+    expected_kind: int,
+    purpose: str,
+) -> None:
+    """Prove a stable no-symlink path trace ending at the receipt-bound object."""
+
+    first_trace = nofollow_descriptor_chain_trace(
+        raw_path,
+        relative_base_descriptor=relative_base_descriptor,
+        expected_kind=expected_kind,
+        purpose=purpose,
+    )
+    second_trace = nofollow_descriptor_chain_trace(
+        raw_path,
+        relative_base_descriptor=relative_base_descriptor,
+        expected_kind=expected_kind,
+        purpose=purpose,
+    )
+    if first_trace != second_trace:
+        raise PlanError(
+            f"{purpose} descriptor chain changed during endpoint revalidation"
+        )
+    if first_trace[-1] != expected_fingerprint:
+        raise PlanError(
+            f"{purpose} no-follow endpoint does not match the receipt-bound object"
+        )
+
+
+def parse_managed_gitdir_content(
+    worktree_path: Path,
+    source_git_dir: Path,
+    content: bytes,
+) -> Path:
+    raw_path = managed_gitdir_pointer_bytes(worktree_path, content)
     admin_git_dir = Path(os.fsdecode(raw_path))
     if not admin_git_dir.is_absolute():
         admin_git_dir = worktree_path / admin_git_dir
@@ -7138,14 +7297,10 @@ def capture_managed_control_receipt(
         )
         if backlink_content is None:
             raise PlanError("managed worktree admin backlink returned no content")
-        raw_backlink = backlink_content.rstrip(b"\r\n")
-        if (
-            not raw_backlink
-            or b"\n" in raw_backlink
-            or b"\r" in raw_backlink
-            or len(raw_backlink) > MAX_CHECKOUT_PATH_BYTES
-        ):
-            raise PlanError("managed worktree admin backlink is malformed")
+        raw_backlink = plain_gitdir_pointer_bytes(
+            backlink_content,
+            "managed worktree admin backlink",
+        )
         backlink_path = Path(os.fsdecode(raw_backlink))
         if not backlink_path.is_absolute():
             backlink_path = admin_git_dir / backlink_path
@@ -7158,6 +7313,50 @@ def capture_managed_control_receipt(
                 f"  backlink: {backlink_path}\n"
                 f"  expected: {expected_gitfile}"
             )
+        revalidate_nofollow_pointer_endpoint(
+            managed_gitdir_pointer_bytes(worktree_path, content),
+            relative_base_descriptor=target_descriptor,
+            expected_fingerprint=admin_lease.binding.fingerprint,
+            expected_kind=stat.S_IFDIR,
+            purpose="managed worktree .git-to-admin pointer",
+        )
+        revalidate_nofollow_pointer_endpoint(
+            raw_backlink,
+            relative_base_descriptor=admin_lease.descriptor,
+            expected_fingerprint=git_file_binding.fingerprint,
+            expected_kind=stat.S_IFREG,
+            purpose="managed worktree admin backlink endpoint",
+        )
+        observed_git_file, _ = bind_regular_file_descriptor_at(
+            descriptor,
+            target_descriptor,
+            ".git",
+            git_file_binding.path,
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose="descriptor-bound managed worktree control file",
+            retain_content=False,
+        )
+        require_matching_file_binding(
+            git_file_binding,
+            observed_git_file,
+            "descriptor-bound managed worktree control file",
+        )
+        observed_backlink, _ = bind_regular_file_descriptor_at(
+            backlink_descriptor,
+            admin_lease.descriptor,
+            "gitdir",
+            admin_gitdir_binding.path,
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose="managed worktree admin backlink",
+            retain_content=False,
+        )
+        require_matching_file_binding(
+            admin_gitdir_binding,
+            observed_backlink,
+            "managed worktree admin backlink",
+        )
         return ManagedControlReceipt(
             git_file_descriptor=descriptor,
             git_file_binding=git_file_binding,
@@ -7202,11 +7401,54 @@ def revalidate_managed_admin_backlink(
     revalidate_directory_entry_lease(receipt.admin_lease)
 
 
+def revalidate_managed_control_endpoints(
+    receipt: ManagedControlReceipt,
+    target_descriptor: int,
+) -> None:
+    revalidate_nofollow_pointer_endpoint(
+        managed_gitdir_pointer_bytes(
+            receipt.git_file_binding.path.parent,
+            receipt.git_file_content,
+        ),
+        relative_base_descriptor=target_descriptor,
+        expected_fingerprint=receipt.admin_lease.binding.fingerprint,
+        expected_kind=stat.S_IFDIR,
+        purpose="managed worktree .git-to-admin pointer",
+    )
+    revalidate_nofollow_pointer_endpoint(
+        plain_gitdir_pointer_bytes(
+            receipt.admin_gitdir_content,
+            "managed worktree admin backlink",
+        ),
+        relative_base_descriptor=receipt.admin_lease.descriptor,
+        expected_fingerprint=receipt.git_file_binding.fingerprint,
+        expected_kind=stat.S_IFREG,
+        purpose="managed worktree admin backlink endpoint",
+    )
+
+
 def revalidate_managed_control_receipt(
     receipt: ManagedControlReceipt,
     target_descriptor: int,
 ) -> None:
     revalidate_managed_admin_backlink(receipt)
+    current_binding, _ = bind_regular_file_descriptor_at(
+        receipt.git_file_descriptor,
+        target_descriptor,
+        ".git",
+        receipt.git_file_binding.path,
+        maximum_bytes=MAX_GITDIR_FILE_BYTES,
+        mode=os.R_OK,
+        purpose="descriptor-bound managed worktree control file",
+        retain_content=False,
+    )
+    require_matching_file_binding(
+        receipt.git_file_binding,
+        current_binding,
+        "descriptor-bound managed worktree control file",
+    )
+    revalidate_managed_admin_backlink(receipt)
+    revalidate_managed_control_endpoints(receipt, target_descriptor)
     current_binding, _ = bind_regular_file_descriptor_at(
         receipt.git_file_descriptor,
         target_descriptor,
@@ -7384,6 +7626,7 @@ def checkout_existing_worktree(
     *,
     target_descriptor: Optional[int] = None,
     source_git_dir: Optional[Path] = None,
+    source_lease: Optional[DirectoryEntryLease] = None,
     finalize_checkout: Optional[
         Callable[[ManagedControlReceipt, DirectoryEntryLease], None]
     ] = None,
@@ -7405,20 +7648,13 @@ def checkout_existing_worktree(
         raise PlanError("managed checkout requires a descriptor-bound target directory")
     if source_git_dir is None:
         raise PlanError("managed checkout requires an explicit common gitdir")
+    if source_lease is None or source_lease.path != source_git_dir.resolve(strict=True):
+        raise PlanError("managed checkout requires a matching source gitdir lease")
     control = capture_managed_control_receipt(
         worktree_path,
         source_git_dir,
         target_descriptor,
     )
-    try:
-        source_lease = capture_directory_entry_lease(
-            source_git_dir,
-            os.R_OK | os.W_OK | os.X_OK,
-            "selected source common gitdir",
-        )
-    except BaseException:
-        control.close()
-        raise
     try:
         revalidate_managed_control_receipt(control, target_descriptor)
         revalidate_directory_entry_lease(source_lease)
@@ -7448,10 +7684,7 @@ def checkout_existing_worktree(
         if finalize_checkout is not None:
             finalize_checkout(control, source_lease)
     finally:
-        try:
-            control.close()
-        finally:
-            source_lease.close()
+        control.close()
 
 
 def stage_retained_control_file_for_rollback(
@@ -7817,6 +8050,7 @@ def add_worktree(
     dry_run: bool,
     *,
     lease: Optional[MaterializedTargetLease] = None,
+    source_lease: Optional[DirectoryEntryLease] = None,
     finalize_checkout: Optional[
         Callable[[ManagedControlReceipt, DirectoryEntryLease], None]
     ] = None,
@@ -7836,11 +8070,8 @@ def add_worktree(
         return
     if lease is None or lease.target != worktree_path:
         raise PlanError("new worktree creation requires a matching target lease")
-    source_lease = capture_directory_entry_lease(
-        source_git_dir,
-        os.R_OK | os.W_OK | os.X_OK,
-        "selected source common gitdir",
-    )
+    if source_lease is None or source_lease.path != source_git_dir.resolve(strict=True):
+        raise PlanError("new worktree creation requires a matching source gitdir lease")
     control: Optional[ManagedControlReceipt] = None
     registration_attempted = False
     registered = False
@@ -7964,11 +8195,8 @@ def add_worktree(
             raise PlanError(f"{exc}\n" + "\n".join(cleanup_details)) from exc
         raise
     finally:
-        try:
-            if control is not None:
-                control.close()
-        finally:
-            source_lease.close()
+        if control is not None:
+            control.close()
 
 
 def classify_planned_target(
@@ -8074,6 +8302,82 @@ def source_access_bindings(
                 )
             )
     return bindings
+
+
+def planned_source_gitdir_binding(entry: PlannedWorktree) -> AccessBinding:
+    candidates = tuple(
+        binding
+        for binding in entry.source_bindings
+        if binding.path == entry.source_git_dir
+        and binding.purpose == "source gitdir administration and registry writes"
+    )
+    if len(candidates) != 1:
+        raise PlanError(
+            "preflight source access bindings do not name exactly one source gitdir"
+        )
+    binding = candidates[0]
+    completeness_binding = entry.source_completeness.gitdir_binding
+    if (
+        completeness_binding.path != entry.source_git_dir
+        or completeness_binding.fingerprint != binding.fingerprint
+    ):
+        raise PlanError(
+            "preflight source access and completeness receipts disagree on the "
+            "source gitdir"
+        )
+    return binding
+
+
+def revalidate_planned_source_lease(
+    entry: PlannedWorktree,
+    lease: DirectoryEntryLease,
+) -> None:
+    expected = planned_source_gitdir_binding(entry)
+    if lease.binding != expected:
+        raise PlanError(
+            "fresh source gitdir lease does not match the preflight source "
+            "access binding"
+        )
+    if (
+        lease.binding.fingerprint
+        != entry.source_completeness.gitdir_binding.fingerprint
+    ):
+        raise PlanError(
+            "fresh source gitdir lease does not match the preflight source "
+            "completeness binding"
+        )
+    revalidate_directory_entry_lease(lease)
+    revalidate_access(expected)
+    revalidate_source_completeness_receipt(
+        entry.source_git_dir,
+        entry.source_completeness,
+    )
+    if (
+        lease.binding.fingerprint != expected.fingerprint
+        or lease.binding.fingerprint
+        != entry.source_completeness.gitdir_binding.fingerprint
+    ):
+        raise PlanError(
+            "fresh source gitdir lease diverged from the preflight source receipts"
+        )
+    revalidate_directory_entry_lease(lease)
+
+
+def capture_planned_source_lease(
+    entry: PlannedWorktree,
+) -> DirectoryEntryLease:
+    expected = planned_source_gitdir_binding(entry)
+    lease = capture_directory_entry_lease(
+        entry.source_git_dir,
+        expected.mode,
+        expected.purpose,
+    )
+    try:
+        revalidate_planned_source_lease(entry, lease)
+        return lease
+    except BaseException:
+        lease.close()
+        raise
 
 
 def target_access_bindings(
@@ -8183,6 +8487,558 @@ def bounded_records(
             f"{description} exceeds the {maximum_records}-record safety limit"
         )
     return records
+
+
+def decode_index_v4_strip_count(
+    content: bytes,
+    offset: int,
+    body_end: int,
+) -> tuple[int, int]:
+    if offset >= body_end:
+        raise PlanError("captured managed worktree index has a truncated v4 path")
+    byte = content[offset]
+    offset += 1
+    value = byte & 0x7F
+    while byte & 0x80:
+        if offset >= body_end:
+            raise PlanError(
+                "captured managed worktree index has a truncated v4 path offset"
+            )
+        byte = content[offset]
+        offset += 1
+        value = ((value + 1) << 7) | (byte & 0x7F)
+        if value > MAX_CHECKOUT_PATH_BYTES:
+            raise PlanError(
+                "captured managed worktree index has an oversized v4 path offset"
+            )
+    return value, offset
+
+
+def validate_captured_cache_tree(
+    content: bytes,
+    extension_start: int,
+    extension_end: int,
+    object_id_bytes: int,
+    expected_nodes: dict[bytes, tuple[int, bytes]],
+) -> None:
+    """Require every cache-tree node to describe the planned target tree."""
+
+    offset = extension_start
+    seen_paths: set[bytes] = set()
+    valid_paths: set[bytes] = set()
+    # Each frame is [full_path, remaining_children, prior_child_component].
+    frames: list[list[object]] = []
+    node_index = 0
+    while offset < extension_end:
+        if node_index >= MAX_CHECKOUT_PATH_COMPONENTS:
+            raise PlanError(
+                "captured managed worktree cache-tree exceeds the "
+                f"{MAX_CHECKOUT_PATH_COMPONENTS}-node safety limit"
+            )
+        component_end = content.find(b"\0", offset, extension_end)
+        if component_end < 0:
+            raise PlanError(
+                "captured managed worktree cache-tree has an unterminated path"
+            )
+        if component_end - offset > MAX_CHECKOUT_PATH_BYTES:
+            raise PlanError(
+                "captured managed worktree cache-tree has an oversized path component"
+            )
+        component = content[offset:component_end]
+        line_end = content.find(b"\n", component_end + 1, extension_end)
+        if line_end < 0:
+            raise PlanError(
+                "captured managed worktree cache-tree has a truncated node header"
+            )
+        header_size = line_end - component_end
+        if header_size > 64:
+            raise PlanError(
+                "captured managed worktree cache-tree has an oversized node header"
+            )
+        header = content[component_end + 1 : line_end + 1]
+        match = re.fullmatch(rb"(-1|0|[1-9][0-9]*) (0|[1-9][0-9]*)\n", header)
+        if match is None:
+            raise PlanError(
+                "captured managed worktree cache-tree has an invalid node header"
+            )
+        entry_count = int(match.group(1))
+        subtree_count = int(match.group(2))
+        if subtree_count > MAX_CHECKOUT_PATH_COMPONENTS:
+            raise PlanError(
+                "captured managed worktree cache-tree has too many subtrees"
+            )
+        offset = line_end + 1
+
+        if node_index == 0:
+            if component:
+                raise PlanError("captured managed worktree cache-tree has no root node")
+            full_path = b""
+        else:
+            while frames and frames[-1][1] == 0:
+                frames.pop()
+            if not frames:
+                raise PlanError(
+                    "captured managed worktree cache-tree has an extra node"
+                )
+            if (
+                not component
+                or b"/" in component
+                or component in {b".", b"..", b".git"}
+            ):
+                raise PlanError(
+                    "captured managed worktree cache-tree has an invalid path component"
+                )
+            parent_path = frames[-1][0]
+            remaining_children = frames[-1][1]
+            prior_component = frames[-1][2]
+            if not isinstance(parent_path, bytes) or not isinstance(
+                remaining_children, int
+            ):
+                raise PlanError("captured managed worktree cache-tree stack is invalid")
+            if prior_component is not None and (
+                not isinstance(prior_component, bytes)
+                or (len(component), component)
+                <= (len(prior_component), prior_component)
+            ):
+                raise PlanError(
+                    "captured managed worktree cache-tree children are not "
+                    "in canonical order"
+                )
+            frames[-1][1] = remaining_children - 1
+            frames[-1][2] = component
+            separator_bytes = 1 if parent_path else 0
+            if (
+                len(parent_path) + separator_bytes + len(component)
+                > MAX_CHECKOUT_PATH_BYTES
+            ):
+                raise PlanError(
+                    "captured managed worktree cache-tree path exceeds the "
+                    f"{MAX_CHECKOUT_PATH_BYTES}-byte limit"
+                )
+            full_path = parent_path + b"/" + component if parent_path else component
+            validate_checkout_path(
+                full_path,
+                "captured managed worktree cache-tree",
+            )
+
+        if full_path in seen_paths:
+            raise PlanError(
+                "captured managed worktree cache-tree contains a duplicate path"
+            )
+        expected = expected_nodes.get(full_path)
+        if expected is None:
+            raise PlanError(
+                "captured managed worktree cache-tree names a path outside "
+                "the planned target tree"
+            )
+        seen_paths.add(full_path)
+        expected_entry_count, expected_object_id = expected
+        if entry_count >= 0:
+            if offset + object_id_bytes > extension_end:
+                raise PlanError(
+                    "captured managed worktree cache-tree has a truncated object id"
+                )
+            object_id = content[offset : offset + object_id_bytes]
+            offset += object_id_bytes
+            if entry_count != expected_entry_count or object_id != expected_object_id:
+                raise PlanError(
+                    "captured managed worktree cache-tree does not match "
+                    "the planned target tree"
+                )
+            valid_paths.add(full_path)
+        elif entry_count != -1:
+            raise PlanError(
+                "captured managed worktree cache-tree has an invalid entry count"
+            )
+
+        if subtree_count:
+            frames.append([full_path, subtree_count, None])
+        node_index += 1
+
+    while frames and frames[-1][1] == 0:
+        frames.pop()
+    if frames:
+        raise PlanError(
+            "captured managed worktree cache-tree is missing declared subtrees"
+        )
+    if not seen_paths or len(seen_paths) != len(expected_nodes):
+        raise PlanError(
+            "captured managed worktree cache-tree directory set does not "
+            "match the planned target tree"
+        )
+    if any(
+        path and entry_count == 0 and path not in valid_paths
+        for path, (entry_count, _object_id) in expected_nodes.items()
+    ):
+        raise PlanError(
+            "captured managed worktree cache-tree does not preserve a non-root "
+            "empty target tree"
+        )
+
+
+def captured_index_entries(
+    content: bytes,
+    object_id_bytes: int,
+    *,
+    expected_cache_tree: Optional[dict[bytes, tuple[int, bytes]]] = None,
+    require_cache_tree: bool = False,
+) -> tuple[tuple[bytes, bytes, bytes], ...]:
+    """Parse immutable index bytes and reject conflicts or hidden entry state."""
+
+    if object_id_bytes not in {20, 32}:
+        raise PlanError("captured managed worktree index uses an unsupported hash")
+    if len(content) < 12 + object_id_bytes:
+        raise PlanError("captured managed worktree index is truncated")
+    body_end = len(content) - object_id_bytes
+    body = memoryview(content)[:body_end]
+    expected_checksum = content[body_end:]
+    if expected_checksum == bytes(object_id_bytes):
+        raise PlanError(
+            "captured managed worktree index uses an unsupported skip-hash checksum"
+        )
+    digest = hashlib.sha1() if object_id_bytes == 20 else hashlib.sha256()
+    digest.update(body)
+    if digest.digest() != expected_checksum:
+        raise PlanError("captured managed worktree index checksum is invalid")
+    if content[:4] != b"DIRC":
+        raise PlanError("captured managed worktree index has an invalid signature")
+    version = int.from_bytes(content[4:8], "big")
+    if version not in {2, 3, 4}:
+        raise PlanError(
+            f"captured managed worktree index uses an unsupported version: {version}"
+        )
+    entry_count = int.from_bytes(content[8:12], "big")
+    if entry_count > MAX_CHECKOUT_PATHS:
+        raise PlanError(
+            "captured managed worktree index exceeds the "
+            f"{MAX_CHECKOUT_PATHS}-entry safety limit"
+        )
+
+    offset = 12
+    prior_path: Optional[bytes] = None
+    expanded_path_bytes = 0
+    entries: list[tuple[bytes, bytes, bytes]] = []
+    fixed_prefix_bytes = 40 + object_id_bytes + 2
+    for _entry_index in range(entry_count):
+        entry_start = offset
+        if offset + fixed_prefix_bytes > body_end:
+            raise PlanError("captured managed worktree index has a truncated entry")
+        mode_value = int.from_bytes(content[offset + 24 : offset + 28], "big")
+        object_start = offset + 40
+        object_end = object_start + object_id_bytes
+        object_id = content[object_start:object_end].hex().encode("ascii")
+        flags = int.from_bytes(content[object_end : object_end + 2], "big")
+        offset = object_end + 2
+        stage = (flags >> 12) & 0x3
+        if stage != 0:
+            raise PlanError(
+                "captured managed worktree index has unresolved conflict entries"
+            )
+        if flags & 0x8000:
+            raise PlanError(
+                "captured managed worktree index has hidden assume-valid state"
+            )
+        extended = bool(flags & 0x4000)
+        if extended:
+            if version == 2 or offset + 2 > body_end:
+                raise PlanError(
+                    "captured managed worktree index has invalid extended flags"
+                )
+            extended_flags = int.from_bytes(content[offset : offset + 2], "big")
+            offset += 2
+            if extended_flags != 0:
+                raise PlanError(
+                    "captured managed worktree index has hidden skip-worktree, "
+                    "intent-to-add, or fsmonitor state"
+                )
+
+        if version == 4:
+            strip_count, offset = decode_index_v4_strip_count(
+                content,
+                offset,
+                body_end,
+            )
+            retained_path = prior_path or b""
+            if strip_count > len(retained_path):
+                raise PlanError(
+                    "captured managed worktree index has an invalid v4 path prefix"
+                )
+            suffix_end = content.find(b"\0", offset, body_end)
+            if suffix_end < 0:
+                raise PlanError(
+                    "captured managed worktree index has an unterminated v4 path"
+                )
+            retained_size = len(retained_path) - strip_count
+            suffix_size = suffix_end - offset
+            if retained_size + suffix_size > MAX_CHECKOUT_PATH_BYTES:
+                raise PlanError(
+                    "captured managed worktree index has an oversized v4 path"
+                )
+            suffix = content[offset:suffix_end]
+            retained = retained_path[:retained_size] if strip_count else retained_path
+            raw_path = retained + suffix
+            offset = suffix_end + 1
+        else:
+            path_end = content.find(b"\0", offset, body_end)
+            if path_end < 0:
+                raise PlanError(
+                    "captured managed worktree index has an unterminated path"
+                )
+            if path_end - offset > MAX_CHECKOUT_PATH_BYTES:
+                raise PlanError("captured managed worktree index has an oversized path")
+            raw_path = content[offset:path_end]
+            relative_size = path_end + 1 - entry_start
+            padded_size = (relative_size + 7) & ~7
+            offset = entry_start + padded_size
+            if offset > body_end or any(content[path_end + 1 : offset]):
+                raise PlanError(
+                    "captured managed worktree index has invalid entry padding"
+                )
+
+        declared_length = flags & 0x0FFF
+        if declared_length != min(len(raw_path), 0x0FFF):
+            raise PlanError(
+                "captured managed worktree index path length does not match its flags"
+            )
+        validate_checkout_path(raw_path, "captured managed worktree index")
+        expanded_path_bytes += len(raw_path) + 1
+        if expanded_path_bytes > GIT_ENUMERATION_OUTPUT_LIMIT_BYTES:
+            raise PlanError(
+                "captured managed worktree index expanded paths exceed the "
+                f"{GIT_ENUMERATION_OUTPUT_LIMIT_BYTES}-byte aggregate limit"
+            )
+        if prior_path is not None and raw_path == prior_path:
+            raise PlanError(
+                "captured managed worktree index contains duplicate stage-0 paths"
+            )
+        if prior_path is not None and raw_path < prior_path:
+            raise PlanError(
+                "captured managed worktree index paths are not in canonical order"
+            )
+        prior_path = raw_path
+        entries.append(
+            (
+                raw_path,
+                f"{mode_value:o}".encode("ascii"),
+                object_id,
+            )
+        )
+
+    unsupported_extensions = {
+        b"link": "split-index",
+        b"REUC": "resolve-undo",
+        b"sdir": "sparse-index",
+        b"FSMN": "fsmonitor",
+        b"UNTR": "untracked-cache",
+        b"EOIE": "end-of-index-entry",
+        b"IEOT": "index-entry-offset-table",
+    }
+    seen_extensions: set[bytes] = set()
+    cache_tree_seen = False
+    while offset < body_end:
+        if offset + 8 > body_end:
+            raise PlanError("captured managed worktree index has a truncated extension")
+        signature = content[offset : offset + 4]
+        extension_size = int.from_bytes(content[offset + 4 : offset + 8], "big")
+        offset += 8
+        if offset + extension_size > body_end:
+            raise PlanError(
+                "captured managed worktree index has an oversized extension"
+            )
+        hidden_name = unsupported_extensions.get(signature)
+        if hidden_name is not None:
+            raise PlanError(
+                f"captured managed worktree index has hidden {hidden_name} state"
+            )
+        if signature in seen_extensions:
+            raise PlanError(
+                "captured managed worktree index contains a duplicate "
+                f"extension: {signature!r}"
+            )
+        seen_extensions.add(signature)
+        if signature == b"TREE":
+            if expected_cache_tree is None:
+                raise PlanError(
+                    "captured managed worktree index cache-tree cannot be "
+                    "validated without the planned target tree"
+                )
+            if extension_size > GIT_ENUMERATION_OUTPUT_LIMIT_BYTES:
+                raise PlanError(
+                    "captured managed worktree cache-tree exceeds the "
+                    f"{GIT_ENUMERATION_OUTPUT_LIMIT_BYTES}-byte aggregate limit"
+                )
+            validate_captured_cache_tree(
+                content,
+                offset,
+                offset + extension_size,
+                object_id_bytes,
+                expected_cache_tree,
+            )
+            cache_tree_seen = True
+            offset += extension_size
+            continue
+        if not signature or not 0x41 <= signature[0] <= 0x5A:
+            raise PlanError(
+                "captured managed worktree index has an unsupported mandatory "
+                f"extension: {signature!r}"
+            )
+        raise PlanError(
+            "captured managed worktree index has an unsupported optional "
+            f"extension: {signature!r}"
+        )
+    if require_cache_tree and not cache_tree_seen:
+        raise PlanError(
+            "captured managed worktree index requires a cache-tree extension "
+            "to preserve a non-root empty target tree"
+        )
+    return tuple(entries)
+
+
+def target_tree_index_semantics(
+    source_git_dir: Path,
+    target_sha: str,
+) -> tuple[
+    tuple[tuple[bytes, bytes, bytes], ...],
+    dict[bytes, tuple[int, bytes]],
+]:
+    object_id_length = len(target_sha)
+    if object_id_length not in {40, 64} or not re.fullmatch(
+        r"[0-9a-f]+",
+        target_sha,
+    ):
+        raise PlanError("planned target index tree has an invalid commit id")
+    root_result = read_git_bounded(
+        [
+            *source_object_repo_args(source_git_dir),
+            "rev-parse",
+            "--verify",
+            f"{target_sha}^{{tree}}",
+        ],
+        stdout_limit=object_id_length + 2,
+    )
+    root_object_id = root_result.stdout.rstrip(b"\r\n")
+    if len(root_object_id) != object_id_length or not re.fullmatch(
+        rb"[0-9a-f]+", root_object_id
+    ):
+        raise PlanError("planned target index tree has an invalid root object id")
+    result = read_git_bounded(
+        [
+            *source_object_repo_args(source_git_dir),
+            "ls-tree",
+            "-r",
+            "-t",
+            "-z",
+            "--full-tree",
+            target_sha,
+        ]
+    )
+    entries: list[tuple[bytes, bytes, bytes]] = []
+    tree_object_ids: dict[bytes, bytes] = {b"": bytes.fromhex(root_object_id.decode())}
+    component_count = 0
+    for record in bounded_records(
+        result.stdout,
+        "planned target index tree",
+        maximum_records=MAX_CHECKOUT_PATH_COMPONENTS,
+    ):
+        try:
+            header, raw_path = record.split(b"\t", 1)
+        except ValueError as exc:
+            raise PlanError("planned target index tree has an invalid record") from exc
+        fields = header.split()
+        if len(fields) != 3:
+            raise PlanError("planned target index tree has an invalid header")
+        mode, object_type, object_id = fields
+        if (
+            not re.fullmatch(rb"[0-9a-f]+", object_id)
+            or len(object_id) != object_id_length
+        ):
+            raise PlanError("planned target index tree has an invalid object id")
+        path_parts = validate_checkout_path(raw_path, "planned target index tree")
+        component_count += len(path_parts)
+        if component_count > MAX_CHECKOUT_PATH_COMPONENTS:
+            raise PlanError(
+                "planned target index tree exceeds the "
+                f"{MAX_CHECKOUT_PATH_COMPONENTS}-component safety limit"
+            )
+        if mode == b"040000" and object_type == b"tree":
+            if raw_path in tree_object_ids:
+                raise PlanError(
+                    "planned target index tree contains a duplicate directory"
+                )
+            tree_object_ids[raw_path] = bytes.fromhex(object_id.decode())
+            continue
+        if not (
+            (mode in {b"100644", b"100755", b"120000"} and object_type == b"blob")
+            or (mode == b"160000" and object_type == b"commit")
+        ):
+            raise PlanError(
+                "planned target index tree contains an unsupported entry type"
+            )
+        if len(entries) >= MAX_CHECKOUT_PATHS:
+            raise PlanError(
+                "planned target index tree exceeds the "
+                f"{MAX_CHECKOUT_PATHS}-entry safety limit"
+            )
+        if entries and raw_path == entries[-1][0]:
+            raise PlanError("planned target index tree contains a duplicate path")
+        if entries and raw_path < entries[-1][0]:
+            raise PlanError(
+                "planned target index tree paths are not in canonical order"
+            )
+        entries.append((raw_path, mode, object_id))
+
+    tree_entry_counts = {path: 0 for path in tree_object_ids}
+    for raw_path, _mode, _object_id in entries:
+        tree_entry_counts[b""] += 1
+        parts = raw_path.split(b"/")
+        prefix = b""
+        for component in parts[:-1]:
+            prefix = prefix + b"/" + component if prefix else component
+            if prefix not in tree_entry_counts:
+                raise PlanError(
+                    "planned target index tree is missing a parent directory"
+                )
+            tree_entry_counts[prefix] += 1
+    cache_nodes = {
+        path: (tree_entry_counts[path], object_id)
+        for path, object_id in tree_object_ids.items()
+    }
+    return tuple(entries), cache_nodes
+
+
+def target_tree_index_entries(
+    source_git_dir: Path,
+    target_sha: str,
+) -> tuple[tuple[bytes, bytes, bytes], ...]:
+    entries, _cache_nodes = target_tree_index_semantics(source_git_dir, target_sha)
+    return entries
+
+
+def validate_captured_index_matches_tree(
+    entry: PlannedWorktree,
+    index_content: bytes,
+) -> None:
+    object_id_bytes = len(entry.sha) // 2
+    expected, expected_cache_tree = target_tree_index_semantics(
+        entry.source_git_dir,
+        entry.sha,
+    )
+    captured = captured_index_entries(
+        index_content,
+        object_id_bytes,
+        expected_cache_tree=expected_cache_tree,
+        require_cache_tree=any(
+            path and entry_count == 0
+            for path, (entry_count, _object_id) in expected_cache_tree.items()
+        ),
+    )
+    if captured != expected:
+        raise PlanError(
+            "captured managed worktree index stage-0 mode/OID/path set does "
+            "not match the planned target tree\n"
+            f"  worktree: {entry.target.path}\n"
+            f"  target: {entry.sha}"
+        )
 
 
 def managed_head(worktree_path: Path) -> str:
@@ -9707,6 +10563,82 @@ def validate_sync_plan(plan: SyncPlan) -> None:
         revalidate_planned_entry(plan, entry)
 
 
+def revalidate_managed_final_file_bindings(
+    receipt: ManagedFinalStateReceipt,
+    control: ManagedControlReceipt,
+) -> None:
+    for descriptor, expected, name, maximum_bytes, purpose in (
+        (
+            receipt.head_descriptor,
+            receipt.head_binding,
+            "HEAD",
+            MAX_GITDIR_FILE_BYTES,
+            "managed worktree final HEAD",
+        ),
+        (
+            receipt.common_descriptor,
+            receipt.common_binding,
+            "commondir",
+            MAX_GITDIR_FILE_BYTES,
+            "managed worktree common-gitdir pointer",
+        ),
+        (
+            receipt.index_descriptor,
+            receipt.index_binding,
+            "index",
+            MAX_SUPERPROJECT_INDEX_BYTES,
+            "managed worktree final index",
+        ),
+    ):
+        observed, _ = bind_regular_file_descriptor_at(
+            descriptor,
+            control.admin_lease.descriptor,
+            name,
+            expected.path,
+            maximum_bytes=maximum_bytes,
+            mode=os.R_OK,
+            purpose=purpose,
+            retain_content=False,
+        )
+        require_matching_file_binding(expected, observed, purpose)
+
+
+def revalidate_managed_final_common_endpoint(
+    receipt: ManagedFinalStateReceipt,
+    control: ManagedControlReceipt,
+    source_lease: DirectoryEntryLease,
+) -> None:
+    """Sandwich one endpoint proof between exact pointer-file bindings."""
+
+    for _phase in range(2):
+        observed, _ = bind_regular_file_descriptor_at(
+            receipt.common_descriptor,
+            control.admin_lease.descriptor,
+            "commondir",
+            receipt.common_binding.path,
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose="managed worktree common-gitdir pointer",
+            retain_content=False,
+        )
+        require_matching_file_binding(
+            receipt.common_binding,
+            observed,
+            "managed worktree common-gitdir pointer",
+        )
+        if _phase == 0:
+            revalidate_nofollow_pointer_endpoint(
+                plain_gitdir_pointer_bytes(
+                    receipt.common_content,
+                    "managed worktree common-gitdir pointer",
+                ),
+                relative_base_descriptor=control.admin_lease.descriptor,
+                expected_fingerprint=source_lease.binding.fingerprint,
+                expected_kind=stat.S_IFDIR,
+                purpose="managed worktree commondir-to-source pointer",
+            )
+
+
 def capture_managed_final_state_receipt(
     entry: PlannedWorktree,
     lease: MaterializedTargetLease,
@@ -9721,7 +10653,6 @@ def capture_managed_final_state_receipt(
     head_descriptor = -1
     common_descriptor = -1
     index_descriptor = -1
-    common_target_descriptor = -1
     try:
         (
             head_descriptor,
@@ -9766,32 +10697,37 @@ def capture_managed_final_state_receipt(
             raise PlanError(
                 "managed worktree common-gitdir binding returned no content"
             )
-        raw_common = common_content.rstrip(b"\r\n")
-        if (
-            not raw_common
-            or b"\n" in raw_common
-            or b"\r" in raw_common
-            or b"\0" in raw_common
-            or len(raw_common) > MAX_CHECKOUT_PATH_BYTES
-        ):
-            raise PlanError("managed worktree common-gitdir pointer is malformed")
-        common_target_descriptor = os.open(
-            os.fsdecode(raw_common),
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
-            dir_fd=control.admin_lease.descriptor,
+        raw_common = plain_gitdir_pointer_bytes(
+            common_content,
+            "managed worktree common-gitdir pointer",
         )
-        common_fingerprint = fingerprint_from_stat(os.fstat(common_target_descriptor))
-        if common_fingerprint != source_lease.binding.fingerprint:
-            raise PlanError(
-                "descriptor-bound worktree common gitdir does not match the source\n"
-                f"  path: {entry.target.path}\n"
-                f"  source: {entry.source_git_dir}"
-            )
+        revalidate_nofollow_pointer_endpoint(
+            raw_common,
+            relative_base_descriptor=control.admin_lease.descriptor,
+            expected_fingerprint=source_lease.binding.fingerprint,
+            expected_kind=stat.S_IFDIR,
+            purpose="managed worktree commondir-to-source pointer",
+        )
+        observed_common, _ = bind_regular_file_descriptor_at(
+            common_descriptor,
+            control.admin_lease.descriptor,
+            "commondir",
+            common_binding.path,
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose="managed worktree common-gitdir pointer",
+            retain_content=False,
+        )
+        require_matching_file_binding(
+            common_binding,
+            observed_common,
+            "managed worktree common-gitdir pointer",
+        )
 
         (
             index_descriptor,
             index_binding,
-            _index_content,
+            index_content,
         ) = open_bound_regular_file_at(
             control.admin_lease.descriptor,
             "index",
@@ -9799,19 +10735,46 @@ def capture_managed_final_state_receipt(
             maximum_bytes=MAX_SUPERPROJECT_INDEX_BYTES,
             mode=os.R_OK,
             purpose="managed worktree final index",
+            retain_content=True,
+        )
+        if index_content is None:
+            raise PlanError("managed worktree final index returned no content")
+        validate_captured_index_matches_tree(entry, index_content)
+        observed_index, _ = bind_regular_file_descriptor_at(
+            index_descriptor,
+            control.admin_lease.descriptor,
+            "index",
+            index_binding.path,
+            maximum_bytes=MAX_SUPERPROJECT_INDEX_BYTES,
+            mode=os.R_OK,
+            purpose="managed worktree final index",
             retain_content=False,
         )
-        revalidate_managed_control_receipt(control, lease.target_descriptor)
-        revalidate_directory_entry_lease(source_lease)
-        revalidate_materialized_target_lease(lease)
-        return ManagedFinalStateReceipt(
+        require_matching_file_binding(
+            index_binding,
+            observed_index,
+            "managed worktree final index",
+        )
+        receipt = ManagedFinalStateReceipt(
             head_descriptor=head_descriptor,
             head_binding=head_binding,
             common_descriptor=common_descriptor,
             common_binding=common_binding,
+            common_content=common_content,
             index_descriptor=index_descriptor,
             index_binding=index_binding,
+            index_content=index_content,
         )
+        # Close the capture around every retained file and pointer endpoint
+        # after the potentially long target-tree/index validation above.
+        revalidate_managed_final_state_receipt(
+            entry,
+            receipt,
+            lease,
+            control,
+            source_lease,
+        )
+        return receipt
     except BaseException:
         for descriptor in (
             head_descriptor,
@@ -9821,12 +10784,10 @@ def capture_managed_final_state_receipt(
             if descriptor >= 0:
                 os.close(descriptor)
         raise
-    finally:
-        if common_target_descriptor >= 0:
-            os.close(common_target_descriptor)
 
 
 def revalidate_managed_final_state_receipt(
+    entry: PlannedWorktree,
     receipt: ManagedFinalStateReceipt,
     lease: MaterializedTargetLease,
     control: ManagedControlReceipt,
@@ -9837,40 +10798,18 @@ def revalidate_managed_final_state_receipt(
     revalidate_managed_control_receipt(control, lease.target_descriptor)
     revalidate_materialized_target_lease(lease)
     revalidate_directory_entry_lease(source_lease)
-    for descriptor, expected, name, maximum_bytes, purpose in (
-        (
-            receipt.head_descriptor,
-            receipt.head_binding,
-            "HEAD",
-            MAX_GITDIR_FILE_BYTES,
-            "managed worktree final HEAD",
-        ),
-        (
-            receipt.common_descriptor,
-            receipt.common_binding,
-            "commondir",
-            MAX_GITDIR_FILE_BYTES,
-            "managed worktree common-gitdir pointer",
-        ),
-        (
-            receipt.index_descriptor,
-            receipt.index_binding,
-            "index",
-            MAX_SUPERPROJECT_INDEX_BYTES,
-            "managed worktree final index",
-        ),
-    ):
-        observed, _ = bind_regular_file_descriptor_at(
-            descriptor,
-            control.admin_lease.descriptor,
-            name,
-            expected.path,
-            maximum_bytes=maximum_bytes,
-            mode=os.R_OK,
-            purpose=purpose,
-            retain_content=False,
-        )
-        require_matching_file_binding(expected, observed, purpose)
+    revalidate_managed_final_file_bindings(receipt, control)
+    revalidate_managed_final_common_endpoint(receipt, control, source_lease)
+    validate_captured_index_matches_tree(entry, receipt.index_content)
+    revalidate_managed_final_file_bindings(receipt, control)
+    revalidate_directory_entry_lease(source_lease)
+    revalidate_materialized_target_lease(lease)
+    revalidate_managed_control_receipt(control, lease.target_descriptor)
+    # The long index/tree validation and control revalidation above can race
+    # independently with a pointer-chain replacement. Re-prove commondir last,
+    # then close all three retained state files and both control endpoints.
+    revalidate_managed_final_common_endpoint(receipt, control, source_lease)
+    revalidate_managed_final_file_bindings(receipt, control)
     revalidate_directory_entry_lease(source_lease)
     revalidate_materialized_target_lease(lease)
     revalidate_managed_control_receipt(control, lease.target_descriptor)
@@ -9917,6 +10856,7 @@ def postvalidate_applied_entry(
                 f"target object closure changed during checkout: {entry.submodule.path}"
             )
         revalidate_managed_final_state_receipt(
+            entry,
             final_state,
             lease,
             control,
@@ -9951,6 +10891,7 @@ def finalize_leaf_checkout(
             source_lease,
         )
         revalidate_managed_final_state_receipt(
+            entry,
             final_state,
             lease,
             control,
@@ -9962,6 +10903,7 @@ def finalize_leaf_checkout(
             lease.created_nodes,
         )
         revalidate_managed_final_state_receipt(
+            entry,
             final_state,
             lease,
             control,
@@ -10024,6 +10966,7 @@ def finalize_recursive_parent_checkout(
             existing_updates=updates,
         )
         revalidate_managed_final_state_receipt(
+            entry,
             final_state,
             lease,
             control,
@@ -10037,6 +10980,7 @@ def finalize_recursive_parent_checkout(
             lease,
         )
         revalidate_managed_final_state_receipt(
+            entry,
             final_state,
             lease,
             control,
@@ -10101,73 +11045,80 @@ def apply_sync_plan(plan: SyncPlan) -> None:
         if first_mutation:
             revalidate_plan_input_receipt(plan)
             first_mutation = False
-        lease = materialize_bound_target_directory(target)
+        source_lease = capture_planned_source_lease(entry)
         try:
-            # A final entry revalidation happens after the descriptor lease is
-            # acquired and immediately before Git. Git then operates from the
-            # held target/parent objects rather than recreating missing parents
-            # through a replaceable pathname.
-            revalidate_materialized_target_lease(lease)
-            revalidate_source_object_admission(entry.source_git_dir)
-            revalidate_checkout_preflight(entry)
-            if index in recursive_parent_indexes:
+            lease = materialize_bound_target_directory(target)
+            try:
+                # The fresh source lease is fingerprint-equal to both preflight
+                # source receipts before either managed checkout or new
+                # registration can mutate Git state. Both held directory
+                # objects stay live through checkout and rollback.
+                revalidate_planned_source_lease(entry, source_lease)
+                revalidate_materialized_target_lease(lease)
+                revalidate_source_object_admission(entry.source_git_dir)
+                revalidate_checkout_preflight(entry)
+                if index in recursive_parent_indexes:
 
-                def finalize_recursive_current_checkout(
-                    control: ManagedControlReceipt,
-                    source_lease: DirectoryEntryLease,
-                    current_plan: SyncPlan = plan,
-                    current_index: int = index,
-                    current_entry: PlannedWorktree = entry,
-                    current_lease: MaterializedTargetLease = lease,
-                ) -> None:
-                    finalize_recursive_parent_checkout(
-                        current_plan,
-                        current_index,
-                        current_entry,
-                        current_lease,
-                        control,
-                        source_lease,
+                    def finalize_recursive_current_checkout(
+                        control: ManagedControlReceipt,
+                        callback_source_lease: DirectoryEntryLease,
+                        current_plan: SyncPlan = plan,
+                        current_index: int = index,
+                        current_entry: PlannedWorktree = entry,
+                        current_lease: MaterializedTargetLease = lease,
+                    ) -> None:
+                        finalize_recursive_parent_checkout(
+                            current_plan,
+                            current_index,
+                            current_entry,
+                            current_lease,
+                            control,
+                            callback_source_lease,
+                        )
+
+                    finalize_current_checkout = finalize_recursive_current_checkout
+                else:
+
+                    def finalize_leaf_current_checkout(
+                        control: ManagedControlReceipt,
+                        callback_source_lease: DirectoryEntryLease,
+                        current_plan: SyncPlan = plan,
+                        current_entry: PlannedWorktree = entry,
+                        current_lease: MaterializedTargetLease = lease,
+                    ) -> None:
+                        finalize_leaf_checkout(
+                            current_plan,
+                            current_entry,
+                            current_lease,
+                            control,
+                            callback_source_lease,
+                        )
+
+                    finalize_current_checkout = finalize_leaf_current_checkout
+                if entry.state == "managed":
+                    checkout_existing_worktree(
+                        target.path,
+                        entry.sha,
+                        dry_run=False,
+                        target_descriptor=lease.target_descriptor,
+                        source_git_dir=entry.source_git_dir,
+                        source_lease=source_lease,
+                        finalize_checkout=finalize_current_checkout,
                     )
-
-                finalize_current_checkout = finalize_recursive_current_checkout
-            else:
-
-                def finalize_leaf_current_checkout(
-                    control: ManagedControlReceipt,
-                    source_lease: DirectoryEntryLease,
-                    current_plan: SyncPlan = plan,
-                    current_entry: PlannedWorktree = entry,
-                    current_lease: MaterializedTargetLease = lease,
-                ) -> None:
-                    finalize_leaf_checkout(
-                        current_plan,
-                        current_entry,
-                        current_lease,
-                        control,
-                        source_lease,
+                else:
+                    add_worktree(
+                        entry.source_git_dir,
+                        target.path,
+                        entry.sha,
+                        dry_run=False,
+                        lease=lease,
+                        source_lease=source_lease,
+                        finalize_checkout=finalize_current_checkout,
                     )
-
-                finalize_current_checkout = finalize_leaf_current_checkout
-            if entry.state == "managed":
-                checkout_existing_worktree(
-                    target.path,
-                    entry.sha,
-                    dry_run=False,
-                    target_descriptor=lease.target_descriptor,
-                    source_git_dir=entry.source_git_dir,
-                    finalize_checkout=finalize_current_checkout,
-                )
-            else:
-                add_worktree(
-                    entry.source_git_dir,
-                    target.path,
-                    entry.sha,
-                    dry_run=False,
-                    lease=lease,
-                    finalize_checkout=finalize_current_checkout,
-                )
+            finally:
+                lease.close()
         finally:
-            lease.close()
+            source_lease.close()
 
 
 def sync_one(

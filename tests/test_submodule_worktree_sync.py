@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import errno
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -44,6 +45,67 @@ def run_git(cwd: Path, *args: str) -> str:
         stderr=subprocess.PIPE,
     )
     return result.stdout.strip()
+
+
+def split_v2_index_entries(
+    content: bytes,
+    object_id_bytes: int = 20,
+) -> tuple[tuple[bytes, ...], tuple[bytes, ...], int]:
+    if content[:4] != b"DIRC" or int.from_bytes(content[4:8], "big") != 2:
+        raise AssertionError("expected a version-2 Git index")
+    body_end = len(content) - object_id_bytes
+    entry_count = int.from_bytes(content[8:12], "big")
+    chunks: list[bytes] = []
+    paths: list[bytes] = []
+    offset = 12
+    fixed_size = 40 + object_id_bytes + 2
+    for _entry_index in range(entry_count):
+        entry_start = offset
+        flags_offset = entry_start + 40 + object_id_bytes
+        if flags_offset + 2 > body_end:
+            raise AssertionError("truncated version-2 index entry")
+        flags = int.from_bytes(content[flags_offset : flags_offset + 2], "big")
+        if flags & 0x4000:
+            raise AssertionError("unexpected extended version-2 index entry")
+        path_start = entry_start + fixed_size
+        path_end = content.find(b"\0", path_start, body_end)
+        if path_end < 0:
+            raise AssertionError("unterminated version-2 index path")
+        relative_size = path_end + 1 - entry_start
+        offset = entry_start + ((relative_size + 7) & ~7)
+        if offset > body_end:
+            raise AssertionError("oversized version-2 index entry")
+        chunks.append(content[entry_start:offset])
+        paths.append(content[path_start:path_end])
+    return tuple(chunks), tuple(paths), offset
+
+
+def encode_index_v4_strip_count(value: int) -> bytes:
+    encoded = [value & 0x7F]
+    while value >> 7:
+        value = (value >> 7) - 1
+        encoded.append(0x80 | (value & 0x7F))
+    return bytes(reversed(encoded))
+
+
+def v2_index_extension_signatures(
+    content: bytes,
+    object_id_bytes: int = 20,
+) -> tuple[bytes, ...]:
+    _chunks, _paths, offset = split_v2_index_entries(content, object_id_bytes)
+    body_end = len(content) - object_id_bytes
+    signatures: list[bytes] = []
+    while offset < body_end:
+        if offset + 8 > body_end:
+            raise AssertionError("truncated index extension")
+        signature = content[offset : offset + 4]
+        size = int.from_bytes(content[offset + 4 : offset + 8], "big")
+        offset += 8
+        if offset + size > body_end:
+            raise AssertionError("oversized index extension")
+        signatures.append(signature)
+        offset += size
+    return tuple(signatures)
 
 
 class SubmoduleWorktreeSyncTests(unittest.TestCase):
@@ -2903,6 +2965,11 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             self.linked,
             os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
         )
+        source_lease = MODULE.capture_directory_entry_lease(
+            self.source_git_dir,
+            os.R_OK | os.W_OK | os.X_OK,
+            "selected source common gitdir",
+        )
         try:
             with mock.patch.object(
                 MODULE,
@@ -2915,9 +2982,13 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     dry_run=False,
                     target_descriptor=target_descriptor,
                     source_git_dir=self.source_git_dir,
+                    source_lease=source_lease,
                 )
         finally:
-            os.close(target_descriptor)
+            try:
+                source_lease.close()
+            finally:
+                os.close(target_descriptor)
 
         command = run_command.call_args.args[0]
         self.assertTrue(any(arg.startswith("--git-dir=") for arg in command))
@@ -5988,6 +6059,636 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     )
                 )
 
+    def test_final_pointer_revalidation_rejects_intermediate_symlink_retarget(
+        self,
+    ) -> None:
+        for pointer_kind in ("git-admin", "backlink", "commondir"):
+            with self.subTest(pointer_kind=pointer_kind):
+                source_name = f"pointer-chain-{pointer_kind}"
+                source = self.clone_named_source(source_name)
+                run_git(source, "config", "core.untrackedCache", "false")
+                target_root = self.root / f"{source_name}-target"
+                target_root.mkdir()
+                target = target_root / "lib"
+                self.add_managed_worktree(source, target, self.sha)
+                run_git(target, "update-index", "--no-untracked-cache")
+                run_git(target, "update-index", "--no-fsmonitor")
+                admin = MODULE.gitdir_file_target(target)
+                self.assertIsNotNone(admin)
+                assert admin is not None
+
+                if pointer_kind == "git-admin":
+                    peer = self.root / f"{source_name}-peer"
+                    self.add_managed_worktree(source, peer, self.sha)
+                    peer_admin = MODULE.gitdir_file_target(peer)
+                    self.assertIsNotNone(peer_admin)
+                    assert peer_admin is not None
+                    symlink_target = peer_admin / "child"
+                    symlink_target.mkdir()
+                    route = admin / "route"
+                    route.mkdir()
+                    (target / ".git").write_text(
+                        f"gitdir: {route}/..\n",
+                        encoding="utf-8",
+                    )
+                elif pointer_kind == "backlink":
+                    peer = self.root / f"{source_name}-peer"
+                    self.add_managed_worktree(source, peer, self.sha)
+                    symlink_target = peer / "child"
+                    symlink_target.mkdir()
+                    route = target / "route"
+                    route.mkdir()
+                    (admin / "gitdir").write_text(
+                        f"{route.resolve(strict=True)}/../.git\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    alternate_source = self.clone_named_source(
+                        f"{source_name}-alternate"
+                    )
+                    symlink_target = alternate_source / "a" / "b" / "c"
+                    symlink_target.mkdir(parents=True)
+                    route = admin / "route"
+                    route.mkdir()
+                    (admin / "commondir").write_text(
+                        "route/../../..\n",
+                        encoding="utf-8",
+                    )
+
+                plan = MODULE.build_sync_plan(
+                    root=target_root,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[
+                        (
+                            MODULE.Submodule(
+                                source_name,
+                                "lib",
+                                str(self.remote),
+                            ),
+                            self.sha,
+                        )
+                    ],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    fetch_missing=False,
+                )
+                entry = plan.entries[0]
+                lease = MODULE.materialize_bound_target_directory(entry.target)
+                source_lease = MODULE.capture_planned_source_lease(entry)
+                control = MODULE.capture_managed_control_receipt(
+                    target,
+                    source,
+                    lease.target_descriptor,
+                )
+                final_state = MODULE.capture_managed_final_state_receipt(
+                    entry,
+                    lease,
+                    control,
+                    source_lease,
+                )
+                original_route = route.with_name("route.original")
+                route.rename(original_route)
+                os.symlink(symlink_target, route, target_is_directory=True)
+                try:
+                    with self.assertRaisesRegex(
+                        MODULE.PlanError,
+                        "no-follow descriptor chain|no-follow endpoint",
+                    ):
+                        MODULE.revalidate_managed_final_state_receipt(
+                            entry,
+                            final_state,
+                            lease,
+                            control,
+                            source_lease,
+                        )
+                finally:
+                    route.unlink()
+                    original_route.rename(route)
+                    try:
+                        final_state.close()
+                    finally:
+                        try:
+                            control.close()
+                        finally:
+                            try:
+                                source_lease.close()
+                            finally:
+                                lease.close()
+
+    def test_final_state_capture_and_revalidation_close_index_validation_races(
+        self,
+    ) -> None:
+        for phase in ("capture", "revalidate"):
+            for mutation in ("HEAD", "commondir"):
+                with self.subTest(phase=phase, mutation=mutation):
+                    source_name = f"final-state-{phase}-{mutation.lower()}"
+                    source = self.clone_named_source(source_name)
+                    run_git(source, "config", "core.untrackedCache", "false")
+                    target_root = self.root / f"{source_name}-target"
+                    target_root.mkdir()
+                    target = target_root / "lib"
+                    self.add_managed_worktree(source, target, self.sha)
+                    run_git(target, "update-index", "--no-untracked-cache")
+                    run_git(target, "update-index", "--no-fsmonitor")
+                    admin = MODULE.gitdir_file_target(target)
+                    self.assertIsNotNone(admin)
+                    assert admin is not None
+
+                    head_content = (admin / "HEAD").read_bytes()
+                    route = admin / "route"
+                    original_route = route.with_name("route.original")
+                    alternate_source = self.clone_named_source(
+                        f"{source_name}-alternate"
+                    )
+                    symlink_target = alternate_source / "a" / "b" / "c"
+                    symlink_target.mkdir(parents=True)
+                    route.mkdir()
+                    (admin / "commondir").write_text(
+                        "route/../../..\n",
+                        encoding="utf-8",
+                    )
+
+                    plan = MODULE.build_sync_plan(
+                        root=target_root,
+                        common_git_dir=self.named_common_git_dir,
+                        source_superproject=None,
+                        planned_modules=[
+                            (
+                                MODULE.Submodule(
+                                    source_name,
+                                    "lib",
+                                    str(self.remote),
+                                ),
+                                self.sha,
+                            )
+                        ],
+                        depth=1,
+                        recursive=False,
+                        force_replace_empty=False,
+                        fetch_missing=False,
+                    )
+                    entry = plan.entries[0]
+                    lease = MODULE.materialize_bound_target_directory(entry.target)
+                    source_lease = MODULE.capture_planned_source_lease(entry)
+                    control = MODULE.capture_managed_control_receipt(
+                        target,
+                        source,
+                        lease.target_descriptor,
+                    )
+                    final_state = None
+                    original_validate = MODULE.validate_captured_index_matches_tree
+                    mutated = False
+
+                    def mutate_after_index_validation(
+                        current_entry: object,
+                        index_content: bytes,
+                    ) -> None:
+                        nonlocal mutated
+                        original_validate(current_entry, index_content)
+                        if mutated:
+                            return
+                        if mutation == "HEAD":
+                            (admin / "HEAD").write_text(
+                                f"{'f' * 40}\n",
+                                encoding="ascii",
+                            )
+                        else:
+                            route.rename(original_route)
+                            os.symlink(
+                                symlink_target,
+                                route,
+                                target_is_directory=True,
+                            )
+                        mutated = True
+
+                    error = (
+                        "final HEAD content changed"
+                        if mutation == "HEAD"
+                        else "no-follow descriptor chain|no-follow endpoint"
+                    )
+                    try:
+                        if phase == "revalidate":
+                            final_state = MODULE.capture_managed_final_state_receipt(
+                                entry,
+                                lease,
+                                control,
+                                source_lease,
+                            )
+                        with mock.patch.object(
+                            MODULE,
+                            "validate_captured_index_matches_tree",
+                            side_effect=mutate_after_index_validation,
+                        ):
+                            with self.assertRaisesRegex(MODULE.PlanError, error):
+                                if phase == "capture":
+                                    MODULE.capture_managed_final_state_receipt(
+                                        entry,
+                                        lease,
+                                        control,
+                                        source_lease,
+                                    )
+                                else:
+                                    assert final_state is not None
+                                    MODULE.revalidate_managed_final_state_receipt(
+                                        entry,
+                                        final_state,
+                                        lease,
+                                        control,
+                                        source_lease,
+                                    )
+                        self.assertTrue(mutated)
+                    finally:
+                        if mutation == "HEAD":
+                            (admin / "HEAD").write_bytes(head_content)
+                        elif mutated:
+                            route.unlink()
+                            original_route.rename(route)
+                        if final_state is not None:
+                            final_state.close()
+                        try:
+                            control.close()
+                        finally:
+                            try:
+                                source_lease.close()
+                            finally:
+                                lease.close()
+
+    def test_fresh_source_lease_bridges_preflight_before_managed_and_new_git(
+        self,
+    ) -> None:
+        for state in ("managed", "new"):
+            with self.subTest(state=state):
+                source_name = f"source-lease-bridge-{state}"
+                source = self.clone_named_source(source_name)
+                target_root = self.root / f"{source_name}-target"
+                target_root.mkdir()
+                target = target_root / "lib"
+                if state == "managed":
+                    self.add_managed_worktree(source, target, self.sha)
+                plan = MODULE.build_sync_plan(
+                    root=target_root,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[
+                        (
+                            MODULE.Submodule(
+                                source_name,
+                                "lib",
+                                str(self.remote),
+                            ),
+                            self.sha,
+                        )
+                    ],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    fetch_missing=False,
+                )
+                original_source = source.with_name(f"{source.name}.preflight")
+                original_capture = MODULE.capture_planned_source_lease
+                replaced = False
+
+                def replace_source_before_fresh_capture(
+                    current_entry: object,
+                ) -> object:
+                    nonlocal replaced
+                    source.rename(original_source)
+                    shutil.copytree(original_source, source)
+                    replaced = True
+                    return original_capture(current_entry)
+
+                try:
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "capture_planned_source_lease",
+                            side_effect=replace_source_before_fresh_capture,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "run_git_at_directory_descriptor",
+                        ) as git_mutation,
+                    ):
+                        with self.assertRaisesRegex(
+                            MODULE.PlanError,
+                            "fresh source gitdir lease does not match the "
+                            "preflight source access binding",
+                        ):
+                            MODULE.apply_sync_plan(plan)
+                    self.assertTrue(replaced)
+                    git_mutation.assert_not_called()
+                    if state == "new":
+                        self.assertFalse(target.exists())
+                    else:
+                        self.assertEqual(
+                            run_git(target, "rev-parse", "HEAD"),
+                            self.sha,
+                        )
+                finally:
+                    if replaced:
+                        shutil.rmtree(source)
+                        original_source.rename(source)
+
+    def test_captured_index_rejects_conflict_and_hidden_entry_flags(self) -> None:
+        source = self.clone_named_source("captured-index-flags")
+        target = self.root / "captured-index-flags-target"
+        self.add_managed_worktree(source, target, self.sha)
+        admin = MODULE.gitdir_file_target(target)
+        self.assertIsNotNone(admin)
+        assert admin is not None
+        original = (admin / "index").read_bytes()
+        self.assertEqual(int.from_bytes(original[4:8], "big"), 2)
+        flags_offset = 12 + 40 + 20
+
+        for label, flag, error in (
+            ("conflict", 0x1000, "unresolved conflict"),
+            ("assume-valid", 0x8000, "hidden assume-valid"),
+        ):
+            with self.subTest(label=label):
+                modified = bytearray(original)
+                flags = int.from_bytes(
+                    modified[flags_offset : flags_offset + 2],
+                    "big",
+                )
+                modified[flags_offset : flags_offset + 2] = (flags | flag).to_bytes(
+                    2, "big"
+                )
+                modified[-20:] = hashlib.sha1(modified[:-20]).digest()
+                with self.assertRaisesRegex(MODULE.PlanError, error):
+                    MODULE.captured_index_entries(bytes(modified), 20)
+
+    def test_captured_index_parser_accepts_versions_two_through_four(self) -> None:
+        (self.remote / "docs").mkdir()
+        for name in ("alpha.txt", "alpine.txt", "zebra.txt"):
+            (self.remote / "docs" / name).write_text(
+                f"{name}\n",
+                encoding="utf-8",
+            )
+        for directory in ("z", "aa"):
+            (self.remote / directory).mkdir()
+            (self.remote / directory / "file.txt").write_text(
+                f"{directory}\n",
+                encoding="utf-8",
+            )
+        run_git(self.remote, "add", "docs", "z", "aa")
+        run_git(self.remote, "commit", "-m", "add index version paths")
+        version_sha = run_git(self.remote, "rev-parse", "HEAD")
+        source = self.clone_named_source("captured-index-versions")
+        target = self.root / "captured-index-versions-target"
+        run_git(source, "config", "core.untrackedCache", "false")
+        self.add_managed_worktree(source, target, version_sha)
+        run_git(target, "update-index", "--no-untracked-cache")
+        run_git(target, "update-index", "--no-fsmonitor")
+        run_git(target, "write-tree")
+        admin = MODULE.gitdir_file_target(target)
+        self.assertIsNotNone(admin)
+        assert admin is not None
+        entry = SimpleNamespace(
+            sha=version_sha,
+            source_git_dir=source,
+            target=SimpleNamespace(path=target),
+        )
+
+        version_two = (admin / "index").read_bytes()
+        self.assertEqual(int.from_bytes(version_two[4:8], "big"), 2)
+        self.assertIn(b"TREE", v2_index_extension_signatures(version_two))
+        MODULE.validate_captured_index_matches_tree(entry, version_two)
+
+        chunks, paths, extensions_offset = split_v2_index_entries(version_two)
+        first_chunk = bytearray(chunks[0][:62])
+        first_flags = int.from_bytes(first_chunk[60:62], "big")
+        first_chunk[60:62] = (first_flags | 0x4000).to_bytes(2, "big")
+        first_entry = bytes(first_chunk) + b"\0\0" + paths[0] + b"\0"
+        first_entry += bytes((-len(first_entry)) % 8)
+        version_three_body = (
+            version_two[:4]
+            + (3).to_bytes(4, "big")
+            + version_two[8:12]
+            + first_entry
+            + b"".join(chunks[1:])
+            + version_two[extensions_offset:-20]
+        )
+        version_three = version_three_body + hashlib.sha1(version_three_body).digest()
+        MODULE.validate_captured_index_matches_tree(entry, version_three)
+
+        run_git(target, "update-index", "--index-version", "4")
+        version_four = (admin / "index").read_bytes()
+        self.assertEqual(int.from_bytes(version_four[4:8], "big"), 4)
+        MODULE.validate_captured_index_matches_tree(entry, version_four)
+
+    def test_captured_index_rejects_noncanonical_or_hidden_semantics(self) -> None:
+        for name in ("alpha.txt", "zebra.txt"):
+            (self.remote / name).write_text(f"{name}\n", encoding="utf-8")
+        run_git(self.remote, "add", "alpha.txt", "zebra.txt")
+        run_git(self.remote, "commit", "-m", "add strict index paths")
+        strict_sha = run_git(self.remote, "rev-parse", "HEAD")
+        source = self.clone_named_source("captured-index-strict")
+        run_git(source, "config", "core.untrackedCache", "false")
+        target = self.root / "captured-index-strict-target"
+        self.add_managed_worktree(source, target, strict_sha)
+        admin = MODULE.gitdir_file_target(target)
+        self.assertIsNotNone(admin)
+        assert admin is not None
+        entry = SimpleNamespace(
+            sha=strict_sha,
+            source_git_dir=source,
+            target=SimpleNamespace(path=target),
+        )
+
+        run_git(target, "config", "index.skipHash", "true")
+        run_git(target, "config", "index.recordEndOfIndexEntries", "true")
+        run_git(target, "update-index", "--force-write-index")
+        skip_hash_index = (admin / "index").read_bytes()
+        self.assertEqual(skip_hash_index[-20:], bytes(20))
+        self.assertIn(b"EOIE", v2_index_extension_signatures(skip_hash_index))
+        with self.assertRaisesRegex(MODULE.PlanError, "skip-hash checksum"):
+            MODULE.captured_index_entries(skip_hash_index, 20)
+        self.assertIn("index.skipHash=false", MODULE.SAFE_GIT_CONFIG_ARGS)
+        self.assertIn(
+            "index.recordEndOfIndexEntries=false",
+            MODULE.SAFE_GIT_CONFIG_ARGS,
+        )
+        MODULE.run(
+            [
+                "git",
+                "-C",
+                str(target),
+                "update-index",
+                "--no-untracked-cache",
+                "--no-fsmonitor",
+                "--force-write-index",
+            ]
+        )
+        strict_index = (admin / "index").read_bytes()
+        self.assertNotEqual(strict_index[-20:], bytes(20))
+        self.assertNotIn(b"EOIE", v2_index_extension_signatures(strict_index))
+        chunks, paths, _extensions_offset = split_v2_index_entries(strict_index)
+        self.assertGreaterEqual(len(chunks), 1)
+        base_body = strict_index[:12] + b"".join(chunks)
+
+        for signature, error in (
+            (b"FSMN", "hidden fsmonitor"),
+            (b"UNTR", "hidden untracked-cache"),
+            (b"EOIE", "hidden end-of-index-entry"),
+            (b"IEOT", "hidden index-entry-offset-table"),
+            (b"ABCD", "unsupported optional"),
+        ):
+            with self.subTest(signature=signature):
+                body = base_body + signature + (0).to_bytes(4, "big")
+                modified = body + hashlib.sha1(body).digest()
+                with self.assertRaisesRegex(MODULE.PlanError, error):
+                    MODULE.validate_captured_index_matches_tree(entry, modified)
+
+        cache_tree_payload = (
+            b"\0" + str(len(chunks)).encode("ascii") + b" 0\n" + bytes(20)
+        )
+        cache_tree_body = (
+            base_body
+            + b"TREE"
+            + len(cache_tree_payload).to_bytes(4, "big")
+            + cache_tree_payload
+        )
+        cache_tree_index = cache_tree_body + hashlib.sha1(cache_tree_body).digest()
+        with self.assertRaisesRegex(MODULE.PlanError, "cache-tree does not match"):
+            MODULE.validate_captured_index_matches_tree(entry, cache_tree_index)
+
+        if len(chunks) >= 2:
+            reordered = (chunks[1], chunks[0], *chunks[2:])
+            version_two_body = strict_index[:12] + b"".join(reordered)
+            version_two = version_two_body + hashlib.sha1(version_two_body).digest()
+            with self.assertRaisesRegex(MODULE.PlanError, "canonical order"):
+                MODULE.validate_captured_index_matches_tree(entry, version_two)
+
+            version_four_body = (
+                strict_index[:4] + (4).to_bytes(4, "big") + strict_index[8:12]
+            )
+            prior_path = b""
+            for chunk, raw_path in zip(reordered, (paths[1], paths[0], *paths[2:])):
+                version_four_body += (
+                    chunk[:62]
+                    + encode_index_v4_strip_count(len(prior_path))
+                    + raw_path
+                    + b"\0"
+                )
+                prior_path = raw_path
+            version_four = version_four_body + hashlib.sha1(version_four_body).digest()
+            with self.assertRaisesRegex(MODULE.PlanError, "canonical order"):
+                MODULE.validate_captured_index_matches_tree(entry, version_four)
+
+        strict_index = base_body + hashlib.sha1(base_body).digest()
+        with mock.patch.object(MODULE, "GIT_ENUMERATION_OUTPUT_LIMIT_BYTES", 1):
+            with self.assertRaisesRegex(MODULE.PlanError, "expanded paths exceed"):
+                MODULE.captured_index_entries(strict_index, 20)
+
+        root_object_id = b"\x01" * 20
+        empty_object_id = b"\x02" * 20
+        expected_empty_tree = {
+            b"": (0, root_object_id),
+            b"empty": (0, empty_object_id),
+        }
+        empty_body = b"DIRC" + (2).to_bytes(4, "big") + bytes(4)
+        empty_index = empty_body + hashlib.sha1(empty_body).digest()
+        with self.assertRaisesRegex(MODULE.PlanError, "requires a cache-tree"):
+            MODULE.captured_index_entries(
+                empty_index,
+                20,
+                expected_cache_tree=expected_empty_tree,
+                require_cache_tree=True,
+            )
+
+        cache_tree_payload = (
+            b"\0" + b"0 1\n" + root_object_id + b"empty\0" + b"0 0\n" + empty_object_id
+        )
+        empty_tree_body = (
+            empty_body
+            + b"TREE"
+            + len(cache_tree_payload).to_bytes(4, "big")
+            + cache_tree_payload
+        )
+        empty_tree_index = empty_tree_body + hashlib.sha1(empty_tree_body).digest()
+        self.assertEqual(
+            MODULE.captured_index_entries(
+                empty_tree_index,
+                20,
+                expected_cache_tree=expected_empty_tree,
+                require_cache_tree=True,
+            ),
+            (),
+        )
+
+    def test_final_index_rejects_another_valid_checkout_snapshot(self) -> None:
+        (self.remote / "SECOND.md").write_text("second\n", encoding="utf-8")
+        run_git(self.remote, "add", "SECOND.md")
+        run_git(self.remote, "commit", "-m", "second")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+        peer = self.root / "final-index-peer"
+        self.add_managed_worktree(
+            self.named_source_git_dir,
+            peer,
+            self.sha,
+        )
+        peer_admin = MODULE.gitdir_file_target(peer)
+        self.assertIsNotNone(peer_admin)
+        assert peer_admin is not None
+        peer_index = (peer_admin / "index").read_bytes()
+        peer_chunks, _peer_paths, _peer_extensions = split_v2_index_entries(peer_index)
+        peer_body = peer_index[:12] + b"".join(peer_chunks)
+        peer_index = peer_body + hashlib.sha1(peer_body).digest()
+
+        target, module, input_receipt = self.make_target_superproject(
+            "final-index-target",
+            target_sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, target_sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        final_target = target / module.path
+        original_capture = MODULE.capture_managed_final_state_receipt
+        replaced = False
+
+        def replace_index_before_capture(
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal replaced
+            control = args[2]
+            self.assertIsInstance(control, MODULE.ManagedControlReceipt)
+            (control.admin_git_dir / "index").write_bytes(peer_index)
+            replaced = True
+            return original_capture(*args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "capture_managed_final_state_receipt",
+            side_effect=replace_index_before_capture,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "stage-0 mode/OID/path set does not match",
+                ):
+                    MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(replaced)
+        self.assertFalse(final_target.exists())
+        self.assertTrue(
+            all(
+                ancestor.materialized_node is None
+                for ancestor in plan.shared_missing_ancestors.values()
+            )
+        )
+
     def test_managed_leaf_finalization_retains_original_admin_identity(
         self,
     ) -> None:
@@ -7062,6 +7763,11 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             "test shallow fetched worktree",
         )
         lease = MODULE.materialize_bound_target_directory(target)
+        source_lease = MODULE.capture_directory_entry_lease(
+            shallow_source,
+            os.R_OK | os.W_OK | os.X_OK,
+            "selected source common gitdir",
+        )
         try:
             MODULE.add_worktree(
                 shallow_source,
@@ -7069,9 +7775,13 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 third_sha,
                 dry_run=False,
                 lease=lease,
+                source_lease=source_lease,
             )
         finally:
-            lease.close()
+            try:
+                source_lease.close()
+            finally:
+                lease.close()
         run_git(
             self.root,
             f"--git-dir={shallow_source}",
@@ -7750,6 +8460,12 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 "materialize_bound_target_directory",
                 return_value=lease,
             ),
+            mock.patch.object(
+                MODULE,
+                "capture_planned_source_lease",
+                return_value=mock.MagicMock(),
+            ),
+            mock.patch.object(MODULE, "revalidate_planned_source_lease"),
             mock.patch.object(MODULE, "revalidate_materialized_target_lease"),
             mock.patch.object(MODULE, "revalidate_source_object_admission"),
             mock.patch.object(MODULE, "revalidate_checkout_preflight"),
@@ -7818,10 +8534,12 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             dry_run: bool,
             *,
             lease: object | None = None,
+            source_lease: object | None = None,
             finalize_checkout: object | None = None,
         ) -> None:
             self.assertFalse(dry_run)
             self.assertIsNotNone(lease)
+            self.assertIsNotNone(source_lease)
             events.append(f"add:{target.name}")
             if callable(finalize_checkout):
                 finalize_checkout(
@@ -7858,30 +8576,41 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                             ):
                                 with mock.patch.object(
                                     MODULE,
-                                    "revalidate_materialized_target_lease",
+                                    "capture_planned_source_lease",
+                                    side_effect=lambda _entry: mock.MagicMock(),
                                 ):
                                     with mock.patch.object(
                                         MODULE,
-                                        "revalidate_source_object_admission",
+                                        "revalidate_planned_source_lease",
                                     ):
                                         with mock.patch.object(
                                             MODULE,
-                                            "revalidate_checkout_preflight",
+                                            "revalidate_materialized_target_lease",
                                         ):
                                             with mock.patch.object(
                                                 MODULE,
-                                                "postvalidate_applied_entry",
+                                                "revalidate_source_object_admission",
                                             ):
                                                 with mock.patch.object(
                                                     MODULE,
-                                                    "revalidate_managed_final_state_receipt",
+                                                    "revalidate_checkout_preflight",
                                                 ):
                                                     with mock.patch.object(
                                                         MODULE,
-                                                        "add_worktree",
-                                                        side_effect=add,
+                                                        "postvalidate_applied_entry",
                                                     ):
-                                                        MODULE.apply_sync_plan(plan)
+                                                        with mock.patch.object(
+                                                            MODULE,
+                                                            "revalidate_managed_final_state_receipt",
+                                                        ):
+                                                            with mock.patch.object(
+                                                                MODULE,
+                                                                "add_worktree",
+                                                                side_effect=add,
+                                                            ):
+                                                                MODULE.apply_sync_plan(
+                                                                    plan
+                                                                )
 
         self.assertEqual(events.count("full"), 2)
         second_full = len(events) - 1 - events[::-1].index("full")
