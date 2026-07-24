@@ -115,7 +115,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self,
         *,
         initial_content: bytes | None,
-        fetched_content: bytes,
+        fetched_content: bytes | None,
     ) -> MODULE.TransportReceipt:
         source_shallow = self.named_source_git_dir / MODULE.SOURCE_SHALLOW_NAME
         if initial_content is not None:
@@ -129,9 +129,11 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             self.named_source_git_dir,
             submodule,
         )
-        (receipt.fetch_git_dir / MODULE.SOURCE_SHALLOW_NAME).write_bytes(
-            fetched_content
-        )
+        private_shallow = receipt.fetch_git_dir / MODULE.SOURCE_SHALLOW_NAME
+        if fetched_content is None:
+            private_shallow.unlink(missing_ok=True)
+        else:
+            private_shallow.write_bytes(fetched_content)
         self.addCleanup(receipt.fetch_guard.cleanup)
         return receipt
 
@@ -347,6 +349,176 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                             str(self.remote),
                         ),
                     )
+
+    def test_fetch_transport_freezes_source_object_write_policy(self) -> None:
+        source = self.clone_named_source("object-write-policy")
+        settings = (
+            ("fetch.fsckObjects", "false"),
+            ("transfer.fsckObjects", "true"),
+            ("core.sharedRepository", "0660"),
+            ("core.fsync", "all,-commit-graph"),
+            ("core.fsyncMethod", "fsync"),
+        )
+        for key, value in settings:
+            run_git(
+                self.root,
+                f"--git-dir={source}",
+                "config",
+                key,
+                value,
+            )
+        submodule = MODULE.Submodule(
+            "object-write-policy",
+            "third_party/object-write-policy",
+            str(self.remote),
+        )
+
+        receipt = MODULE.capture_transport_receipt(source, submodule)
+        self.addCleanup(receipt.fetch_guard.cleanup)
+
+        self.assertEqual(receipt.fetch_object_policy, settings)
+        for key, expected in settings:
+            self.assertEqual(
+                run_git(
+                    self.root,
+                    f"--git-dir={receipt.fetch_git_dir}",
+                    "config",
+                    "--get",
+                    key,
+                ),
+                expected,
+            )
+        MODULE.revalidate_transport_receipt(receipt, submodule)
+        with (receipt.fetch_git_dir / "config").open("a", encoding="ascii") as stream:
+            stream.write("[fetch]\n\tfsckObjects = true\n")
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "content changed after preflight",
+        ):
+            MODULE.revalidate_transport_receipt(receipt, submodule)
+
+    def test_fetch_transport_rejects_unreproducible_object_write_policy(
+        self,
+    ) -> None:
+        cases = (
+            ("core.fsyncObjectFiles", "true"),
+            ("fetch.fsck.missingEmail", "ignore"),
+            ("fetch.fsck.skipList", str(self.root / "skip-list")),
+            ("fetch.unpackLimit", "1"),
+            ("transfer.unpackLimit", "1"),
+            ("core.createObject", "link"),
+            ("core.fsync", "pack,unknown-component"),
+            ("core.fsync", "none,pack"),
+            ("core.fsyncMethod", "unknown-method"),
+            ("core.fsyncMethod", "batch"),
+            ("core.sharedRepository", "unknown-mode"),
+        )
+        for index, (key, value) in enumerate(cases):
+            with self.subTest(key=key, value=value):
+                source = self.clone_named_source(f"object-policy-{index}")
+                run_git(
+                    self.root,
+                    f"--git-dir={source}",
+                    "config",
+                    key,
+                    value,
+                )
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "cannot reproduce safely|unsupported|mixes",
+                ):
+                    MODULE.capture_transport_receipt(
+                        source,
+                        MODULE.Submodule(
+                            f"object-policy-{index}",
+                            f"third_party/object-policy-{index}",
+                            str(self.remote),
+                        ),
+                    )
+
+        duplicate_source = self.clone_named_source("duplicate-object-policy")
+        for value in ("pack", "all"):
+            run_git(
+                self.root,
+                f"--git-dir={duplicate_source}",
+                "config",
+                "--add",
+                "core.fsync",
+                value,
+            )
+        with self.assertRaisesRegex(MODULE.PlanError, "duplicate object-write policy"):
+            MODULE.capture_transport_receipt(
+                duplicate_source,
+                MODULE.Submodule(
+                    "duplicate-object-policy",
+                    "third_party/duplicate-object-policy",
+                    str(self.remote),
+                ),
+            )
+
+    def test_authorized_fetch_applies_bound_shared_repository_mode(self) -> None:
+        source = self.clone_named_source("shared-object-policy")
+        run_git(
+            self.root,
+            f"--git-dir={source}",
+            "config",
+            "core.sharedRepository",
+            "0660",
+        )
+        run_git(
+            self.root,
+            f"--git-dir={source}",
+            "config",
+            "fetch.fsckObjects",
+            "true",
+        )
+        before = {
+            path.relative_to(source)
+            for path in (source / "objects").rglob("*")
+            if path.is_file()
+        }
+
+        (self.remote / "SECOND.md").write_text("second\n", encoding="utf-8")
+        run_git(self.remote, "add", "SECOND.md")
+        run_git(self.remote, "commit", "-m", "second")
+        second_sha = run_git(self.remote, "rev-parse", "HEAD")
+        submodule = MODULE.Submodule(
+            "shared-object-policy",
+            "third_party/shared-object-policy",
+            str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(source, submodule)
+        self.addCleanup(receipt.fetch_guard.cleanup)
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(
+                MODULE.fetch_missing_commit(
+                    source,
+                    self.root / "shared-object-target",
+                    submodule,
+                    second_sha,
+                    1,
+                    dry_run=False,
+                    transport_receipt=receipt,
+                    fetch_missing=True,
+                )
+            )
+
+        new_object_files = [
+            path
+            for path in (source / "objects").rglob("*")
+            if path.is_file() and path.relative_to(source) not in before
+        ]
+        self.assertTrue(new_object_files)
+        for path in new_object_files:
+            with self.subTest(path=path):
+                self.assertEqual(path.stat().st_mode & 0o077, 0o040)
+        run_git(
+            self.root,
+            f"--git-dir={source}",
+            "fsck",
+            "--full",
+        )
 
     def test_fetch_transport_requires_one_exact_approved_url(self) -> None:
         source = self.clone_named_source("mismatched-origin")
@@ -1544,6 +1716,58 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.assertFalse(policy.case_sensitive)
         self.assertEqual(policy.normalization, "exact")
+
+    def test_unproven_literal_unicode_names_use_conservative_nfd_tokens(
+        self,
+    ) -> None:
+        cases = (
+            ("unknown-sensitive", True, False, 0xFF534D42),
+            ("unknown-insensitive", False, False, 0xFF534D42),
+            ("known-without-casefold-proof", True, None, 0xEF53),
+        )
+        for name, case_sensitive, casefold, filesystem_magic in cases:
+            with self.subTest(name=name):
+                target_root = self.root / name
+                target_root.mkdir()
+                with mock.patch.object(MODULE.sys, "platform", "linux"):
+                    with mock.patch.object(
+                        MODULE,
+                        "local_git_bool",
+                        return_value=False,
+                    ):
+                        with mock.patch.object(
+                            MODULE,
+                            "probe_directory_case_sensitive",
+                            return_value=case_sensitive,
+                        ):
+                            with mock.patch.object(
+                                MODULE,
+                                "linux_directory_casefold",
+                                return_value=casefold,
+                            ):
+                                with mock.patch.object(
+                                    MODULE,
+                                    "linux_filesystem_magic",
+                                    return_value=filesystem_magic,
+                                ):
+                                    policy = MODULE.filesystem_name_policy(target_root)
+
+                first = MODULE.bind_target_path(
+                    target_root,
+                    ("Caf\u00e9",),
+                    "first",
+                    policy,
+                )
+                second = MODULE.bind_target_path(
+                    target_root,
+                    ("Cafe\u0301" if case_sensitive else "CAFE\u0301",),
+                    "second",
+                    policy,
+                )
+
+                self.assertEqual(policy.case_sensitive, case_sensitive)
+                self.assertEqual(policy.normalization, "NFD")
+                self.assertEqual(first.collision_tokens, second.collision_tokens)
 
     def test_descendant_ext4_casefold_anchor_controls_missing_aliases(self) -> None:
         target_root = self.root / "mixed-name-policy-target"
@@ -3522,6 +3746,225 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             f"--git-dir={shallow_source}",
             "fsck",
             "--full",
+        )
+
+    def test_root_commit_fetch_keeps_complete_source_without_shallow_boundary(
+        self,
+    ) -> None:
+        source = self.named_common_git_dir / "modules" / "root-fetch"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        run_git(self.root, "init", "--bare", str(source))
+        run_git(
+            self.root,
+            f"--git-dir={source}",
+            "config",
+            "remote.origin.url",
+            str(self.remote),
+        )
+        submodule = MODULE.Submodule(
+            "root-fetch",
+            "third_party/root-fetch",
+            str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(source, submodule)
+        self.addCleanup(receipt.fetch_guard.cleanup)
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(
+                MODULE.fetch_missing_commit(
+                    source,
+                    self.root / "root-fetch-target",
+                    submodule,
+                    self.sha,
+                    2,
+                    dry_run=False,
+                    transport_receipt=receipt,
+                    fetch_missing=True,
+                )
+            )
+
+        self.assertFalse((source / MODULE.SOURCE_SHALLOW_NAME).exists())
+        self.assertFalse((source / MODULE.SOURCE_SHALLOW_LOCK_NAME).exists())
+        run_git(
+            self.root,
+            f"--git-dir={source}",
+            "fsck",
+            "--full",
+        )
+
+    def test_shallow_install_absent_to_absent_is_a_true_noop(self) -> None:
+        receipt = self.make_shallow_install_receipt(
+            initial_content=None,
+            fetched_content=None,
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "descriptor_atomic_rename_noreplace",
+            side_effect=AssertionError("no publication expected"),
+        ):
+            with mock.patch.object(
+                MODULE,
+                "descriptor_atomic_rename_exchange",
+                side_effect=AssertionError("no exchange expected"),
+            ):
+                MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertFalse(receipt.source_shallow_path.exists())
+        self.assertFalse(
+            receipt.source_shallow_path.with_name(
+                MODULE.SOURCE_SHALLOW_LOCK_NAME
+            ).exists()
+        )
+
+    def test_shallow_install_present_to_absent_deletes_bound_boundary(self) -> None:
+        initial = b"a" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=initial,
+            fetched_content=None,
+        )
+
+        MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertFalse(receipt.source_shallow_path.exists())
+        self.assertFalse(
+            receipt.source_shallow_path.with_name(
+                MODULE.SOURCE_SHALLOW_LOCK_NAME
+            ).exists()
+        )
+
+    def test_shallow_install_final_fsync_failure_returns_recovery_receipt(
+        self,
+    ) -> None:
+        fetched = b"f" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=None,
+            fetched_content=fetched,
+        )
+        original_fsync = MODULE.os.fsync
+        source_directory_fsyncs = 0
+
+        def fail_final_publish_fsync(descriptor: int) -> None:
+            nonlocal source_directory_fsyncs
+            observed = MODULE.fingerprint_from_stat(os.fstat(descriptor))
+            if observed == receipt.source_shallow_parent_binding.fingerprint:
+                source_directory_fsyncs += 1
+                if source_directory_fsyncs == 2:
+                    raise OSError(errno.EIO, "injected final directory fsync failure")
+            original_fsync(descriptor)
+
+        with mock.patch.object(
+            MODULE.os,
+            "fsync",
+            side_effect=fail_final_publish_fsync,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                '"state":"durability-unverified-rolled-back-fence-retained"',
+            ):
+                MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertGreaterEqual(source_directory_fsyncs, 3)
+        self.assertFalse(receipt.source_shallow_path.exists())
+        self.assertEqual(
+            receipt.source_shallow_path.with_name(
+                MODULE.SOURCE_SHALLOW_LOCK_NAME
+            ).read_bytes(),
+            fetched,
+        )
+
+    def test_shallow_install_post_publish_recheck_returns_recovery_receipt(
+        self,
+    ) -> None:
+        fetched = b"e" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=None,
+            fetched_content=fetched,
+        )
+        original_bind = MODULE.bind_regular_file_descriptor_at
+        injected = False
+
+        def fail_installed_recheck(
+            descriptor: int,
+            directory_descriptor: int,
+            name: str,
+            display_path: Path,
+            **kwargs: object,
+        ) -> tuple[object, object]:
+            nonlocal injected
+            if (
+                not injected
+                and name == MODULE.SOURCE_SHALLOW_NAME
+                and kwargs.get("purpose") == "installed source shallow boundary"
+            ):
+                injected = True
+                raise MODULE.PlanError("injected post-publication recheck failure")
+            return original_bind(
+                descriptor,
+                directory_descriptor,
+                name,
+                display_path,
+                **kwargs,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "bind_regular_file_descriptor_at",
+            side_effect=fail_installed_recheck,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                '"state":"rolled-back-fence-retained"',
+            ):
+                MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertTrue(injected)
+        self.assertFalse(receipt.source_shallow_path.exists())
+        self.assertEqual(
+            receipt.source_shallow_path.with_name(
+                MODULE.SOURCE_SHALLOW_LOCK_NAME
+            ).read_bytes(),
+            fetched,
+        )
+
+    def test_shallow_delete_fsync_failure_retains_old_boundary_fence(self) -> None:
+        initial = b"d" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=initial,
+            fetched_content=None,
+        )
+        original_fsync = MODULE.os.fsync
+        source_directory_fsyncs = 0
+
+        def fail_delete_fsync(descriptor: int) -> None:
+            nonlocal source_directory_fsyncs
+            observed = MODULE.fingerprint_from_stat(os.fstat(descriptor))
+            if observed == receipt.source_shallow_parent_binding.fingerprint:
+                source_directory_fsyncs += 1
+                if source_directory_fsyncs == 2:
+                    raise OSError(
+                        errno.EIO, "injected deletion directory fsync failure"
+                    )
+            original_fsync(descriptor)
+
+        with mock.patch.object(
+            MODULE.os,
+            "fsync",
+            side_effect=fail_delete_fsync,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                '"state":"delete-durability-unverified-fence-retained"',
+            ):
+                MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertEqual(source_directory_fsyncs, 2)
+        self.assertFalse(receipt.source_shallow_path.exists())
+        self.assertEqual(
+            receipt.source_shallow_path.with_name(
+                MODULE.SOURCE_SHALLOW_LOCK_NAME
+            ).read_bytes(),
+            initial,
         )
 
     def test_shallow_install_holds_parent_descriptor_across_path_replace_restore(

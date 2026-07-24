@@ -73,6 +73,16 @@ LINUX_CASE_SENSITIVE_FILESYSTEM_MAGICS = frozenset(
         0xEF53,  # ext2/ext3/ext4
     }
 )
+# Keep the Unicode-name property independent from the case-sensitivity property.
+# These filesystems preserve literal directory-entry bytes when per-directory
+# casefolding is known to be disabled.
+LINUX_EXACT_NAME_FILESYSTEM_MAGICS = frozenset(
+    {
+        0x01021994,  # tmpfs
+        0x9123683E,  # Btrfs
+        0xEF53,  # ext2/ext3/ext4
+    }
+)
 LINUX_OVERLAYFS_MAGIC = 0x794C7630
 
 GIT_ENV_PASSTHROUGH = (
@@ -290,6 +300,7 @@ class PlanInputReceipt:
 @dataclass(frozen=True)
 class TransportReceipt:
     config_binding: FileContentBinding
+    fetch_object_policy: tuple[tuple[str, str], ...]
     approved_url: str
     origin_url: str
     ssh_executable_binding: Optional[FileContentBinding]
@@ -1973,7 +1984,16 @@ def filesystem_name_policy(root: Path) -> FilesystemNamePolicy:
             "  no existing entry supports an authoritative lookup probe\n"
             "  no target worktree or source object was changed"
         )
-    normalization = "NFD" if directory_casefold or configured_precompose else "exact"
+    literal_unicode_names = (
+        sys.platform.startswith("linux")
+        and directory_casefold is False
+        and filesystem_magic in LINUX_EXACT_NAME_FILESYSTEM_MAGICS
+    )
+    normalization = (
+        "exact"
+        if literal_unicode_names and configured_precompose is not True
+        else "NFD"
+    )
     return FilesystemNamePolicy(
         case_sensitive=case_sensitive,
         normalization=normalization,
@@ -2717,6 +2737,181 @@ def source_object_format(
     return object_format
 
 
+FETCH_OBJECT_POLICY_KEYS = (
+    "fetch.fsckobjects",
+    "transfer.fsckobjects",
+    "core.sharedrepository",
+    "core.fsync",
+    "core.fsyncmethod",
+)
+FETCH_OBJECT_POLICY_CONFIG_NAMES = {
+    "fetch.fsckobjects": "fetch.fsckObjects",
+    "transfer.fsckobjects": "transfer.fsckObjects",
+    "core.sharedrepository": "core.sharedRepository",
+    "core.fsync": "core.fsync",
+    "core.fsyncmethod": "core.fsyncMethod",
+}
+FSYNC_COMPONENTS = frozenset(
+    {
+        "none",
+        "loose-object",
+        "pack",
+        "pack-metadata",
+        "commit-graph",
+        "index",
+        "objects",
+        "reference",
+        "derived-metadata",
+        "committed",
+        "added",
+        "all",
+    }
+)
+
+
+def normalize_fetch_policy_boolean(value: str, key: str, source: Path) -> str:
+    normalized = value.strip().casefold()
+    if normalized in {"true", "yes", "on", "1"}:
+        return "true"
+    if normalized in {"", "false", "no", "off", "0"}:
+        return "false"
+    raise PlanError(
+        "source Git config contains a non-canonical fetch object-policy boolean\n"
+        f"  path: {source}\n"
+        f"  key: {key}\n"
+        f"  value: {value}"
+    )
+
+
+def normalize_shared_repository(value: str, source: Path) -> str:
+    normalized = value.strip().casefold()
+    aliases = {
+        "false": "umask",
+        "umask": "umask",
+        "true": "group",
+        "group": "group",
+        "all": "all",
+        "world": "all",
+        "everybody": "all",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    if re.fullmatch(r"0[0-7]{3}", normalized):
+        return normalized
+    raise PlanError(
+        "source Git config contains an unsupported core.sharedRepository policy\n"
+        f"  path: {source}\n"
+        f"  value: {value}"
+    )
+
+
+def normalize_fsync_policy(value: str, source: Path) -> str:
+    if not value.strip():
+        return ""
+    normalized: list[str] = []
+    for raw_component in value.split(","):
+        component = raw_component.strip().casefold()
+        disabled = component.startswith("-")
+        name = component[1:] if disabled else component
+        if not name or name not in FSYNC_COMPONENTS or (disabled and name == "none"):
+            raise PlanError(
+                "source Git config contains an unsupported core.fsync component\n"
+                f"  path: {source}\n"
+                f"  value: {value}\n"
+                f"  component: {raw_component}"
+            )
+        normalized.append(f"-{name}" if disabled else name)
+    if "none" in normalized and len(normalized) != 1:
+        raise PlanError(
+            "source Git config mixes the core.fsync reset with components\n"
+            f"  path: {source}\n"
+            f"  value: {value}"
+        )
+    return ",".join(normalized)
+
+
+def capture_fetch_object_policy(
+    entries: tuple[tuple[str, str], ...],
+    source: Path,
+) -> tuple[tuple[str, str], ...]:
+    collected: dict[str, list[str]] = {key: [] for key in FETCH_OBJECT_POLICY_KEYS}
+    for key, value in entries:
+        lowered = key.casefold()
+        if lowered in collected:
+            collected[lowered].append(value)
+            continue
+        unsupported = (
+            lowered == "core.fsyncobjectfiles"
+            or lowered == "core.createobject"
+            or lowered in {"fetch.unpacklimit", "transfer.unpacklimit"}
+            or lowered.startswith("fetch.fsck.")
+            or lowered.startswith("transfer.fsck.")
+            or (
+                lowered.startswith("core.fsync")
+                and lowered not in FETCH_OBJECT_POLICY_KEYS
+            )
+        )
+        if unsupported:
+            raise PlanError(
+                "source Git config contains object-write policy that the isolated "
+                "fetch cannot reproduce safely\n"
+                f"  path: {source}\n"
+                f"  key: {key}"
+            )
+
+    for key, values in collected.items():
+        if len(values) > 1:
+            raise PlanError(
+                "source Git config contains duplicate object-write policy\n"
+                f"  path: {source}\n"
+                f"  key: {FETCH_OBJECT_POLICY_CONFIG_NAMES[key]}\n"
+                f"  count: {len(values)}"
+            )
+
+    policy: list[tuple[str, str]] = []
+    for key in FETCH_OBJECT_POLICY_KEYS:
+        values = collected[key]
+        if not values:
+            continue
+        value = values[0]
+        if key in {"fetch.fsckobjects", "transfer.fsckobjects"}:
+            normalized = normalize_fetch_policy_boolean(value, key, source)
+        elif key == "core.sharedrepository":
+            normalized = normalize_shared_repository(value, source)
+        elif key == "core.fsync":
+            normalized = normalize_fsync_policy(value, source)
+        elif key == "core.fsyncmethod":
+            normalized = value.strip().casefold()
+            if normalized not in {"fsync", "writeout-only"}:
+                raise PlanError(
+                    "source Git config contains an unsupported core.fsyncMethod\n"
+                    f"  path: {source}\n"
+                    f"  value: {value}"
+                )
+        else:
+            raise AssertionError(f"unhandled fetch object policy: {key}")
+        policy.append((FETCH_OBJECT_POLICY_CONFIG_NAMES[key], normalized))
+    return tuple(policy)
+
+
+def render_fetch_object_policy(
+    policy: tuple[tuple[str, str], ...],
+) -> str:
+    rendered: list[str] = []
+    allowed_names = set(FETCH_OBJECT_POLICY_CONFIG_NAMES.values())
+    for key, value in policy:
+        if key not in allowed_names or (value and not value.isascii()):
+            raise PlanError(f"invalid frozen fetch object policy entry: {key}")
+        section, variable = key.split(".", 1)
+        rendered.extend(
+            [
+                f"[{section}]",
+                f"\t{variable} = {value}",
+            ]
+        )
+    return "\n".join(rendered) + ("\n" if rendered else "")
+
+
 def require_absent_entry_at(
     directory_descriptor: int,
     name: str,
@@ -2738,6 +2933,45 @@ def require_absent_entry_at(
             f"cannot verify absent {purpose}: {display_path}\n  error: {exc}"
         ) from exc
     raise PlanError(f"{purpose} appeared after preflight\n  path: {display_path}")
+
+
+def open_optional_bound_regular_file_at(
+    directory_descriptor: int,
+    name: str,
+    display_path: Path,
+    *,
+    maximum_bytes: int,
+    mode: int,
+    purpose: str,
+    retain_content: bool,
+) -> tuple[int, Optional[FileContentBinding], Optional[bytes]]:
+    try:
+        os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        require_absent_entry_at(
+            directory_descriptor,
+            name,
+            display_path,
+            purpose,
+        )
+        return -1, None, None
+    except OSError as exc:
+        raise PlanError(
+            f"cannot inspect optional {purpose}\n  path: {display_path}\n  error: {exc}"
+        ) from exc
+    return open_bound_regular_file_at(
+        directory_descriptor,
+        name,
+        display_path,
+        maximum_bytes=maximum_bytes,
+        mode=mode,
+        purpose=purpose,
+        retain_content=retain_content,
+    )
 
 
 def require_matching_file_binding(
@@ -3198,7 +3432,7 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
             private_descriptor,
             private_binding,
             private_content,
-        ) = open_bound_regular_file_at(
+        ) = open_optional_bound_regular_file_at(
             private_directory_descriptor,
             SOURCE_SHALLOW_NAME,
             private_shallow_path,
@@ -3207,8 +3441,6 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
             purpose="post-fetch private shallow boundary",
             retain_content=True,
         )
-        if private_content is None:
-            raise PlanError("post-fetch private shallow boundary returned no content")
         revalidate_directory_descriptor(
             private_directory_binding,
             private_directory_descriptor,
@@ -3222,6 +3454,32 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
             receipt.source_shallow_parent_binding,
             source_directory_descriptor,
         )
+        expected_shallow_descriptor = open_revalidated_source_shallow_at(
+            receipt,
+            source_directory_descriptor,
+        )
+        if receipt.source_shallow_binding is None and private_binding is None:
+            require_absent_entry_at(
+                source_directory_descriptor,
+                SOURCE_SHALLOW_LOCK_NAME,
+                receipt.source_shallow_path.with_name(SOURCE_SHALLOW_LOCK_NAME),
+                "source shallow lock",
+            )
+            require_absent_entry_at(
+                private_directory_descriptor,
+                SOURCE_SHALLOW_NAME,
+                private_shallow_path,
+                "post-fetch private shallow boundary",
+            )
+            revalidate_directory_descriptor(
+                private_directory_binding,
+                private_directory_descriptor,
+            )
+            revalidate_directory_descriptor(
+                receipt.source_shallow_parent_binding,
+                source_directory_descriptor,
+            )
+            return
         mode = (
             receipt.source_shallow_binding.fingerprint.permissions
             if receipt.source_shallow_binding is not None
@@ -3257,7 +3515,7 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
         cleanup_owned_lock = True
         os.fchmod(lock_descriptor, mode)
         lock_fingerprint = fingerprint_from_stat(os.fstat(lock_descriptor))
-        pending = memoryview(private_content)
+        pending = memoryview(private_content if private_content is not None else b"")
         while pending:
             written = os.write(lock_descriptor, pending)
             if written <= 0:
@@ -3278,26 +3536,29 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
         )
         os.fsync(source_directory_descriptor)
 
-        private_observed, _ = bind_regular_file_descriptor_at(
-            private_descriptor,
-            private_directory_descriptor,
-            SOURCE_SHALLOW_NAME,
-            private_shallow_path,
-            maximum_bytes=private_binding.maximum_bytes,
-            mode=private_binding.mode,
-            purpose=private_binding.purpose,
-            retain_content=False,
-        )
-        require_matching_file_binding(
-            private_binding,
-            private_observed,
-            "post-fetch private shallow boundary",
-        )
-        expected_shallow_descriptor = open_revalidated_source_shallow_at(
-            receipt,
-            source_directory_descriptor,
-        )
-
+        if private_binding is None:
+            require_absent_entry_at(
+                private_directory_descriptor,
+                SOURCE_SHALLOW_NAME,
+                private_shallow_path,
+                "post-fetch private shallow boundary",
+            )
+        else:
+            private_observed, _ = bind_regular_file_descriptor_at(
+                private_descriptor,
+                private_directory_descriptor,
+                SOURCE_SHALLOW_NAME,
+                private_shallow_path,
+                maximum_bytes=private_binding.maximum_bytes,
+                mode=private_binding.mode,
+                purpose=private_binding.purpose,
+                retain_content=False,
+            )
+            require_matching_file_binding(
+                private_binding,
+                private_observed,
+                "post-fetch private shallow boundary",
+            )
         if receipt.source_shallow_binding is None:
             try:
                 descriptor_atomic_rename_noreplace(
@@ -3346,7 +3607,7 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
                     source_directory_descriptor,
                 )
                 os.fsync(source_directory_descriptor)
-            except PlanError as exc:
+            except (OSError, PlanError) as exc:
                 rollback_state, rollback_error = rollback_absent_source_shallow_publish(
                     receipt,
                     source_directory_descriptor,
@@ -3355,6 +3616,8 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
                 )
                 preserve_fence = rollback_state.endswith("fence-retained")
                 detail = str(exc)
+                if isinstance(exc, OSError):
+                    rollback_state = f"durability-unverified-{rollback_state}"
                 if rollback_error is not None:
                     detail += f"; rollback: {rollback_error}"
                 raise source_shallow_recovery_error(
@@ -3414,7 +3677,7 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
                 installed,
                 "installed source shallow boundary",
             )
-            if (
+            if private_binding is not None and (
                 installed.size != private_binding.size
                 or installed.content_sha256 != private_binding.content_sha256
             ):
@@ -3426,7 +3689,7 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
                 receipt.source_shallow_parent_binding,
                 source_directory_descriptor,
             )
-        except PlanError as exc:
+        except (OSError, PlanError) as exc:
             rollback_state, rollback_error = rollback_source_shallow_exchange(
                 receipt,
                 source_directory_descriptor,
@@ -3443,6 +3706,90 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
                 rollback_state,
                 detail,
             ) from exc
+
+        if private_binding is None:
+            marker_unlinked = False
+            old_lock_unlinked = False
+            try:
+                installed_path_fingerprint = fingerprint_from_stat(
+                    os.stat(
+                        SOURCE_SHALLOW_NAME,
+                        dir_fd=source_directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+                if installed_path_fingerprint != lock_binding.fingerprint:
+                    raise PlanError(
+                        "source shallow deletion marker identity changed before unlink"
+                    )
+                old_path_fingerprint = fingerprint_from_stat(
+                    os.stat(
+                        SOURCE_SHALLOW_LOCK_NAME,
+                        dir_fd=source_directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+                if old_path_fingerprint != receipt.source_shallow_binding.fingerprint:
+                    raise PlanError(
+                        "exchanged source shallow lock identity changed before "
+                        "deletion commit"
+                    )
+                os.unlink(
+                    SOURCE_SHALLOW_NAME,
+                    dir_fd=source_directory_descriptor,
+                )
+                marker_unlinked = True
+                os.fsync(source_directory_descriptor)
+
+                old_path_fingerprint = fingerprint_from_stat(
+                    os.stat(
+                        SOURCE_SHALLOW_LOCK_NAME,
+                        dir_fd=source_directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+                if old_path_fingerprint != receipt.source_shallow_binding.fingerprint:
+                    raise PlanError(
+                        "exchanged source shallow lock identity changed after "
+                        "deletion commit"
+                    )
+                os.unlink(
+                    SOURCE_SHALLOW_LOCK_NAME,
+                    dir_fd=source_directory_descriptor,
+                )
+                old_lock_unlinked = True
+                os.fsync(source_directory_descriptor)
+            except (OSError, PlanError) as exc:
+                if not marker_unlinked:
+                    rollback_state, rollback_error = rollback_source_shallow_exchange(
+                        receipt,
+                        source_directory_descriptor,
+                        lock_descriptor,
+                        lock_binding,
+                    )
+                    preserve_fence = True
+                elif not old_lock_unlinked:
+                    rollback_state = "delete-durability-unverified-fence-retained"
+                    rollback_error = (
+                        "source shallow is absent and the receipt-bound old "
+                        "boundary remains at shallow.lock"
+                    )
+                    preserve_fence = True
+                else:
+                    rollback_state = "delete-commit-durability-unverified"
+                    rollback_error = (
+                        "source shallow and the receipt-bound old lock are absent"
+                    )
+                detail = str(exc)
+                if rollback_error is not None:
+                    detail += f"; recovery: {rollback_error}"
+                raise source_shallow_recovery_error(
+                    receipt,
+                    source_directory_descriptor,
+                    rollback_state,
+                    detail,
+                ) from exc
+            return
 
         try:
             old_path_fingerprint = fingerprint_from_stat(
@@ -3603,6 +3950,7 @@ def capture_fetch_control_gitdir(
     object_format: str,
     submodule_path: str,
     initial_shallow_content: Optional[bytes],
+    fetch_object_policy: tuple[tuple[str, str], ...],
 ) -> tuple[
     object,
     Path,
@@ -3624,6 +3972,7 @@ def capture_fetch_control_gitdir(
         )
         if object_format == "sha256":
             config_content += "[extensions]\n\tobjectformat = sha256\n"
+        config_content += render_fetch_object_policy(fetch_object_policy)
         config_path = fetch_git_dir / "config"
         head_path = fetch_git_dir / "HEAD"
         write_owner_private_file(
@@ -3755,6 +4104,7 @@ def capture_transport_receipt(
     entries = parse_bound_git_config(config_content, config_path)
     origin_url = reject_unsafe_fetch_config(entries, config_path)
     object_format = source_object_format(entries, config_path)
+    fetch_object_policy = capture_fetch_object_policy(entries, config_path)
     validate_approved_fetch_url(submodule.url, submodule.path)
     if origin_url != submodule.url:
         raise PlanError(
@@ -3829,12 +4179,14 @@ def capture_transport_receipt(
         object_format,
         submodule.path,
         source_shallow_content,
+        fetch_object_policy,
     )
     environment = git_environment()
     environment["GIT_OBJECT_DIRECTORY"] = str(source_object_directory)
     revalidate_file_content_binding(config_binding)
     return TransportReceipt(
         config_binding=config_binding,
+        fetch_object_policy=fetch_object_policy,
         approved_url=submodule.url,
         origin_url=origin_url,
         ssh_executable_binding=ssh_binding,
@@ -3896,7 +4248,30 @@ def revalidate_transport_receipt(
         or receipt.origin_url != receipt.approved_url
     ):
         raise PlanError(f"fetch transport receipt no longer matches {submodule.path}")
-    revalidate_file_content_binding(receipt.config_binding)
+    current_config_binding, current_config_content = read_bound_regular_file(
+        receipt.config_binding.path,
+        maximum_bytes=receipt.config_binding.maximum_bytes,
+        mode=receipt.config_binding.mode,
+        purpose=receipt.config_binding.purpose,
+        retain_content=True,
+    )
+    require_matching_file_binding(
+        receipt.config_binding,
+        current_config_binding,
+        "source Git config",
+    )
+    if current_config_content is None:
+        raise PlanError("source Git config revalidation returned no content")
+    current_entries = parse_bound_git_config(
+        current_config_content,
+        receipt.config_binding.path,
+    )
+    current_fetch_object_policy = capture_fetch_object_policy(
+        current_entries,
+        receipt.config_binding.path,
+    )
+    if current_fetch_object_policy != receipt.fetch_object_policy:
+        raise PlanError("fetch object policy changed after preflight")
     if receipt.ssh_executable_binding is not None:
         revalidate_file_content_binding(receipt.ssh_executable_binding)
     revalidate_source_shallow_state(receipt)
