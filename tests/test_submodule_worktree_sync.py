@@ -500,6 +500,18 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             str(target),
             sha,
         )
+        MODULE.run(
+            [
+                "git",
+                "-C",
+                str(target),
+                "update-index",
+                "--no-split-index",
+                "--no-untracked-cache",
+                "--no-fsmonitor",
+                "--force-write-index",
+            ]
+        )
 
     def filtered_target_sha(self, filter_name: str, required: bool) -> str:
         (self.remote / ".gitattributes").write_text(
@@ -672,8 +684,139 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         ):
             MODULE.revalidate_transport_receipt(receipt, submodule)
 
+    def test_fetch_transport_normalizes_valueless_supported_booleans(self) -> None:
+        source = self.clone_named_source("valueless-object-policy")
+        config_path = source / "config"
+        with config_path.open("ab") as stream:
+            stream.write(
+                b"[fetch]\n"
+                b"\tfsckObjects\n"
+                b"[transfer]\n"
+                b"\tfsckObjects =\n"
+                b"[core]\n"
+                b"\tsharedRepository\n"
+            )
+        submodule = MODULE.Submodule(
+            "valueless-object-policy",
+            "third_party/valueless-object-policy",
+            str(self.remote),
+        )
+
+        receipt = MODULE.capture_transport_receipt(source, submodule)
+        self.addCleanup(receipt.fetch_guard.cleanup)
+
+        self.assertEqual(
+            receipt.fetch_object_policy,
+            (
+                ("fetch.fsckObjects", "true"),
+                ("transfer.fsckObjects", "false"),
+                ("core.sharedRepository", "group"),
+            ),
+        )
+        MODULE.revalidate_transport_receipt(receipt, submodule)
+
+    def test_fetch_transport_normalizes_empty_shared_repository(self) -> None:
+        source = self.clone_named_source("empty-shared-repository")
+        config_path = source / "config"
+        with config_path.open("ab") as stream:
+            stream.write(b"[core]\n\tsharedRepository =\n")
+        submodule = MODULE.Submodule(
+            "empty-shared-repository",
+            "third_party/empty-shared-repository",
+            str(self.remote),
+        )
+
+        receipt = MODULE.capture_transport_receipt(source, submodule)
+        self.addCleanup(receipt.fetch_guard.cleanup)
+
+        self.assertEqual(
+            receipt.fetch_object_policy,
+            (("core.sharedRepository", "umask"),),
+        )
+        MODULE.revalidate_transport_receipt(receipt, submodule)
+
+    def test_fetch_policy_boolean_uses_git_native_semantics(self) -> None:
+        source = self.named_source_git_dir / "config"
+        cases = (
+            ("true", "true"),
+            ("yes", "true"),
+            ("on", "true"),
+            ("1", "true"),
+            ("2", "true"),
+            ("", "false"),
+            ("false", "false"),
+            ("no", "false"),
+            ("off", "false"),
+            ("0", "false"),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(
+                    MODULE.normalize_fetch_policy_boolean(
+                        value,
+                        "fetch.fsckobjects",
+                        source,
+                    ),
+                    expected,
+                )
+
+        for value in ("maybe", "truthy"):
+            with self.subTest(invalid=value):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "invalid fetch object-policy boolean",
+                ):
+                    MODULE.normalize_fetch_policy_boolean(
+                        value,
+                        "fetch.fsckobjects",
+                        source,
+                    )
+
+    def test_fetch_transport_rejects_unsupported_valueless_policy(self) -> None:
+        source = self.clone_named_source("unsupported-valueless-policy")
+        config_path = source / "config"
+        with config_path.open("ab") as stream:
+            stream.write(b"[core]\n\tfsync\n")
+
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "unsupported valueless entry",
+        ):
+            MODULE.capture_transport_receipt(
+                source,
+                MODULE.Submodule(
+                    "unsupported-valueless-policy",
+                    "third_party/unsupported-valueless-policy",
+                    str(self.remote),
+                ),
+            )
+
+    def test_fetch_transport_rejects_malformed_supported_boolean(self) -> None:
+        source = self.clone_named_source("malformed-object-policy")
+        run_git(
+            self.root,
+            f"--git-dir={source}",
+            "config",
+            "fetch.fsckObjects",
+            "truthy",
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "invalid fetch object-policy boolean",
+        ):
+            MODULE.capture_transport_receipt(
+                source,
+                MODULE.Submodule(
+                    "malformed-object-policy",
+                    "third_party/malformed-object-policy",
+                    str(self.remote),
+                ),
+            )
+
     def test_shared_repository_normalizes_git_native_values(self) -> None:
         cases = (
+            ("", "umask"),
             ("0", "umask"),
             ("false", "umask"),
             ("umask", "umask"),
@@ -732,6 +875,81 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     ),
                     (("core.sharedRepository", expected),),
                 )
+
+    def test_fetch_url_classifies_scp_style_before_generic_schemes(self) -> None:
+        cases = (
+            ("host:path", True),
+            ("host:/absolute/path", True),
+            ("user@host:path", True),
+            ("http:path", True),
+            ("file:/path", True),
+            ("ssh://host/path", True),
+            ("http://host/path", False),
+            ("https://host/path", False),
+            ("git://host/path", False),
+            ("file:///absolute/path", False),
+        )
+        for url, expected_ssh in cases:
+            with self.subTest(url=url):
+                MODULE.validate_approved_fetch_url(url, "third_party/example")
+                self.assertEqual(MODULE.transport_uses_ssh(url), expected_ssh)
+
+        for url in (
+            "foo://host/path",
+            "user@host://path",
+            "ext::command",
+            "host:\npath",
+            "-host:path",
+        ):
+            with self.subTest(rejected=url):
+                with self.assertRaises(MODULE.PlanError):
+                    MODULE.validate_approved_fetch_url(
+                        url,
+                        "third_party/example",
+                    )
+
+    def test_username_less_scp_fetch_uses_private_ssh_snapshot(self) -> None:
+        source = self.clone_named_source("scp-style-ssh")
+        approved_url = "example.invalid:org/repo.git"
+        run_git(
+            self.root,
+            f"--git-dir={source}",
+            "config",
+            "remote.origin.url",
+            approved_url,
+        )
+        ssh_source = self.root / "scp-style-ssh-executable"
+        ssh_source.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        ssh_source.chmod(0o700)
+        submodule = MODULE.Submodule(
+            "scp-style-ssh",
+            "third_party/scp-style-ssh",
+            approved_url,
+        )
+
+        with mock.patch.object(
+            MODULE.shutil,
+            "which",
+            return_value=str(ssh_source),
+        ):
+            receipt = MODULE.capture_transport_receipt(source, submodule)
+        self.addCleanup(receipt.fetch_guard.cleanup)
+
+        self.assertIsNotNone(receipt.ssh_executable_snapshot)
+        self.assertIsNotNone(receipt.ssh_command)
+        MODULE.revalidate_transport_receipt(receipt, submodule)
+        command = MODULE.transport_fetch_command(
+            source,
+            receipt,
+            "f" * 40,
+            1,
+        )
+        self.assertIn(
+            f"core.sshCommand={receipt.ssh_command}",
+            command,
+        )
+        self.assertEqual(command[-2], approved_url)
+        self.assertEqual(command[-1], "f" * 40)
 
     def test_ssh_fetch_uses_private_snapshot_after_source_mutation(self) -> None:
         trusted_content = "#!/bin/sh\nprintf 'trusted-ssh\\n' >&2\nexit 1\n"
@@ -2421,31 +2639,31 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertIsNotNone(first_admin)
         self.assertIsNotNone(second_admin)
         (first / ".git").write_bytes((second / ".git").read_bytes())
-        plan = MODULE.build_sync_plan(
-            root=target_super,
-            common_git_dir=self.named_common_git_dir,
-            source_superproject=None,
-            planned_modules=[
-                (
-                    MODULE.Submodule(
-                        "cross-admin",
-                        "first",
-                        str(self.remote),
-                    ),
-                    target_sha,
+        with mock.patch.object(MODULE, "checkout_existing_worktree") as checkout:
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "backlink points at a different worktree",
+            ):
+                MODULE.build_sync_plan(
+                    root=target_super,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[
+                        (
+                            MODULE.Submodule(
+                                "cross-admin",
+                                "first",
+                                str(self.remote),
+                            ),
+                            target_sha,
+                        )
+                    ],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    fetch_missing=False,
                 )
-            ],
-            depth=1,
-            recursive=False,
-            force_replace_empty=False,
-            fetch_missing=False,
-        )
-
-        with self.assertRaisesRegex(
-            MODULE.PlanError,
-            "backlink points at a different worktree",
-        ):
-            MODULE.apply_sync_plan(plan)
+        checkout.assert_not_called()
 
         self.assertEqual(
             (first_admin / "HEAD").read_text(encoding="utf-8").strip(),
@@ -4784,6 +5002,18 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             "--detach",
             str(self.linked),
             self.sha,
+        )
+        MODULE.run(
+            [
+                "git",
+                "-C",
+                str(self.linked),
+                "update-index",
+                "--no-split-index",
+                "--no-untracked-cache",
+                "--no-fsmonitor",
+                "--force-write-index",
+            ]
         )
         readme_path = self.linked / "README.md"
         readme_stat = readme_path.stat()
@@ -7213,6 +7443,102 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             ),
             (),
         )
+
+    def test_managed_preflight_rejects_split_index_before_checkout(self) -> None:
+        source = self.clone_named_source("managed-split-index")
+        target_super = self.root / "managed-split-index-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        self.add_managed_worktree(source, target, self.sha)
+        run_git(target, "update-index", "--split-index")
+        admin = MODULE.gitdir_file_target(target)
+        self.assertIsNotNone(admin)
+        assert admin is not None
+        self.assertIn(
+            b"link",
+            v2_index_extension_signatures((admin / "index").read_bytes()),
+        )
+
+        with (
+            mock.patch.object(MODULE, "probe_managed_checkout") as probe,
+            mock.patch.object(MODULE, "checkout_existing_worktree") as checkout,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "hidden split-index state",
+            ):
+                MODULE.build_sync_plan(
+                    root=target_super,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[
+                        (
+                            MODULE.Submodule(
+                                "managed-split-index",
+                                "lib",
+                                str(self.remote),
+                            ),
+                            self.sha,
+                        )
+                    ],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    fetch_missing=False,
+                )
+        probe.assert_not_called()
+        checkout.assert_not_called()
+
+    def test_managed_preflight_rejects_unknown_index_extension_before_checkout(
+        self,
+    ) -> None:
+        source = self.clone_named_source("managed-unknown-index-extension")
+        target_super = self.root / "managed-unknown-index-extension-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        self.add_managed_worktree(source, target, self.sha)
+        admin = MODULE.gitdir_file_target(target)
+        self.assertIsNotNone(admin)
+        assert admin is not None
+        index_path = admin / "index"
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "managed-unknown-index-extension",
+                        "lib",
+                        str(self.remote),
+                    ),
+                    self.sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        original = index_path.read_bytes()
+        body = original[:-20] + b"ABCD" + bytes(4)
+        index_path.write_bytes(body + hashlib.sha1(body).digest())
+        self.assertIn(
+            b"ABCD",
+            v2_index_extension_signatures(index_path.read_bytes()),
+        )
+
+        with (
+            mock.patch.object(MODULE, "probe_managed_checkout") as probe,
+            mock.patch.object(MODULE, "checkout_existing_worktree") as checkout,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "unsupported optional extension: b'ABCD'",
+            ):
+                MODULE.apply_sync_plan(plan)
+        probe.assert_not_called()
+        checkout.assert_not_called()
 
     def test_final_index_rejects_another_valid_checkout_snapshot(self) -> None:
         (self.remote / "SECOND.md").write_text("second\n", encoding="utf-8")

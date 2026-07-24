@@ -4783,13 +4783,26 @@ def parse_bound_git_config(
         f"source Git config entries from {source}",
         maximum_records=MAX_CONFIG_ENTRIES,
     ):
-        try:
+        if b"\n" in record:
             raw_key, raw_value = record.split(b"\n", 1)
-        except ValueError as exc:
+            key = os.fsdecode(raw_key)
+        else:
+            raw_key = record
+            key = os.fsdecode(raw_key)
+            if key.casefold() not in VALUELESS_GIT_BOOLEAN_POLICY_KEYS:
+                raise PlanError(
+                    "source Git config returned an unsupported valueless entry\n"
+                    f"  path: {source}\n"
+                    f"  key: {key}"
+                )
+            # Git's native boolean grammar interprets a key without an equals
+            # sign as true. Preserve that distinction from an explicit empty
+            # value, which Git interprets as false.
+            raw_value = b"true"
+        if not raw_key:
             raise PlanError(
                 f"source Git config returned an invalid entry\n  path: {source}"
-            ) from exc
-        key = os.fsdecode(raw_key)
+            )
         value = os.fsdecode(raw_value)
         entries.append((key, value))
     return tuple(entries)
@@ -4875,6 +4888,13 @@ FETCH_OBJECT_POLICY_KEYS = (
     "core.fsync",
     "core.fsyncmethod",
 )
+VALUELESS_GIT_BOOLEAN_POLICY_KEYS = frozenset(
+    {
+        "fetch.fsckobjects",
+        "transfer.fsckobjects",
+        "core.sharedrepository",
+    }
+)
 FETCH_OBJECT_POLICY_CONFIG_NAMES = {
     "fetch.fsckobjects": "fetch.fsckObjects",
     "transfer.fsckobjects": "transfer.fsckObjects",
@@ -4901,13 +4921,23 @@ FSYNC_COMPONENTS = frozenset(
 
 
 def normalize_fetch_policy_boolean(value: str, key: str, source: Path) -> str:
-    normalized = value.strip().casefold()
-    if normalized in {"true", "yes", "on", "1"}:
-        return "true"
-    if normalized in {"", "false", "no", "off", "0"}:
-        return "false"
+    result = read_git_bounded(
+        [
+            "-c",
+            f"codex.fetchpolicyboolean={value}",
+            "config",
+            "--type=bool",
+            "--get",
+            "codex.fetchpolicyboolean",
+        ],
+        check=False,
+        stdout_limit=16,
+    )
+    normalized = os.fsdecode(result.stdout).strip()
+    if result.returncode == 0 and normalized in {"true", "false"}:
+        return normalized
     raise PlanError(
-        "source Git config contains a non-canonical fetch object-policy boolean\n"
+        "source Git config contains an invalid fetch object-policy boolean\n"
         f"  path: {source}\n"
         f"  key: {key}\n"
         f"  value: {value}"
@@ -4917,6 +4947,7 @@ def normalize_fetch_policy_boolean(value: str, key: str, source: Path) -> str:
 def normalize_shared_repository(value: str, source: Path) -> str:
     normalized = value.strip().casefold()
     aliases = {
+        "": "umask",
         "0": "umask",
         "false": "umask",
         "umask": "umask",
@@ -6476,11 +6507,16 @@ def capture_fetch_control_gitdir(
         raise
 
 
+SCP_STYLE_SSH_URL = re.compile(r"(?:[^@/:]+@)?[^/:]+:(?!//).+")
+
+
 def transport_uses_ssh(url: str) -> bool:
+    if SCP_STYLE_SSH_URL.fullmatch(url):
+        return True
     scheme_match = re.match(r"([A-Za-z][A-Za-z0-9+.-]*):", url)
     if scheme_match:
         return scheme_match.group(1).casefold() == "ssh"
-    return bool(re.fullmatch(r"(?:[^@/:]+@)?[^/:]+:.+", url))
+    return False
 
 
 def ssh_command_for_executable(executable: Path) -> str:
@@ -6510,6 +6546,8 @@ def validate_approved_fetch_url(url: str, submodule_path: str) -> None:
         )
     if Path(url).is_absolute():
         return
+    if transport_uses_ssh(url):
+        return
     scheme_match = re.match(r"([A-Za-z][A-Za-z0-9+.-]*):", url)
     if scheme_match:
         if scheme_match.group(1).casefold() not in {
@@ -6517,14 +6555,11 @@ def validate_approved_fetch_url(url: str, submodule_path: str) -> None:
             "git",
             "http",
             "https",
-            "ssh",
         }:
             raise PlanError(
                 f"submodule {submodule_path} uses an unsupported fetch URL scheme: "
                 f"{scheme_match.group(1)}"
             )
-        return
-    if transport_uses_ssh(url):
         return
     raise PlanError(
         f"submodule {submodule_path} uses a relative or ambiguous fetch URL\n"
@@ -9442,6 +9477,7 @@ def captured_index_entries(
     prior_path: Optional[bytes] = None
     expanded_path_bytes = 0
     entries: list[tuple[bytes, bytes, bytes]] = []
+    empty_path_seen = False
     fixed_prefix_bytes = 40 + object_id_bytes + 2
     for _entry_index in range(entry_count):
         entry_start = offset
@@ -9524,6 +9560,13 @@ def captured_index_entries(
             raise PlanError(
                 "captured managed worktree index path length does not match its flags"
             )
+        if not raw_path:
+            # Split-index replacement entries may deliberately omit their path
+            # and recover it from the shared index named by the later `link`
+            # extension. Defer the generic empty-path failure so that hidden
+            # split-index state is classified explicitly.
+            empty_path_seen = True
+            continue
         validate_checkout_path(raw_path, "captured managed worktree index")
         expanded_path_bytes += len(raw_path) + 1
         if expanded_path_bytes > GIT_ENUMERATION_OUTPUT_LIMIT_BYTES:
@@ -9559,6 +9602,24 @@ def captured_index_entries(
     }
     seen_extensions: set[bytes] = set()
     cache_tree_seen = False
+    if empty_path_seen:
+        extension_probe_offset = offset
+        while extension_probe_offset + 8 <= body_end:
+            signature = content[extension_probe_offset : extension_probe_offset + 4]
+            extension_size = int.from_bytes(
+                content[extension_probe_offset + 4 : extension_probe_offset + 8],
+                "big",
+            )
+            extension_probe_offset += 8
+            if extension_probe_offset + extension_size > body_end:
+                break
+            if signature == b"link":
+                raise PlanError(
+                    "captured managed worktree index has hidden split-index state"
+                )
+            if signature != b"TREE":
+                break
+            extension_probe_offset += extension_size
     while offset < body_end:
         if offset + 8 > body_end:
             raise PlanError("captured managed worktree index has a truncated extension")
@@ -9610,6 +9671,8 @@ def captured_index_entries(
             "captured managed worktree index has an unsupported optional "
             f"extension: {signature!r}"
         )
+    if empty_path_seen:
+        raise PlanError("captured managed worktree index contains an empty Git path")
     if require_cache_tree and not cache_tree_seen:
         raise PlanError(
             "captured managed worktree index requires a cache-tree extension "
@@ -9742,10 +9805,24 @@ def validate_captured_index_matches_tree(
     entry: PlannedWorktree,
     index_content: bytes,
 ) -> None:
-    object_id_bytes = len(entry.sha) // 2
-    expected, expected_cache_tree = target_tree_index_semantics(
+    validate_captured_index_matches_commit(
         entry.source_git_dir,
         entry.sha,
+        entry.target.path,
+        index_content,
+    )
+
+
+def validate_captured_index_matches_commit(
+    source_git_dir: Path,
+    target_sha: str,
+    worktree_path: Path,
+    index_content: bytes,
+) -> None:
+    object_id_bytes = len(target_sha) // 2
+    expected, expected_cache_tree = target_tree_index_semantics(
+        source_git_dir,
+        target_sha,
     )
     captured = captured_index_entries(
         index_content,
@@ -9760,9 +9837,82 @@ def validate_captured_index_matches_tree(
         raise PlanError(
             "captured managed worktree index stage-0 mode/OID/path set does "
             "not match the planned target tree\n"
-            f"  worktree: {entry.target.path}\n"
-            f"  target: {entry.sha}"
+            f"  worktree: {worktree_path}\n"
+            f"  target: {target_sha}"
         )
+
+
+def validate_managed_preflight_index(
+    entry: PlannedWorktree,
+    current_head: str,
+) -> None:
+    """Reject hidden raw-index state before any managed checkout probe."""
+
+    target_descriptor = open_directory_descriptor(
+        entry.target.path,
+        "managed worktree preflight target",
+    )
+    control: Optional[ManagedControlReceipt] = None
+    index_descriptor = -1
+    try:
+        control = capture_managed_control_receipt(
+            entry.target.path,
+            entry.source_git_dir,
+            target_descriptor,
+        )
+        revalidate_managed_control_receipt(control, target_descriptor)
+        (
+            index_descriptor,
+            index_binding,
+            index_content,
+        ) = open_bound_regular_file_at(
+            control.admin_lease.descriptor,
+            "index",
+            control.admin_git_dir / "index",
+            maximum_bytes=MAX_SUPERPROJECT_INDEX_BYTES,
+            mode=os.R_OK,
+            purpose="managed worktree preflight index",
+            retain_content=True,
+        )
+        if index_content is None:
+            raise PlanError("managed worktree preflight index returned no content")
+        # The protected property is the raw index's supported semantic state:
+        # checksum, format/extensions, and stage-0 mode/OID/path values. The
+        # parser intentionally ignores stat-cache timestamps, while the held
+        # descriptor and rebind prove object identity, bytes, and access policy
+        # did not change around that semantic validation.
+        validate_captured_index_matches_commit(
+            entry.source_git_dir,
+            current_head,
+            entry.target.path,
+            index_content,
+        )
+        observed_index, _ = bind_regular_file_descriptor_at(
+            index_descriptor,
+            control.admin_lease.descriptor,
+            "index",
+            index_binding.path,
+            maximum_bytes=MAX_SUPERPROJECT_INDEX_BYTES,
+            mode=os.R_OK,
+            purpose="managed worktree preflight index",
+            retain_content=False,
+        )
+        require_matching_file_binding(
+            index_binding,
+            observed_index,
+            "managed worktree preflight index",
+        )
+        revalidate_managed_control_receipt(control, target_descriptor)
+    finally:
+        try:
+            if index_descriptor >= 0:
+                os.close(index_descriptor)
+        finally:
+            try:
+                if control is not None:
+                    control.close()
+            finally:
+                os.close(target_descriptor)
 
 
 def managed_head(worktree_path: Path) -> str:
@@ -10818,6 +10968,7 @@ def capture_checkout_preflight(
             changes,
         )
         reject_managed_ignored_conflicts(entry.target.path, changes)
+        validate_managed_preflight_index(entry, current_head)
         probe_managed_checkout(entry.target.path, entry.sha)
     else:
         reject_checkout_filters(
@@ -10906,6 +11057,7 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
             f"{entry.target.path} has local changes; clean it before syncing"
         )
     reject_managed_ignored_conflicts(entry.target.path, receipt.changes)
+    validate_managed_preflight_index(entry, current_head)
     probe_managed_checkout(entry.target.path, entry.sha)
 
 

@@ -36,6 +36,9 @@ superseded_by:
 - Known rollback verifies the exact receipt-bound admin name is absent from its held parent and requires the raw inventory to return to its pre-add baseline before transaction-created target parents can be removed. Internal files changing inside an unchanged peer admin directory do not alter this protected direct-entry property.
 - Recursive shared-prefix policy failures no longer widen permissions on surviving managed checkouts; owner access is adjusted only for a newly registered transaction-owned parent that proceeds through full-worktree rollback.
 - Finalization parses the immutable descriptor-captured index bytes, rejects zero skip-hash checksums, noncanonical ordering, conflict/hidden/unknown extension state, validates any cache-tree against the target tree, and requires the complete canonical stage-0 mode/object-id/raw-path sequence to equal that tree. The protected property is the captured index semantics, not working-tree stat-cache or file-content bytes.
+- Managed preflight and final revalidation now descriptor-read that raw index and run the same parser against the current HEAD before the checkout probe or real checkout can be invoked; split-index `link` state and unknown optional extensions therefore fail before mutation.
+- Authorized fetch URL classification now recognizes username-less `host:path` and other Git-compatible scp-style forms before generic schemes, so every Git-SSH form receives the private SSH executable snapshot while `://` schemes retain strict allowlisting.
+- Valueless supported fetch booleans preserve Git's implicit-`true` meaning; explicit empty fsck remains `false`, explicit empty `core.sharedRepository` becomes `umask`, and explicit fsck values are normalized through the bound Git runtime's boolean parser. Unsupported valueless keys and malformed boolean values remain blocked.
 - A same-source, same-HEAD redirect to another worktree admin cannot satisfy finalization. New-target rollback atomically preserves each unexpected marker/backlink entry while temporarily restoring the retained original bytes for Git unregister, then verifies target, registry, materialized-parent, and plan-receipt restoration.
 
 ## Next Steps
@@ -71,3 +74,7 @@ superseded_by:
 - The final complete helper suite passed 181 tests in 498.252 seconds.
 - Final repository coverage passed 940 tests: the README module matrix passed 902 tests in 1022.017 seconds, and its omitted public-release workflow module passed 38 tests in 1.264 seconds.
 - Repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, Python compilation, helper `--help`, isolated PyYAML skill validation, project-journal validation, sync-manifest validation, and `git diff --check` passed. An exploratory Ruff 0.16.0 all-rules invocation reported 592 project-wide style and modernization findings; that unconfigured rule set is not the repository's lint gate.
+- Exact-head GitHub review follow-up: 11 focused scp-style URL, valueless/native Git boolean, raw split-index, unknown-index-extension, and final-index regressions passed in 10.827 seconds.
+- The final reviewer follow-up covering explicit-empty shared-repository policy passed five focused regressions in 5.610 seconds; the read-only re-review reported no findings.
+- The final exact-head follow-up complete helper suite passed 190 tests in 451.303 seconds.
+- Final complete repository coverage passed 949 tests: the README module matrix passed 911 tests in 654.769 seconds, and its omitted public-release workflow module passed 38 tests in 1.838 seconds.
