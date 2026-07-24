@@ -35,6 +35,7 @@ GIT_MINIMUM_VERSION = (2, 45, 0)
 MAX_GIT_EXECUTABLE_BYTES = 128 * 1024 * 1024
 PROCESS_CLEANUP_TIMEOUT_SECONDS = 1.0
 PROCESS_TERM_GRACE_SECONDS = 0.5
+UMASK_CAPTURE_TIMEOUT_SECONDS = 5.0
 MAX_CHECKOUT_PATHS = 250_000
 MAX_CHECKOUT_PATH_BYTES = 4096
 MAX_CHECKOUT_PATH_COMPONENTS = 1_000_000
@@ -397,6 +398,15 @@ class PlanInputReceipt:
 
 
 @dataclass(frozen=True)
+class SourceShallowCreationPolicy:
+    shared_repository: str
+    process_umask: int
+    owner: int
+    group: int
+    permissions: int
+
+
+@dataclass(frozen=True)
 class TransportReceipt:
     config_binding: FileContentBinding
     fetch_object_policy: tuple[tuple[str, str], ...]
@@ -408,6 +418,7 @@ class TransportReceipt:
     source_shallow_path: Path
     source_shallow_parent_binding: AccessBinding
     source_shallow_binding: Optional[FileContentBinding]
+    source_shallow_creation_policy: Optional[SourceShallowCreationPolicy]
     fetch_git_dir: Path
     fetch_access_bindings: tuple[AccessBinding, ...]
     fetch_file_bindings: tuple[FileContentBinding, ...]
@@ -432,6 +443,19 @@ class BoundTarget:
     collision_tokens: tuple[tuple[object, ...], ...]
 
 
+@dataclass(frozen=True)
+class CreatedTargetNode:
+    relative_parts: tuple[str, ...]
+    node: BoundNode
+
+
+@dataclass
+class SharedMissingAncestor:
+    relative_parts: tuple[str, ...]
+    participant_targets: frozenset[tuple[str, ...]]
+    materialized_node: Optional[BoundNode] = None
+
+
 @dataclass
 class MaterializedTargetLease:
     target: Path
@@ -440,6 +464,7 @@ class MaterializedTargetLease:
     parent_binding: AccessBinding
     parent_descriptor: int
     entry_name: str
+    created_nodes: tuple[CreatedTargetNode, ...] = ()
 
     def close(self) -> None:
         descriptors = (self.target_descriptor, self.parent_descriptor)
@@ -492,6 +517,10 @@ class SyncPlan:
     force_replace_empty: bool
     fetch_missing: bool
     input_receipt: Optional[PlanInputReceipt]
+    shared_missing_ancestors: dict[
+        tuple[str, ...],
+        SharedMissingAncestor,
+    ] = dataclass_field(default_factory=dict)
 
 
 class TargetCollisionNode:
@@ -499,6 +528,7 @@ class TargetCollisionNode:
         self.children: dict[tuple[object, ...], TargetCollisionNode] = {}
         self.terminal_index: Optional[int] = None
         self.first_descendant_index: Optional[int] = None
+        self.original_component: Optional[str] = None
 
 
 class TargetCollisionIndex:
@@ -516,7 +546,11 @@ class TargetCollisionIndex:
         )
         node = self.root
         visited = [node]
-        for token in candidate.target.collision_tokens:
+        for component, token in zip(
+            candidate.target.relative_parts,
+            candidate.target.collision_tokens,
+            strict=True,
+        ):
             if (
                 node.terminal_index is not None
                 and node.terminal_index not in active_ancestors
@@ -528,6 +562,16 @@ class TargetCollisionIndex:
                     f"  second: {candidate.target.path}"
                 )
             node = node.children.setdefault(token, TargetCollisionNode())
+            if node.original_component is None:
+                node.original_component = component
+            elif node.original_component != component:
+                prior = entries[node.first_descendant_index]
+                raise PlanError(
+                    "planned worktree target components alias on the target "
+                    "filesystem\n"
+                    f"  first: {prior.target.path}\n"
+                    f"  second: {candidate.target.path}"
+                )
             visited.append(node)
 
         if node.terminal_index is not None:
@@ -2406,6 +2450,164 @@ def revalidate_bound_target(target: BoundTarget) -> None:
         )
 
 
+def capture_shared_missing_ancestors(
+    entries: list[PlannedWorktree],
+) -> dict[tuple[str, ...], SharedMissingAncestor]:
+    participants: dict[tuple[str, ...], set[tuple[str, ...]]] = {}
+    for entry in entries:
+        target = entry.target
+        existing_component_count = len(target.relative_parts) - len(
+            target.missing_parts
+        )
+        # The final worktree root belongs only to its own entry. Sharing is
+        # limited to strict ancestors that at least two planned targets proved
+        # absent during the complete preflight.
+        for component_count in range(
+            existing_component_count + 1,
+            len(target.relative_parts),
+        ):
+            prefix = target.relative_parts[:component_count]
+            participants.setdefault(prefix, set()).add(target.relative_parts)
+    return {
+        prefix: SharedMissingAncestor(
+            relative_parts=prefix,
+            participant_targets=frozenset(targets),
+        )
+        for prefix, targets in participants.items()
+        if len(targets) > 1
+    }
+
+
+def revalidate_materialized_shared_node(node: BoundNode) -> None:
+    try:
+        current = filesystem_fingerprint(node.path)
+    except PlanError as exc:
+        raise PlanError(
+            f"plan-owned shared target ancestor changed: {node.path}"
+        ) from exc
+    if current != node.fingerprint or current.kind != stat.S_IFDIR:
+        raise PlanError(
+            f"plan-owned shared target ancestor changed: {node.path}"
+        )
+    if not probe_access(node.path, os.W_OK | os.X_OK):
+        raise PlanError(
+            "plan-owned shared target ancestor no longer permits "
+            f"materialization: {node.path}"
+        )
+
+
+def revalidate_shared_missing_ancestors(plan: SyncPlan) -> None:
+    ancestors = getattr(plan, "shared_missing_ancestors", {})
+    for relative_parts, ancestor in sorted(
+        ancestors.items(),
+        key=lambda item: (len(item[0]), item[0]),
+    ):
+        if ancestor.relative_parts != relative_parts:
+            raise PlanError("shared target ancestor receipt has an invalid key")
+        path = plan.root.joinpath(*relative_parts)
+        if ancestor.materialized_node is not None:
+            if ancestor.materialized_node.path != path:
+                raise PlanError(
+                    "shared target ancestor receipt names the wrong path"
+                )
+            revalidate_materialized_shared_node(ancestor.materialized_node)
+            continue
+        try:
+            os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except PermissionError as exc:
+            raise PlanError(
+                f"planned shared target ancestor became unreadable: {path}"
+            ) from exc
+        except OSError as exc:
+            raise PlanError(
+                f"cannot revalidate planned shared target ancestor: {path}\n"
+                f"  error: {exc}"
+            ) from exc
+        raise PlanError(
+            f"planned shared target ancestor changed after preflight: {path}"
+        )
+
+
+def target_with_materialized_shared_ancestors(
+    plan: SyncPlan,
+    entry: PlannedWorktree,
+) -> BoundTarget:
+    ancestors = getattr(plan, "shared_missing_ancestors", {})
+    if not ancestors or not entry.target.missing_parts:
+        return entry.target
+    existing_nodes = list(entry.target.existing_nodes)
+    existing_component_count = len(entry.target.relative_parts) - len(
+        entry.target.missing_parts
+    )
+    consumed = 0
+    for offset, _part in enumerate(entry.target.missing_parts, start=1):
+        prefix = entry.target.relative_parts[
+            : existing_component_count + offset
+        ]
+        ancestor = ancestors.get(prefix)
+        if ancestor is None or ancestor.materialized_node is None:
+            break
+        if entry.target.relative_parts not in ancestor.participant_targets:
+            raise PlanError(
+                "planned target attempted to consume another target's shared "
+                f"ancestor receipt: {entry.target.path}"
+            )
+        revalidate_materialized_shared_node(ancestor.materialized_node)
+        existing_nodes.append(ancestor.materialized_node)
+        consumed = offset
+    if consumed == 0:
+        return entry.target
+    anchor = existing_nodes[-1]
+    current_policy = filesystem_name_policy(anchor.path)
+    if (
+        current_policy.case_sensitive != entry.target.name_policy.case_sensitive
+        or current_policy.normalization != entry.target.name_policy.normalization
+    ):
+        raise PlanError(
+            "plan-owned shared target ancestor name semantics changed\n"
+            f"  anchor: {anchor.path}"
+        )
+    return replace(
+        entry.target,
+        existing_nodes=tuple(existing_nodes),
+        missing_parts=entry.target.missing_parts[consumed:],
+        name_policy_anchor=anchor,
+    )
+
+
+def record_materialized_shared_ancestors(
+    plan: SyncPlan,
+    entry: PlannedWorktree,
+    created_nodes: tuple[CreatedTargetNode, ...],
+) -> None:
+    ancestors = getattr(plan, "shared_missing_ancestors", {})
+    for created in created_nodes:
+        ancestor = ancestors.get(created.relative_parts)
+        if ancestor is None:
+            continue
+        if entry.target.relative_parts not in ancestor.participant_targets:
+            raise PlanError(
+                "planned target created an unowned shared target ancestor\n"
+                f"  target: {entry.target.path}\n"
+                f"  ancestor: {created.node.path}"
+            )
+        if created.relative_parts == entry.target.relative_parts:
+            raise PlanError(
+                "a final worktree target cannot become a shared ancestor receipt"
+            )
+        revalidate_materialized_shared_node(created.node)
+        if ancestor.materialized_node is None:
+            ancestor.materialized_node = created.node
+        elif ancestor.materialized_node != created.node:
+            raise PlanError(
+                "plan-owned shared target ancestor identity changed during "
+                f"materialization: {created.node.path}"
+            )
+    revalidate_shared_missing_ancestors(plan)
+
+
 def materialize_bound_target_directory(
     target: BoundTarget,
 ) -> MaterializedTargetLease:
@@ -2423,6 +2625,7 @@ def materialize_bound_target_directory(
     )
     parent_descriptor = -1
     target_descriptor = -1
+    created_nodes: list[CreatedTargetNode] = []
     try:
         root_binding = AccessBinding(
             path=root.path,
@@ -2495,6 +2698,13 @@ def materialize_bound_target_directory(
                     "target directory entry changed during descriptor binding\n"
                     f"  path: {child_path}"
                 )
+            if expected is None:
+                created_nodes.append(
+                    CreatedTargetNode(
+                        relative_parts=target.relative_parts[: index + 1],
+                        node=BoundNode(child_path, child_fingerprint),
+                    )
+                )
             if index == len(target.relative_parts) - 1:
                 parent_descriptor = current_descriptor
                 target_descriptor = child_descriptor
@@ -2529,6 +2739,7 @@ def materialize_bound_target_directory(
             parent_binding=parent_binding,
             parent_descriptor=parent_descriptor,
             entry_name=target.relative_parts[-1],
+            created_nodes=tuple(created_nodes),
         )
         revalidate_materialized_target_lease(lease)
         return lease
@@ -3775,6 +3986,241 @@ def normalize_shared_repository(value: str, source: Path) -> str:
     )
 
 
+def wait_for_forked_child(
+    child_pid: int,
+    deadline: float,
+) -> Optional[int]:
+    while True:
+        try:
+            waited_pid, child_status = os.waitpid(child_pid, os.WNOHANG)
+        except ChildProcessError as exc:
+            raise PlanError(
+                "process cleanup-incomplete: forked child was lost before reap"
+            ) from exc
+        except OSError as exc:
+            raise PlanError(
+                f"process cleanup-incomplete: cannot reap forked child: {exc}"
+            ) from exc
+        if waited_pid == child_pid:
+            return child_status
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.01, remaining))
+
+
+def terminate_forked_child(child_pid: int) -> None:
+    try:
+        os.kill(child_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        raise PlanError(
+            f"process cleanup-incomplete: cannot kill forked child: {exc}"
+        ) from exc
+    child_status = wait_for_forked_child(
+        child_pid,
+        time.monotonic() + PROCESS_CLEANUP_TIMEOUT_SECONDS,
+    )
+    if child_status is None:
+        raise PlanError(
+            "process cleanup-incomplete: forked child could not be reaped within "
+            f"{PROCESS_CLEANUP_TIMEOUT_SECONDS:g} seconds"
+        )
+
+
+def capture_process_umask() -> int:
+    if os.name != "posix" or not all(
+        hasattr(os, name)
+        for name in ("fork", "pipe", "set_blocking", "umask", "waitpid")
+    ) or not hasattr(os, "WNOHANG"):
+        raise PlanError(
+            "cannot safely capture the process umask for source shallow creation"
+        )
+    read_descriptor, write_descriptor = os.pipe()
+    child_pid = -1
+    child_status: Optional[int] = None
+    try:
+        child_pid = os.fork()
+        if child_pid == 0:
+            try:
+                os.close(read_descriptor)
+                process_umask = os.umask(0)
+                payload = process_umask.to_bytes(2, "big")
+                offset = 0
+                while offset < len(payload):
+                    written = os.write(write_descriptor, payload[offset:])
+                    if written <= 0:
+                        os._exit(1)
+                    offset += written
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        os.close(write_descriptor)
+        write_descriptor = -1
+        os.set_blocking(read_descriptor, False)
+        payload = bytearray()
+        deadline = time.monotonic() + UMASK_CAPTURE_TIMEOUT_SECONDS
+        while child_status is None:
+            while len(payload) < 2:
+                try:
+                    chunk = os.read(read_descriptor, 2 - len(payload))
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            try:
+                waited_pid, observed_status = os.waitpid(
+                    child_pid,
+                    os.WNOHANG,
+                )
+            except ChildProcessError as exc:
+                raise PlanError(
+                    "cannot safely capture the process umask: "
+                    "forked child was lost before reap"
+                ) from exc
+            except OSError as exc:
+                raise PlanError(
+                    f"cannot safely capture the process umask: {exc}"
+                ) from exc
+            if waited_pid == child_pid:
+                child_status = observed_status
+                child_pid = -1
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PlanError(
+                    "process umask capture exceeded its "
+                    f"{UMASK_CAPTURE_TIMEOUT_SECONDS:g}-second deadline"
+                )
+            time.sleep(min(0.01, remaining))
+
+        while len(payload) < 2:
+            try:
+                chunk = os.read(read_descriptor, 2 - len(payload))
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if (
+            child_status is None
+            or not os.WIFEXITED(child_status)
+            or os.WEXITSTATUS(child_status) != 0
+            or len(payload) != 2
+        ):
+            raise PlanError(
+                "cannot safely capture the process umask for source shallow creation"
+            )
+        process_umask = int.from_bytes(payload, "big")
+        if process_umask < 0 or process_umask > 0o777:
+            raise PlanError("captured process umask is outside the POSIX mode range")
+        return process_umask
+    except OSError as exc:
+        raise PlanError(
+            f"cannot safely capture the process umask: {exc}"
+        ) from exc
+    finally:
+        if read_descriptor >= 0:
+            os.close(read_descriptor)
+        if write_descriptor >= 0:
+            os.close(write_descriptor)
+        if child_pid > 0:
+            terminate_forked_child(child_pid)
+
+
+def frozen_shared_repository(
+    policy: tuple[tuple[str, str], ...],
+) -> str:
+    values = [
+        value
+        for key, value in policy
+        if key == FETCH_OBJECT_POLICY_CONFIG_NAMES["core.sharedrepository"]
+    ]
+    if len(values) > 1:
+        raise PlanError("frozen fetch object policy duplicates core.sharedRepository")
+    return values[0] if values else "umask"
+
+
+def source_shallow_permissions(shared_repository: str, process_umask: int) -> int:
+    requested_mode = 0o666
+    created_mode = requested_mode & ~process_umask
+    if shared_repository == "umask":
+        permissions = created_mode
+    elif shared_repository == "group":
+        permissions = created_mode | 0o660
+    elif shared_repository == "all":
+        permissions = created_mode | 0o664
+    elif re.fullmatch(r"0[0-7]{3}", shared_repository):
+        permissions = int(shared_repository, 8)
+    else:
+        raise PlanError(
+            "frozen core.sharedRepository cannot determine source shallow mode"
+        )
+    if permissions & 0o600 != 0o600:
+        raise PlanError(
+            "core.sharedRepository and the frozen process umask do not leave "
+            "the source shallow boundary owner-readable and owner-writable"
+        )
+    return permissions
+
+
+def capture_source_shallow_creation_policy(
+    parent_binding: AccessBinding,
+    fetch_object_policy: tuple[tuple[str, str], ...],
+) -> SourceShallowCreationPolicy:
+    if parent_binding.fingerprint.kind != stat.S_IFDIR:
+        raise PlanError("source shallow creation parent is not a directory")
+    effective_owner = os.geteuid()
+    effective_group = os.getegid()
+    parent = parent_binding.fingerprint
+    if parent.permissions & stat.S_ISGID:
+        expected_group = parent.group
+    elif parent.group == effective_group:
+        expected_group = effective_group
+    else:
+        raise PlanError(
+            "cannot prove source shallow group ownership before mutation\n"
+            f"  parent: {parent_binding.path}\n"
+            f"  parent group: {parent.group}\n"
+            f"  effective group: {effective_group}\n"
+            "  set the parent directory setgid bit or use the effective group"
+        )
+    process_umask = capture_process_umask()
+    shared_repository = frozen_shared_repository(fetch_object_policy)
+    return SourceShallowCreationPolicy(
+        shared_repository=shared_repository,
+        process_umask=process_umask,
+        owner=effective_owner,
+        group=expected_group,
+        permissions=source_shallow_permissions(
+            shared_repository,
+            process_umask,
+        ),
+    )
+
+
+def revalidate_source_shallow_creation_policy(
+    receipt: TransportReceipt,
+) -> None:
+    policy = receipt.source_shallow_creation_policy
+    if policy is None:
+        return
+    if receipt.source_shallow_binding is not None:
+        raise PlanError(
+            "source shallow creation policy is attached to an existing boundary"
+        )
+    current = capture_source_shallow_creation_policy(
+        receipt.source_shallow_parent_binding,
+        receipt.fetch_object_policy,
+    )
+    if current != policy:
+        raise PlanError(
+            "source shallow mode or ownership policy changed after preflight"
+        )
+
+
 def normalize_fsync_policy(value: str, source: Path) -> str:
     if not value.strip():
         return ""
@@ -4375,6 +4821,7 @@ def rollback_absent_source_shallow_publish(
 
 
 def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
+    revalidate_source_shallow_creation_policy(receipt)
     private_shallow_path = receipt.fetch_git_dir / SOURCE_SHALLOW_NAME
     private_directory_binding = access_binding_for_path(
         receipt.fetch_access_bindings,
@@ -4450,11 +4897,20 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
                 source_directory_descriptor,
             )
             return
-        mode = (
-            receipt.source_shallow_binding.fingerprint.permissions
-            if receipt.source_shallow_binding is not None
-            else 0o600
-        )
+        creation_policy = receipt.source_shallow_creation_policy
+        if receipt.source_shallow_binding is not None:
+            mode = receipt.source_shallow_binding.fingerprint.permissions
+            create_mode = mode
+        else:
+            if creation_policy is None:
+                raise PlanError(
+                    "absent source shallow boundary lacks a frozen creation policy"
+                )
+            mode = creation_policy.permissions
+            # Git creates ordinary lockfiles with 0666 and then applies the
+            # frozen shared-repository adjustment. Match that shape instead of
+            # making a fixed owner-private file.
+            create_mode = 0o666
         try:
             lock_descriptor = os.open(
                 SOURCE_SHALLOW_LOCK_NAME,
@@ -4464,7 +4920,7 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
                 | os.O_CLOEXEC
                 | os.O_NONBLOCK
                 | os.O_NOFOLLOW,
-                mode,
+                create_mode,
                 dir_fd=source_directory_descriptor,
             )
         except FileExistsError as exc:
@@ -4483,8 +4939,25 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
             ) from exc
         lock_fingerprint = fingerprint_from_stat(os.fstat(lock_descriptor))
         cleanup_owned_lock = True
+        if creation_policy is not None and (
+            lock_fingerprint.owner != creation_policy.owner
+            or lock_fingerprint.group != creation_policy.group
+        ):
+            raise PlanError(
+                "source shallow lock ownership does not match the frozen "
+                "creation policy"
+            )
         os.fchmod(lock_descriptor, mode)
         lock_fingerprint = fingerprint_from_stat(os.fstat(lock_descriptor))
+        if creation_policy is not None and (
+            lock_fingerprint.owner != creation_policy.owner
+            or lock_fingerprint.group != creation_policy.group
+            or lock_fingerprint.permissions != creation_policy.permissions
+        ):
+            raise PlanError(
+                "source shallow lock mode or ownership does not match the "
+                "frozen creation policy"
+            )
         pending = memoryview(private_content if private_content is not None else b"")
         while pending:
             written = os.write(lock_descriptor, pending)
@@ -5140,6 +5613,14 @@ def capture_transport_receipt(
         source_shallow_binding,
         source_shallow_content,
     ) = capture_source_shallow_state(source_git_dir, submodule.path)
+    source_shallow_creation_policy = (
+        capture_source_shallow_creation_policy(
+            source_shallow_parent_binding,
+            fetch_object_policy,
+        )
+        if source_shallow_binding is None
+        else None
+    )
     (
         fetch_guard,
         fetch_git_dir,
@@ -5165,6 +5646,7 @@ def capture_transport_receipt(
         source_shallow_path=source_shallow_path,
         source_shallow_parent_binding=source_shallow_parent_binding,
         source_shallow_binding=source_shallow_binding,
+        source_shallow_creation_policy=source_shallow_creation_policy,
         fetch_git_dir=fetch_git_dir,
         fetch_access_bindings=(
             *source_object_bindings,
@@ -5245,6 +5727,7 @@ def revalidate_transport_receipt(
     if receipt.ssh_executable_binding is not None:
         revalidate_file_content_binding(receipt.ssh_executable_binding)
     revalidate_source_shallow_state(receipt)
+    revalidate_source_shallow_creation_policy(receipt)
     for binding in receipt.fetch_access_bindings:
         revalidate_access(binding)
     for binding in receipt.fetch_file_bindings:
@@ -7686,6 +8169,7 @@ def build_sync_plan(
         force_replace_empty=force_replace_empty,
         fetch_missing=fetch_missing,
         input_receipt=input_receipt,
+        shared_missing_ancestors=capture_shared_missing_ancestors(entries),
     )
 
 
@@ -7764,8 +8248,9 @@ def revalidate_planned_entry(
         entry.source_completeness,
     )
 
+    shared_target = target_with_materialized_shared_ancestors(plan, entry)
     if allow_parent_materialization and entry.parent_index is not None:
-        for node in entry.target.existing_nodes:
+        for node in shared_target.existing_nodes:
             current = filesystem_fingerprint(node.path)
             if current != node.fingerprint:
                 raise PlanError(f"target-path object or policy changed: {node.path}")
@@ -7787,9 +8272,9 @@ def revalidate_planned_entry(
         target_access_bindings(current_target, current_state, entry.source_git_dir)
         target = current_target
     else:
-        revalidate_bound_target(entry.target)
+        revalidate_bound_target(shared_target)
         current_state = classify_planned_target(
-            entry.target,
+            shared_target,
             entry.source_git_dir,
             plan.force_replace_empty,
         )
@@ -7798,7 +8283,13 @@ def revalidate_planned_entry(
                 f"target state changed after preflight for {entry.target.path}: "
                 f"{entry.state} -> {current_state}"
             )
-        target = entry.target
+        if shared_target is not entry.target:
+            target_access_bindings(
+                shared_target,
+                current_state,
+                entry.source_git_dir,
+            )
+        target = shared_target
 
     if not entry.needs_fetch and not commit_exists(
         entry.source_git_dir,
@@ -7816,6 +8307,7 @@ def revalidate_planned_entry(
 
 def validate_sync_plan(plan: SyncPlan) -> None:
     revalidate_plan_input_receipt(plan)
+    revalidate_shared_missing_ancestors(plan)
     for entry in plan.entries:
         revalidate_planned_entry(plan, entry)
 
@@ -7867,6 +8359,7 @@ def postvalidate_applied_entry(
 
 def apply_sync_plan(plan: SyncPlan) -> None:
     validate_sync_plan(plan)
+    plan_state_changed = False
     for entry in plan.entries:
         if not entry.needs_fetch:
             continue
@@ -7884,6 +8377,7 @@ def apply_sync_plan(plan: SyncPlan) -> None:
             fetch_missing=True,
         )
         entry.needs_fetch = False
+        plan_state_changed = True
 
     for entry in plan.entries:
         if entry.checkout_preflight is not None:
@@ -7891,8 +8385,10 @@ def apply_sync_plan(plan: SyncPlan) -> None:
         checkout_preflight, write_bindings = capture_checkout_preflight(entry)
         entry.checkout_preflight = checkout_preflight
         entry.target_bindings = (*entry.target_bindings, *write_bindings)
+        plan_state_changed = True
 
-    validate_sync_plan(plan)
+    if plan_state_changed:
+        validate_sync_plan(plan)
     applied_indexes: set[int] = set()
     first_mutation = True
     for index, entry in enumerate(plan.entries):
@@ -7932,6 +8428,11 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                     lease=lease,
                 )
             postvalidate_applied_entry(entry, lease)
+            record_materialized_shared_ancestors(
+                plan,
+                entry,
+                lease.created_nodes,
+            )
         finally:
             lease.close()
         applied_indexes.add(index)

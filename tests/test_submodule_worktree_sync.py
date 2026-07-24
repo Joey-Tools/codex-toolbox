@@ -6,6 +6,7 @@ import errno
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -116,10 +117,19 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         *,
         initial_content: bytes | None,
         fetched_content: bytes | None,
+        shared_repository: str | None = None,
     ) -> MODULE.TransportReceipt:
         source_shallow = self.named_source_git_dir / MODULE.SOURCE_SHALLOW_NAME
         if initial_content is not None:
             source_shallow.write_bytes(initial_content)
+        if shared_repository is not None:
+            run_git(
+                self.root,
+                f"--git-dir={self.named_source_git_dir}",
+                "config",
+                "core.sharedRepository",
+                shared_repository,
+            )
         submodule = MODULE.Submodule(
             name="custom-lib",
             path="third_party/libexample",
@@ -397,6 +407,52 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         ):
             MODULE.revalidate_transport_receipt(receipt, submodule)
 
+    def test_source_shallow_creation_policy_matches_shared_repository_modes(
+        self,
+    ) -> None:
+        parent_binding = MODULE.capture_typed_access(
+            self.named_source_git_dir,
+            os.R_OK | os.W_OK | os.X_OK,
+            "test source shallow parent",
+            stat.S_IFDIR,
+        )
+        cases = (
+            ("group", 0o022, 0o664),
+            ("group", 0o002, 0o664),
+            ("group", 0o027, 0o660),
+            ("all", 0o027, 0o664),
+            ("0640", 0o077, 0o640),
+        )
+        for shared_repository, process_umask, expected in cases:
+            with self.subTest(
+                shared_repository=shared_repository,
+                process_umask=oct(process_umask),
+            ):
+                policy = (
+                    ("core.sharedRepository", shared_repository),
+                )
+                with mock.patch.object(
+                    MODULE,
+                    "capture_process_umask",
+                    return_value=process_umask,
+                ):
+                    creation = MODULE.capture_source_shallow_creation_policy(
+                        parent_binding,
+                        policy,
+                    )
+                self.assertEqual(creation.permissions, expected)
+                self.assertEqual(creation.owner, os.geteuid())
+                self.assertEqual(creation.group, os.getegid())
+
+    def test_process_umask_capture_does_not_change_parent_policy(self) -> None:
+        previous_umask = os.umask(0o027)
+        try:
+            self.assertEqual(MODULE.capture_process_umask(), 0o027)
+            observed_umask = os.umask(0o027)
+            self.assertEqual(observed_umask, 0o027)
+        finally:
+            os.umask(previous_umask)
+
     def test_fetch_transport_rejects_unreproducible_object_write_policy(
         self,
     ) -> None:
@@ -481,6 +537,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         (self.remote / "SECOND.md").write_text("second\n", encoding="utf-8")
         run_git(self.remote, "add", "SECOND.md")
         run_git(self.remote, "commit", "-m", "second")
+        (self.remote / "THIRD.md").write_text("third\n", encoding="utf-8")
+        run_git(self.remote, "add", "THIRD.md")
+        run_git(self.remote, "commit", "-m", "third")
         second_sha = run_git(self.remote, "rev-parse", "HEAD")
         submodule = MODULE.Submodule(
             "shared-object-policy",
@@ -513,6 +572,16 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         for path in new_object_files:
             with self.subTest(path=path):
                 self.assertEqual(path.stat().st_mode & 0o077, 0o040)
+        shallow = source / MODULE.SOURCE_SHALLOW_NAME
+        self.assertTrue(shallow.is_file())
+        self.assertIsNotNone(receipt.source_shallow_creation_policy)
+        creation_policy = receipt.source_shallow_creation_policy
+        self.assertEqual(
+            shallow.stat().st_mode & 0o777,
+            creation_policy.permissions,
+        )
+        self.assertEqual(shallow.stat().st_uid, creation_policy.owner)
+        self.assertEqual(shallow.stat().st_gid, creation_policy.group)
         run_git(
             self.root,
             f"--git-dir={source}",
@@ -1353,6 +1422,253 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 force_replace_empty=False,
                 dry_run=True,
             )
+
+    def test_apply_reuses_exact_shared_missing_parent(self) -> None:
+        target_super = self.root / "shared-parent-target"
+        target_super.mkdir()
+        self.clone_named_source("shared-parent-a")
+        self.clone_named_source("shared-parent-b")
+        modules = [
+            (
+                MODULE.Submodule(
+                    "shared-parent-a",
+                    "vendor/a",
+                    str(self.remote),
+                ),
+                self.sha,
+            ),
+            (
+                MODULE.Submodule(
+                    "shared-parent-b",
+                    "vendor/b",
+                    str(self.remote),
+                ),
+                self.sha,
+            ),
+        ]
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=modules,
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+
+        self.assertEqual(set(plan.shared_missing_ancestors), {("vendor",)})
+        MODULE.apply_sync_plan(plan)
+
+        self.assertEqual(
+            run_git(target_super / "vendor" / "a", "rev-parse", "HEAD"),
+            self.sha,
+        )
+        self.assertEqual(
+            run_git(target_super / "vendor" / "b", "rev-parse", "HEAD"),
+            self.sha,
+        )
+
+    def test_apply_reuses_multiple_shared_missing_prefix_depths(self) -> None:
+        target_super = self.root / "shared-prefix-depth-target"
+        target_super.mkdir()
+        module_specs = (
+            ("shared-depth-a", "vendor/common/a"),
+            ("shared-depth-b", "vendor/other/b"),
+            ("shared-depth-c", "vendor/common/c"),
+        )
+        for name, _path in module_specs:
+            self.clone_named_source(name)
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(name, path, str(self.remote)),
+                    self.sha,
+                )
+                for name, path in module_specs
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+
+        self.assertEqual(
+            set(plan.shared_missing_ancestors),
+            {("vendor",), ("vendor", "common")},
+        )
+        MODULE.apply_sync_plan(plan)
+
+        for _name, path in module_specs:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    run_git(target_super / path, "rev-parse", "HEAD"),
+                    self.sha,
+                )
+
+    def test_shared_parent_replacement_is_rejected_before_second_git_write(
+        self,
+    ) -> None:
+        target_super = self.root / "shared-parent-race-target"
+        target_super.mkdir()
+        self.clone_named_source("shared-race-a")
+        second_source = self.clone_named_source("shared-race-b")
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "shared-race-a",
+                        "vendor/a",
+                        str(self.remote),
+                    ),
+                    self.sha,
+                ),
+                (
+                    MODULE.Submodule(
+                        "shared-race-b",
+                        "vendor/b",
+                        str(self.remote),
+                    ),
+                    self.sha,
+                ),
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        second_registry_before = run_git(
+            self.root,
+            f"--git-dir={second_source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        quarantined = self.root / "shared-parent-race-quarantined"
+        original_record = MODULE.record_materialized_shared_ancestors
+        replaced = False
+
+        def replace_after_first_receipt(
+            current_plan: object,
+            entry: object,
+            created_nodes: object,
+        ) -> None:
+            nonlocal replaced
+            original_record(current_plan, entry, created_nodes)
+            if not replaced and entry is plan.entries[0]:
+                replaced = True
+                shared_parent = target_super / "vendor"
+                shared_parent.rename(quarantined)
+                shared_parent.mkdir()
+                (shared_parent / "sentinel").write_text(
+                    "replacement\n",
+                    encoding="utf-8",
+                )
+
+        with mock.patch.object(
+            MODULE,
+            "record_materialized_shared_ancestors",
+            side_effect=replace_after_first_receipt,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "plan-owned shared target ancestor changed",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(replaced)
+        self.assertEqual(
+            (target_super / "vendor" / "sentinel").read_text(encoding="utf-8"),
+            "replacement\n",
+        )
+        self.assertFalse((target_super / "vendor" / "b").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={second_source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            second_registry_before,
+        )
+
+    def test_shared_parent_external_state_blocks_before_first_mutation(
+        self,
+    ) -> None:
+        target_super = self.root / "shared-parent-partial-target"
+        target_super.mkdir()
+        first_source = self.clone_named_source("shared-partial-a")
+        self.clone_named_source("shared-partial-b")
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "shared-partial-a",
+                        "vendor/a",
+                        str(self.remote),
+                    ),
+                    self.sha,
+                ),
+                (
+                    MODULE.Submodule(
+                        "shared-partial-b",
+                        "vendor/b",
+                        str(self.remote),
+                    ),
+                    self.sha,
+                ),
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        first_registry_before = run_git(
+            self.root,
+            f"--git-dir={first_source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        (target_super / "vendor" / "b").mkdir(parents=True)
+        (target_super / "vendor" / "b" / "sentinel").write_text(
+            "external\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "shared target ancestor changed after preflight",
+        ):
+            MODULE.apply_sync_plan(plan)
+
+        self.assertFalse((target_super / "vendor" / "a").exists())
+        self.assertEqual(
+            (target_super / "vendor" / "b" / "sentinel").read_text(
+                encoding="utf-8"
+            ),
+            "external\n",
+        )
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={first_source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            first_registry_before,
+        )
 
     def test_apply_rejects_parent_symlink_inserted_after_entry_revalidation(
         self,
@@ -2835,6 +3151,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 parent_index=None,
                 target=SimpleNamespace(
                     path=Path(f"module-{index}"),
+                    relative_parts=(f"module-{index}",),
                     collision_tokens=(("missing", f"module-{index}"),),
                 ),
             )
@@ -2842,6 +3159,47 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             entries.append(candidate)
 
         self.assertEqual(len(entries), 20_000)
+
+    def test_collision_index_rejects_aliased_shared_prefix_spellings(
+        self,
+    ) -> None:
+        target_root = self.root / "shared-prefix-alias-target"
+        target_root.mkdir()
+        policy = MODULE.FilesystemNamePolicy(
+            case_sensitive=False,
+            normalization="NFD",
+            source="test",
+        )
+        cases = (
+            (("Vendor", "a"), ("vendor", "b")),
+            (("Caf\u00e9", "a"), ("Cafe\u0301", "b")),
+        )
+        for first_parts, second_parts in cases:
+            with self.subTest(first=first_parts, second=second_parts):
+                first = SimpleNamespace(
+                    target=MODULE.bind_target_path(
+                        target_root,
+                        first_parts,
+                        "first",
+                        policy,
+                    )
+                )
+                second = SimpleNamespace(
+                    target=MODULE.bind_target_path(
+                        target_root,
+                        second_parts,
+                        "second",
+                        policy,
+                    )
+                )
+                entries = [first]
+                collision_index = MODULE.TargetCollisionIndex()
+                collision_index.add([], first)
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "components alias",
+                ):
+                    collision_index.add(entries, second)
 
     def test_deep_collision_chain_uses_active_ancestor_metadata(self) -> None:
         class NoParentLookups(list[object]):
@@ -2860,6 +3218,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 parent_index=index - 1 if index else None,
                 target=SimpleNamespace(
                     path=Path(f"deep-level-{index}"),
+                    relative_parts=tuple(
+                        f"level-{level}" for level in range(index + 1)
+                    ),
                     collision_tokens=tuple(tokens),
                 ),
             )
@@ -4750,6 +5111,72 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             ).exists()
         )
 
+    def test_shallow_install_absent_to_present_uses_group_policy(self) -> None:
+        fetched = b"g" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=None,
+            fetched_content=fetched,
+            shared_repository="group",
+        )
+        creation = receipt.source_shallow_creation_policy
+        self.assertIsNotNone(creation)
+
+        MODULE.install_post_fetch_shallow_state(receipt)
+
+        observed = receipt.source_shallow_path.stat()
+        self.assertEqual(stat.S_IMODE(observed.st_mode), creation.permissions)
+        self.assertEqual(observed.st_uid, creation.owner)
+        self.assertEqual(observed.st_gid, creation.group)
+        self.assertEqual(receipt.source_shallow_path.read_bytes(), fetched)
+
+    def test_shallow_install_absent_to_present_uses_numeric_policy(self) -> None:
+        fetched = b"n" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=None,
+            fetched_content=fetched,
+            shared_repository="0640",
+        )
+        creation = receipt.source_shallow_creation_policy
+        self.assertIsNotNone(creation)
+
+        MODULE.install_post_fetch_shallow_state(receipt)
+
+        observed = receipt.source_shallow_path.stat()
+        self.assertEqual(stat.S_IMODE(observed.st_mode), 0o640)
+        self.assertEqual(observed.st_uid, creation.owner)
+        self.assertEqual(observed.st_gid, creation.group)
+
+    def test_shallow_install_rejects_umask_drift_before_source_mutation(
+        self,
+    ) -> None:
+        fetched = b"u" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=None,
+            fetched_content=fetched,
+            shared_repository="group",
+        )
+        creation = receipt.source_shallow_creation_policy
+        self.assertIsNotNone(creation)
+        drifted_umask = creation.process_umask ^ 0o002
+
+        with mock.patch.object(
+            MODULE,
+            "capture_process_umask",
+            return_value=drifted_umask,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "mode or ownership policy changed",
+            ):
+                MODULE.install_post_fetch_shallow_state(receipt)
+
+        self.assertFalse(receipt.source_shallow_path.exists())
+        self.assertFalse(
+            receipt.source_shallow_path.with_name(
+                MODULE.SOURCE_SHALLOW_LOCK_NAME
+            ).exists()
+        )
+
     def test_shallow_install_present_to_absent_deletes_bound_boundary(self) -> None:
         initial = b"a" * 40 + b"\n"
         receipt = self.make_shallow_install_receipt(
@@ -5253,6 +5680,48 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.assertNotIn("would fetch missing commit", output.getvalue())
         self.assertFalse(any("fetch" in command for command in commands))
+
+    def test_no_fetch_apply_skips_redundant_full_plan_validation(self) -> None:
+        target = SimpleNamespace(path=self.root / "no-fetch-target")
+        entry = SimpleNamespace(
+            needs_fetch=False,
+            checkout_preflight=mock.sentinel.checkout_receipt,
+            parent_index=None,
+            target=target,
+            source_git_dir=self.named_source_git_dir,
+            submodule=MODULE.Submodule(
+                "no-fetch",
+                "no-fetch",
+                str(self.remote),
+            ),
+            sha=self.sha,
+            state="missing",
+        )
+        plan = SimpleNamespace(entries=[entry], depth=1)
+        lease = mock.MagicMock()
+        lease.created_nodes = ()
+
+        with (
+            mock.patch.object(MODULE, "validate_sync_plan") as validate,
+            mock.patch.object(
+                MODULE,
+                "revalidate_planned_entry",
+                return_value=target,
+            ),
+            mock.patch.object(
+                MODULE,
+                "materialize_bound_target_directory",
+                return_value=lease,
+            ),
+            mock.patch.object(MODULE, "revalidate_materialized_target_lease"),
+            mock.patch.object(MODULE, "revalidate_source_object_admission"),
+            mock.patch.object(MODULE, "revalidate_checkout_preflight"),
+            mock.patch.object(MODULE, "add_worktree"),
+            mock.patch.object(MODULE, "postvalidate_applied_entry"),
+        ):
+            MODULE.apply_sync_plan(plan)
+
+        validate.assert_called_once_with(plan)
 
     def test_apply_revalidates_only_each_fetch_source_before_one_full_pass(
         self,
