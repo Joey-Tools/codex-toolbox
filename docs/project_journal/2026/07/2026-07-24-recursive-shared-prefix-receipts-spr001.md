@@ -3,7 +3,7 @@ id: 20260724-spr001
 title: Recursive Shared Prefix Receipts
 status: completed
 created: 2026-07-24
-updated: 2026-07-24
+updated: 2026-07-27
 branch: codex/toolbox-skill-sync-refactor
 pr:
 supersedes: []
@@ -39,6 +39,10 @@ superseded_by:
 - Managed preflight and final revalidation now descriptor-read that raw index and run the same parser against the current HEAD before the checkout probe or real checkout can be invoked; split-index `link` state and unknown optional extensions therefore fail before mutation.
 - Authorized fetch URL classification now recognizes username-less `host:path` and other Git-compatible scp-style forms before generic schemes, so every Git-SSH form receives the private SSH executable snapshot while `://` schemes retain strict allowlisting.
 - Valueless supported fetch booleans preserve Git's implicit-`true` meaning; explicit empty fsck remains `false`, explicit empty `core.sharedRepository` becomes `umask`, and explicit fsck values are normalized through the bound Git runtime's boolean parser. Unsupported valueless keys and malformed boolean values remain blocked.
+- Shared-prefix publication and revalidation require both the bound owner write/search mode bits and effective write/search access, so root or another DAC-bypass context cannot bless a `0555` ancestor.
+- Superproject split-index discovery preserves existing `link` state for the read-only `--shared-index-path` query and binds the shared index object alongside the primary index; same-content shared-index replacement blocks apply before worktree mutation.
+- Authorized fetch receipts bind all 256 lower-case loose-object fanout names as absent or exact accessible directory objects. Existing symlinks are rejected, and an absent/present/symlink drift visible at the child exec gate retains the fetch recovery fence before Git writes.
+- Existing source shallow replacement locks must preserve the receipt-bound owner, group, and mode before exchange. A shared-repository process that cannot reproduce that policy fails closed without changing the original boundary.
 - A same-source, same-HEAD redirect to another worktree admin cannot satisfy finalization. New-target rollback atomically preserves each unexpected marker/backlink entry while temporarily restoring the retained original bytes for Git unregister, then verifies target, registry, materialized-parent, and plan-receipt restoration.
 
 ## Next Steps
@@ -78,3 +82,6 @@ superseded_by:
 - The final reviewer follow-up covering explicit-empty shared-repository policy passed five focused regressions in 5.610 seconds; the read-only re-review reported no findings.
 - The final exact-head follow-up complete helper suite passed 190 tests in 451.303 seconds.
 - Final complete repository coverage passed 949 tests: the README module matrix passed 911 tests in 654.769 seconds, and its omitted public-release workflow module passed 38 tests in 1.838 seconds.
+- GitHub round-two follow-up: 12 focused owner-mode, shared-index, loose-object fanout, and shallow-policy regressions passed in 10.017 seconds; four strengthened race and shared-policy cases passed independently in 1.290 seconds.
+- The final complete helper suite passed 196 tests in 133.095 seconds, and the final repository-level module matrix passed 917 tests in 255.066 seconds.
+- Repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, Python compilation, helper `--help`, skill validation, and `git diff --check` passed. An independent read-only diff audit reported no actionable findings.

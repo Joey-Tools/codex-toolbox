@@ -62,6 +62,7 @@ MAX_CONFIG_ENTRIES = 100_000
 SOURCE_SHALLOW_NAME = "shallow"
 SOURCE_SHALLOW_LOCK_NAME = "shallow.lock"
 SOURCE_FETCH_TRANSACTION_NAME = "codex-submodule-fetch.pending"
+LOOSE_OBJECT_FANOUT_NAMES = tuple(f"{value:02x}" for value in range(256))
 MAX_SOURCE_FETCH_TRANSACTION_BYTES = 64 * 1024
 LINUX_RENAME_NOREPLACE = 0x00000001
 LINUX_RENAME_EXCHANGE = 0x00000002
@@ -416,6 +417,14 @@ class DirectoryEntryLease:
 
 
 @dataclass(frozen=True)
+class DirectoryChildInventoryLease:
+    directory_binding: AccessBinding
+    directory_descriptor: int
+    entries: tuple[tuple[str, Optional[FsFingerprint]], ...]
+    purpose: str
+
+
+@dataclass(frozen=True)
 class WorktreeAdminInventory:
     source_fingerprint: FsFingerprint
     root_fingerprint: Optional[FsFingerprint]
@@ -586,6 +595,10 @@ class TransportReceipt:
     source_shallow_parent_binding: AccessBinding
     source_shallow_binding: Optional[FileContentBinding]
     source_shallow_creation_policy: Optional[SourceShallowCreationPolicy]
+    source_loose_object_fanout: tuple[
+        tuple[str, Optional[FsFingerprint]],
+        ...,
+    ]
     fetch_git_dir: Path
     fetch_access_bindings: tuple[AccessBinding, ...]
     fetch_file_bindings: tuple[FileContentBinding, ...]
@@ -1127,11 +1140,24 @@ def git_runtime() -> GitRuntime:
     return _GIT_RUNTIME
 
 
-def safe_command(args: list[str]) -> list[str]:
+def safe_command(
+    args: list[str],
+    *,
+    preserve_split_index: bool = False,
+) -> list[str]:
     if not args or args[0] != "git":
         return args
     runtime = git_runtime()
-    return [str(runtime.executable), *SAFE_GIT_CONFIG_ARGS, *args[1:]]
+    config_args = list(SAFE_GIT_CONFIG_ARGS)
+    if preserve_split_index:
+        try:
+            split_index_value = config_args.index("core.splitIndex=false")
+        except ValueError as exc:
+            raise PlanError("safe Git config lacks the split-index override") from exc
+        if split_index_value == 0 or config_args[split_index_value - 1] != "-c":
+            raise PlanError("safe Git split-index override has an invalid shape")
+        del config_args[split_index_value - 1 : split_index_value + 1]
+    return [str(runtime.executable), *config_args, *args[1:]]
 
 
 def run(
@@ -1243,8 +1269,13 @@ def run_bounded_bytes(
     extra_env: Optional[dict[str, str]] = None,
     fixed_env: Optional[dict[str, str]] = None,
     prepare_git_command: bool = True,
+    preserve_split_index: bool = False,
     directory_descriptor: Optional[int] = None,
     directory_identity_leases: tuple[DirectoryEntryLease, ...] = (),
+    directory_child_inventory_leases: tuple[
+        DirectoryChildInventoryLease,
+        ...,
+    ] = (),
 ) -> subprocess.CompletedProcess[bytes]:
     if input_bytes is not None and len(input_bytes) > GIT_INPUT_LIMIT_BYTES:
         raise PlanError(
@@ -1254,12 +1285,20 @@ def run_bounded_bytes(
         raise PlanError(
             "fixed and incremental command environments are mutually exclusive"
         )
-    command = safe_command(args) if prepare_git_command else args
+    if preserve_split_index and not prepare_git_command:
+        raise PlanError("split-index preservation requires a prepared Git command")
+    command = (
+        safe_command(args, preserve_split_index=preserve_split_index)
+        if prepare_git_command
+        else args
+    )
     environment = (
         dict(fixed_env) if fixed_env is not None else git_environment(extra_env)
     )
     if (
-        directory_descriptor is not None or directory_identity_leases
+        directory_descriptor is not None
+        or directory_identity_leases
+        or directory_child_inventory_leases
     ) and os.name != "posix":
         raise PlanError("descriptor-anchored Git writes require a POSIX runtime")
 
@@ -1336,6 +1375,70 @@ def run_bounded_bytes(
                     errno.ESTALE,
                     f"{lease.binding.purpose} changed before exec",
                 )
+        for lease in directory_child_inventory_leases:
+            directory_stat = os.fstat(lease.directory_descriptor)
+            expected_directory = lease.directory_binding.fingerprint
+            directory_values = (
+                directory_stat.st_dev,
+                directory_stat.st_ino,
+                stat.S_IFMT(directory_stat.st_mode),
+                directory_stat.st_uid,
+                directory_stat.st_gid,
+                stat.S_IMODE(directory_stat.st_mode),
+            )
+            expected_directory_values = (
+                expected_directory.device,
+                expected_directory.inode,
+                expected_directory.kind,
+                expected_directory.owner,
+                expected_directory.group,
+                expected_directory.permissions,
+            )
+            if directory_values != expected_directory_values:
+                raise OSError(
+                    errno.ESTALE,
+                    f"{lease.purpose} parent changed before exec",
+                )
+            for name, expected_entry in lease.entries:
+                try:
+                    entry_stat = os.stat(
+                        name,
+                        dir_fd=lease.directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    if expected_entry is None:
+                        continue
+                    raise OSError(
+                        errno.ESTALE,
+                        f"{lease.purpose} entry disappeared before exec",
+                    )
+                if expected_entry is None:
+                    raise OSError(
+                        errno.ESTALE,
+                        f"{lease.purpose} entry appeared before exec",
+                    )
+                entry_values = (
+                    entry_stat.st_dev,
+                    entry_stat.st_ino,
+                    stat.S_IFMT(entry_stat.st_mode),
+                    entry_stat.st_uid,
+                    entry_stat.st_gid,
+                    stat.S_IMODE(entry_stat.st_mode),
+                )
+                expected_entry_values = (
+                    expected_entry.device,
+                    expected_entry.inode,
+                    expected_entry.kind,
+                    expected_entry.owner,
+                    expected_entry.group,
+                    expected_entry.permissions,
+                )
+                if entry_values != expected_entry_values:
+                    raise OSError(
+                        errno.ESTALE,
+                        f"{lease.purpose} entry changed before exec",
+                    )
         if directory_descriptor is not None:
             os.fchdir(directory_descriptor)
 
@@ -1345,6 +1448,8 @@ def run_bounded_bytes(
     for lease in directory_identity_leases:
         inherited_descriptors.add(lease.descriptor)
         inherited_descriptors.add(lease.parent_descriptor)
+    for lease in directory_child_inventory_leases:
+        inherited_descriptors.add(lease.directory_descriptor)
 
     input_file = tempfile.TemporaryFile()
     if input_bytes is not None:
@@ -1362,7 +1467,11 @@ def run_bounded_bytes(
             pass_fds=tuple(sorted(inherited_descriptors)),
             preexec_fn=(
                 enter_bound_directory
-                if directory_descriptor is not None or directory_identity_leases
+                if (
+                    directory_descriptor is not None
+                    or directory_identity_leases
+                    or directory_child_inventory_leases
+                )
                 else None
             ),
         )
@@ -1487,6 +1596,7 @@ def read_git_bounded(
     extra_env: Optional[dict[str, str]] = None,
     fixed_env: Optional[dict[str, str]] = None,
     timeout_seconds: float = GIT_ENUMERATION_TIMEOUT_SECONDS,
+    preserve_split_index: bool = False,
     directory_identity_leases: tuple[DirectoryEntryLease, ...] = (),
 ) -> subprocess.CompletedProcess[bytes]:
     return run_bounded_bytes(
@@ -1498,6 +1608,7 @@ def read_git_bounded(
         extra_env=extra_env,
         fixed_env=fixed_env,
         timeout_seconds=timeout_seconds,
+        preserve_split_index=preserve_split_index,
         directory_identity_leases=directory_identity_leases,
     )
 
@@ -1621,6 +1732,11 @@ def probe_access_at(directory_descriptor: int, name: str, mode: int) -> bool:
         raise PlanError(
             "descriptor-relative effective-access checks are unavailable"
         ) from exc
+
+
+def owner_mode_permits_write_search(fingerprint: FsFingerprint) -> bool:
+    required = stat.S_IWUSR | stat.S_IXUSR
+    return fingerprint.permissions & required == required
 
 
 def access_mode_text(mode: int) -> str:
@@ -2695,7 +2811,11 @@ def revalidate_materialized_shared_node(node: BoundNode) -> None:
         ) from exc
     if current != node.fingerprint or current.kind != stat.S_IFDIR:
         raise PlanError(f"plan-owned shared target ancestor changed: {node.path}")
-    if not probe_access(node.path, os.W_OK | os.X_OK):
+    if (
+        current.owner != os.geteuid()
+        or not owner_mode_permits_write_search(current)
+        or not probe_access(node.path, os.W_OK | os.X_OK)
+    ):
         raise PlanError(
             "plan-owned shared target ancestor no longer permits "
             f"materialization: {node.path}"
@@ -3047,7 +3167,9 @@ def capture_checkout_materialized_shared_ancestors(
                             "wrong owner\n"
                             f"  path: {child_path}"
                         )
-                    if not probe_access_at(
+                    if not owner_mode_permits_write_search(
+                        child_fingerprint
+                    ) or not probe_access_at(
                         child_descriptor,
                         ".",
                         os.W_OK | os.X_OK,
@@ -3956,6 +4078,10 @@ def superproject_index_paths(root: Path) -> tuple[Path, ...]:
             "--shared-index-path",
         ],
         stdout_limit=MAX_CHECKOUT_PATH_BYTES + 1,
+        # This read-only query must observe an existing `link` extension.
+        # The ordinary command profile disables new split-index writes, but
+        # applying that override here makes Git hide the linked shared index.
+        preserve_split_index=True,
     )
     shared_text = os.fsdecode(shared_result.stdout).strip()
     if not shared_text:
@@ -4879,6 +5005,100 @@ def source_object_format(
             f"  format: {object_format}"
         )
     return object_format
+
+
+def loose_object_fanout_inventory_at(
+    directory_descriptor: int,
+    object_directory: Path,
+    purpose: str,
+) -> tuple[tuple[str, Optional[FsFingerprint]], ...]:
+    inventory: list[tuple[str, Optional[FsFingerprint]]] = []
+    for name in LOOSE_OBJECT_FANOUT_NAMES:
+        try:
+            fingerprint = fingerprint_from_stat(
+                os.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+        except FileNotFoundError:
+            inventory.append((name, None))
+            continue
+        except OSError as exc:
+            raise PlanError(
+                f"cannot inspect {purpose}\n"
+                f"  path: {object_directory / name}\n"
+                f"  error: {exc}"
+            ) from exc
+        if fingerprint.kind != stat.S_IFDIR:
+            raise PlanError(
+                f"{purpose} has an unsafe object type\n"
+                f"  path: {object_directory / name}"
+            )
+        if not probe_access_at(
+            directory_descriptor,
+            name,
+            os.R_OK | os.W_OK | os.X_OK,
+        ):
+            raise PlanError(
+                f"{purpose} denies loose-object writes\n"
+                f"  path: {object_directory / name}"
+            )
+        inventory.append((name, fingerprint))
+    return tuple(inventory)
+
+
+def capture_loose_object_fanout_inventory(
+    object_binding: AccessBinding,
+    purpose: str,
+) -> tuple[tuple[str, Optional[FsFingerprint]], ...]:
+    object_descriptor = open_directory_descriptor(
+        object_binding.path,
+        purpose,
+    )
+    try:
+        revalidate_directory_descriptor(object_binding, object_descriptor)
+        first = loose_object_fanout_inventory_at(
+            object_descriptor,
+            object_binding.path,
+            purpose,
+        )
+        second = loose_object_fanout_inventory_at(
+            object_descriptor,
+            object_binding.path,
+            purpose,
+        )
+        revalidate_directory_descriptor(object_binding, object_descriptor)
+        if first != second:
+            raise PlanError(f"{purpose} changed during preflight binding")
+        return first
+    finally:
+        os.close(object_descriptor)
+
+
+def capture_loose_object_fanout_lease(
+    object_lease: DirectoryEntryLease,
+    expected: tuple[tuple[str, Optional[FsFingerprint]], ...],
+    purpose: str,
+) -> DirectoryChildInventoryLease:
+    if tuple(name for name, _ in expected) != LOOSE_OBJECT_FANOUT_NAMES:
+        raise PlanError(f"{purpose} has an invalid receipt shape")
+    revalidate_directory_entry_lease(object_lease)
+    current = loose_object_fanout_inventory_at(
+        object_lease.descriptor,
+        object_lease.path,
+        purpose,
+    )
+    revalidate_directory_entry_lease(object_lease)
+    if current != expected:
+        raise PlanError(f"{purpose} changed after preflight")
+    return DirectoryChildInventoryLease(
+        directory_binding=object_lease.binding,
+        directory_descriptor=object_lease.descriptor,
+        entries=expected,
+        purpose=purpose,
+    )
 
 
 FETCH_OBJECT_POLICY_KEYS = (
@@ -5925,24 +6145,37 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
             ) from exc
         lock_fingerprint = fingerprint_from_stat(os.fstat(lock_descriptor))
         cleanup_owned_lock = True
-        if creation_policy is not None and (
-            lock_fingerprint.owner != creation_policy.owner
-            or lock_fingerprint.group != creation_policy.group
+        if receipt.source_shallow_binding is not None:
+            existing_policy = receipt.source_shallow_binding.fingerprint
+            expected_owner = existing_policy.owner
+            expected_group = existing_policy.group
+            expected_permissions = existing_policy.permissions
+        else:
+            if creation_policy is None:
+                raise PlanError(
+                    "absent source shallow boundary lacks a frozen creation policy"
+                )
+            expected_owner = creation_policy.owner
+            expected_group = creation_policy.group
+            expected_permissions = creation_policy.permissions
+        if (
+            lock_fingerprint.owner != expected_owner
+            or lock_fingerprint.group != expected_group
         ):
             raise PlanError(
-                "source shallow lock ownership does not match the frozen "
-                "creation policy"
+                "source shallow lock ownership does not preserve the frozen "
+                "boundary policy"
             )
         os.fchmod(lock_descriptor, mode)
         lock_fingerprint = fingerprint_from_stat(os.fstat(lock_descriptor))
-        if creation_policy is not None and (
-            lock_fingerprint.owner != creation_policy.owner
-            or lock_fingerprint.group != creation_policy.group
-            or lock_fingerprint.permissions != creation_policy.permissions
+        if (
+            lock_fingerprint.owner != expected_owner
+            or lock_fingerprint.group != expected_group
+            or lock_fingerprint.permissions != expected_permissions
         ):
             raise PlanError(
                 "source shallow lock mode or ownership does not match the "
-                "frozen creation policy"
+                "frozen boundary policy"
             )
         pending = memoryview(private_content if private_content is not None else b"")
         while pending:
@@ -6615,14 +6848,17 @@ def capture_transport_receipt(
             )
         ssh_source = (ssh_path, ssh_fingerprint)
     source_object_directory = (source_git_dir / "objects").resolve(strict=True)
-    source_object_bindings = [
-        capture_typed_access(
-            source_object_directory,
-            os.R_OK | os.W_OK | os.X_OK,
-            f"authorized fetch object database for {submodule.path}",
-            stat.S_IFDIR,
-        )
-    ]
+    source_object_binding = capture_typed_access(
+        source_object_directory,
+        os.R_OK | os.W_OK | os.X_OK,
+        f"authorized fetch object database for {submodule.path}",
+        stat.S_IFDIR,
+    )
+    source_object_bindings = [source_object_binding]
+    source_loose_object_fanout = capture_loose_object_fanout_inventory(
+        source_object_binding,
+        f"authorized fetch loose-object fanout for {submodule.path}",
+    )
     source_pack_directory = source_object_directory / "pack"
     if path_entry_exists(source_pack_directory):
         source_object_bindings.append(
@@ -6702,6 +6938,7 @@ def capture_transport_receipt(
             source_shallow_parent_binding=source_shallow_parent_binding,
             source_shallow_binding=source_shallow_binding,
             source_shallow_creation_policy=source_shallow_creation_policy,
+            source_loose_object_fanout=source_loose_object_fanout,
             fetch_git_dir=fetch_git_dir,
             fetch_access_bindings=(
                 *source_object_bindings,
@@ -6808,6 +7045,17 @@ def revalidate_transport_receipt(
     revalidate_source_shallow_creation_policy(receipt)
     for binding in receipt.fetch_access_bindings:
         revalidate_access(binding)
+    expected_object_binding = access_binding_for_path(
+        receipt.fetch_access_bindings,
+        receipt.source_object_directory,
+        f"authorized fetch object database for {submodule.path}",
+    )
+    current_fanout = capture_loose_object_fanout_inventory(
+        expected_object_binding,
+        f"authorized fetch loose-object fanout for {submodule.path}",
+    )
+    if current_fanout != receipt.source_loose_object_fanout:
+        raise PlanError("authorized fetch loose-object fanout changed after preflight")
     for binding in receipt.fetch_file_bindings:
         revalidate_file_content_binding(binding)
     validate_frozen_git_environment(
@@ -6930,6 +7178,11 @@ def fetch_missing_commit(
                 "authorized fetch object database changed during descriptor binding"
             )
         revalidate_directory_entry_lease(source_object_lease)
+        source_fanout_lease = capture_loose_object_fanout_lease(
+            source_object_lease,
+            receipt.source_loose_object_fanout,
+            f"authorized fetch loose-object fanout for {submodule.path}",
+        )
         transaction = begin_source_fetch_transaction(receipt)
     except BaseException:
         source_object_lease.close()
@@ -6947,6 +7200,7 @@ def fetch_missing_commit(
             stderr_limit=GIT_ERROR_OUTPUT_LIMIT_BYTES,
             fixed_env=dict(receipt.git_environment),
             directory_identity_leases=(source_object_lease,),
+            directory_child_inventory_leases=(source_fanout_lease,),
         )
     except BaseException as exc:
         try:

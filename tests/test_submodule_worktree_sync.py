@@ -3044,6 +3044,53 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 receipt.superproject_index,
             )
 
+    def test_split_superproject_index_receipt_binds_shared_index_drift(
+        self,
+    ) -> None:
+        target, module, initial_receipt = self.make_target_superproject(
+            "split-index-receipt-target",
+            self.sha,
+        )
+        run_git(target, "update-index", "--split-index")
+        index_receipt = MODULE.capture_superproject_index_receipt(
+            target,
+            (module.path,),
+        )
+        self.assertEqual(len(index_receipt.index_bindings), 2)
+        shared_binding = index_receipt.index_bindings[1]
+        self.assertTrue(shared_binding.path.name.startswith("sharedindex."))
+        self.assertEqual(
+            index_receipt.selected_gitlinks,
+            ((module.path, self.sha),),
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=MODULE.PlanInputReceipt(
+                gitmodules_binding=initial_receipt.gitmodules_binding,
+                superproject_index=index_receipt,
+            ),
+        )
+
+        replacement = shared_binding.path.with_name("sharedindex.replacement")
+        replacement.write_bytes(shared_binding.path.read_bytes())
+        replacement.chmod(shared_binding.fingerprint.permissions)
+        os.replace(replacement, shared_binding.path)
+
+        with mock.patch.object(MODULE, "add_worktree") as add:
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "superproject index.*changed",
+            ):
+                MODULE.apply_sync_plan(plan)
+        add.assert_not_called()
+
     def test_index_drift_blocks_authorized_fetch_before_source_mutation(self) -> None:
         (self.remote / "INDEX-FETCH.md").write_text(
             "index fetch\n",
@@ -5317,6 +5364,26 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 child_sha,
             )
 
+    def test_shared_prefix_revalidation_requires_owner_mode_under_dac_override(
+        self,
+    ) -> None:
+        shared = self.root / "dac-override-shared-prefix"
+        shared.mkdir()
+        shared.chmod(0o555)
+        node = MODULE.BoundNode(
+            shared,
+            MODULE.filesystem_fingerprint(shared),
+        )
+        try:
+            with mock.patch.object(MODULE, "probe_access", return_value=True):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "no longer permits materialization",
+                ):
+                    MODULE.revalidate_materialized_shared_node(node)
+        finally:
+            shared.chmod(0o755)
+
     def test_recursive_parent_checkout_does_not_bless_unrelated_sibling(
         self,
     ) -> None:
@@ -5491,6 +5558,17 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                             )
                     if policy == "non-writable":
                         group.chmod(0o555)
+                        with mock.patch.object(
+                            MODULE,
+                            "probe_access_at",
+                            return_value=True,
+                        ):
+                            return original_capture(
+                                current_plan,
+                                owner_index,
+                                entry,
+                                lease,
+                            )
                     else:
                         shutil.rmtree(group)
                         group.symlink_to(outside, target_is_directory=True)
@@ -8363,6 +8441,113 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 self.sha,
             )
 
+    def test_fetch_transport_rejects_loose_object_fanout_symlink(self) -> None:
+        source_objects = self.named_source_git_dir / "objects"
+        fanout_name = next(
+            name
+            for name in MODULE.LOOSE_OBJECT_FANOUT_NAMES
+            if not (source_objects / name).exists()
+        )
+        outside = self.root / "outside-loose-object-fanout"
+        outside.mkdir()
+        (source_objects / fanout_name).symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "loose-object fanout.*unsafe object type",
+        ):
+            MODULE.capture_transport_receipt(
+                self.named_source_git_dir,
+                submodule,
+            )
+
+    def test_fetch_rejects_raced_loose_object_fanout_symlink_before_git_starts(
+        self,
+    ) -> None:
+        (self.remote / "FETCH-FANOUT-REPLACEMENT.md").write_text(
+            "fetch fanout replacement\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "FETCH-FANOUT-REPLACEMENT.md")
+        run_git(self.remote, "commit", "-m", "fetch fanout replacement")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        source_objects = self.named_source_git_dir / "objects"
+        fanout_name = next(
+            name
+            for name in MODULE.LOOSE_OBJECT_FANOUT_NAMES
+            if not (source_objects / name).exists()
+        )
+        source_fanout = source_objects / fanout_name
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        self.assertEqual(len(receipt.source_loose_object_fanout), 256)
+        self.assertEqual(
+            tuple(name for name, _ in receipt.source_loose_object_fanout),
+            MODULE.LOOSE_OBJECT_FANOUT_NAMES,
+        )
+        self.assertEqual(
+            dict(receipt.source_loose_object_fanout)[fanout_name],
+            None,
+        )
+        outside = self.root / "outside-raced-loose-object-fanout"
+        outside.mkdir()
+        original_run_bounded = MODULE.run_bounded_bytes
+        replacement_performed = False
+
+        def replace_fanout_before_fetch(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal replacement_performed
+            if "fetch" in args:
+                self.assertFalse(replacement_performed)
+                replacement_performed = True
+                source_fanout.symlink_to(outside, target_is_directory=True)
+            return original_run_bounded(args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "run_bounded_bytes",
+            side_effect=replace_fanout_before_fetch,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "recovery fence was retained",
+                ):
+                    MODULE.fetch_missing_commit(
+                        self.named_source_git_dir,
+                        self.root / "unused-target",
+                        submodule,
+                        missing_sha,
+                        1,
+                        dry_run=False,
+                        transport_receipt=receipt,
+                        fetch_missing=True,
+                    )
+
+        self.assertTrue(replacement_performed)
+        self.assertTrue(source_fanout.is_symlink())
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertTrue(
+            (self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME).is_file()
+        )
+
     def test_fetch_rejects_source_object_directory_replacement_before_git_starts(
         self,
     ) -> None:
@@ -8814,6 +8999,118 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(observed.st_mode), 0o640)
         self.assertEqual(observed.st_uid, creation.owner)
         self.assertEqual(observed.st_gid, creation.group)
+
+    def test_shallow_install_preserves_existing_owner_group_and_mode(self) -> None:
+        initial = b"o" * 40 + b"\n"
+        fetched = b"p" * 40 + b"\n"
+        receipt = self.make_shallow_install_receipt(
+            initial_content=initial,
+            fetched_content=fetched,
+            shared_repository="group",
+        )
+        receipt.source_shallow_path.chmod(0o660)
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            MODULE.Submodule(
+                name="custom-lib",
+                path="third_party/libexample",
+                url=str(self.remote),
+            ),
+        )
+        self.addCleanup(receipt.fetch_guard.cleanup)
+        (receipt.fetch_git_dir / MODULE.SOURCE_SHALLOW_NAME).write_bytes(fetched)
+        expected = receipt.source_shallow_binding
+        self.assertIsNotNone(expected)
+        assert expected is not None
+
+        MODULE.install_post_fetch_shallow_state(receipt)
+
+        observed = MODULE.filesystem_fingerprint(receipt.source_shallow_path)
+        self.assertEqual(observed.owner, expected.fingerprint.owner)
+        self.assertEqual(observed.group, expected.fingerprint.group)
+        self.assertEqual(
+            observed.permissions,
+            expected.fingerprint.permissions,
+        )
+        self.assertEqual(receipt.source_shallow_path.read_bytes(), fetched)
+
+    def test_shallow_install_rejects_replacement_lock_policy_drift(self) -> None:
+        for drift in ("owner", "group", "mode"):
+            with self.subTest(drift=drift):
+                initial = b"q" * 40 + b"\n"
+                fetched = b"r" * 40 + b"\n"
+                receipt = self.make_shallow_install_receipt(
+                    initial_content=initial,
+                    fetched_content=fetched,
+                    shared_repository="group",
+                )
+                original_fingerprint = MODULE.fingerprint_from_stat
+                lock_inode: int | None = None
+                known_regular_inodes = {
+                    receipt.source_shallow_path.stat().st_ino,
+                    (receipt.fetch_git_dir / MODULE.SOURCE_SHALLOW_NAME).stat().st_ino,
+                }
+
+                def report_policy_drift(
+                    observed: os.stat_result,
+                ) -> MODULE.FsFingerprint:
+                    nonlocal lock_inode
+                    fingerprint = original_fingerprint(observed)
+                    if (
+                        lock_inode is None
+                        and fingerprint.kind == stat.S_IFREG
+                        and fingerprint.inode not in known_regular_inodes
+                    ):
+                        lock_inode = fingerprint.inode
+                    if lock_inode is None or fingerprint.inode != lock_inode:
+                        return fingerprint
+                    return MODULE.FsFingerprint(
+                        device=fingerprint.device,
+                        inode=fingerprint.inode,
+                        kind=fingerprint.kind,
+                        owner=(
+                            fingerprint.owner + 1
+                            if drift == "owner"
+                            else fingerprint.owner
+                        ),
+                        group=(
+                            fingerprint.group + 1
+                            if drift == "group"
+                            else fingerprint.group
+                        ),
+                        permissions=(
+                            fingerprint.permissions ^ stat.S_IXUSR
+                            if drift == "mode"
+                            else fingerprint.permissions
+                        ),
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "fingerprint_from_stat",
+                        side_effect=report_policy_drift,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "descriptor_atomic_rename_exchange",
+                        side_effect=AssertionError(
+                            "replacement policy drift must block exchange"
+                        ),
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.PlanError,
+                        "frozen boundary policy",
+                    ):
+                        MODULE.install_post_fetch_shallow_state(receipt)
+
+                self.assertEqual(receipt.source_shallow_path.read_bytes(), initial)
+                self.assertFalse(
+                    receipt.source_shallow_path.with_name(
+                        MODULE.SOURCE_SHALLOW_LOCK_NAME
+                    ).exists()
+                )
 
     def test_shallow_install_rejects_umask_drift_before_source_mutation(
         self,
