@@ -8688,6 +8688,259 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 submodule,
             )
 
+    def test_fetch_rejects_raced_private_gitdir_replacement_before_git_starts(
+        self,
+    ) -> None:
+        (self.remote / "FETCH-CONTROL-GITDIR-REPLACEMENT.md").write_text(
+            "fetch control gitdir replacement\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "FETCH-CONTROL-GITDIR-REPLACEMENT.md")
+        run_git(self.remote, "commit", "-m", "fetch control gitdir replacement")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        self.addCleanup(receipt.fetch_guard.cleanup)
+        held_gitdir = receipt.fetch_git_dir.with_name(
+            f"{receipt.fetch_git_dir.name}.held"
+        )
+        self.assertFalse(held_gitdir.exists())
+        replacement_content = b"replacement control gitdir\n"
+        original_run_bounded = MODULE.run_bounded_bytes
+        replacement_performed = False
+
+        def replace_control_gitdir_before_fetch(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal replacement_performed
+            if "fetch" in args:
+                self.assertFalse(replacement_performed)
+                replacement_performed = True
+                directory_leases = kwargs["directory_identity_leases"]
+                self.assertTrue(
+                    any(
+                        lease.path == receipt.fetch_git_dir
+                        for lease in directory_leases
+                    )
+                )
+                receipt.fetch_git_dir.rename(held_gitdir)
+                receipt.fetch_git_dir.mkdir(mode=0o700)
+                (receipt.fetch_git_dir / "sentinel").write_bytes(replacement_content)
+            return original_run_bounded(args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "run_bounded_bytes",
+                side_effect=replace_control_gitdir_before_fetch,
+            ):
+                with redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        MODULE.PlanError,
+                        "recovery fence was retained",
+                    ) as error:
+                        MODULE.fetch_missing_commit(
+                            self.named_source_git_dir,
+                            self.root / "unused-target",
+                            submodule,
+                            missing_sha,
+                            1,
+                            dry_run=False,
+                            transport_receipt=receipt,
+                            fetch_missing=True,
+                        )
+
+            self.assertTrue(replacement_performed)
+            self.assertEqual(
+                list(receipt.fetch_git_dir.iterdir()),
+                [receipt.fetch_git_dir / "sentinel"],
+            )
+            self.assertEqual(
+                (receipt.fetch_git_dir / "sentinel").read_bytes(),
+                replacement_content,
+            )
+            self.assertIn(
+                '"profile":"source-fetch-transaction-v1"',
+                str(error.exception),
+            )
+            self.assertTrue(
+                (
+                    self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME
+                ).is_file()
+            )
+        finally:
+            if receipt.fetch_git_dir.exists():
+                shutil.rmtree(receipt.fetch_git_dir)
+            if held_gitdir.exists():
+                held_gitdir.rename(receipt.fetch_git_dir)
+
+    def test_fetch_rejects_raced_private_config_replacement_before_git_starts(
+        self,
+    ) -> None:
+        (self.remote / "FETCH-CONTROL-CONFIG-REPLACEMENT.md").write_text(
+            "fetch control config replacement\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "FETCH-CONTROL-CONFIG-REPLACEMENT.md")
+        run_git(self.remote, "commit", "-m", "fetch control config replacement")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        self.addCleanup(receipt.fetch_guard.cleanup)
+        config_path = receipt.fetch_git_dir / "config"
+        held_config = receipt.fetch_git_dir / "config.receipt-held"
+        malicious_content = (
+            b"[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
+            b"[transfer]\n\tfsckObjects = false\n"
+            b'[url "file:///attacker.invalid/"]\n\tinsteadOf = file:///\n'
+        )
+        original_run_bounded = MODULE.run_bounded_bytes
+        replacement_performed = False
+
+        def replace_control_config_before_fetch(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal replacement_performed
+            if "fetch" in args:
+                self.assertFalse(replacement_performed)
+                replacement_performed = True
+                file_leases = kwargs["file_content_leases"]
+                self.assertEqual(
+                    tuple(lease.entry_name for lease in file_leases),
+                    MODULE.FETCH_CONTROL_FILE_NAMES,
+                )
+                config_path.rename(held_config)
+                config_path.write_bytes(malicious_content)
+                config_path.chmod(0o600)
+            return original_run_bounded(args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "run_bounded_bytes",
+                side_effect=replace_control_config_before_fetch,
+            ):
+                with redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        MODULE.PlanError,
+                        "recovery fence was retained",
+                    ) as error:
+                        MODULE.fetch_missing_commit(
+                            self.named_source_git_dir,
+                            self.root / "unused-target",
+                            submodule,
+                            missing_sha,
+                            1,
+                            dry_run=False,
+                            transport_receipt=receipt,
+                            fetch_missing=True,
+                        )
+
+            self.assertTrue(replacement_performed)
+            self.assertEqual(config_path.read_bytes(), malicious_content)
+            self.assertIn(
+                '"profile":"source-fetch-transaction-v1"',
+                str(error.exception),
+            )
+            self.assertTrue(
+                (
+                    self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME
+                ).is_file()
+            )
+        finally:
+            config_path.unlink(missing_ok=True)
+            if held_config.exists():
+                held_config.rename(config_path)
+
+    def test_fetch_rejects_raced_private_config_content_rewrite_before_git_starts(
+        self,
+    ) -> None:
+        (self.remote / "FETCH-CONTROL-CONFIG-CONTENT-RACE.md").write_text(
+            "fetch control config content race\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "FETCH-CONTROL-CONFIG-CONTENT-RACE.md")
+        run_git(self.remote, "commit", "-m", "fetch control config content race")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        self.addCleanup(receipt.fetch_guard.cleanup)
+        config_path = receipt.fetch_git_dir / "config"
+        original_content = config_path.read_bytes()
+        rewritten_content = original_content.replace(b"bare = true", b"bare = fals", 1)
+        self.assertEqual(len(rewritten_content), len(original_content))
+        self.assertNotEqual(rewritten_content, original_content)
+        original_inode = config_path.stat().st_ino
+        original_run_bounded = MODULE.run_bounded_bytes
+        replacement_performed = False
+
+        def rewrite_control_config_before_fetch(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal replacement_performed
+            if "fetch" in args:
+                self.assertFalse(replacement_performed)
+                replacement_performed = True
+                config_path.write_bytes(rewritten_content)
+                self.assertEqual(config_path.stat().st_ino, original_inode)
+            return original_run_bounded(args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "run_bounded_bytes",
+                side_effect=rewrite_control_config_before_fetch,
+            ):
+                with redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        MODULE.PlanError,
+                        "recovery fence was retained",
+                    ):
+                        MODULE.fetch_missing_commit(
+                            self.named_source_git_dir,
+                            self.root / "unused-target",
+                            submodule,
+                            missing_sha,
+                            1,
+                            dry_run=False,
+                            transport_receipt=receipt,
+                            fetch_missing=True,
+                        )
+
+            self.assertTrue(replacement_performed)
+            self.assertEqual(config_path.read_bytes(), rewritten_content)
+            self.assertTrue(
+                (
+                    self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME
+                ).is_file()
+            )
+        finally:
+            config_path.write_bytes(original_content)
+
     def test_fetch_rejects_raced_loose_object_fanout_symlink_before_git_starts(
         self,
     ) -> None:

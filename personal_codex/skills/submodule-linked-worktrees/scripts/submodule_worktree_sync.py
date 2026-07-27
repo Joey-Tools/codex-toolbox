@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import configparser
+from contextlib import ExitStack
 import ctypes
 from dataclasses import dataclass, field as dataclass_field, replace
 import errno
@@ -64,6 +65,13 @@ SOURCE_SHALLOW_LOCK_NAME = "shallow.lock"
 SOURCE_FETCH_TRANSACTION_NAME = "codex-submodule-fetch.pending"
 LOOSE_OBJECT_FANOUT_NAMES = tuple(f"{value:02x}" for value in range(256))
 OBJECT_WRITE_CHILD_NAMES = (*LOOSE_OBJECT_FANOUT_NAMES, "pack")
+FETCH_CONTROL_DIRECTORY_PARTS = (
+    (),
+    ("objects",),
+    ("refs",),
+    ("refs", "heads"),
+)
+FETCH_CONTROL_FILE_NAMES = ("config", "HEAD")
 MAX_SOURCE_FETCH_TRANSACTION_BYTES = 64 * 1024
 LINUX_RENAME_NOREPLACE = 0x00000001
 LINUX_RENAME_EXCHANGE = 0x00000002
@@ -423,6 +431,63 @@ class DirectoryChildInventoryLease:
     directory_descriptor: int
     entries: tuple[tuple[str, Optional[FsFingerprint]], ...]
     purpose: str
+
+
+@dataclass(frozen=True)
+class DescriptorBoundFileLease:
+    directory_binding: AccessBinding
+    directory_descriptor: int
+    entry_name: str
+    descriptor: int
+    binding: FileContentBinding
+    content: bytes
+
+
+@dataclass
+class FetchControlLease:
+    directory_leases: tuple[DirectoryEntryLease, ...]
+    file_leases: tuple[DescriptorBoundFileLease, ...]
+    active: bool = True
+
+    def close(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        first_error: Optional[BaseException] = None
+        for file_lease in reversed(self.file_leases):
+            try:
+                os.close(file_lease.descriptor)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        for directory_lease in reversed(self.directory_leases):
+            try:
+                directory_lease.close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise PlanError(
+                f"fetch control-plane lease cleanup failed: {first_error}"
+            ) from first_error
+
+
+def close_fetch_execution_leases(
+    source_object_lease: DirectoryEntryLease,
+    fetch_control_lease: Optional[FetchControlLease],
+) -> None:
+    cleanup_errors: list[str] = []
+    if fetch_control_lease is not None:
+        try:
+            fetch_control_lease.close()
+        except BaseException as exc:
+            cleanup_errors.append(f"fetch control-plane lease cleanup failed: {exc}")
+    try:
+        source_object_lease.close()
+    except BaseException as exc:
+        cleanup_errors.append(f"source object-directory lease cleanup failed: {exc}")
+    if cleanup_errors:
+        raise PlanError("; ".join(cleanup_errors))
 
 
 @dataclass(frozen=True)
@@ -1277,6 +1342,7 @@ def run_bounded_bytes(
         DirectoryChildInventoryLease,
         ...,
     ] = (),
+    file_content_leases: tuple[DescriptorBoundFileLease, ...] = (),
 ) -> subprocess.CompletedProcess[bytes]:
     if input_bytes is not None and len(input_bytes) > GIT_INPUT_LIMIT_BYTES:
         raise PlanError(
@@ -1300,8 +1366,19 @@ def run_bounded_bytes(
         directory_descriptor is not None
         or directory_identity_leases
         or directory_child_inventory_leases
+        or file_content_leases
     ) and os.name != "posix":
         raise PlanError("descriptor-anchored Git writes require a POSIX runtime")
+    if file_content_leases and not hasattr(os, "pread"):
+        raise PlanError("descriptor-bound control-file exec gates require POSIX pread")
+    for lease in file_content_leases:
+        validate_descriptor_entry_name(lease.entry_name)
+        if len(lease.content) != lease.binding.size or (
+            hashlib.sha256(lease.content).hexdigest() != lease.binding.content_sha256
+        ):
+            raise PlanError(
+                f"{lease.binding.purpose} has an invalid exec-lease content receipt"
+            )
 
     def enter_bound_directory() -> None:
         for lease in directory_identity_leases:
@@ -1376,6 +1453,17 @@ def run_bounded_bytes(
                     errno.ESTALE,
                     f"{lease.binding.purpose} changed before exec",
                 )
+            if not os.access(
+                lease.entry_name,
+                lease.binding.mode,
+                dir_fd=lease.parent_descriptor,
+                effective_ids=True,
+                follow_symlinks=False,
+            ):
+                raise OSError(
+                    errno.EACCES,
+                    f"{lease.binding.purpose} access changed before exec",
+                )
         for lease in directory_child_inventory_leases:
             directory_stat = os.fstat(lease.directory_descriptor)
             expected_directory = lease.directory_binding.fingerprint
@@ -1440,6 +1528,132 @@ def run_bounded_bytes(
                         errno.ESTALE,
                         f"{lease.purpose} entry changed before exec",
                     )
+        for lease in file_content_leases:
+            expected_directory = lease.directory_binding.fingerprint
+            expected_file = lease.binding.fingerprint
+
+            def fingerprint_values(path_stat: os.stat_result) -> tuple[int, ...]:
+                return (
+                    path_stat.st_dev,
+                    path_stat.st_ino,
+                    stat.S_IFMT(path_stat.st_mode),
+                    path_stat.st_uid,
+                    path_stat.st_gid,
+                    stat.S_IMODE(path_stat.st_mode),
+                )
+
+            expected_directory_values = (
+                expected_directory.device,
+                expected_directory.inode,
+                expected_directory.kind,
+                expected_directory.owner,
+                expected_directory.group,
+                expected_directory.permissions,
+            )
+            expected_file_values = (
+                expected_file.device,
+                expected_file.inode,
+                expected_file.kind,
+                expected_file.owner,
+                expected_file.group,
+                expected_file.permissions,
+            )
+            directory_path_stat = os.stat(
+                lease.directory_binding.path,
+                follow_symlinks=False,
+            )
+            directory_stat = os.fstat(lease.directory_descriptor)
+            entry_stat = os.stat(
+                lease.entry_name,
+                dir_fd=lease.directory_descriptor,
+                follow_symlinks=False,
+            )
+            descriptor_stat = os.fstat(lease.descriptor)
+            if (
+                fingerprint_values(directory_path_stat) != expected_directory_values
+                or fingerprint_values(directory_stat) != expected_directory_values
+                or fingerprint_values(entry_stat) != expected_file_values
+                or fingerprint_values(descriptor_stat) != expected_file_values
+                or entry_stat.st_size != lease.binding.size
+                or descriptor_stat.st_size != lease.binding.size
+            ):
+                raise OSError(
+                    errno.ESTALE,
+                    f"{lease.binding.purpose} changed before exec",
+                )
+            if not os.access(
+                lease.entry_name,
+                lease.binding.mode,
+                dir_fd=lease.directory_descriptor,
+                effective_ids=True,
+                follow_symlinks=False,
+            ):
+                raise OSError(
+                    errno.EACCES,
+                    f"{lease.binding.purpose} access changed before exec",
+                )
+            offset = 0
+            while offset < lease.binding.size:
+                chunk = os.pread(
+                    lease.descriptor,
+                    min(64 * 1024, lease.binding.size - offset),
+                    offset,
+                )
+                if not chunk:
+                    raise OSError(
+                        errno.ESTALE,
+                        f"{lease.binding.purpose} changed size before exec",
+                    )
+                if chunk != lease.content[offset : offset + len(chunk)]:
+                    raise OSError(
+                        errno.ESTALE,
+                        f"{lease.binding.purpose} content changed before exec",
+                    )
+                offset += len(chunk)
+            if os.pread(lease.descriptor, 1, lease.binding.size):
+                raise OSError(
+                    errno.ESTALE,
+                    f"{lease.binding.purpose} changed size before exec",
+                )
+            entry_after = os.stat(
+                lease.entry_name,
+                dir_fd=lease.directory_descriptor,
+                follow_symlinks=False,
+            )
+            descriptor_after = os.fstat(lease.descriptor)
+            directory_path_after = os.stat(
+                lease.directory_binding.path,
+                follow_symlinks=False,
+            )
+            directory_after = os.fstat(lease.directory_descriptor)
+            if (
+                fingerprint_values(entry_after) != expected_file_values
+                or fingerprint_values(descriptor_after) != expected_file_values
+                or fingerprint_values(directory_path_after) != expected_directory_values
+                or fingerprint_values(directory_after) != expected_directory_values
+                or entry_after.st_size != lease.binding.size
+                or descriptor_after.st_size != lease.binding.size
+            ):
+                raise OSError(
+                    errno.ESTALE,
+                    f"{lease.binding.purpose} content changed before exec",
+                )
+            if not os.access(
+                lease.entry_name,
+                lease.binding.mode,
+                dir_fd=lease.directory_descriptor,
+                effective_ids=True,
+                follow_symlinks=False,
+            ) or not os.access(
+                lease.directory_binding.path,
+                lease.directory_binding.mode,
+                effective_ids=True,
+                follow_symlinks=False,
+            ):
+                raise OSError(
+                    errno.EACCES,
+                    f"{lease.binding.purpose} access changed before exec",
+                )
         if directory_descriptor is not None:
             os.fchdir(directory_descriptor)
 
@@ -1451,6 +1665,9 @@ def run_bounded_bytes(
         inherited_descriptors.add(lease.parent_descriptor)
     for lease in directory_child_inventory_leases:
         inherited_descriptors.add(lease.directory_descriptor)
+    for lease in file_content_leases:
+        inherited_descriptors.add(lease.directory_descriptor)
+        inherited_descriptors.add(lease.descriptor)
 
     input_file = tempfile.TemporaryFile()
     if input_bytes is not None:
@@ -1472,6 +1689,7 @@ def run_bounded_bytes(
                     directory_descriptor is not None
                     or directory_identity_leases
                     or directory_child_inventory_leases
+                    or file_content_leases
                 )
                 else None
             ),
@@ -6671,7 +6889,7 @@ def capture_fetch_control_gitdir(
     tuple[FileContentBinding, ...],
 ]:
     guard = OwnerPrivateTemporaryDirectory(prefix="submodule-worktree-fetch.")
-    fetch_git_dir = Path(guard.name)
+    fetch_git_dir = Path(guard.name).resolve(strict=True)
     try:
         objects_dir = fetch_git_dir / "objects"
         refs_dir = fetch_git_dir / "refs"
@@ -7199,6 +7417,7 @@ def fetch_missing_commit(
         expected_object_binding.mode,
         expected_object_binding.purpose,
     )
+    fetch_control_lease: Optional[FetchControlLease] = None
     try:
         if source_object_lease.binding != expected_object_binding:
             raise PlanError(
@@ -7211,10 +7430,24 @@ def fetch_missing_commit(
             "authorized fetch loose-object fanout and pack directory for "
             f"{submodule.path}",
         )
+        fetch_control_lease = capture_fetch_control_lease(
+            receipt,
+            submodule,
+        )
         transaction = begin_source_fetch_transaction(receipt)
-    except BaseException:
-        source_object_lease.close()
+    except BaseException as exc:
+        try:
+            close_fetch_execution_leases(
+                source_object_lease,
+                fetch_control_lease,
+            )
+        except BaseException as cleanup_exc:
+            raise PlanError(
+                f"{exc}; fetch exec-lease cleanup failed: {cleanup_exc}"
+            ) from exc
         raise
+    if fetch_control_lease is None:
+        raise PlanError("authorized fetch lacks a control-plane exec lease")
     try:
         print(
             f"fetch missing commit for {submodule.path}: {shell_join(command)}",
@@ -7227,26 +7460,34 @@ def fetch_missing_commit(
             stdout_limit=GIT_ERROR_OUTPUT_LIMIT_BYTES,
             stderr_limit=GIT_ERROR_OUTPUT_LIMIT_BYTES,
             fixed_env=dict(receipt.git_environment),
-            directory_identity_leases=(source_object_lease,),
+            directory_identity_leases=(
+                source_object_lease,
+                *fetch_control_lease.directory_leases,
+            ),
             directory_child_inventory_leases=(source_object_child_lease,),
+            file_content_leases=fetch_control_lease.file_leases,
         )
     except BaseException as exc:
         try:
-            source_object_lease.close()
-        except BaseException as cleanup_exc:
-            exc = PlanError(
-                f"{exc}; source object-directory lease cleanup failed: {cleanup_exc}"
+            close_fetch_execution_leases(
+                source_object_lease,
+                fetch_control_lease,
             )
+        except BaseException as cleanup_exc:
+            exc = PlanError(f"{exc}; fetch exec-lease cleanup failed: {cleanup_exc}")
         raise retain_source_fetch_transaction(
             transaction,
             f"fetch process failed before boundary installation: {exc}",
         ) from exc
     try:
-        source_object_lease.close()
+        close_fetch_execution_leases(
+            source_object_lease,
+            fetch_control_lease,
+        )
     except BaseException as exc:
         raise retain_source_fetch_transaction(
             transaction,
-            f"source object-directory lease cleanup failed: {exc}",
+            f"fetch exec-lease cleanup failed: {exc}",
         ) from exc
     result = subprocess.CompletedProcess(
         args=bounded_result.args,
@@ -7597,6 +7838,145 @@ def revalidate_directory_entry_lease(lease: DirectoryEntryLease) -> None:
         raise PlanError(
             f"{lease.binding.purpose} directory entry changed\n  path: {lease.path}"
         )
+
+
+def revalidate_descriptor_bound_file_lease(
+    lease: DescriptorBoundFileLease,
+) -> None:
+    revalidate_directory_descriptor(
+        lease.directory_binding,
+        lease.directory_descriptor,
+    )
+    observed, content = bind_regular_file_descriptor_at(
+        lease.descriptor,
+        lease.directory_descriptor,
+        lease.entry_name,
+        lease.binding.path,
+        maximum_bytes=lease.binding.maximum_bytes,
+        mode=lease.binding.mode,
+        purpose=lease.binding.purpose,
+        retain_content=True,
+    )
+    require_matching_file_binding(
+        lease.binding,
+        observed,
+        lease.binding.purpose,
+    )
+    if content != lease.content:
+        raise PlanError(
+            f"{lease.binding.purpose} exact content changed after descriptor binding"
+        )
+    revalidate_directory_descriptor(
+        lease.directory_binding,
+        lease.directory_descriptor,
+    )
+
+
+def revalidate_fetch_control_lease(lease: FetchControlLease) -> None:
+    if not lease.active or not lease.directory_leases:
+        raise PlanError("fetch control-plane lease is inactive or incomplete")
+    for directory_lease in lease.directory_leases:
+        revalidate_directory_entry_lease(directory_lease)
+    for file_lease in lease.file_leases:
+        revalidate_descriptor_bound_file_lease(file_lease)
+    for directory_lease in lease.directory_leases:
+        revalidate_directory_entry_lease(directory_lease)
+
+
+def capture_fetch_control_lease(
+    receipt: TransportReceipt,
+    submodule: Submodule,
+) -> FetchControlLease:
+    expected_directory_paths = tuple(
+        receipt.fetch_git_dir.joinpath(*parts)
+        for parts in FETCH_CONTROL_DIRECTORY_PARTS
+    )
+    directory_bindings = tuple(
+        access_binding_for_path(
+            receipt.fetch_access_bindings,
+            path,
+            f"isolated fetch control directory for {submodule.path}",
+        )
+        for path in expected_directory_paths
+    )
+    private_binding_paths = {
+        binding.path
+        for binding in receipt.fetch_access_bindings
+        if binding.path == receipt.fetch_git_dir
+        or receipt.fetch_git_dir in binding.path.parents
+    }
+    if private_binding_paths != set(expected_directory_paths):
+        raise PlanError(
+            f"isolated fetch control directory receipt has an invalid shape for "
+            f"{submodule.path}"
+        )
+
+    with ExitStack() as cleanup:
+        directory_leases: list[DirectoryEntryLease] = []
+        file_leases: list[DescriptorBoundFileLease] = []
+        for binding in directory_bindings:
+            directory_lease = capture_directory_entry_lease(
+                binding.path,
+                binding.mode,
+                binding.purpose,
+            )
+            if directory_lease.binding != binding:
+                raise PlanError(f"{binding.purpose} changed during descriptor binding")
+            directory_leases.append(directory_lease)
+            cleanup.callback(directory_lease.close)
+        root_lease = directory_leases[0]
+        expected_file_names = FETCH_CONTROL_FILE_NAMES + (
+            (SOURCE_SHALLOW_NAME,) if receipt.source_shallow_binding is not None else ()
+        )
+        observed_file_names = tuple(
+            binding.path.name for binding in receipt.fetch_file_bindings
+        )
+        if observed_file_names != expected_file_names or any(
+            binding.path.parent != receipt.fetch_git_dir
+            for binding in receipt.fetch_file_bindings
+        ):
+            raise PlanError(
+                f"isolated fetch control-file receipt has an invalid shape for "
+                f"{submodule.path}"
+            )
+        for binding in receipt.fetch_file_bindings:
+            entry_name = validate_descriptor_entry_name(binding.path.name)
+            descriptor, observed, content = open_bound_regular_file_at(
+                root_lease.descriptor,
+                os.fsdecode(entry_name),
+                binding.path,
+                maximum_bytes=binding.maximum_bytes,
+                mode=binding.mode,
+                purpose=binding.purpose,
+                retain_content=True,
+            )
+            cleanup.callback(os.close, descriptor)
+            require_matching_file_binding(
+                binding,
+                observed,
+                binding.purpose,
+            )
+            if content is None:
+                raise PlanError(
+                    f"{binding.purpose} descriptor binding returned no content"
+                )
+            file_leases.append(
+                DescriptorBoundFileLease(
+                    directory_binding=root_lease.binding,
+                    directory_descriptor=root_lease.descriptor,
+                    entry_name=binding.path.name,
+                    descriptor=descriptor,
+                    binding=binding,
+                    content=content,
+                )
+            )
+        lease = FetchControlLease(
+            directory_leases=tuple(directory_leases),
+            file_leases=tuple(file_leases),
+        )
+        revalidate_fetch_control_lease(lease)
+        cleanup.pop_all()
+        return lease
 
 
 def capture_managed_control_receipt(
