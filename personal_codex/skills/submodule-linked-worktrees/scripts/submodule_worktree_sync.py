@@ -72,6 +72,7 @@ FETCH_CONTROL_DIRECTORY_PARTS = (
     ("refs", "heads"),
 )
 FETCH_CONTROL_FILE_NAMES = ("config", "HEAD")
+FETCH_CONTROL_LOCK_NAMES = ("config.lock", "HEAD.lock", SOURCE_SHALLOW_LOCK_NAME)
 MAX_SOURCE_FETCH_TRANSACTION_BYTES = 64 * 1024
 LINUX_RENAME_NOREPLACE = 0x00000001
 LINUX_RENAME_EXCHANGE = 0x00000002
@@ -443,10 +444,53 @@ class DescriptorBoundFileLease:
     content: bytes
 
 
+@dataclass(frozen=True)
+class DirectoryAbsentEntryLease:
+    directory_binding: AccessBinding
+    directory_descriptor: int
+    entry_names: tuple[str, ...]
+    purpose: str
+
+
+@dataclass
+class ExecutableExecutionLease:
+    path: Path
+    parent_binding: AccessBinding
+    parent_descriptor: int
+    entry_name: str
+    descriptor: int
+    state: ExecutableState
+    content_sha256: str
+    description: str
+    active: bool = True
+
+    def close(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        descriptors = (self.descriptor, self.parent_descriptor)
+        self.descriptor = -1
+        self.parent_descriptor = -1
+        first_error: Optional[OSError] = None
+        for descriptor in descriptors:
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise PlanError(
+                f"executable execution-lease cleanup failed: {first_error}"
+            ) from first_error
+
+
 @dataclass
 class FetchControlLease:
     directory_leases: tuple[DirectoryEntryLease, ...]
     file_leases: tuple[DescriptorBoundFileLease, ...]
+    absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...]
     active: bool = True
 
     def close(self) -> None:
@@ -890,6 +934,28 @@ def executable_state_from_stat(path_stat: os.stat_result) -> ExecutableState:
     )
 
 
+def fingerprint_stat_values(path_stat: os.stat_result) -> tuple[int, ...]:
+    return (
+        path_stat.st_dev,
+        path_stat.st_ino,
+        stat.S_IFMT(path_stat.st_mode),
+        path_stat.st_uid,
+        path_stat.st_gid,
+        stat.S_IMODE(path_stat.st_mode),
+    )
+
+
+def fingerprint_values(fingerprint: FsFingerprint) -> tuple[int, ...]:
+    return (
+        fingerprint.device,
+        fingerprint.inode,
+        fingerprint.kind,
+        fingerprint.owner,
+        fingerprint.group,
+        fingerprint.permissions,
+    )
+
+
 def read_fd_digest(
     descriptor: int,
     expected_size: int,
@@ -911,6 +977,241 @@ def read_fd_digest(
     if os.read(descriptor, 1):
         raise PlanError(f"{description} changed size during content binding")
     return digest.hexdigest()
+
+
+def capture_executable_execution_lease(
+    path: Path,
+    recorded_state: ExecutableState,
+    expected_digest: str,
+    description: str,
+) -> ExecutableExecutionLease:
+    if not path.is_absolute():
+        raise PlanError(f"{description} path must be absolute: {path}")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        raise PlanError(f"{description} has an invalid content digest receipt")
+    entry_name = os.fsdecode(validate_descriptor_entry_name(path.name))
+    parent = path.parent
+    parent_binding = capture_typed_access(
+        parent,
+        os.R_OK | os.X_OK,
+        f"{description} parent",
+        stat.S_IFDIR,
+    )
+    parent_descriptor = open_directory_descriptor(
+        parent,
+        f"{description} parent",
+    )
+    descriptor = -1
+    lease_created = False
+    try:
+        revalidate_directory_descriptor(parent_binding, parent_descriptor)
+        descriptor = os.open(
+            entry_name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=parent_descriptor,
+        )
+        descriptor_state = executable_state_from_stat(os.fstat(descriptor))
+        entry_state = executable_state_from_stat(
+            os.stat(
+                entry_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        )
+        if (
+            descriptor_state != entry_state
+            or descriptor_state.fingerprint != recorded_state.fingerprint
+            or descriptor_state.fingerprint.kind != stat.S_IFREG
+            or descriptor_state.size != recorded_state.size
+            or descriptor_state.size <= 0
+            or descriptor_state.size > MAX_GIT_EXECUTABLE_BYTES
+        ):
+            raise PlanError(
+                f"{description} object, size, or access policy changed\n"
+                f"  executable: {path}"
+            )
+        if not probe_access_at(
+            parent_descriptor,
+            entry_name,
+            os.R_OK | os.X_OK,
+        ):
+            raise PlanError(f"access policy denies {description}\n  executable: {path}")
+        digest = read_fd_digest(
+            descriptor,
+            descriptor_state.size,
+            deadline=time.monotonic() + GIT_VERSION_TIMEOUT_SECONDS,
+            description=description,
+        )
+        final_descriptor_state = executable_state_from_stat(os.fstat(descriptor))
+        final_entry_state = executable_state_from_stat(
+            os.stat(
+                entry_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        )
+        if (
+            final_descriptor_state != descriptor_state
+            or final_entry_state != descriptor_state
+            or digest != expected_digest
+        ):
+            raise PlanError(
+                f"{description} content changed after version preflight\n"
+                f"  executable: {path}"
+            )
+        revalidate_directory_descriptor(parent_binding, parent_descriptor)
+        lease = ExecutableExecutionLease(
+            path=path,
+            parent_binding=parent_binding,
+            parent_descriptor=parent_descriptor,
+            entry_name=entry_name,
+            descriptor=descriptor,
+            state=descriptor_state,
+            content_sha256=expected_digest,
+            description=description,
+        )
+        lease_created = True
+        return lease
+    except OSError as exc:
+        raise PlanError(f"cannot bind {description}: {path}: {exc}") from exc
+    finally:
+        if not lease_created:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(parent_descriptor)
+
+
+def executable_subprocess_path(lease: ExecutableExecutionLease) -> str:
+    if sys.platform.startswith("linux"):
+        descriptor_path = Path("/proc/self/fd") / str(lease.descriptor)
+        try:
+            descriptor_state = fingerprint_from_stat(os.fstat(lease.descriptor))
+            path_state = fingerprint_from_stat(os.stat(descriptor_path))
+        except OSError:
+            pass
+        else:
+            if descriptor_state == path_state and os.access(
+                descriptor_path,
+                os.X_OK,
+            ):
+                return str(descriptor_path)
+    return str(lease.path)
+
+
+def revalidate_executable_execution_lease_in_child(
+    lease: ExecutableExecutionLease,
+) -> None:
+    # Protected property: exec must select the receipt-bound regular-file object,
+    # exact bytes, and effective access through the same parent dirent. Receipt
+    # timestamps are not compared; current mtime/ctime only sandwich the full read
+    # so benign pre-gate metadata churn is allowed but an in-read rewrite is not.
+    if (
+        not lease.active
+        or lease.descriptor < 0
+        or lease.parent_descriptor < 0
+        or not hasattr(os, "pread")
+    ):
+        raise OSError(errno.EBADF, f"{lease.description} lease is inactive")
+    expected_parent = fingerprint_values(lease.parent_binding.fingerprint)
+    expected_executable = fingerprint_values(lease.state.fingerprint)
+    parent_path_stat = os.stat(
+        lease.parent_binding.path,
+        follow_symlinks=False,
+    )
+    parent_descriptor_stat = os.fstat(lease.parent_descriptor)
+    entry_stat = os.stat(
+        lease.entry_name,
+        dir_fd=lease.parent_descriptor,
+        follow_symlinks=False,
+    )
+    descriptor_stat = os.fstat(lease.descriptor)
+    entry_state = executable_state_from_stat(entry_stat)
+    descriptor_state = executable_state_from_stat(descriptor_stat)
+    if (
+        fingerprint_stat_values(parent_path_stat) != expected_parent
+        or fingerprint_stat_values(parent_descriptor_stat) != expected_parent
+        or fingerprint_stat_values(entry_stat) != expected_executable
+        or fingerprint_stat_values(descriptor_stat) != expected_executable
+        or entry_state != descriptor_state
+        or descriptor_state.size != lease.state.size
+    ):
+        raise OSError(
+            errno.ESTALE,
+            f"{lease.description} changed before exec",
+        )
+    if not os.access(
+        lease.entry_name,
+        os.R_OK | os.X_OK,
+        dir_fd=lease.parent_descriptor,
+        effective_ids=True,
+        follow_symlinks=False,
+    ) or not os.access(
+        lease.parent_binding.path,
+        lease.parent_binding.mode,
+        effective_ids=True,
+        follow_symlinks=False,
+    ):
+        raise OSError(
+            errno.EACCES,
+            f"{lease.description} access changed before exec",
+        )
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < lease.state.size:
+        chunk = os.pread(
+            lease.descriptor,
+            min(64 * 1024, lease.state.size - offset),
+            offset,
+        )
+        if not chunk:
+            raise OSError(
+                errno.ESTALE,
+                f"{lease.description} changed size before exec",
+            )
+        digest.update(chunk)
+        offset += len(chunk)
+    if (
+        os.pread(lease.descriptor, 1, lease.state.size)
+        or digest.hexdigest() != lease.content_sha256
+    ):
+        raise OSError(
+            errno.ESTALE,
+            f"{lease.description} content changed before exec",
+        )
+    final_parent_path_stat = os.stat(
+        lease.parent_binding.path,
+        follow_symlinks=False,
+    )
+    final_parent_descriptor_stat = os.fstat(lease.parent_descriptor)
+    final_entry_stat = os.stat(
+        lease.entry_name,
+        dir_fd=lease.parent_descriptor,
+        follow_symlinks=False,
+    )
+    final_descriptor_stat = os.fstat(lease.descriptor)
+    if (
+        fingerprint_stat_values(final_parent_path_stat) != expected_parent
+        or fingerprint_stat_values(final_parent_descriptor_stat) != expected_parent
+        or executable_state_from_stat(final_entry_stat) != entry_state
+        or executable_state_from_stat(final_descriptor_stat) != descriptor_state
+        or not os.access(
+            lease.entry_name,
+            os.R_OK | os.X_OK,
+            dir_fd=lease.parent_descriptor,
+            effective_ids=True,
+            follow_symlinks=False,
+        )
+        or not os.access(
+            lease.parent_binding.path,
+            lease.parent_binding.mode,
+            effective_ids=True,
+            follow_symlinks=False,
+        )
+    ):
+        raise OSError(
+            errno.ESTALE,
+            f"{lease.description} changed during the final exec gate",
+        )
 
 
 def copy_executable_snapshot(
@@ -1087,8 +1388,6 @@ def revalidate_executable_content(
             raise PlanError(
                 f"{description} object or access policy changed\n  executable: {path}"
             )
-        if current_state == recorded_state:
-            return recorded_state
         if current_state.size <= 0 or current_state.size > MAX_GIT_EXECUTABLE_BYTES:
             raise PlanError(
                 f"{description} content changed after version preflight\n"
@@ -1102,7 +1401,11 @@ def revalidate_executable_content(
             description=description,
         )
         final_state = executable_state_from_stat(os.fstat(descriptor))
-        if final_state != current_state or digest != expected_digest:
+        if (
+            final_state != current_state
+            or current_state.size != recorded_state.size
+            or digest != expected_digest
+        ):
             raise PlanError(
                 f"{description} content changed after version preflight\n"
                 f"  executable: {path}"
@@ -1144,6 +1447,13 @@ def discover_git_runtime() -> GitRuntime:
             stdout_limit=256,
             stderr_limit=256,
             prepare_git_command=False,
+            executable_snapshot_receipt=ExecutableSnapshotReceipt(
+                source_executable=executable,
+                source_state=source_state,
+                executable=snapshot,
+                executable_state=snapshot_state,
+                content_sha256=content_sha256,
+            ),
         )
         version_text = os.fsdecode(result.stdout).strip()
         match = re.fullmatch(
@@ -1206,14 +1516,12 @@ def git_runtime() -> GitRuntime:
     return _GIT_RUNTIME
 
 
-def safe_command(
+def safe_git_command_for_runtime(
+    runtime: GitRuntime,
     args: list[str],
     *,
     preserve_split_index: bool = False,
 ) -> list[str]:
-    if not args or args[0] != "git":
-        return args
-    runtime = git_runtime()
     config_args = list(SAFE_GIT_CONFIG_ARGS)
     if preserve_split_index:
         try:
@@ -1226,6 +1534,59 @@ def safe_command(
     return [str(runtime.executable), *config_args, *args[1:]]
 
 
+def safe_command(
+    args: list[str],
+    *,
+    preserve_split_index: bool = False,
+) -> list[str]:
+    if not args or args[0] != "git":
+        return args
+    return safe_git_command_for_runtime(
+        git_runtime(),
+        args,
+        preserve_split_index=preserve_split_index,
+    )
+
+
+def prepare_command_execution(
+    args: list[str],
+    *,
+    preserve_split_index: bool = False,
+    executable_snapshot_receipt: Optional[ExecutableSnapshotReceipt] = None,
+) -> tuple[list[str], Optional[ExecutableExecutionLease]]:
+    if executable_snapshot_receipt is not None:
+        if preserve_split_index:
+            raise PlanError(
+                "an explicit executable snapshot cannot preserve split-index config"
+            )
+        if not args or Path(args[0]) != executable_snapshot_receipt.executable:
+            raise PlanError(
+                "explicit executable snapshot receipt does not match the command"
+            )
+        lease = capture_executable_execution_lease(
+            executable_snapshot_receipt.executable,
+            executable_snapshot_receipt.executable_state,
+            executable_snapshot_receipt.content_sha256,
+            "owner-private executable snapshot",
+        )
+        return list(args), lease
+    if not args or args[0] != "git":
+        return args, None
+    runtime = git_runtime()
+    command = safe_git_command_for_runtime(
+        runtime,
+        args,
+        preserve_split_index=preserve_split_index,
+    )
+    lease = capture_executable_execution_lease(
+        runtime.executable,
+        runtime.executable_state,
+        runtime.content_sha256,
+        "owner-private Git executable snapshot",
+    )
+    return command, lease
+
+
 def run(
     args: list[str],
     *,
@@ -1234,16 +1595,42 @@ def run(
     capture: bool = True,
     extra_env: Optional[dict[str, str]] = None,
 ) -> subprocess.CompletedProcess[str]:
-    command = safe_command(args)
-    result = subprocess.run(
-        command,
-        cwd=str(cwd) if cwd else None,
-        env=git_environment(extra_env),
-        stdin=subprocess.DEVNULL,
-        text=True,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.PIPE if capture else None,
+    command, executable_lease = prepare_command_execution(args)
+
+    def executable_gate() -> None:
+        if executable_lease is not None:
+            revalidate_executable_execution_lease_in_child(executable_lease)
+
+    inherited_descriptors = (
+        ()
+        if executable_lease is None
+        else (
+            executable_lease.parent_descriptor,
+            executable_lease.descriptor,
+        )
     )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd) if cwd else None,
+            env=git_environment(extra_env),
+            stdin=subprocess.DEVNULL,
+            text=True,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            executable=(
+                None
+                if executable_lease is None
+                else executable_subprocess_path(executable_lease)
+            ),
+            pass_fds=inherited_descriptors,
+            preexec_fn=executable_gate if executable_lease is not None else None,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise GitError(f"failed to start {shell_join(command)}: {exc}") from exc
+    finally:
+        if executable_lease is not None:
+            executable_lease.close()
     if check and result.returncode != 0:
         stderr = (result.stderr or "").strip()
         raise GitError(
@@ -1342,7 +1729,9 @@ def run_bounded_bytes(
         DirectoryChildInventoryLease,
         ...,
     ] = (),
+    directory_absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...] = (),
     file_content_leases: tuple[DescriptorBoundFileLease, ...] = (),
+    executable_snapshot_receipt: Optional[ExecutableSnapshotReceipt] = None,
 ) -> subprocess.CompletedProcess[bytes]:
     if input_bytes is not None and len(input_bytes) > GIT_INPUT_LIMIT_BYTES:
         raise PlanError(
@@ -1354,11 +1743,10 @@ def run_bounded_bytes(
         )
     if preserve_split_index and not prepare_git_command:
         raise PlanError("split-index preservation requires a prepared Git command")
-    command = (
-        safe_command(args, preserve_split_index=preserve_split_index)
-        if prepare_git_command
-        else args
-    )
+    if prepare_git_command and executable_snapshot_receipt is not None:
+        raise PlanError(
+            "prepared Git commands cannot use an explicit executable snapshot receipt"
+        )
     environment = (
         dict(fixed_env) if fixed_env is not None else git_environment(extra_env)
     )
@@ -1366,6 +1754,7 @@ def run_bounded_bytes(
         directory_descriptor is not None
         or directory_identity_leases
         or directory_child_inventory_leases
+        or directory_absent_entry_leases
         or file_content_leases
     ) and os.name != "posix":
         raise PlanError("descriptor-anchored Git writes require a POSIX runtime")
@@ -1379,6 +1768,36 @@ def run_bounded_bytes(
             raise PlanError(
                 f"{lease.binding.purpose} has an invalid exec-lease content receipt"
             )
+    for lease in directory_absent_entry_leases:
+        if not lease.entry_names or len(set(lease.entry_names)) != len(
+            lease.entry_names
+        ):
+            raise PlanError(f"{lease.purpose} has an invalid absent-entry receipt")
+        for entry_name in lease.entry_names:
+            validate_descriptor_entry_name(entry_name)
+        revalidate_directory_absent_entry_lease(lease)
+
+    input_file = tempfile.TemporaryFile()
+    try:
+        if input_bytes is not None:
+            input_file.write(input_bytes)
+            input_file.seek(0)
+        if prepare_git_command:
+            command, executable_lease = prepare_command_execution(
+                args,
+                preserve_split_index=preserve_split_index,
+            )
+        elif executable_snapshot_receipt is not None:
+            command, executable_lease = prepare_command_execution(
+                args,
+                executable_snapshot_receipt=executable_snapshot_receipt,
+            )
+        else:
+            command = args
+            executable_lease = None
+    except BaseException:
+        input_file.close()
+        raise
 
     def enter_bound_directory() -> None:
         for lease in directory_identity_leases:
@@ -1528,11 +1947,60 @@ def run_bounded_bytes(
                         errno.ESTALE,
                         f"{lease.purpose} entry changed before exec",
                     )
+        for lease in directory_absent_entry_leases:
+            expected_directory = fingerprint_values(lease.directory_binding.fingerprint)
+            directory_path_stat = os.stat(
+                lease.directory_binding.path,
+                follow_symlinks=False,
+            )
+            directory_descriptor_stat = os.fstat(lease.directory_descriptor)
+            if (
+                fingerprint_stat_values(directory_path_stat) != expected_directory
+                or fingerprint_stat_values(directory_descriptor_stat)
+                != expected_directory
+            ):
+                raise OSError(
+                    errno.ESTALE,
+                    f"{lease.purpose} directory changed before exec",
+                )
+            for entry_name in lease.entry_names:
+                try:
+                    os.stat(
+                        entry_name,
+                        dir_fd=lease.directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                raise OSError(
+                    errno.ESTALE,
+                    f"{lease.purpose} entry appeared before exec",
+                )
+            directory_path_after = os.stat(
+                lease.directory_binding.path,
+                follow_symlinks=False,
+            )
+            directory_descriptor_after = os.fstat(lease.directory_descriptor)
+            if (
+                fingerprint_stat_values(directory_path_after) != expected_directory
+                or fingerprint_stat_values(directory_descriptor_after)
+                != expected_directory
+                or not os.access(
+                    lease.directory_binding.path,
+                    lease.directory_binding.mode,
+                    effective_ids=True,
+                    follow_symlinks=False,
+                )
+            ):
+                raise OSError(
+                    errno.ESTALE,
+                    f"{lease.purpose} directory changed before exec",
+                )
         for lease in file_content_leases:
             expected_directory = lease.directory_binding.fingerprint
             expected_file = lease.binding.fingerprint
 
-            def fingerprint_values(path_stat: os.stat_result) -> tuple[int, ...]:
+            def file_stat_values(path_stat: os.stat_result) -> tuple[int, ...]:
                 return (
                     path_stat.st_dev,
                     path_stat.st_ino,
@@ -1570,10 +2038,10 @@ def run_bounded_bytes(
             )
             descriptor_stat = os.fstat(lease.descriptor)
             if (
-                fingerprint_values(directory_path_stat) != expected_directory_values
-                or fingerprint_values(directory_stat) != expected_directory_values
-                or fingerprint_values(entry_stat) != expected_file_values
-                or fingerprint_values(descriptor_stat) != expected_file_values
+                file_stat_values(directory_path_stat) != expected_directory_values
+                or file_stat_values(directory_stat) != expected_directory_values
+                or file_stat_values(entry_stat) != expected_file_values
+                or file_stat_values(descriptor_stat) != expected_file_values
                 or entry_stat.st_size != lease.binding.size
                 or descriptor_stat.st_size != lease.binding.size
             ):
@@ -1627,10 +2095,10 @@ def run_bounded_bytes(
             )
             directory_after = os.fstat(lease.directory_descriptor)
             if (
-                fingerprint_values(entry_after) != expected_file_values
-                or fingerprint_values(descriptor_after) != expected_file_values
-                or fingerprint_values(directory_path_after) != expected_directory_values
-                or fingerprint_values(directory_after) != expected_directory_values
+                file_stat_values(entry_after) != expected_file_values
+                or file_stat_values(descriptor_after) != expected_file_values
+                or file_stat_values(directory_path_after) != expected_directory_values
+                or file_stat_values(directory_after) != expected_directory_values
                 or entry_after.st_size != lease.binding.size
                 or descriptor_after.st_size != lease.binding.size
             ):
@@ -1656,6 +2124,9 @@ def run_bounded_bytes(
                 )
         if directory_descriptor is not None:
             os.fchdir(directory_descriptor)
+        if executable_lease is not None:
+            # Keep this as the final child-side action before Popen performs exec.
+            revalidate_executable_execution_lease_in_child(executable_lease)
 
     inherited_descriptors: set[int] = set()
     if directory_descriptor is not None:
@@ -1665,14 +2136,15 @@ def run_bounded_bytes(
         inherited_descriptors.add(lease.parent_descriptor)
     for lease in directory_child_inventory_leases:
         inherited_descriptors.add(lease.directory_descriptor)
+    for lease in directory_absent_entry_leases:
+        inherited_descriptors.add(lease.directory_descriptor)
     for lease in file_content_leases:
         inherited_descriptors.add(lease.directory_descriptor)
         inherited_descriptors.add(lease.descriptor)
+    if executable_lease is not None:
+        inherited_descriptors.add(executable_lease.parent_descriptor)
+        inherited_descriptors.add(executable_lease.descriptor)
 
-    input_file = tempfile.TemporaryFile()
-    if input_bytes is not None:
-        input_file.write(input_bytes)
-        input_file.seek(0)
     try:
         process = subprocess.Popen(
             command,
@@ -1683,20 +2155,53 @@ def run_bounded_bytes(
             stderr=subprocess.PIPE,
             start_new_session=os.name == "posix",
             pass_fds=tuple(sorted(inherited_descriptors)),
+            executable=(
+                None
+                if executable_lease is None
+                else executable_subprocess_path(executable_lease)
+            ),
             preexec_fn=(
                 enter_bound_directory
                 if (
                     directory_descriptor is not None
                     or directory_identity_leases
                     or directory_child_inventory_leases
+                    or directory_absent_entry_leases
                     or file_content_leases
+                    or executable_lease is not None
                 )
                 else None
             ),
         )
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        lease_cleanup_error: Optional[BaseException] = None
+        if executable_lease is not None:
+            try:
+                executable_lease.close()
+            except BaseException as cleanup_exc:
+                lease_cleanup_error = cleanup_exc
         input_file.close()
+        if lease_cleanup_error is not None:
+            raise GitError(
+                f"failed to start {shell_join(command)}: {exc}; "
+                f"executable lease cleanup failed: {lease_cleanup_error}"
+            ) from exc
         raise GitError(f"failed to start {shell_join(command)}: {exc}") from exc
+    if executable_lease is not None:
+        try:
+            executable_lease.close()
+        except BaseException as exc:
+            try:
+                terminate_process_group(process)
+            finally:
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+                input_file.close()
+            raise PlanError(
+                f"executable execution-lease cleanup failed after spawn: {exc}"
+            ) from exc
 
     stdout_pipe = process.stdout
     stderr_pipe = process.stderr
@@ -6949,10 +7454,12 @@ def capture_fetch_control_gitdir(
             (
                 config_path,
                 f"isolated fetch config for {submodule_path}",
+                MAX_SOURCE_CONFIG_BYTES,
             ),
             (
                 head_path,
                 f"isolated fetch HEAD for {submodule_path}",
+                MAX_GITDIR_FILE_BYTES,
             ),
         ]
         if initial_shallow_content is not None:
@@ -6960,17 +7467,18 @@ def capture_fetch_control_gitdir(
                 (
                     private_shallow_path,
                     f"isolated fetch shallow boundary for {submodule_path}",
+                    MAX_SOURCE_SHALLOW_BYTES,
                 )
             )
         file_bindings = tuple(
             read_bound_regular_file(
                 path,
-                maximum_bytes=MAX_SOURCE_CONFIG_BYTES,
+                maximum_bytes=maximum_bytes,
                 mode=os.R_OK,
                 purpose=purpose,
                 retain_content=False,
             )[0]
-            for path, purpose in file_specs
+            for path, purpose, maximum_bytes in file_specs
         )
         return guard, fetch_git_dir, access_bindings, file_bindings
     except Exception:
@@ -7465,6 +7973,7 @@ def fetch_missing_commit(
                 *fetch_control_lease.directory_leases,
             ),
             directory_child_inventory_leases=(source_object_child_lease,),
+            directory_absent_entry_leases=fetch_control_lease.absent_entry_leases,
             file_content_leases=fetch_control_lease.file_leases,
         )
     except BaseException as exc:
@@ -7872,15 +8381,102 @@ def revalidate_descriptor_bound_file_lease(
     )
 
 
+def require_absent_directory_entries(
+    directory_descriptor: int,
+    directory_path: Path,
+    entry_names: tuple[str, ...],
+    purpose: str,
+) -> None:
+    # Protected property: these names resolve to ENOENT at the pre-exec gate.
+    # Any object type is unsafe before exec; Git-created output after exec is
+    # intentionally outside this one-way launch receipt.
+    for entry_name in entry_names:
+        try:
+            os.stat(
+                entry_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise PlanError(
+                f"cannot prove an absent {purpose} entry\n"
+                f"  path: {directory_path / entry_name}\n"
+                f"  error: {exc}"
+            ) from exc
+        raise PlanError(
+            f"{purpose} entry must be absent before exec\n"
+            f"  path: {directory_path / entry_name}"
+        )
+
+
+def capture_directory_absent_entry_lease(
+    directory_lease: DirectoryEntryLease,
+    entry_names: tuple[str, ...],
+    purpose: str,
+) -> DirectoryAbsentEntryLease:
+    if not entry_names or len(set(entry_names)) != len(entry_names):
+        raise PlanError(f"{purpose} absent-entry names have an invalid shape")
+    normalized_names = tuple(
+        os.fsdecode(validate_descriptor_entry_name(entry_name))
+        for entry_name in entry_names
+    )
+    revalidate_directory_entry_lease(directory_lease)
+    require_absent_directory_entries(
+        directory_lease.descriptor,
+        directory_lease.path,
+        normalized_names,
+        purpose,
+    )
+    revalidate_directory_entry_lease(directory_lease)
+    require_absent_directory_entries(
+        directory_lease.descriptor,
+        directory_lease.path,
+        normalized_names,
+        purpose,
+    )
+    revalidate_directory_entry_lease(directory_lease)
+    return DirectoryAbsentEntryLease(
+        directory_binding=directory_lease.binding,
+        directory_descriptor=directory_lease.descriptor,
+        entry_names=normalized_names,
+        purpose=purpose,
+    )
+
+
+def revalidate_directory_absent_entry_lease(
+    lease: DirectoryAbsentEntryLease,
+) -> None:
+    revalidate_directory_descriptor(
+        lease.directory_binding,
+        lease.directory_descriptor,
+    )
+    require_absent_directory_entries(
+        lease.directory_descriptor,
+        lease.directory_binding.path,
+        lease.entry_names,
+        lease.purpose,
+    )
+    revalidate_directory_descriptor(
+        lease.directory_binding,
+        lease.directory_descriptor,
+    )
+
+
 def revalidate_fetch_control_lease(lease: FetchControlLease) -> None:
     if not lease.active or not lease.directory_leases:
         raise PlanError("fetch control-plane lease is inactive or incomplete")
     for directory_lease in lease.directory_leases:
         revalidate_directory_entry_lease(directory_lease)
+    for absent_entry_lease in lease.absent_entry_leases:
+        revalidate_directory_absent_entry_lease(absent_entry_lease)
     for file_lease in lease.file_leases:
         revalidate_descriptor_bound_file_lease(file_lease)
     for directory_lease in lease.directory_leases:
         revalidate_directory_entry_lease(directory_lease)
+    for absent_entry_lease in lease.absent_entry_leases:
+        revalidate_directory_absent_entry_lease(absent_entry_lease)
 
 
 def capture_fetch_control_lease(
@@ -7970,9 +8566,18 @@ def capture_fetch_control_lease(
                     content=content,
                 )
             )
+        absent_entry_names = (
+            () if receipt.source_shallow_binding is not None else (SOURCE_SHALLOW_NAME,)
+        ) + FETCH_CONTROL_LOCK_NAMES
+        absent_entry_lease = capture_directory_absent_entry_lease(
+            root_lease,
+            absent_entry_names,
+            f"isolated fetch control absence for {submodule.path}",
+        )
         lease = FetchControlLease(
             directory_leases=tuple(directory_leases),
             file_leases=tuple(file_leases),
+            absent_entry_leases=(absent_entry_lease,),
         )
         revalidate_fetch_control_lease(lease)
         cleanup.pop_all()
@@ -10736,18 +11341,35 @@ def verify_target_object_payloads(
             "target checkout object closure exceeds the "
             f"{GIT_INPUT_LIMIT_BYTES}-byte object-query input limit"
         )
-    command = safe_command(
-        [
-            "git",
-            "--no-optional-locks",
-            *source_object_repo_args(source_git_dir),
-            "cat-file",
-            "--batch",
-        ]
-    )
     input_file = tempfile.TemporaryFile()
-    input_file.write(object_input)
-    input_file.seek(0)
+    try:
+        input_file.write(object_input)
+        input_file.seek(0)
+        command, executable_lease = prepare_command_execution(
+            [
+                "git",
+                "--no-optional-locks",
+                *source_object_repo_args(source_git_dir),
+                "cat-file",
+                "--batch",
+            ]
+        )
+    except BaseException:
+        input_file.close()
+        raise
+
+    def executable_gate() -> None:
+        if executable_lease is not None:
+            revalidate_executable_execution_lease_in_child(executable_lease)
+
+    inherited_descriptors = (
+        ()
+        if executable_lease is None
+        else (
+            executable_lease.parent_descriptor,
+            executable_lease.descriptor,
+        )
+    )
     try:
         process = subprocess.Popen(
             command,
@@ -10756,12 +11378,46 @@ def verify_target_object_payloads(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=os.name == "posix",
+            pass_fds=inherited_descriptors,
+            executable=(
+                None
+                if executable_lease is None
+                else executable_subprocess_path(executable_lease)
+            ),
+            preexec_fn=executable_gate if executable_lease is not None else None,
         )
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        lease_cleanup_error: Optional[BaseException] = None
+        if executable_lease is not None:
+            try:
+                executable_lease.close()
+            except BaseException as cleanup_exc:
+                lease_cleanup_error = cleanup_exc
         input_file.close()
+        if lease_cleanup_error is not None:
+            raise GitError(
+                "failed to start target object payload verification: "
+                f"{exc}; executable lease cleanup failed: {lease_cleanup_error}"
+            ) from exc
         raise GitError(
             f"failed to start target object payload verification: {exc}"
         ) from exc
+    if executable_lease is not None:
+        try:
+            executable_lease.close()
+        except BaseException as exc:
+            try:
+                terminate_process_group(process)
+            finally:
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+                input_file.close()
+            raise PlanError(
+                "target object payload verifier executable lease cleanup "
+                f"failed after spawn: {exc}"
+            ) from exc
 
     stdout_pipe = process.stdout
     stderr_pipe = process.stderr

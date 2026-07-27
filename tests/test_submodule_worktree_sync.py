@@ -1440,6 +1440,51 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 absent_submodule,
             )
 
+    def test_private_fetch_control_files_keep_independent_size_limits(self) -> None:
+        self.assertEqual(MODULE.MAX_SOURCE_CONFIG_BYTES, 4 * 1024 * 1024)
+        self.assertEqual(MODULE.MAX_GITDIR_FILE_BYTES, 64 * 1024)
+        self.assertEqual(MODULE.MAX_SOURCE_SHALLOW_BYTES, 64 * 1024 * 1024)
+        shallow_content = b"x" * (MODULE.MAX_SOURCE_CONFIG_BYTES + 1)
+        guard, _gitdir, _directory_bindings, file_bindings = (
+            MODULE.capture_fetch_control_gitdir(
+                "sha1",
+                "third_party/large-shallow",
+                shallow_content,
+                (),
+            )
+        )
+        self.addCleanup(guard.cleanup)
+        bindings = {binding.path.name: binding for binding in file_bindings}
+
+        self.assertEqual(
+            bindings["config"].maximum_bytes,
+            MODULE.MAX_SOURCE_CONFIG_BYTES,
+        )
+        self.assertEqual(
+            bindings["HEAD"].maximum_bytes,
+            MODULE.MAX_GITDIR_FILE_BYTES,
+        )
+        self.assertEqual(
+            bindings["shallow"].maximum_bytes,
+            MODULE.MAX_SOURCE_SHALLOW_BYTES,
+        )
+        self.assertEqual(bindings["shallow"].size, len(shallow_content))
+
+    def test_private_fetch_shallow_rejects_content_over_its_own_limit(
+        self,
+    ) -> None:
+        with mock.patch.object(MODULE, "MAX_SOURCE_SHALLOW_BYTES", 1024):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "isolated fetch shallow boundary.*exceeds the 1024-byte",
+            ):
+                MODULE.capture_fetch_control_gitdir(
+                    "sha1",
+                    "third_party/oversized-shallow",
+                    b"x" * 1025,
+                    (),
+                )
+
     def test_fetch_command_uses_exact_url_and_closed_transport_overrides(self) -> None:
         submodule = MODULE.Submodule(
             "custom-lib",
@@ -1677,6 +1722,115 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 original_content,
             )
         finally:
+            runtime.snapshot_guard.cleanup()
+
+    def test_git_exec_gate_rejects_snapshot_path_replacement_before_exec(
+        self,
+    ) -> None:
+        fake_git = self.root / "exec-gate-path-git"
+        fake_git.write_text(
+            "#!/bin/sh\nprintf 'git version 2.53.0\\n'\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o700)
+        with mock.patch.object(MODULE.shutil, "which", return_value=str(fake_git)):
+            runtime = MODULE.discover_git_runtime()
+        snapshot = runtime.executable
+        held_snapshot = snapshot.with_name("git.held")
+        replacement = "#!/bin/sh\nprintf 'git version 9.99.9\\n'\n"
+        original_popen = MODULE.subprocess.Popen
+        replacement_performed = False
+
+        def replace_snapshot_before_spawn(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal replacement_performed
+            self.assertFalse(replacement_performed)
+            replacement_performed = True
+            snapshot.rename(held_snapshot)
+            snapshot.write_text(replacement, encoding="utf-8")
+            snapshot.chmod(0o500)
+            return original_popen(*args, **kwargs)
+
+        try:
+            with mock.patch.object(MODULE, "_GIT_RUNTIME", runtime):
+                with mock.patch.object(
+                    MODULE.subprocess,
+                    "Popen",
+                    side_effect=replace_snapshot_before_spawn,
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.GitError,
+                        "failed to start",
+                    ):
+                        MODULE.run_bounded_bytes(
+                            ["git", "--version"],
+                            timeout_seconds=5,
+                            stdout_limit=256,
+                            stderr_limit=256,
+                        )
+            self.assertTrue(replacement_performed)
+        finally:
+            snapshot.unlink(missing_ok=True)
+            if held_snapshot.exists():
+                held_snapshot.rename(snapshot)
+            runtime.snapshot_guard.cleanup()
+
+    def test_git_exec_gate_rejects_same_inode_snapshot_rewrite_before_exec(
+        self,
+    ) -> None:
+        fake_git = self.root / "exec-gate-content-git"
+        fake_git.write_text(
+            "#!/bin/sh\nprintf 'git version 2.53.0\\n'\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o700)
+        with mock.patch.object(MODULE.shutil, "which", return_value=str(fake_git)):
+            runtime = MODULE.discover_git_runtime()
+        snapshot = runtime.executable
+        original_content = snapshot.read_bytes()
+        rewritten_content = original_content.replace(b"2.53.0", b"9.99.9", 1)
+        self.assertEqual(len(rewritten_content), len(original_content))
+        original_inode = snapshot.stat().st_ino
+        original_popen = MODULE.subprocess.Popen
+        replacement_performed = False
+
+        def rewrite_snapshot_before_spawn(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal replacement_performed
+            self.assertFalse(replacement_performed)
+            replacement_performed = True
+            snapshot.chmod(0o700)
+            snapshot.write_bytes(rewritten_content)
+            snapshot.chmod(0o500)
+            self.assertEqual(snapshot.stat().st_ino, original_inode)
+            return original_popen(*args, **kwargs)
+
+        try:
+            with mock.patch.object(MODULE, "_GIT_RUNTIME", runtime):
+                with mock.patch.object(
+                    MODULE.subprocess,
+                    "Popen",
+                    side_effect=rewrite_snapshot_before_spawn,
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.GitError,
+                        "failed to start",
+                    ):
+                        MODULE.run_bounded_bytes(
+                            ["git", "--version"],
+                            timeout_seconds=5,
+                            stdout_limit=256,
+                            stderr_limit=256,
+                        )
+            self.assertTrue(replacement_performed)
+        finally:
+            snapshot.chmod(0o700)
+            snapshot.write_bytes(original_content)
+            snapshot.chmod(0o500)
             runtime.snapshot_guard.cleanup()
 
     def test_bounded_command_stops_at_retained_stdout_limit(self) -> None:
@@ -8687,6 +8841,97 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 self.named_source_git_dir,
                 submodule,
             )
+
+    def test_fetch_rejects_absent_private_shallow_injection_before_git_starts(
+        self,
+    ) -> None:
+        sources = {
+            injection_kind: self.clone_named_source(
+                f"fetch-control-absent-shallow-{injection_kind}"
+            )
+            for injection_kind in ("regular", "symlink")
+        }
+        (self.remote / "FETCH-CONTROL-ABSENT-SHALLOW.md").write_text(
+            "fetch control absent shallow\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "FETCH-CONTROL-ABSENT-SHALLOW.md")
+        run_git(self.remote, "commit", "-m", "fetch control absent shallow")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+
+        for injection_kind, source_git_dir in sources.items():
+            with self.subTest(injection_kind=injection_kind):
+                submodule = MODULE.Submodule(
+                    f"fetch-control-absent-shallow-{injection_kind}",
+                    f"third_party/fetch-control-absent-shallow-{injection_kind}",
+                    str(self.remote),
+                )
+                receipt = MODULE.capture_transport_receipt(
+                    source_git_dir,
+                    submodule,
+                )
+                self.addCleanup(receipt.fetch_guard.cleanup)
+                injected_path = receipt.fetch_git_dir / MODULE.SOURCE_SHALLOW_NAME
+                symlink_target = self.root / f"{injection_kind}-shallow-target"
+                symlink_target.write_text("outside\n", encoding="utf-8")
+                original_run_bounded = MODULE.run_bounded_bytes
+                injection_performed = False
+
+                def inject_absent_shallow_before_fetch(
+                    args: list[str],
+                    **kwargs: object,
+                ) -> subprocess.CompletedProcess[bytes]:
+                    nonlocal injection_performed
+                    if "fetch" in args:
+                        self.assertFalse(injection_performed)
+                        injection_performed = True
+                        absent_leases = kwargs["directory_absent_entry_leases"]
+                        self.assertEqual(len(absent_leases), 1)
+                        self.assertEqual(
+                            absent_leases[0].entry_names,
+                            (
+                                MODULE.SOURCE_SHALLOW_NAME,
+                                *MODULE.FETCH_CONTROL_LOCK_NAMES,
+                            ),
+                        )
+                        if injection_kind == "regular":
+                            injected_path.write_text(
+                                "injected\n",
+                                encoding="utf-8",
+                            )
+                        else:
+                            injected_path.symlink_to(symlink_target)
+                    return original_run_bounded(args, **kwargs)
+
+                try:
+                    with mock.patch.object(
+                        MODULE,
+                        "run_bounded_bytes",
+                        side_effect=inject_absent_shallow_before_fetch,
+                    ):
+                        with redirect_stdout(io.StringIO()):
+                            with self.assertRaisesRegex(
+                                MODULE.PlanError,
+                                "recovery fence was retained",
+                            ):
+                                MODULE.fetch_missing_commit(
+                                    source_git_dir,
+                                    self.root / "unused-target",
+                                    submodule,
+                                    missing_sha,
+                                    1,
+                                    dry_run=False,
+                                    transport_receipt=receipt,
+                                    fetch_missing=True,
+                                )
+                    self.assertTrue(injection_performed)
+                    self.assertTrue(
+                        (
+                            source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME
+                        ).is_file()
+                    )
+                finally:
+                    injected_path.unlink(missing_ok=True)
 
     def test_fetch_rejects_raced_private_gitdir_replacement_before_git_starts(
         self,
