@@ -63,6 +63,7 @@ SOURCE_SHALLOW_NAME = "shallow"
 SOURCE_SHALLOW_LOCK_NAME = "shallow.lock"
 SOURCE_FETCH_TRANSACTION_NAME = "codex-submodule-fetch.pending"
 LOOSE_OBJECT_FANOUT_NAMES = tuple(f"{value:02x}" for value in range(256))
+OBJECT_WRITE_CHILD_NAMES = (*LOOSE_OBJECT_FANOUT_NAMES, "pack")
 MAX_SOURCE_FETCH_TRANSACTION_BYTES = 64 * 1024
 LINUX_RENAME_NOREPLACE = 0x00000001
 LINUX_RENAME_EXCHANGE = 0x00000002
@@ -595,7 +596,7 @@ class TransportReceipt:
     source_shallow_parent_binding: AccessBinding
     source_shallow_binding: Optional[FileContentBinding]
     source_shallow_creation_policy: Optional[SourceShallowCreationPolicy]
-    source_loose_object_fanout: tuple[
+    source_object_write_children: tuple[
         tuple[str, Optional[FsFingerprint]],
         ...,
     ]
@@ -3857,6 +3858,26 @@ def revalidate_materialized_target_lease(
         )
 
 
+def materialized_target_exec_identity_lease(
+    lease: MaterializedTargetLease,
+) -> DirectoryEntryLease:
+    """Borrow a target lease for the child process identity gate.
+
+    The returned view does not own its descriptors and must not be closed.
+    The materialized target lease retains ownership through the subprocess.
+    """
+
+    revalidate_materialized_target_lease(lease)
+    return DirectoryEntryLease(
+        path=lease.target,
+        binding=lease.target_binding,
+        descriptor=lease.target_descriptor,
+        parent_binding=lease.parent_binding,
+        parent_descriptor=lease.parent_descriptor,
+        entry_name=lease.entry_name,
+    )
+
+
 def source_repo_args(source_git_dir: Path, work_tree: Path) -> list[str]:
     return [f"--git-dir={source_git_dir}", f"--work-tree={work_tree}"]
 
@@ -5007,13 +5028,13 @@ def source_object_format(
     return object_format
 
 
-def loose_object_fanout_inventory_at(
+def object_write_child_inventory_at(
     directory_descriptor: int,
     object_directory: Path,
     purpose: str,
 ) -> tuple[tuple[str, Optional[FsFingerprint]], ...]:
     inventory: list[tuple[str, Optional[FsFingerprint]]] = []
-    for name in LOOSE_OBJECT_FANOUT_NAMES:
+    for name in OBJECT_WRITE_CHILD_NAMES:
         try:
             fingerprint = fingerprint_from_stat(
                 os.stat(
@@ -5042,14 +5063,13 @@ def loose_object_fanout_inventory_at(
             os.R_OK | os.W_OK | os.X_OK,
         ):
             raise PlanError(
-                f"{purpose} denies loose-object writes\n"
-                f"  path: {object_directory / name}"
+                f"{purpose} denies object writes\n  path: {object_directory / name}"
             )
         inventory.append((name, fingerprint))
     return tuple(inventory)
 
 
-def capture_loose_object_fanout_inventory(
+def capture_object_write_child_inventory(
     object_binding: AccessBinding,
     purpose: str,
 ) -> tuple[tuple[str, Optional[FsFingerprint]], ...]:
@@ -5059,12 +5079,12 @@ def capture_loose_object_fanout_inventory(
     )
     try:
         revalidate_directory_descriptor(object_binding, object_descriptor)
-        first = loose_object_fanout_inventory_at(
+        first = object_write_child_inventory_at(
             object_descriptor,
             object_binding.path,
             purpose,
         )
-        second = loose_object_fanout_inventory_at(
+        second = object_write_child_inventory_at(
             object_descriptor,
             object_binding.path,
             purpose,
@@ -5077,15 +5097,15 @@ def capture_loose_object_fanout_inventory(
         os.close(object_descriptor)
 
 
-def capture_loose_object_fanout_lease(
+def capture_object_write_child_lease(
     object_lease: DirectoryEntryLease,
     expected: tuple[tuple[str, Optional[FsFingerprint]], ...],
     purpose: str,
 ) -> DirectoryChildInventoryLease:
-    if tuple(name for name, _ in expected) != LOOSE_OBJECT_FANOUT_NAMES:
+    if tuple(name for name, _ in expected) != OBJECT_WRITE_CHILD_NAMES:
         raise PlanError(f"{purpose} has an invalid receipt shape")
     revalidate_directory_entry_lease(object_lease)
-    current = loose_object_fanout_inventory_at(
+    current = object_write_child_inventory_at(
         object_lease.descriptor,
         object_lease.path,
         purpose,
@@ -6855,20 +6875,24 @@ def capture_transport_receipt(
         stat.S_IFDIR,
     )
     source_object_bindings = [source_object_binding]
-    source_loose_object_fanout = capture_loose_object_fanout_inventory(
+    source_object_write_children = capture_object_write_child_inventory(
         source_object_binding,
-        f"authorized fetch loose-object fanout for {submodule.path}",
+        f"authorized fetch loose-object fanout and pack directory for {submodule.path}",
     )
     source_pack_directory = source_object_directory / "pack"
-    if path_entry_exists(source_pack_directory):
-        source_object_bindings.append(
-            capture_typed_access(
-                source_pack_directory,
-                os.R_OK | os.W_OK | os.X_OK,
-                f"authorized fetch pack directory for {submodule.path}",
-                stat.S_IFDIR,
-            )
+    source_pack_fingerprint = dict(source_object_write_children)["pack"]
+    if source_pack_fingerprint is not None:
+        source_pack_binding = capture_typed_access(
+            source_pack_directory,
+            os.R_OK | os.W_OK | os.X_OK,
+            f"authorized fetch pack directory for {submodule.path}",
+            stat.S_IFDIR,
         )
+        if source_pack_binding.fingerprint != source_pack_fingerprint:
+            raise PlanError(
+                "authorized fetch pack directory changed during receipt binding"
+            )
+        source_object_bindings.append(source_pack_binding)
     (
         source_shallow_path,
         source_shallow_parent_binding,
@@ -6938,7 +6962,7 @@ def capture_transport_receipt(
             source_shallow_parent_binding=source_shallow_parent_binding,
             source_shallow_binding=source_shallow_binding,
             source_shallow_creation_policy=source_shallow_creation_policy,
-            source_loose_object_fanout=source_loose_object_fanout,
+            source_object_write_children=source_object_write_children,
             fetch_git_dir=fetch_git_dir,
             fetch_access_bindings=(
                 *source_object_bindings,
@@ -7050,12 +7074,15 @@ def revalidate_transport_receipt(
         receipt.source_object_directory,
         f"authorized fetch object database for {submodule.path}",
     )
-    current_fanout = capture_loose_object_fanout_inventory(
+    current_object_write_children = capture_object_write_child_inventory(
         expected_object_binding,
-        f"authorized fetch loose-object fanout for {submodule.path}",
+        f"authorized fetch loose-object fanout and pack directory for {submodule.path}",
     )
-    if current_fanout != receipt.source_loose_object_fanout:
-        raise PlanError("authorized fetch loose-object fanout changed after preflight")
+    if current_object_write_children != receipt.source_object_write_children:
+        raise PlanError(
+            "authorized fetch loose-object fanout or pack directory changed "
+            "after preflight"
+        )
     for binding in receipt.fetch_file_bindings:
         revalidate_file_content_binding(binding)
     validate_frozen_git_environment(
@@ -7178,10 +7205,11 @@ def fetch_missing_commit(
                 "authorized fetch object database changed during descriptor binding"
             )
         revalidate_directory_entry_lease(source_object_lease)
-        source_fanout_lease = capture_loose_object_fanout_lease(
+        source_object_child_lease = capture_object_write_child_lease(
             source_object_lease,
-            receipt.source_loose_object_fanout,
-            f"authorized fetch loose-object fanout for {submodule.path}",
+            receipt.source_object_write_children,
+            "authorized fetch loose-object fanout and pack directory for "
+            f"{submodule.path}",
         )
         transaction = begin_source_fetch_transaction(receipt)
     except BaseException:
@@ -7200,7 +7228,7 @@ def fetch_missing_commit(
             stderr_limit=GIT_ERROR_OUTPUT_LIMIT_BYTES,
             fixed_env=dict(receipt.git_environment),
             directory_identity_leases=(source_object_lease,),
-            directory_child_inventory_leases=(source_fanout_lease,),
+            directory_child_inventory_leases=(source_object_child_lease,),
         )
     except BaseException as exc:
         try:
@@ -8767,6 +8795,7 @@ def rollback_added_worktree(
     revalidate_directory_entry_lease(source_lease)
     if control is not None:
         revalidate_directory_entry_lease(control.admin_lease)
+    target_exec_lease = materialized_target_exec_identity_lease(lease)
     try:
         run_git_at_directory_descriptor(
             [
@@ -8780,9 +8809,9 @@ def rollback_added_worktree(
             ],
             lease.parent_descriptor,
             directory_identity_leases=(
-                (source_lease, control.admin_lease)
+                (source_lease, control.admin_lease, target_exec_lease)
                 if control is not None
-                else (source_lease,)
+                else (source_lease, target_exec_lease)
             ),
         )
     except BaseException as exc:
@@ -9608,6 +9637,9 @@ def validate_captured_cache_tree(
                 remaining_children, int
             ):
                 raise PlanError("captured managed worktree cache-tree stack is invalid")
+            # Git cache-tree.c uses subtree_name_cmp/write_one order: component
+            # length first, then raw name bytes. This is intentionally distinct
+            # from Git tree-entry ordering.
             if prior_component is not None and (
                 not isinstance(prior_component, bytes)
                 or (len(component), component)
@@ -9615,7 +9647,9 @@ def validate_captured_cache_tree(
             ):
                 raise PlanError(
                     "captured managed worktree cache-tree children are not "
-                    "in canonical order"
+                    "in canonical order\n"
+                    f"  prior: {prior_component!r}\n"
+                    f"  current: {component!r}"
                 )
             frames[-1][1] = remaining_children - 1
             frames[-1][2] = component

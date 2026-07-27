@@ -108,6 +108,62 @@ def v2_index_extension_signatures(
     return tuple(signatures)
 
 
+def v2_index_extension_payload(
+    content: bytes,
+    expected_signature: bytes,
+    object_id_bytes: int = 20,
+) -> bytes:
+    _chunks, _paths, offset = split_v2_index_entries(content, object_id_bytes)
+    body_end = len(content) - object_id_bytes
+    while offset < body_end:
+        if offset + 8 > body_end:
+            raise AssertionError("truncated index extension")
+        signature = content[offset : offset + 4]
+        size = int.from_bytes(content[offset + 4 : offset + 8], "big")
+        offset += 8
+        if offset + size > body_end:
+            raise AssertionError("oversized index extension")
+        payload = content[offset : offset + size]
+        if signature == expected_signature:
+            return payload
+        offset += size
+    raise AssertionError(f"missing index extension: {expected_signature!r}")
+
+
+def cache_tree_root_leaf_child_names(
+    payload: bytes,
+    object_id_bytes: int = 20,
+) -> tuple[bytes, ...]:
+    component_end = payload.find(b"\0")
+    if component_end != 0:
+        raise AssertionError("expected cache-tree root node")
+    line_end = payload.find(b"\n", component_end + 1)
+    if line_end < 0:
+        raise AssertionError("truncated cache-tree root header")
+    entry_count, subtree_count = (
+        int(value) for value in payload[component_end + 1 : line_end].split(b" ", 1)
+    )
+    offset = line_end + 1 + (object_id_bytes if entry_count >= 0 else 0)
+    names: list[bytes] = []
+    for _index in range(subtree_count):
+        component_end = payload.find(b"\0", offset)
+        if component_end < 0:
+            raise AssertionError("truncated cache-tree child name")
+        names.append(payload[offset:component_end])
+        line_end = payload.find(b"\n", component_end + 1)
+        if line_end < 0:
+            raise AssertionError("truncated cache-tree child header")
+        entry_count, child_count = (
+            int(value) for value in payload[component_end + 1 : line_end].split(b" ", 1)
+        )
+        if child_count:
+            raise AssertionError("expected leaf cache-tree children")
+        offset = line_end + 1 + (object_id_bytes if entry_count >= 0 else 0)
+    if offset != len(payload):
+        raise AssertionError("cache-tree payload has trailing data")
+    return tuple(names)
+
+
 class SubmoduleWorktreeSyncTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory(prefix="submodule-worktree-sync.")
@@ -7058,6 +7114,76 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertTrue(created_parent.is_dir())
         self.assertTrue(recreated_admin.is_dir())
 
+    def test_rollback_exec_gate_preserves_raced_target_replacement(
+        self,
+    ) -> None:
+        target, module, input_receipt = self.make_target_superproject(
+            "rollback-target-entry-replacement",
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        final_target = target / module.path
+        held_original = self.root / "rollback-target-entry-original"
+        original_run_bounded = MODULE.run_bounded_bytes
+        replacement_performed = False
+        registered_admin: Path | None = None
+
+        def replace_target_before_remove_exec(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal replacement_performed, registered_admin
+            if "worktree" in args and "remove" in args:
+                self.assertFalse(replacement_performed)
+                registered_admin = MODULE.gitdir_file_target(final_target)
+                self.assertIsNotNone(registered_admin)
+                final_target.rename(held_original)
+                final_target.mkdir()
+                (final_target / "replacement.txt").write_text(
+                    "must survive failed rollback\n",
+                    encoding="utf-8",
+                )
+                replacement_performed = True
+            return original_run_bounded(args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "postvalidate_applied_entry",
+                side_effect=MODULE.PlanError("injected finalization failure"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "run_bounded_bytes",
+                side_effect=replace_target_before_remove_exec,
+            ),
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(MODULE.PlanError) as raised:
+                    MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(replacement_performed)
+        self.assertIn("recovery_status: rollback-incomplete", str(raised.exception))
+        self.assertEqual(
+            (final_target / "replacement.txt").read_text(encoding="utf-8"),
+            "must survive failed rollback\n",
+        )
+        self.assertFalse((final_target / ".git").exists())
+        self.assertTrue((held_original / ".git").is_file())
+        self.assertIsNotNone(registered_admin)
+        assert registered_admin is not None
+        self.assertTrue(registered_admin.is_dir())
+
     def assert_unproven_admin_ownership_preserved(
         self,
         scenario: str,
@@ -7381,6 +7507,99 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         version_four = (admin / "index").read_bytes()
         self.assertEqual(int.from_bytes(version_four[4:8], "big"), 4)
         MODULE.validate_captured_index_matches_tree(entry, version_four)
+
+    def test_new_worktree_accepts_real_cache_tree_name_order(self) -> None:
+        for directory in ("aa", "b"):
+            path = self.remote / directory
+            path.mkdir()
+            (path / "file.txt").write_text(
+                f"{directory}\n",
+                encoding="utf-8",
+            )
+        run_git(self.remote, "add", "aa", "b")
+        run_git(self.remote, "commit", "-m", "add cache tree name ordering")
+        ordered_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+        target, module, input_receipt = self.make_target_superproject(
+            "cache-tree-name-order",
+            ordered_sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, ordered_sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+
+        with redirect_stdout(io.StringIO()):
+            MODULE.apply_sync_plan(plan)
+
+        final_target = target / module.path
+        self.assertEqual(
+            (final_target / "aa/file.txt").read_text(encoding="utf-8"),
+            "aa\n",
+        )
+        self.assertEqual(
+            (final_target / "b/file.txt").read_text(encoding="utf-8"),
+            "b\n",
+        )
+        admin = MODULE.gitdir_file_target(final_target)
+        self.assertIsNotNone(admin)
+        assert admin is not None
+        index_content = (admin / "index").read_bytes()
+        self.assertIn(
+            b"TREE",
+            v2_index_extension_signatures(index_content),
+        )
+        self.assertEqual(
+            cache_tree_root_leaf_child_names(
+                v2_index_extension_payload(index_content, b"TREE"),
+            ),
+            (b"b", b"aa"),
+        )
+        self.assertEqual(
+            MODULE.registered_target_path(
+                self.named_source_git_dir,
+                final_target,
+            ),
+            final_target.resolve(strict=True),
+        )
+
+    def test_captured_cache_tree_rejects_tree_entry_name_order(self) -> None:
+        root_object_id = b"\x01" * 20
+        aa_object_id = b"\x02" * 20
+        b_object_id = b"\x03" * 20
+        expected_nodes = {
+            b"": (2, root_object_id),
+            b"aa": (1, aa_object_id),
+            b"b": (1, b_object_id),
+        }
+        root = b"\0" + b"2 2\n" + root_object_id
+        aa = b"aa\0" + b"1 0\n" + aa_object_id
+        b_node = b"b\0" + b"1 0\n" + b_object_id
+        canonical = root + b_node + aa
+        MODULE.validate_captured_cache_tree(
+            canonical,
+            0,
+            len(canonical),
+            20,
+            expected_nodes,
+        )
+
+        malformed = root + aa + b_node
+        with self.assertRaisesRegex(MODULE.PlanError, "canonical order"):
+            MODULE.validate_captured_cache_tree(
+                malformed,
+                0,
+                len(malformed),
+                20,
+                expected_nodes,
+            )
 
     def test_captured_index_rejects_noncanonical_or_hidden_semantics(self) -> None:
         for name in ("alpha.txt", "zebra.txt"):
@@ -8495,13 +8714,13 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             self.named_source_git_dir,
             submodule,
         )
-        self.assertEqual(len(receipt.source_loose_object_fanout), 256)
+        self.assertEqual(len(receipt.source_object_write_children), 257)
         self.assertEqual(
-            tuple(name for name, _ in receipt.source_loose_object_fanout),
-            MODULE.LOOSE_OBJECT_FANOUT_NAMES,
+            tuple(name for name, _ in receipt.source_object_write_children),
+            MODULE.OBJECT_WRITE_CHILD_NAMES,
         )
         self.assertEqual(
-            dict(receipt.source_loose_object_fanout)[fanout_name],
+            dict(receipt.source_object_write_children)[fanout_name],
             None,
         )
         outside = self.root / "outside-raced-loose-object-fanout"
@@ -8543,6 +8762,149 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.assertTrue(replacement_performed)
         self.assertTrue(source_fanout.is_symlink())
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertTrue(
+            (self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME).is_file()
+        )
+
+    def test_fetch_rejects_raced_pack_directory_replacement_before_git_starts(
+        self,
+    ) -> None:
+        (self.remote / "FETCH-PACK-REPLACEMENT.md").write_text(
+            "fetch pack replacement\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "FETCH-PACK-REPLACEMENT.md")
+        run_git(self.remote, "commit", "-m", "fetch pack replacement")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        source_objects = self.named_source_git_dir / "objects"
+        source_pack = source_objects / "pack"
+        source_pack.mkdir(exist_ok=True)
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        self.assertEqual(
+            dict(receipt.source_object_write_children)["pack"],
+            MODULE.filesystem_fingerprint(source_pack),
+        )
+        outside = self.root / "outside-raced-pack-directory"
+        outside.mkdir()
+        held_pack = self.root / "held-source-pack-directory"
+        original_run_bounded = MODULE.run_bounded_bytes
+        replacement_performed = False
+
+        def replace_pack_before_fetch(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal replacement_performed
+            if "fetch" in args:
+                self.assertFalse(replacement_performed)
+                replacement_performed = True
+                source_pack.rename(held_pack)
+                source_pack.symlink_to(outside, target_is_directory=True)
+            return original_run_bounded(args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "run_bounded_bytes",
+            side_effect=replace_pack_before_fetch,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "recovery fence was retained",
+                ):
+                    MODULE.fetch_missing_commit(
+                        self.named_source_git_dir,
+                        self.root / "unused-target",
+                        submodule,
+                        missing_sha,
+                        1,
+                        dry_run=False,
+                        transport_receipt=receipt,
+                        fetch_missing=True,
+                    )
+
+        self.assertTrue(replacement_performed)
+        self.assertTrue(source_pack.is_symlink())
+        self.assertTrue(held_pack.is_dir())
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertTrue(
+            (self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME).is_file()
+        )
+
+    def test_fetch_rejects_raced_absent_pack_symlink_before_git_starts(
+        self,
+    ) -> None:
+        (self.remote / "FETCH-ABSENT-PACK-REPLACEMENT.md").write_text(
+            "fetch absent pack replacement\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "FETCH-ABSENT-PACK-REPLACEMENT.md")
+        run_git(self.remote, "commit", "-m", "fetch absent pack replacement")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        source_objects = self.named_source_git_dir / "objects"
+        source_pack = source_objects / "pack"
+        held_pack = self.root / "preflight-absent-source-pack"
+        source_pack.rename(held_pack)
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        self.assertIsNone(
+            dict(receipt.source_object_write_children)["pack"],
+        )
+        outside = self.root / "outside-raced-absent-pack"
+        outside.mkdir()
+        original_run_bounded = MODULE.run_bounded_bytes
+        replacement_performed = False
+
+        def publish_pack_symlink_before_fetch(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal replacement_performed
+            if "fetch" in args:
+                self.assertFalse(replacement_performed)
+                replacement_performed = True
+                source_pack.symlink_to(outside, target_is_directory=True)
+            return original_run_bounded(args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "run_bounded_bytes",
+            side_effect=publish_pack_symlink_before_fetch,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "recovery fence was retained",
+                ):
+                    MODULE.fetch_missing_commit(
+                        self.named_source_git_dir,
+                        self.root / "unused-target",
+                        submodule,
+                        missing_sha,
+                        1,
+                        dry_run=False,
+                        transport_receipt=receipt,
+                        fetch_missing=True,
+                    )
+
+        self.assertTrue(replacement_performed)
+        self.assertTrue(source_pack.is_symlink())
         self.assertEqual(list(outside.iterdir()), [])
         self.assertTrue(
             (self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME).is_file()
