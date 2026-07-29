@@ -788,49 +788,23 @@ class CheckoutExecutionView:
             )
 
 
-@dataclass
-class SuperprojectIndexView:
-    """One query-only primary/shared index namespace.
+@dataclass(frozen=True)
+class CapturedSuperprojectIndexEntry:
+    """One entry decoded only from captured Git index bytes."""
 
-    Exact directory inventory protects every pathname Git may open for the
-    primary or linked shared index. Descriptor digest leases protect the bytes,
-    object identities, and access policies behind those names. Timestamps are
-    excluded because they do not change any selected input property.
-    """
+    raw_path: bytes
+    mode: int
+    object_id: bytes
+    stage: int
 
-    private_index_path: Path
-    directory_lease: DirectoryEntryLease
-    exact_inventory_lease: DirectoryExactInventoryLease
-    digest_file_leases: tuple[DescriptorBoundDigestFileLease, ...]
-    guard: object = dataclass_field(repr=False, compare=False)
-    active: bool = dataclass_field(default=True, repr=False, compare=False)
 
-    def close(self) -> None:
-        if not self.active:
-            return
-        self.active = False
-        cleanup_errors: list[str] = []
-        for file_lease in reversed(self.digest_file_leases):
-            try:
-                os.close(file_lease.descriptor)
-            except OSError as exc:
-                cleanup_errors.append(str(exc))
-        try:
-            self.directory_lease.close()
-        except BaseException as exc:
-            cleanup_errors.append(str(exc))
-        cleanup = getattr(self.guard, "cleanup", None)
-        if cleanup is None:
-            cleanup_errors.append("owner-private index view has no cleanup method")
-        else:
-            try:
-                cleanup()
-            except BaseException as exc:
-                cleanup_errors.append(str(exc))
-        if cleanup_errors:
-            raise PlanError(
-                "superproject index-view cleanup failed: " + "; ".join(cleanup_errors)
-            )
+@dataclass(frozen=True)
+class ParsedCapturedSuperprojectIndex:
+    """Checksum-verified entries and extensions from one captured index file."""
+
+    object_id_bytes: int
+    entries: tuple[CapturedSuperprojectIndexEntry, ...]
+    extensions: tuple[tuple[bytes, bytes], ...]
 
 
 def close_fetch_execution_leases(
@@ -6442,7 +6416,7 @@ def capture_superproject_index_snapshot(
     return tuple(bindings), tuple(contents)
 
 
-def superproject_index_view_names(
+def superproject_index_snapshot_names(
     bindings: tuple[FileContentBinding, ...],
 ) -> tuple[str, ...]:
     if len(bindings) not in {1, 2}:
@@ -6455,36 +6429,298 @@ def superproject_index_view_names(
     return "index", shared_name
 
 
-def revalidate_superproject_index_view(view: SuperprojectIndexView) -> None:
-    # The exact inventory proves that Git has only the intended primary/shared
-    # names. Each digest lease separately proves the same regular-file object,
-    # complete bytes, POSIX policy, and effective read access behind that name.
-    if not view.active:
-        raise PlanError("superproject index view is inactive")
-    if (
-        not view.private_index_path.is_absolute()
-        or view.private_index_path.parent != view.directory_lease.path
-        or view.private_index_path.name != "index"
-    ):
-        raise PlanError("superproject index view has an invalid private index path")
-    if not any(
-        lease.binding.path == view.private_index_path
-        for lease in view.digest_file_leases
-    ):
-        raise PlanError("superproject index view lacks its private primary index")
-    revalidate_directory_entry_lease(view.directory_lease)
-    revalidate_directory_exact_inventory_lease(view.exact_inventory_lease)
-    for lease in view.digest_file_leases:
-        revalidate_descriptor_bound_digest_file_lease(lease)
-    revalidate_directory_exact_inventory_lease(view.exact_inventory_lease)
-    revalidate_directory_entry_lease(view.directory_lease)
+def captured_superproject_index_object_id_bytes(
+    content: bytes,
+    purpose: str,
+) -> int:
+    candidates: list[int] = []
+    for object_id_bytes, constructor in ((20, hashlib.sha1), (32, hashlib.sha256)):
+        if len(content) < 12 + object_id_bytes:
+            continue
+        digest = constructor()
+        digest.update(memoryview(content)[:-object_id_bytes])
+        if digest.digest() == content[-object_id_bytes:]:
+            candidates.append(object_id_bytes)
+    if len(candidates) != 1:
+        raise PlanError(
+            f"{purpose} checksum does not identify exactly one supported object format"
+        )
+    return candidates[0]
 
 
-def capture_superproject_index_view(
+def parse_captured_superproject_index(
+    content: bytes,
+    object_id_bytes: int,
+    purpose: str,
+) -> ParsedCapturedSuperprojectIndex:
+    """Decode one exact v2/v3/v4 index byte string without reopening a path."""
+
+    if object_id_bytes not in {20, 32}:
+        raise PlanError(f"{purpose} uses an unsupported object format")
+    if len(content) < 12 + object_id_bytes:
+        raise PlanError(f"{purpose} is truncated")
+    body_end = len(content) - object_id_bytes
+    digest = hashlib.sha1() if object_id_bytes == 20 else hashlib.sha256()
+    digest.update(memoryview(content)[:body_end])
+    if digest.digest() != content[body_end:]:
+        raise PlanError(f"{purpose} checksum is invalid")
+    if content[:4] != b"DIRC":
+        raise PlanError(f"{purpose} has an invalid signature")
+    version = int.from_bytes(content[4:8], "big")
+    if version not in {2, 3, 4}:
+        raise PlanError(f"{purpose} uses an unsupported version: {version}")
+    entry_count = int.from_bytes(content[8:12], "big")
+    if entry_count > MAX_CHECKOUT_PATHS:
+        raise PlanError(
+            f"{purpose} exceeds the {MAX_CHECKOUT_PATHS}-entry safety limit"
+        )
+
+    offset = 12
+    prior_path: Optional[bytes] = None
+    expanded_path_bytes = 0
+    entries: list[CapturedSuperprojectIndexEntry] = []
+    fixed_prefix_bytes = 40 + object_id_bytes + 2
+    for _entry_index in range(entry_count):
+        entry_start = offset
+        if offset + fixed_prefix_bytes > body_end:
+            raise PlanError(f"{purpose} has a truncated entry")
+        mode = int.from_bytes(content[offset + 24 : offset + 28], "big")
+        object_start = offset + 40
+        object_end = object_start + object_id_bytes
+        object_id = content[object_start:object_end]
+        flags = int.from_bytes(content[object_end : object_end + 2], "big")
+        offset = object_end + 2
+        stage = (flags >> 12) & 0x3
+        if flags & 0x4000:
+            if version == 2 or offset + 2 > body_end:
+                raise PlanError(f"{purpose} has invalid extended entry flags")
+            extended_flags = int.from_bytes(content[offset : offset + 2], "big")
+            offset += 2
+            if extended_flags & ~0x6000:
+                raise PlanError(f"{purpose} has unsupported extended entry flags")
+
+        if version == 4:
+            strip_count, offset = decode_index_v4_strip_count(
+                content,
+                offset,
+                body_end,
+                purpose=purpose,
+            )
+            retained_path = prior_path or b""
+            if strip_count > len(retained_path):
+                raise PlanError(f"{purpose} has an invalid v4 path prefix")
+            suffix_end = content.find(b"\0", offset, body_end)
+            if suffix_end < 0:
+                raise PlanError(f"{purpose} has an unterminated v4 path")
+            retained_size = len(retained_path) - strip_count
+            suffix_size = suffix_end - offset
+            if retained_size + suffix_size > MAX_CHECKOUT_PATH_BYTES:
+                raise PlanError(f"{purpose} has an oversized v4 path")
+            raw_path = retained_path[:retained_size] + content[offset:suffix_end]
+            offset = suffix_end + 1
+        else:
+            path_end = content.find(b"\0", offset, body_end)
+            if path_end < 0:
+                raise PlanError(f"{purpose} has an unterminated path")
+            if path_end - offset > MAX_CHECKOUT_PATH_BYTES:
+                raise PlanError(f"{purpose} has an oversized path")
+            raw_path = content[offset:path_end]
+            relative_size = path_end + 1 - entry_start
+            padded_size = (relative_size + 7) & ~7
+            offset = entry_start + padded_size
+            if offset > body_end or any(content[path_end + 1 : offset]):
+                raise PlanError(f"{purpose} has invalid entry padding")
+
+        declared_length = flags & 0x0FFF
+        if declared_length != min(len(raw_path), 0x0FFF):
+            raise PlanError(f"{purpose} path length does not match its flags")
+        if raw_path:
+            validate_checkout_path(raw_path, purpose)
+            expanded_path_bytes += len(raw_path) + 1
+            if expanded_path_bytes > GIT_ENUMERATION_OUTPUT_LIMIT_BYTES:
+                raise PlanError(
+                    f"{purpose} paths exceed the "
+                    f"{GIT_ENUMERATION_OUTPUT_LIMIT_BYTES}-byte aggregate limit"
+                )
+        prior_path = raw_path
+        entries.append(
+            CapturedSuperprojectIndexEntry(
+                raw_path=raw_path,
+                mode=mode,
+                object_id=object_id,
+                stage=stage,
+            )
+        )
+
+    extensions: list[tuple[bytes, bytes]] = []
+    extension_count = 0
+    while offset < body_end:
+        extension_count += 1
+        if extension_count > MAX_CHECKOUT_PATHS:
+            raise PlanError(
+                f"{purpose} exceeds the {MAX_CHECKOUT_PATHS}-extension safety limit"
+            )
+        if offset + 8 > body_end:
+            raise PlanError(f"{purpose} has a truncated extension")
+        signature = content[offset : offset + 4]
+        extension_size = int.from_bytes(content[offset + 4 : offset + 8], "big")
+        offset += 8
+        extension_end = offset + extension_size
+        if extension_end > body_end:
+            raise PlanError(f"{purpose} has an oversized extension")
+        if signature == b"sdir":
+            raise PlanError(f"{purpose} uses unsupported sparse-index entry semantics")
+        if signature != b"link" and not 0x41 <= signature[0] <= 0x5A:
+            raise PlanError(
+                f"{purpose} uses an unsupported mandatory extension: {signature!r}"
+            )
+        if signature == b"link":
+            maximum_ewah_words = ((MAX_CHECKOUT_PATHS + 63) // 64) * 2 + 1
+            maximum_link_bytes = object_id_bytes + 2 * (12 + maximum_ewah_words * 8)
+            if extension_size > maximum_link_bytes:
+                raise PlanError(f"{purpose} link extension exceeds its safety limit")
+            extensions.append((signature, content[offset:extension_end]))
+        offset = extension_end
+    return ParsedCapturedSuperprojectIndex(
+        object_id_bytes=object_id_bytes,
+        entries=tuple(entries),
+        extensions=tuple(extensions),
+    )
+
+
+def require_canonical_captured_index_entries(
+    entries: tuple[CapturedSuperprojectIndexEntry, ...],
+    purpose: str,
+) -> None:
+    prior_key: Optional[tuple[bytes, int]] = None
+    for entry in entries:
+        if not entry.raw_path:
+            raise PlanError(
+                f"{purpose} contains an empty path outside split replacement"
+            )
+        key = (entry.raw_path, entry.stage)
+        if prior_key is not None and key == prior_key:
+            raise PlanError(f"{purpose} contains a duplicate path and stage")
+        if prior_key is not None and key < prior_key:
+            raise PlanError(f"{purpose} entries are not in canonical order")
+        prior_key = key
+
+
+def decode_captured_ewah_set_bits(
+    payload: bytes,
+    offset: int,
+    maximum_bits: int,
+    purpose: str,
+) -> tuple[tuple[int, ...], int]:
+    if offset + 8 > len(payload):
+        raise PlanError(f"{purpose} is truncated before its EWAH header")
+    bit_size = int.from_bytes(payload[offset : offset + 4], "big")
+    word_count = int.from_bytes(payload[offset + 4 : offset + 8], "big")
+    maximum_words = max(1, ((maximum_bits + 63) // 64) * 2 + 1)
+    if word_count == 0 or word_count > maximum_words:
+        raise PlanError(f"{purpose} has an invalid EWAH word count")
+    words_start = offset + 8
+    words_end = words_start + word_count * 8
+    serialized_end = words_end + 4
+    if serialized_end > len(payload):
+        raise PlanError(f"{purpose} is truncated in its EWAH words")
+    rlw_position = int.from_bytes(payload[words_end:serialized_end], "big")
+    if rlw_position >= word_count:
+        raise PlanError(f"{purpose} has an invalid EWAH RLW position")
+    if bit_size > maximum_bits:
+        raise PlanError(f"{purpose} exceeds the shared-index entry count")
+
+    encoded_ceiling = ((bit_size + 63) // 64) * 64
+    set_bits: list[int] = []
+    word_position = 0
+    pointer = 0
+    last_rlw_position = -1
+    while pointer < word_count:
+        last_rlw_position = pointer
+        word_offset = words_start + pointer * 8
+        rlw = int.from_bytes(payload[word_offset : word_offset + 8], "big")
+        run_bit = rlw & 1
+        running_words = (rlw >> 1) & 0xFFFFFFFF
+        literal_words = rlw >> 33
+        if pointer + 1 + literal_words > word_count:
+            raise PlanError(f"{purpose} has truncated EWAH literal words")
+
+        run_end = word_position + running_words * 64
+        if run_end > encoded_ceiling:
+            raise PlanError(f"{purpose} has an oversized EWAH run")
+        if run_bit:
+            if run_end > bit_size or run_end > maximum_bits:
+                raise PlanError(f"{purpose} sets an out-of-range EWAH bit")
+            set_bits.extend(range(word_position, run_end))
+        word_position = run_end
+        pointer += 1
+
+        for _literal_index in range(literal_words):
+            literal_offset = words_start + pointer * 8
+            literal = int.from_bytes(
+                payload[literal_offset : literal_offset + 8],
+                "big",
+            )
+            while literal:
+                lowest = literal & -literal
+                bit = word_position + lowest.bit_length() - 1
+                if bit >= bit_size or bit >= maximum_bits:
+                    raise PlanError(f"{purpose} sets an out-of-range EWAH bit")
+                set_bits.append(bit)
+                literal ^= lowest
+            word_position += 64
+            if word_position > encoded_ceiling:
+                raise PlanError(f"{purpose} has oversized EWAH literal coverage")
+            pointer += 1
+
+    if last_rlw_position != rlw_position:
+        raise PlanError(f"{purpose} has a mismatched EWAH RLW position")
+    if bit_size > word_position:
+        raise PlanError(f"{purpose} has incomplete EWAH bit coverage")
+    return tuple(set_bits), serialized_end
+
+
+def parse_captured_split_index_link(
+    payload: bytes,
+    object_id_bytes: int,
+    shared_entry_count: int,
+) -> tuple[bytes, tuple[int, ...], tuple[int, ...]]:
+    if len(payload) < object_id_bytes:
+        raise PlanError("captured superproject split-index link is truncated")
+    shared_checksum = payload[:object_id_bytes]
+    offset = object_id_bytes
+    if offset == len(payload):
+        return shared_checksum, (), ()
+    delete_bits, offset = decode_captured_ewah_set_bits(
+        payload,
+        offset,
+        shared_entry_count,
+        "captured superproject split-index delete bitmap",
+    )
+    replace_bits, offset = decode_captured_ewah_set_bits(
+        payload,
+        offset,
+        shared_entry_count,
+        "captured superproject split-index replace bitmap",
+    )
+    if offset != len(payload):
+        raise PlanError(
+            "captured superproject split-index link has trailing bitmap bytes"
+        )
+    if set(delete_bits).intersection(replace_bits):
+        raise PlanError(
+            "captured superproject split-index entry is both replaced and deleted"
+        )
+    return shared_checksum, delete_bits, replace_bits
+
+
+def captured_superproject_index_entries(
     bindings: tuple[FileContentBinding, ...],
     contents: tuple[bytes, ...],
-) -> SuperprojectIndexView:
-    names = superproject_index_view_names(bindings)
+) -> tuple[CapturedSuperprojectIndexEntry, ...]:
+    """Derive final index semantics solely from already-bound exact bytes."""
+
+    names = superproject_index_snapshot_names(bindings)
     if len(contents) != len(bindings):
         raise PlanError("superproject index snapshot has an invalid content set")
     for binding, content in zip(bindings, contents):
@@ -6496,86 +6732,134 @@ def capture_superproject_index_view(
                 "superproject index snapshot bytes do not match their binding"
             )
 
-    with ExitStack() as cleanup:
-        guard = OwnerPrivateTemporaryDirectory(
-            prefix="submodule-worktree-superproject-index."
+    if len(bindings) == 2:
+        shared_hex = names[1].removeprefix("sharedindex.")
+        object_id_bytes = len(shared_hex) // 2
+    else:
+        object_id_bytes = captured_superproject_index_object_id_bytes(
+            contents[0],
+            "captured superproject primary index",
         )
-        cleanup.callback(guard.cleanup)
-        private_root = Path(guard.name).resolve(strict=True)
-        private_paths = tuple(private_root / name for name in names)
-        for private_path, content in zip(private_paths, contents):
-            write_owner_private_file(
-                private_path,
-                content,
-                "isolated superproject index",
-                final_mode=0o400,
-            )
-
-        private_root_binding = capture_owner_private_directory(
-            private_root,
-            "isolated superproject index directory",
+    primary = parse_captured_superproject_index(
+        contents[0],
+        object_id_bytes,
+        "captured superproject primary index",
+    )
+    link_payloads = tuple(
+        payload for signature, payload in primary.extensions if signature == b"link"
+    )
+    if len(link_payloads) > 1:
+        raise PlanError(
+            "captured superproject primary index contains duplicate link extensions"
         )
-        directory_lease = capture_directory_entry_lease(
-            private_root_binding.path,
-            private_root_binding.mode,
-            private_root_binding.purpose,
-        )
-        cleanup.callback(directory_lease.close)
-        if directory_lease.binding.fingerprint != private_root_binding.fingerprint:
+    if not link_payloads:
+        if len(bindings) != 1:
             raise PlanError(
-                "isolated superproject index directory changed during binding"
+                "captured superproject shared-index path lacks a primary link"
             )
-
-        digest_file_leases: list[DescriptorBoundDigestFileLease] = []
-        for private_path, source_binding in zip(private_paths, bindings):
-            descriptor, private_binding, content = open_bound_regular_file_at(
-                directory_lease.descriptor,
-                private_path.name,
-                private_path,
-                maximum_bytes=MAX_SUPERPROJECT_INDEX_BYTES,
-                mode=os.R_OK,
-                purpose="isolated superproject index",
-                retain_content=False,
-            )
-            cleanup.callback(os.close, descriptor)
-            if content is not None:
-                raise PlanError(
-                    "isolated superproject index retained unexpected content"
-                )
-            if (
-                private_binding.size != source_binding.size
-                or private_binding.content_sha256 != source_binding.content_sha256
-                or private_binding.fingerprint.owner != os.geteuid()
-                or private_binding.fingerprint.permissions != 0o400
-            ):
-                raise PlanError(
-                    "isolated superproject index changed during private binding"
-                )
-            digest_file_leases.append(
-                DescriptorBoundDigestFileLease(
-                    directory_binding=directory_lease.binding,
-                    directory_descriptor=directory_lease.descriptor,
-                    entry_name=private_path.name,
-                    descriptor=descriptor,
-                    binding=private_binding,
-                )
-            )
-
-        exact_inventory_lease = capture_directory_exact_inventory_lease(
-            directory_lease,
-            names,
-            "isolated superproject index inventory",
+        require_canonical_captured_index_entries(
+            primary.entries,
+            "captured superproject primary index",
         )
-        view = SuperprojectIndexView(
-            private_index_path=private_paths[0],
-            directory_lease=directory_lease,
-            exact_inventory_lease=exact_inventory_lease,
-            digest_file_leases=tuple(digest_file_leases),
-            guard=guard,
+        return primary.entries
+
+    raw_shared_checksum = link_payloads[0][:object_id_bytes]
+    if len(raw_shared_checksum) != object_id_bytes:
+        raise PlanError("captured superproject split-index link is truncated")
+    if raw_shared_checksum == bytes(object_id_bytes):
+        if len(bindings) != 1:
+            raise PlanError(
+                "captured superproject null split-index link has a shared path"
+            )
+        shared_entries: tuple[CapturedSuperprojectIndexEntry, ...] = ()
+    else:
+        if len(bindings) != 2:
+            raise PlanError(
+                "captured superproject split-index link requires a shared index"
+            )
+        expected_shared_name = f"sharedindex.{raw_shared_checksum.hex()}"
+        if names[1] != expected_shared_name:
+            raise PlanError(
+                "captured superproject shared-index name does not match its link"
+            )
+        shared = parse_captured_superproject_index(
+            contents[1],
+            object_id_bytes,
+            "captured superproject shared index",
         )
-        revalidate_superproject_index_view(view)
-        cleanup.pop_all()
-        return view
+        if any(signature == b"link" for signature, _payload in shared.extensions):
+            raise PlanError(
+                "captured superproject shared index contains a nested link extension"
+            )
+        if contents[1][-object_id_bytes:] != raw_shared_checksum:
+            raise PlanError(
+                "captured superproject shared-index checksum does not match its link"
+            )
+        require_canonical_captured_index_entries(
+            shared.entries,
+            "captured superproject shared index",
+        )
+        shared_entries = shared.entries
+
+    shared_checksum, delete_bits, replace_bits = parse_captured_split_index_link(
+        link_payloads[0],
+        object_id_bytes,
+        len(shared_entries),
+    )
+    if shared_checksum != raw_shared_checksum:
+        raise PlanError("captured superproject split-index link changed while parsing")
+    if len(replace_bits) > len(primary.entries):
+        raise PlanError(
+            "captured superproject split-index has too many replacement bits"
+        )
+
+    replacements = primary.entries[: len(replace_bits)]
+    additions = primary.entries[len(replace_bits) :]
+    if any(entry.raw_path for entry in replacements):
+        raise PlanError(
+            "captured superproject split-index replacement has a nonempty path"
+        )
+    if any(not entry.raw_path for entry in additions):
+        raise PlanError("captured superproject split-index addition has an empty path")
+    require_canonical_captured_index_entries(
+        additions,
+        "captured superproject split-index additions",
+    )
+
+    overlaid = list(shared_entries)
+    for position, replacement in zip(replace_bits, replacements):
+        shared_entry = overlaid[position]
+        overlaid[position] = CapturedSuperprojectIndexEntry(
+            raw_path=shared_entry.raw_path,
+            mode=replacement.mode,
+            object_id=replacement.object_id,
+            stage=replacement.stage,
+        )
+    deleted = set(delete_bits)
+    merged = [
+        entry for position, entry in enumerate(overlaid) if position not in deleted
+    ]
+    merged.extend(additions)
+    if len(merged) > MAX_CHECKOUT_PATHS:
+        raise PlanError(
+            "captured superproject split index exceeds the "
+            f"{MAX_CHECKOUT_PATHS}-entry safety limit"
+        )
+    merged.sort(key=lambda entry: (entry.raw_path, entry.stage))
+    result = tuple(merged)
+    require_canonical_captured_index_entries(
+        result,
+        "captured superproject merged split index",
+    )
+    if (
+        sum(len(entry.raw_path) + 1 for entry in result)
+        > GIT_ENUMERATION_OUTPUT_LIMIT_BYTES
+    ):
+        raise PlanError(
+            "captured superproject merged split-index paths exceed the "
+            f"{GIT_ENUMERATION_OUTPUT_LIMIT_BYTES}-byte aggregate limit"
+        )
+    return result
 
 
 def selected_gitlink_rows(
@@ -6584,137 +6868,60 @@ def selected_gitlink_rows(
     index_bindings: tuple[FileContentBinding, ...],
     index_contents: tuple[bytes, ...],
 ) -> tuple[tuple[str, str], ...]:
-    view = capture_superproject_index_view(index_bindings, index_contents)
-    outcome_exception: Optional[BaseException] = None
-    try:
-        return selected_gitlink_rows_from_view(root, selected_paths, view)
-    except BaseException as exc:
-        outcome_exception = exc
-        raise
-    finally:
-        finish_explicit_cleanup(
-            view.close,
-            outcome_exception=outcome_exception,
-            purpose="superproject index query view",
-            recovery_identity=str(view.directory_lease.path),
-        )
-
-
-def selected_gitlink_rows_from_view(
-    root: Path,
-    selected_paths: tuple[str, ...],
-    view: SuperprojectIndexView,
-) -> tuple[tuple[str, str], ...]:
-    revalidate_superproject_index_view(view)
+    del root
     if not selected_paths:
         raise PlanError("cannot bind an empty selected-gitlink set")
+    if len(selected_paths) > MAX_CHECKOUT_PATHS:
+        raise PlanError(
+            "selected gitlink lookup exceeds the "
+            f"{MAX_CHECKOUT_PATHS}-entry safety limit"
+        )
     expected_raw: dict[bytes, str] = {}
-    batches: list[list[str]] = []
-    batch: list[str] = []
-    batch_bytes = 0
+    selected_path_bytes = 0
     for path in selected_paths:
         raw_path = os.fsencode(path)
         if raw_path in expected_raw:
             raise PlanError(f"duplicate selected gitlink path: {path}")
         expected_raw[raw_path] = path
-        path_bytes = len(raw_path) + 1
-        if path_bytes > MAX_GIT_PATHSPEC_ARG_BYTES:
+        if len(raw_path) + 1 > MAX_GIT_PATHSPEC_ARG_BYTES:
             raise PlanError(f"selected gitlink pathspec is too large: {path}")
-        if batch and (
-            batch_bytes + path_bytes > MAX_GIT_PATHSPEC_ARG_BYTES
-            or len(batch) >= MAX_GIT_PATHSPECS_PER_BATCH
-        ):
-            batches.append(batch)
-            batch = []
-            batch_bytes = 0
-        batch.append(path)
-        batch_bytes += path_bytes
-    if batch:
-        batches.append(batch)
-    if len(batches) > MAX_GIT_PATHSPEC_BATCHES:
-        raise PlanError(
-            "selected gitlink lookup exceeds the "
-            f"{MAX_GIT_PATHSPEC_BATCHES}-batch safety limit"
-        )
-    rows: dict[str, str] = {}
-    retained_bytes = 0
-    deadline = time.monotonic() + GIT_ENUMERATION_TIMEOUT_SECONDS
-    for batch_paths in batches:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise PlanError("selected gitlink lookup exceeded its deadline")
-        retained_limit = GIT_ENUMERATION_OUTPUT_LIMIT_BYTES - retained_bytes
-        if retained_limit <= 0:
+        selected_path_bytes += len(raw_path) + 1
+        if selected_path_bytes > GIT_ENUMERATION_OUTPUT_LIMIT_BYTES:
             raise PlanError(
-                "selected gitlink rows exceed the "
+                "selected gitlink paths exceed the "
                 f"{GIT_ENUMERATION_OUTPUT_LIMIT_BYTES}-byte aggregate limit"
             )
-        result = read_git_bounded(
-            [
-                "-C",
-                str(root),
-                "ls-files",
-                "-s",
-                "--full-name",
-                "-z",
-                "--",
-                *batch_paths,
-            ],
-            stdout_limit=retained_limit,
-            timeout_seconds=remaining,
-            extra_env={"GIT_INDEX_FILE": str(view.private_index_path)},
-            directory_identity_leases=(view.directory_lease,),
-            directory_exact_inventory_leases=(view.exact_inventory_lease,),
-            digest_file_leases=view.digest_file_leases,
-        )
-        revalidate_superproject_index_view(view)
-        retained_bytes += len(result.stdout)
-        for record in bounded_records(
-            result.stdout,
-            "selected superproject gitlink rows",
-            maximum_records=len(batch_paths) * 4,
-        ):
-            try:
-                metadata, raw_path = record.split(b"\t", 1)
-            except ValueError as exc:
-                raise PlanError(
-                    "superproject index returned an invalid gitlink row"
-                ) from exc
-            fields = metadata.split()
-            if len(fields) != 3:
-                raise PlanError("superproject index returned invalid gitlink metadata")
-            mode, raw_object_id, raw_stage = fields
-            selected_path = expected_raw.get(raw_path)
-            if selected_path is None:
-                raise PlanError(
-                    "superproject index returned an unrequested gitlink path"
-                )
-            if selected_path in rows:
-                raise PlanError(
-                    f"{selected_path} has unresolved index entries; "
-                    "resolve conflicts before syncing"
-                )
-            object_id = os.fsdecode(raw_object_id)
-            stage = os.fsdecode(raw_stage)
-            if mode != b"160000":
-                raise PlanError(
-                    f"{selected_path} is not a gitlink in the current index"
-                )
-            if stage != "0":
-                raise PlanError(
-                    f"{selected_path} has unresolved index stage {stage}; "
-                    "resolve conflicts before syncing"
-                )
-            if not re.fullmatch(r"[0-9a-f]+", object_id):
-                raise PlanError(
-                    f"{selected_path} has an invalid gitlink object id in the index"
-                )
-            rows[selected_path] = object_id
-    missing = [path for path in selected_paths if path not in rows]
-    if missing:
-        raise PlanError(f"{missing[0]} is not a gitlink in the current index")
-    revalidate_superproject_index_view(view)
-    return tuple((path, rows[path]) for path in selected_paths)
+    matches: dict[bytes, list[CapturedSuperprojectIndexEntry]] = {
+        raw_path: [] for raw_path in expected_raw
+    }
+    for entry in captured_superproject_index_entries(
+        index_bindings,
+        index_contents,
+    ):
+        selected = matches.get(entry.raw_path)
+        if selected is not None:
+            selected.append(entry)
+
+    rows: list[tuple[str, str]] = []
+    for path in selected_paths:
+        raw_path = os.fsencode(path)
+        selected = matches[raw_path]
+        if not selected:
+            raise PlanError(f"{path} is not a gitlink in the current index")
+        if len(selected) != 1:
+            raise PlanError(
+                f"{path} has unresolved index entries; resolve conflicts before syncing"
+            )
+        entry = selected[0]
+        if entry.mode != 0o160000:
+            raise PlanError(f"{path} is not a gitlink in the current index")
+        if entry.stage != 0:
+            raise PlanError(
+                f"{path} has unresolved index stage {entry.stage}; "
+                "resolve conflicts before syncing"
+            )
+        rows.append((path, entry.object_id.hex()))
+    return tuple(rows)
 
 
 def capture_superproject_index_receipt(
@@ -13423,24 +13630,22 @@ def decode_index_v4_strip_count(
     content: bytes,
     offset: int,
     body_end: int,
+    *,
+    purpose: str = "captured managed worktree index",
 ) -> tuple[int, int]:
     if offset >= body_end:
-        raise PlanError("captured managed worktree index has a truncated v4 path")
+        raise PlanError(f"{purpose} has a truncated v4 path")
     byte = content[offset]
     offset += 1
     value = byte & 0x7F
     while byte & 0x80:
         if offset >= body_end:
-            raise PlanError(
-                "captured managed worktree index has a truncated v4 path offset"
-            )
+            raise PlanError(f"{purpose} has a truncated v4 path offset")
         byte = content[offset]
         offset += 1
         value = ((value + 1) << 7) | (byte & 0x7F)
         if value > MAX_CHECKOUT_PATH_BYTES:
-            raise PlanError(
-                "captured managed worktree index has an oversized v4 path offset"
-            )
+            raise PlanError(f"{purpose} has an oversized v4 path offset")
     return value, offset
 
 

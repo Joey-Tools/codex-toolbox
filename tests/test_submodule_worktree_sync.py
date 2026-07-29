@@ -4660,7 +4660,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 completeness,
             )
 
-    def test_expected_sha_reads_the_bound_private_index(self) -> None:
+    def test_expected_sha_reads_the_captured_index_bytes(self) -> None:
         target, module, _receipt = self.make_target_superproject(
             "expected-sha-target",
             self.sha,
@@ -4752,7 +4752,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 receipt.superproject_index,
             )
 
-    def test_superproject_gitlink_queries_ignore_same_inode_valid_index_aba(
+    def test_superproject_gitlink_parser_ignores_same_inode_valid_index_aba(
         self,
     ) -> None:
         target, module, initial_receipt = self.make_target_superproject(
@@ -4788,62 +4788,63 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertNotEqual(attacker_index, original_index)
         self.assertEqual(index_path.stat().st_ino, original_stat.st_ino)
 
-        original_popen = MODULE.subprocess.Popen
-        query_count = 0
-        private_roots: list[Path] = []
+        original_parser = MODULE.parse_captured_superproject_index
+        original_read_git_bounded = MODULE.read_git_bounded
+        parse_count = 0
 
-        def run_gitlink_query_during_live_index_aba(
-            *args: object,
-            **kwargs: object,
-        ) -> object:
-            nonlocal query_count
-            command = args[0] if args else kwargs.get("args")
-            if isinstance(command, (list, tuple)) and "ls-files" in command:
-                environment = kwargs.get("env")
-                self.assertIsInstance(environment, dict)
-                assert isinstance(environment, dict)
-                private_index = Path(environment["GIT_INDEX_FILE"])
-                self.assertTrue(private_index.is_absolute())
-                self.assertNotEqual(private_index, index_path)
-                self.assertEqual(private_index.read_bytes(), original_index)
-                private_roots.append(private_index.parent)
-
-                index_path.write_bytes(attacker_index)
-                attack_stat = index_path.stat()
-                self.assertEqual(attack_stat.st_ino, original_stat.st_ino)
-                self.assertEqual(attack_stat.st_size, original_stat.st_size)
-                process = original_popen(*args, **kwargs)
-                try:
-                    process.wait(timeout=10)
-                finally:
-                    index_path.write_bytes(original_index)
+        def parse_during_live_index_aba(
+            content: bytes,
+            object_id_bytes: int,
+            purpose: str,
+        ) -> MODULE.ParsedCapturedSuperprojectIndex:
+            nonlocal parse_count
+            self.assertEqual(purpose, "captured superproject primary index")
+            self.assertEqual(content, original_index)
+            index_path.write_bytes(attacker_index)
+            attack_stat = index_path.stat()
+            self.assertEqual(attack_stat.st_ino, original_stat.st_ino)
+            self.assertEqual(attack_stat.st_size, original_stat.st_size)
+            try:
+                parsed = original_parser(content, object_id_bytes, purpose)
+                self.assertEqual(index_path.read_bytes(), attacker_index)
+                return parsed
+            finally:
+                index_path.write_bytes(original_index)
                 restored_stat = index_path.stat()
                 self.assertEqual(restored_stat.st_ino, original_stat.st_ino)
                 self.assertEqual(restored_stat.st_size, original_stat.st_size)
-                query_count += 1
-                return process
-            return original_popen(*args, **kwargs)
+                parse_count += 1
+
+        def forbid_ls_files(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            self.assertNotIn("ls-files", args)
+            return original_read_git_bounded(args, **kwargs)
 
         with mock.patch.object(
-            MODULE.subprocess,
-            "Popen",
-            side_effect=run_gitlink_query_during_live_index_aba,
+            MODULE,
+            "parse_captured_superproject_index",
+            side_effect=parse_during_live_index_aba,
         ):
-            receipt = MODULE.capture_superproject_index_receipt(
-                target,
-                (module.path,),
-            )
-            self.assertEqual(
-                receipt.selected_gitlinks,
-                ((module.path, self.sha),),
-            )
-            MODULE.revalidate_superproject_index_receipt(target, receipt)
+            with mock.patch.object(
+                MODULE,
+                "read_git_bounded",
+                side_effect=forbid_ls_files,
+            ):
+                receipt = MODULE.capture_superproject_index_receipt(
+                    target,
+                    (module.path,),
+                )
+                self.assertEqual(
+                    receipt.selected_gitlinks,
+                    ((module.path, self.sha),),
+                )
+                MODULE.revalidate_superproject_index_receipt(target, receipt)
 
-        self.assertEqual(query_count, 3)
+        self.assertEqual(parse_count, 3)
         self.assertEqual(index_path.read_bytes(), original_index)
         self.assertEqual(index_path.stat().st_ino, original_stat.st_ino)
-        self.assertTrue(private_roots)
-        self.assertTrue(all(not path.exists() for path in private_roots))
 
     def test_split_superproject_index_receipt_binds_shared_index_drift(
         self,
@@ -4856,49 +4857,29 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         index_paths = MODULE.superproject_index_paths(target)
         self.assertEqual(len(index_paths), 2)
         primary_index, shared_index = index_paths
-        original_read_git_bounded = MODULE.read_git_bounded
-        private_roots: list[Path] = []
+        original_parser = MODULE.captured_superproject_index_entries
+        parser_inputs: list[tuple[bytes, ...]] = []
 
-        def observe_private_split_index(
-            args: list[str],
-            **kwargs: object,
-        ) -> subprocess.CompletedProcess[bytes]:
-            if "ls-files" in args:
-                extra_env = kwargs.get("extra_env")
-                self.assertIsInstance(extra_env, dict)
-                assert isinstance(extra_env, dict)
-                private_index = Path(extra_env["GIT_INDEX_FILE"])
-                private_shared = private_index.parent / shared_index.name
-                self.assertNotEqual(private_index, primary_index)
-                self.assertEqual(
-                    private_index.read_bytes(),
-                    primary_index.read_bytes(),
-                )
-                self.assertEqual(
-                    private_shared.read_bytes(),
-                    shared_index.read_bytes(),
-                )
-                inventory_leases = kwargs.get("directory_exact_inventory_leases")
-                self.assertIsInstance(inventory_leases, tuple)
-                assert isinstance(inventory_leases, tuple)
-                self.assertEqual(
-                    tuple(name for name, _fingerprint in inventory_leases[0].entries),
-                    ("index", shared_index.name),
-                )
-                private_roots.append(private_index.parent)
-            return original_read_git_bounded(args, **kwargs)
+        def observe_captured_split_index(
+            bindings: tuple[MODULE.FileContentBinding, ...],
+            contents: tuple[bytes, ...],
+        ) -> tuple[MODULE.CapturedSuperprojectIndexEntry, ...]:
+            self.assertEqual(tuple(binding.path for binding in bindings), index_paths)
+            self.assertEqual(contents[0], primary_index.read_bytes())
+            self.assertEqual(contents[1], shared_index.read_bytes())
+            parser_inputs.append(contents)
+            return original_parser(bindings, contents)
 
         with mock.patch.object(
             MODULE,
-            "read_git_bounded",
-            side_effect=observe_private_split_index,
+            "captured_superproject_index_entries",
+            side_effect=observe_captured_split_index,
         ):
             index_receipt = MODULE.capture_superproject_index_receipt(
                 target,
                 (module.path,),
             )
-        self.assertEqual(len(private_roots), 2)
-        self.assertTrue(all(not path.exists() for path in private_roots))
+        self.assertEqual(len(parser_inputs), 2)
         self.assertEqual(len(index_receipt.index_bindings), 2)
         shared_binding = index_receipt.index_bindings[1]
         self.assertTrue(shared_binding.path.name.startswith("sharedindex."))
@@ -4933,6 +4914,166 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             ):
                 MODULE.apply_sync_plan(plan)
         add.assert_not_called()
+
+    def test_captured_superproject_index_supports_v2_v3_and_v4(self) -> None:
+        target, module, _receipt = self.make_target_superproject(
+            "captured-index-versions-target",
+            self.sha,
+        )
+        for version in (2, 3, 4):
+            if version == 3:
+                run_git(target, "update-index", "--skip-worktree", ".gitmodules")
+            else:
+                run_git(target, "update-index", "--no-skip-worktree", ".gitmodules")
+            run_git(target, "update-index", "--index-version", str(version))
+            index_paths = MODULE.superproject_index_paths(target)
+            self.assertEqual(len(index_paths), 1)
+            bindings, contents = MODULE.capture_superproject_index_snapshot(index_paths)
+            self.assertEqual(int.from_bytes(contents[0][4:8], "big"), version)
+            self.assertEqual(
+                MODULE.selected_gitlink_rows(
+                    target,
+                    (module.path,),
+                    bindings,
+                    contents,
+                ),
+                ((module.path, self.sha),),
+            )
+
+    def test_captured_superproject_index_supports_sha256_and_split_index(
+        self,
+    ) -> None:
+        target = self.root / "captured-sha256-index-target"
+        run_git(self.root, "init", "--object-format=sha256", str(target))
+        run_git(target, "config", "user.name", "Test User")
+        run_git(target, "config", "user.email", "test@example.com")
+        run_git(target, "commit", "--allow-empty", "-m", "sha256 index")
+        initial_sha = run_git(target, "rev-parse", "HEAD")
+        self.assertEqual(len(initial_sha), 64)
+        module_path = "modules/sha256"
+        run_git(
+            target,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{initial_sha},{module_path}",
+        )
+        self.assertEqual(
+            MODULE.capture_superproject_index_receipt(
+                target,
+                (module_path,),
+            ).selected_gitlinks,
+            ((module_path, initial_sha),),
+        )
+
+        run_git(target, "config", "splitIndex.maxPercentChange", "100")
+        run_git(target, "update-index", "--split-index")
+        replacement_sha = "f" * 64
+        run_git(
+            target,
+            "update-index",
+            "--cacheinfo",
+            f"160000,{replacement_sha},{module_path}",
+        )
+        index_paths = MODULE.superproject_index_paths(target)
+        self.assertEqual(len(index_paths), 2)
+        self.assertRegex(index_paths[1].name, r"^sharedindex\.[0-9a-f]{64}$")
+        self.assertEqual(
+            MODULE.capture_superproject_index_receipt(
+                target,
+                (module_path,),
+            ).selected_gitlinks,
+            ((module_path, replacement_sha),),
+        )
+
+    def test_captured_split_index_applies_delete_replace_and_add_overlays(
+        self,
+    ) -> None:
+        target, module, _receipt = self.make_target_superproject(
+            "captured-split-overlay-target",
+            self.sha,
+        )
+        shared_paths = tuple(f"modules/entry-{index:03d}" for index in range(130))
+        delete_path = shared_paths[65]
+        keep_path = shared_paths[64]
+        added_path = "modules/added"
+        subprocess.run(
+            ["git", "-c", "commit.gpgsign=false", "update-index", "--index-info"],
+            cwd=target,
+            input="".join(f"160000 {self.sha} 0\t{path}\n" for path in shared_paths),
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        run_git(target, "config", "splitIndex.maxPercentChange", "100")
+        run_git(target, "update-index", "--split-index")
+        replacement_sha = "f" * len(self.sha)
+        added_sha = "e" * len(self.sha)
+        run_git(
+            target,
+            "update-index",
+            "--cacheinfo",
+            f"160000,{replacement_sha},{module.path}",
+        )
+        run_git(target, "update-index", "--force-remove", delete_path)
+        run_git(
+            target,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{added_sha},{added_path}",
+        )
+
+        index_paths = MODULE.superproject_index_paths(target)
+        self.assertEqual(len(index_paths), 2)
+        bindings, contents = MODULE.capture_superproject_index_snapshot(index_paths)
+        object_id_bytes = len(index_paths[1].name.removeprefix("sharedindex.")) // 2
+        primary = MODULE.parse_captured_superproject_index(
+            contents[0],
+            object_id_bytes,
+            "test split primary index",
+        )
+        shared = MODULE.parse_captured_superproject_index(
+            contents[1],
+            object_id_bytes,
+            "test split shared index",
+        )
+        link_payloads = tuple(
+            payload for signature, payload in primary.extensions if signature == b"link"
+        )
+        self.assertEqual(len(link_payloads), 1)
+        _shared_checksum, delete_bits, replace_bits = (
+            MODULE.parse_captured_split_index_link(
+                link_payloads[0],
+                object_id_bytes,
+                len(shared.entries),
+            )
+        )
+        self.assertTrue(delete_bits)
+        self.assertTrue(replace_bits)
+        self.assertGreater(max(delete_bits), 64)
+        self.assertGreater(max(replace_bits), 64)
+        self.assertEqual(
+            MODULE.selected_gitlink_rows(
+                target,
+                (module.path, keep_path, added_path),
+                bindings,
+                contents,
+            ),
+            (
+                (module.path, replacement_sha),
+                (keep_path, self.sha),
+                (added_path, added_sha),
+            ),
+        )
+        with self.assertRaisesRegex(MODULE.PlanError, "is not a gitlink"):
+            MODULE.selected_gitlink_rows(
+                target,
+                (delete_path,),
+                bindings,
+                contents,
+            )
 
     def test_index_drift_blocks_authorized_fetch_before_source_mutation(self) -> None:
         (self.remote / "INDEX-FETCH.md").write_text(
