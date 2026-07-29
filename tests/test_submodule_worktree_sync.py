@@ -4660,47 +4660,34 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 completeness,
             )
 
-    def test_expected_sha_rejects_unmerged_index_entries(self) -> None:
-        original_git = MODULE.git
-
-        def fake_git(
-            args: list[str], *, cwd: Path | None = None, check: bool = True
-        ) -> str:
-            self.assertEqual(
-                args[:4], ["ls-files", "-s", "--", "third_party/libexample"]
-            )
-            return "\n".join(
-                [
-                    f"160000 {'a' * 40} 1\tthird_party/libexample",
-                    f"160000 {'b' * 40} 2\tthird_party/libexample",
-                    f"160000 {'c' * 40} 3\tthird_party/libexample",
-                ]
-            )
-
-        try:
-            MODULE.git = fake_git
-            with self.assertRaisesRegex(MODULE.PlanError, "unresolved index entries"):
-                MODULE.expected_sha(self.root, "third_party/libexample")
-        finally:
-            MODULE.git = original_git
+    def test_expected_sha_reads_the_bound_private_index(self) -> None:
+        target, module, _receipt = self.make_target_superproject(
+            "expected-sha-target",
+            self.sha,
+        )
+        self.assertEqual(
+            MODULE.expected_sha(target, module.path),
+            self.sha,
+        )
 
     def test_expected_sha_rejects_nonzero_index_stage(self) -> None:
-        original_git = MODULE.git
+        target, module, _receipt = self.make_target_superproject(
+            "expected-sha-stage-target",
+            self.sha,
+        )
+        run_git(target, "update-index", "--force-remove", module.path)
+        subprocess.run(
+            ["git", "-c", "commit.gpgsign=false", "update-index", "--index-info"],
+            cwd=target,
+            input=f"160000 {self.sha} 2\t{module.path}\n",
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
-        def fake_git(
-            args: list[str], *, cwd: Path | None = None, check: bool = True
-        ) -> str:
-            self.assertEqual(
-                args[:4], ["ls-files", "-s", "--", "third_party/libexample"]
-            )
-            return f"160000 {'a' * 40} 2\tthird_party/libexample"
-
-        try:
-            MODULE.git = fake_git
-            with self.assertRaisesRegex(MODULE.PlanError, "unresolved index stage 2"):
-                MODULE.expected_sha(self.root, "third_party/libexample")
-        finally:
-            MODULE.git = original_git
+        with self.assertRaisesRegex(MODULE.PlanError, "unresolved index stage 2"):
+            MODULE.expected_sha(target, module.path)
 
     def test_superproject_index_receipt_binds_identity_content_and_gitlink_rows(
         self,
@@ -4765,6 +4752,99 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 receipt.superproject_index,
             )
 
+    def test_superproject_gitlink_queries_ignore_same_inode_valid_index_aba(
+        self,
+    ) -> None:
+        target, module, initial_receipt = self.make_target_superproject(
+            "gitlink-index-aba-target",
+            self.sha,
+        )
+        index_path = initial_receipt.superproject_index.index_bindings[0].path
+        original_index = index_path.read_bytes()
+        original_stat = index_path.stat()
+        attacker_sha = "f" * len(self.sha)
+        attacker_path = index_path.with_name("index.attacker")
+        attacker_path.write_bytes(original_index)
+        attacker_environment = os.environ.copy()
+        attacker_environment["GIT_INDEX_FILE"] = str(attacker_path)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                "update-index",
+                "--cacheinfo",
+                f"160000,{attacker_sha},{module.path}",
+            ],
+            cwd=target,
+            env=attacker_environment,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        attacker_index = attacker_path.read_bytes()
+        attacker_path.unlink()
+        self.assertEqual(len(attacker_index), len(original_index))
+        self.assertNotEqual(attacker_index, original_index)
+        self.assertEqual(index_path.stat().st_ino, original_stat.st_ino)
+
+        original_popen = MODULE.subprocess.Popen
+        query_count = 0
+        private_roots: list[Path] = []
+
+        def run_gitlink_query_during_live_index_aba(
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal query_count
+            command = args[0] if args else kwargs.get("args")
+            if isinstance(command, (list, tuple)) and "ls-files" in command:
+                environment = kwargs.get("env")
+                self.assertIsInstance(environment, dict)
+                assert isinstance(environment, dict)
+                private_index = Path(environment["GIT_INDEX_FILE"])
+                self.assertTrue(private_index.is_absolute())
+                self.assertNotEqual(private_index, index_path)
+                self.assertEqual(private_index.read_bytes(), original_index)
+                private_roots.append(private_index.parent)
+
+                index_path.write_bytes(attacker_index)
+                attack_stat = index_path.stat()
+                self.assertEqual(attack_stat.st_ino, original_stat.st_ino)
+                self.assertEqual(attack_stat.st_size, original_stat.st_size)
+                process = original_popen(*args, **kwargs)
+                try:
+                    process.wait(timeout=10)
+                finally:
+                    index_path.write_bytes(original_index)
+                restored_stat = index_path.stat()
+                self.assertEqual(restored_stat.st_ino, original_stat.st_ino)
+                self.assertEqual(restored_stat.st_size, original_stat.st_size)
+                query_count += 1
+                return process
+            return original_popen(*args, **kwargs)
+
+        with mock.patch.object(
+            MODULE.subprocess,
+            "Popen",
+            side_effect=run_gitlink_query_during_live_index_aba,
+        ):
+            receipt = MODULE.capture_superproject_index_receipt(
+                target,
+                (module.path,),
+            )
+            self.assertEqual(
+                receipt.selected_gitlinks,
+                ((module.path, self.sha),),
+            )
+            MODULE.revalidate_superproject_index_receipt(target, receipt)
+
+        self.assertEqual(query_count, 3)
+        self.assertEqual(index_path.read_bytes(), original_index)
+        self.assertEqual(index_path.stat().st_ino, original_stat.st_ino)
+        self.assertTrue(private_roots)
+        self.assertTrue(all(not path.exists() for path in private_roots))
+
     def test_split_superproject_index_receipt_binds_shared_index_drift(
         self,
     ) -> None:
@@ -4773,10 +4853,52 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             self.sha,
         )
         run_git(target, "update-index", "--split-index")
-        index_receipt = MODULE.capture_superproject_index_receipt(
-            target,
-            (module.path,),
-        )
+        index_paths = MODULE.superproject_index_paths(target)
+        self.assertEqual(len(index_paths), 2)
+        primary_index, shared_index = index_paths
+        original_read_git_bounded = MODULE.read_git_bounded
+        private_roots: list[Path] = []
+
+        def observe_private_split_index(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            if "ls-files" in args:
+                extra_env = kwargs.get("extra_env")
+                self.assertIsInstance(extra_env, dict)
+                assert isinstance(extra_env, dict)
+                private_index = Path(extra_env["GIT_INDEX_FILE"])
+                private_shared = private_index.parent / shared_index.name
+                self.assertNotEqual(private_index, primary_index)
+                self.assertEqual(
+                    private_index.read_bytes(),
+                    primary_index.read_bytes(),
+                )
+                self.assertEqual(
+                    private_shared.read_bytes(),
+                    shared_index.read_bytes(),
+                )
+                inventory_leases = kwargs.get("directory_exact_inventory_leases")
+                self.assertIsInstance(inventory_leases, tuple)
+                assert isinstance(inventory_leases, tuple)
+                self.assertEqual(
+                    tuple(name for name, _fingerprint in inventory_leases[0].entries),
+                    ("index", shared_index.name),
+                )
+                private_roots.append(private_index.parent)
+            return original_read_git_bounded(args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "read_git_bounded",
+            side_effect=observe_private_split_index,
+        ):
+            index_receipt = MODULE.capture_superproject_index_receipt(
+                target,
+                (module.path,),
+            )
+        self.assertEqual(len(private_roots), 2)
+        self.assertTrue(all(not path.exists() for path in private_roots))
         self.assertEqual(len(index_receipt.index_bindings), 2)
         shared_binding = index_receipt.index_bindings[1]
         self.assertTrue(shared_binding.path.name.startswith("sharedindex."))

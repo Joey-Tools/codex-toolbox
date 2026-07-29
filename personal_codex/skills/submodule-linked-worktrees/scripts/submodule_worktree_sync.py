@@ -788,6 +788,51 @@ class CheckoutExecutionView:
             )
 
 
+@dataclass
+class SuperprojectIndexView:
+    """One query-only primary/shared index namespace.
+
+    Exact directory inventory protects every pathname Git may open for the
+    primary or linked shared index. Descriptor digest leases protect the bytes,
+    object identities, and access policies behind those names. Timestamps are
+    excluded because they do not change any selected input property.
+    """
+
+    private_index_path: Path
+    directory_lease: DirectoryEntryLease
+    exact_inventory_lease: DirectoryExactInventoryLease
+    digest_file_leases: tuple[DescriptorBoundDigestFileLease, ...]
+    guard: object = dataclass_field(repr=False, compare=False)
+    active: bool = dataclass_field(default=True, repr=False, compare=False)
+
+    def close(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        cleanup_errors: list[str] = []
+        for file_lease in reversed(self.digest_file_leases):
+            try:
+                os.close(file_lease.descriptor)
+            except OSError as exc:
+                cleanup_errors.append(str(exc))
+        try:
+            self.directory_lease.close()
+        except BaseException as exc:
+            cleanup_errors.append(str(exc))
+        cleanup = getattr(self.guard, "cleanup", None)
+        if cleanup is None:
+            cleanup_errors.append("owner-private index view has no cleanup method")
+        else:
+            try:
+                cleanup()
+            except BaseException as exc:
+                cleanup_errors.append(str(exc))
+        if cleanup_errors:
+            raise PlanError(
+                "superproject index-view cleanup failed: " + "; ".join(cleanup_errors)
+            )
+
+
 def close_fetch_execution_leases(
     source_object_lease: DirectoryEntryLease,
     fetch_control_lease: Optional[FetchControlLease],
@@ -6308,22 +6353,8 @@ def read_commit_gitmodules(
 
 
 def expected_sha(root: Path, rel_path: str) -> str:
-    output = git(["ls-files", "-s", "--", rel_path], cwd=root)
-    lines = [line for line in output.splitlines() if line.strip()]
-    if not lines:
-        raise PlanError(f"{rel_path} is not a gitlink in the current index")
-    if len(lines) != 1:
-        raise PlanError(
-            f"{rel_path} has unresolved index entries; resolve conflicts before syncing"
-        )
-    fields = lines[0].split()
-    if len(fields) < 4 or fields[0] != "160000":
-        raise PlanError(f"{rel_path} is not a gitlink in the current index")
-    if fields[2] != "0":
-        raise PlanError(
-            f"{rel_path} has unresolved index stage {fields[2]}; resolve conflicts before syncing"
-        )
-    return fields[1]
+    receipt = capture_superproject_index_receipt(root, (rel_path,))
+    return receipt.selected_gitlinks[0][1]
 
 
 def superproject_index_paths(root: Path) -> tuple[Path, ...]:
@@ -6368,10 +6399,213 @@ def superproject_index_paths(root: Path) -> tuple[Path, ...]:
     return index_path, shared_path
 
 
+def capture_superproject_index_snapshot(
+    index_paths: tuple[Path, ...],
+    *,
+    expected_bindings: Optional[tuple[FileContentBinding, ...]] = None,
+) -> tuple[tuple[FileContentBinding, ...], tuple[bytes, ...]]:
+    """Bind source object identity, bytes, and effective read policy.
+
+    The retained bytes, rather than a later pathname open, become the selected
+    gitlink query input. FileContentBinding deliberately excludes timestamps,
+    so a restored same-object/same-content ABA is benign at this source layer.
+    """
+
+    if len(index_paths) not in {1, 2}:
+        raise PlanError("superproject index path set has an invalid shape")
+    if expected_bindings is not None and (
+        tuple(binding.path for binding in expected_bindings) != index_paths
+    ):
+        raise PlanError("superproject index path set changed after preflight")
+    bindings: list[FileContentBinding] = []
+    contents: list[bytes] = []
+    for index, path in enumerate(index_paths):
+        binding, content = read_bound_regular_file(
+            path,
+            maximum_bytes=MAX_SUPERPROJECT_INDEX_BYTES,
+            mode=os.R_OK,
+            purpose="superproject index",
+            retain_content=True,
+        )
+        if content is None:
+            raise PlanError("superproject index binding returned no exact bytes")
+        if expected_bindings is not None:
+            require_matching_file_binding(
+                expected_bindings[index],
+                binding,
+                "superproject index",
+            )
+        bindings.append(binding)
+        contents.append(content)
+    for binding in bindings:
+        revalidate_file_content_binding(binding)
+    return tuple(bindings), tuple(contents)
+
+
+def superproject_index_view_names(
+    bindings: tuple[FileContentBinding, ...],
+) -> tuple[str, ...]:
+    if len(bindings) not in {1, 2}:
+        raise PlanError("superproject index binding set has an invalid shape")
+    if len(bindings) == 1:
+        return ("index",)
+    shared_name = os.fsdecode(validate_descriptor_entry_name(bindings[1].path.name))
+    if not re.fullmatch(r"sharedindex\.(?:[0-9a-f]{40}|[0-9a-f]{64})", shared_name):
+        raise PlanError("superproject shared index has an invalid filename")
+    return "index", shared_name
+
+
+def revalidate_superproject_index_view(view: SuperprojectIndexView) -> None:
+    # The exact inventory proves that Git has only the intended primary/shared
+    # names. Each digest lease separately proves the same regular-file object,
+    # complete bytes, POSIX policy, and effective read access behind that name.
+    if not view.active:
+        raise PlanError("superproject index view is inactive")
+    if (
+        not view.private_index_path.is_absolute()
+        or view.private_index_path.parent != view.directory_lease.path
+        or view.private_index_path.name != "index"
+    ):
+        raise PlanError("superproject index view has an invalid private index path")
+    if not any(
+        lease.binding.path == view.private_index_path
+        for lease in view.digest_file_leases
+    ):
+        raise PlanError("superproject index view lacks its private primary index")
+    revalidate_directory_entry_lease(view.directory_lease)
+    revalidate_directory_exact_inventory_lease(view.exact_inventory_lease)
+    for lease in view.digest_file_leases:
+        revalidate_descriptor_bound_digest_file_lease(lease)
+    revalidate_directory_exact_inventory_lease(view.exact_inventory_lease)
+    revalidate_directory_entry_lease(view.directory_lease)
+
+
+def capture_superproject_index_view(
+    bindings: tuple[FileContentBinding, ...],
+    contents: tuple[bytes, ...],
+) -> SuperprojectIndexView:
+    names = superproject_index_view_names(bindings)
+    if len(contents) != len(bindings):
+        raise PlanError("superproject index snapshot has an invalid content set")
+    for binding, content in zip(bindings, contents):
+        if (
+            len(content) != binding.size
+            or hashlib.sha256(content).hexdigest() != binding.content_sha256
+        ):
+            raise PlanError(
+                "superproject index snapshot bytes do not match their binding"
+            )
+
+    with ExitStack() as cleanup:
+        guard = OwnerPrivateTemporaryDirectory(
+            prefix="submodule-worktree-superproject-index."
+        )
+        cleanup.callback(guard.cleanup)
+        private_root = Path(guard.name).resolve(strict=True)
+        private_paths = tuple(private_root / name for name in names)
+        for private_path, content in zip(private_paths, contents):
+            write_owner_private_file(
+                private_path,
+                content,
+                "isolated superproject index",
+                final_mode=0o400,
+            )
+
+        private_root_binding = capture_owner_private_directory(
+            private_root,
+            "isolated superproject index directory",
+        )
+        directory_lease = capture_directory_entry_lease(
+            private_root_binding.path,
+            private_root_binding.mode,
+            private_root_binding.purpose,
+        )
+        cleanup.callback(directory_lease.close)
+        if directory_lease.binding.fingerprint != private_root_binding.fingerprint:
+            raise PlanError(
+                "isolated superproject index directory changed during binding"
+            )
+
+        digest_file_leases: list[DescriptorBoundDigestFileLease] = []
+        for private_path, source_binding in zip(private_paths, bindings):
+            descriptor, private_binding, content = open_bound_regular_file_at(
+                directory_lease.descriptor,
+                private_path.name,
+                private_path,
+                maximum_bytes=MAX_SUPERPROJECT_INDEX_BYTES,
+                mode=os.R_OK,
+                purpose="isolated superproject index",
+                retain_content=False,
+            )
+            cleanup.callback(os.close, descriptor)
+            if content is not None:
+                raise PlanError(
+                    "isolated superproject index retained unexpected content"
+                )
+            if (
+                private_binding.size != source_binding.size
+                or private_binding.content_sha256 != source_binding.content_sha256
+                or private_binding.fingerprint.owner != os.geteuid()
+                or private_binding.fingerprint.permissions != 0o400
+            ):
+                raise PlanError(
+                    "isolated superproject index changed during private binding"
+                )
+            digest_file_leases.append(
+                DescriptorBoundDigestFileLease(
+                    directory_binding=directory_lease.binding,
+                    directory_descriptor=directory_lease.descriptor,
+                    entry_name=private_path.name,
+                    descriptor=descriptor,
+                    binding=private_binding,
+                )
+            )
+
+        exact_inventory_lease = capture_directory_exact_inventory_lease(
+            directory_lease,
+            names,
+            "isolated superproject index inventory",
+        )
+        view = SuperprojectIndexView(
+            private_index_path=private_paths[0],
+            directory_lease=directory_lease,
+            exact_inventory_lease=exact_inventory_lease,
+            digest_file_leases=tuple(digest_file_leases),
+            guard=guard,
+        )
+        revalidate_superproject_index_view(view)
+        cleanup.pop_all()
+        return view
+
+
 def selected_gitlink_rows(
     root: Path,
     selected_paths: tuple[str, ...],
+    index_bindings: tuple[FileContentBinding, ...],
+    index_contents: tuple[bytes, ...],
 ) -> tuple[tuple[str, str], ...]:
+    view = capture_superproject_index_view(index_bindings, index_contents)
+    outcome_exception: Optional[BaseException] = None
+    try:
+        return selected_gitlink_rows_from_view(root, selected_paths, view)
+    except BaseException as exc:
+        outcome_exception = exc
+        raise
+    finally:
+        finish_explicit_cleanup(
+            view.close,
+            outcome_exception=outcome_exception,
+            purpose="superproject index query view",
+            recovery_identity=str(view.directory_lease.path),
+        )
+
+
+def selected_gitlink_rows_from_view(
+    root: Path,
+    selected_paths: tuple[str, ...],
+    view: SuperprojectIndexView,
+) -> tuple[tuple[str, str], ...]:
+    revalidate_superproject_index_view(view)
     if not selected_paths:
         raise PlanError("cannot bind an empty selected-gitlink set")
     expected_raw: dict[bytes, str] = {}
@@ -6428,7 +6662,12 @@ def selected_gitlink_rows(
             ],
             stdout_limit=retained_limit,
             timeout_seconds=remaining,
+            extra_env={"GIT_INDEX_FILE": str(view.private_index_path)},
+            directory_identity_leases=(view.directory_lease,),
+            directory_exact_inventory_leases=(view.exact_inventory_lease,),
+            digest_file_leases=view.digest_file_leases,
         )
+        revalidate_superproject_index_view(view)
         retained_bytes += len(result.stdout)
         for record in bounded_records(
             result.stdout,
@@ -6474,6 +6713,7 @@ def selected_gitlink_rows(
     missing = [path for path in selected_paths if path not in rows]
     if missing:
         raise PlanError(f"{missing[0]} is not a gitlink in the current index")
+    revalidate_superproject_index_view(view)
     return tuple((path, rows[path]) for path in selected_paths)
 
 
@@ -6481,22 +6721,24 @@ def capture_superproject_index_receipt(
     root: Path,
     selected_paths: tuple[str, ...],
 ) -> SuperprojectIndexReceipt:
-    bindings = tuple(
-        read_bound_regular_file(
-            path,
-            maximum_bytes=MAX_SUPERPROJECT_INDEX_BYTES,
-            mode=os.R_OK,
-            purpose="superproject index",
-            retain_content=False,
-        )[0]
-        for path in superproject_index_paths(root)
+    index_paths = superproject_index_paths(root)
+    bindings, contents = capture_superproject_index_snapshot(index_paths)
+    selected_rows = selected_gitlink_rows(
+        root,
+        selected_paths,
+        bindings,
+        contents,
     )
-    selected_rows = selected_gitlink_rows(root, selected_paths)
     for binding in bindings:
         revalidate_file_content_binding(binding)
     if superproject_index_paths(root) != tuple(binding.path for binding in bindings):
         raise PlanError("superproject index path set changed during preflight")
-    repeated_rows = selected_gitlink_rows(root, selected_paths)
+    repeated_rows = selected_gitlink_rows(
+        root,
+        selected_paths,
+        bindings,
+        contents,
+    )
     if repeated_rows != selected_rows:
         raise PlanError("selected superproject gitlink rows changed during preflight")
     for binding in bindings:
@@ -6517,8 +6759,17 @@ def revalidate_superproject_index_receipt(
     expected_paths = tuple(binding.path for binding in receipt.index_bindings)
     if current_paths != expected_paths:
         raise PlanError("superproject index path set changed after preflight")
+    _bindings, contents = capture_superproject_index_snapshot(
+        current_paths,
+        expected_bindings=receipt.index_bindings,
+    )
     selected_paths = tuple(path for path, _ in receipt.selected_gitlinks)
-    current_rows = selected_gitlink_rows(root, selected_paths)
+    current_rows = selected_gitlink_rows(
+        root,
+        selected_paths,
+        receipt.index_bindings,
+        contents,
+    )
     if current_rows != receipt.selected_gitlinks:
         raise PlanError("selected superproject gitlink rows changed after preflight")
     for binding in receipt.index_bindings:
