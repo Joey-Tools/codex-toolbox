@@ -61,6 +61,7 @@ MAX_GIT_PATHSPEC_BATCHES = 4096
 MAX_GITMODULES_FILE_BYTES = 4 * 1024 * 1024
 MAX_GITMODULES_RETAINED_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_CONFIG_BYTES = 4 * 1024 * 1024
+MAX_CHECKOUT_ATTRIBUTES_BYTES = 4 * 1024 * 1024
 MAX_GITDIR_FILE_BYTES = 64 * 1024
 MAX_SOURCE_SHALLOW_BYTES = 64 * 1024 * 1024
 MAX_SUPERPROJECT_INDEX_BYTES = 512 * 1024 * 1024
@@ -475,6 +476,12 @@ class FilterSelection:
     driver: str
 
 
+@dataclass(frozen=True)
+class CheckoutAttributesReceipt:
+    info_binding: AccessBinding
+    attributes_binding: Optional[FileContentBinding]
+
+
 @dataclass
 class GitmodulesReadBudget:
     deadline: float
@@ -517,6 +524,7 @@ class CheckoutPreflight:
     index_digest: Optional[str]
     index_entry_count: Optional[int]
     target_blob_paths: tuple[tuple[str, ...], ...]
+    attributes_receipt: CheckoutAttributesReceipt
     filter_selections: tuple[FilterSelection, ...]
     path_count: int
     path_digest: str
@@ -11937,6 +11945,8 @@ def add_worktree(
     finalize_checkout: Optional[
         Callable[[ManagedControlReceipt, DirectoryEntryLease], None]
     ] = None,
+    pre_checkout: Optional[Callable[[], None]] = None,
+    adopt_materialization: Optional[Callable[[], None]] = None,
 ) -> None:
     command = [
         "git",
@@ -11968,6 +11978,8 @@ def add_worktree(
             source_git_dir,
             source_lease,
         )
+        if adopt_materialization is not None:
+            adopt_materialization()
         # Run from the held target directory and name that exact object as ".".
         # Passing the final pathname from its parent would let Git follow a
         # same-UID symlink replacement after our precheck and write outside the
@@ -12009,6 +12021,11 @@ def add_worktree(
         )
         admin_ownership_proven = True
         signal_checkpoint("add-admin-ownership-complete")
+        if pre_checkout is not None:
+            pre_checkout()
+        revalidate_managed_control_receipt(control, lease.target_descriptor)
+        revalidate_directory_entry_lease(source_lease)
+        revalidate_materialized_target_lease(lease)
         run_git_at_directory_descriptor(
             [
                 "git",
@@ -14107,6 +14124,95 @@ def revalidate_recursive_metadata_receipt(
         )
 
 
+def capture_checkout_attributes_receipt(
+    source_git_dir: Path,
+) -> CheckoutAttributesReceipt:
+    info_path = source_git_dir / "info"
+    info_binding = capture_typed_access(
+        info_path,
+        os.R_OK | os.X_OK,
+        "checkout attributes directory",
+        stat.S_IFDIR,
+    )
+    info_descriptor = open_directory_descriptor(
+        info_path,
+        "checkout attributes directory",
+    )
+    attributes_descriptor = -1
+    try:
+        revalidate_directory_descriptor(info_binding, info_descriptor)
+        (
+            attributes_descriptor,
+            attributes_binding,
+            _attributes_content,
+        ) = open_optional_bound_regular_file_at(
+            info_descriptor,
+            "attributes",
+            info_path / "attributes",
+            maximum_bytes=MAX_CHECKOUT_ATTRIBUTES_BYTES,
+            mode=os.R_OK,
+            purpose="common checkout attributes",
+            retain_content=False,
+        )
+        revalidate_directory_descriptor(info_binding, info_descriptor)
+        if attributes_binding is None:
+            require_absent_entry_at(
+                info_descriptor,
+                "attributes",
+                info_path / "attributes",
+                "common checkout attributes",
+            )
+        else:
+            observed, _ = bind_regular_file_descriptor_at(
+                attributes_descriptor,
+                info_descriptor,
+                "attributes",
+                info_path / "attributes",
+                maximum_bytes=MAX_CHECKOUT_ATTRIBUTES_BYTES,
+                mode=os.R_OK,
+                purpose="common checkout attributes",
+                retain_content=False,
+            )
+            require_matching_file_binding(
+                attributes_binding,
+                observed,
+                "common checkout attributes",
+            )
+        return CheckoutAttributesReceipt(
+            info_binding=info_binding,
+            attributes_binding=attributes_binding,
+        )
+    finally:
+        if attributes_descriptor >= 0:
+            os.close(attributes_descriptor)
+        os.close(info_descriptor)
+
+
+def require_checkout_attributes_receipt(
+    expected: CheckoutAttributesReceipt,
+    observed: CheckoutAttributesReceipt,
+) -> None:
+    if observed.info_binding != expected.info_binding:
+        raise PlanError(
+            "checkout attributes directory changed after preflight\n"
+            f"  path: {expected.info_binding.path}"
+        )
+    if (observed.attributes_binding is None) != (expected.attributes_binding is None):
+        raise PlanError(
+            "common checkout attributes presence changed after preflight\n"
+            f"  path: {expected.info_binding.path / 'attributes'}"
+        )
+    if (
+        expected.attributes_binding is not None
+        and observed.attributes_binding is not None
+    ):
+        require_matching_file_binding(
+            expected.attributes_binding,
+            observed.attributes_binding,
+            "common checkout attributes",
+        )
+
+
 def selected_checkout_filters(
     source_git_dir: Path,
     treeish: str,
@@ -14296,6 +14402,43 @@ def reject_checkout_filters(
         "  this helper does not execute repository-defined clean, process, "
         "or smudge filters"
     )
+
+
+def bind_checkout_filter_selection(
+    entry: PlannedWorktree,
+    tree_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...],
+    index_paths: tuple[tuple[str, ...], ...] = (),
+    *,
+    expected_attributes: Optional[CheckoutAttributesReceipt] = None,
+    expected_selections: Optional[tuple[FilterSelection, ...]] = None,
+) -> tuple[CheckoutAttributesReceipt, tuple[FilterSelection, ...]]:
+    # Protected properties: the source-local config bytes, common
+    # info/attributes object/content, and the resulting filter selection stay
+    # exact across the authoritative check-attr query. Any selected filter is
+    # rejected regardless of whether its driver currently has a command.
+    revalidate_file_content_binding(entry.source_completeness.config_binding)
+    attributes = capture_checkout_attributes_receipt(entry.source_git_dir)
+    if expected_attributes is not None:
+        require_checkout_attributes_receipt(expected_attributes, attributes)
+    selections = reject_checkout_filters(
+        entry.source_git_dir,
+        entry.target.path,
+        tree_paths,
+        index_paths,
+    )
+    repeated_attributes = capture_checkout_attributes_receipt(entry.source_git_dir)
+    require_checkout_attributes_receipt(attributes, repeated_attributes)
+    if expected_attributes is not None:
+        require_checkout_attributes_receipt(
+            expected_attributes,
+            repeated_attributes,
+        )
+    revalidate_file_content_binding(entry.source_completeness.config_binding)
+    if expected_selections is not None and selections != expected_selections:
+        raise PlanError(
+            f"checkout filter selection changed after preflight: {entry.submodule.path}"
+        )
+    return attributes, selections
 
 
 def checkout_write_access_bindings(
@@ -14653,14 +14796,15 @@ def capture_checkout_preflight(
             entry.source_git_dir,
             current_head,
         )
-        filter_selections = reject_checkout_filters(
-            entry.source_git_dir,
-            entry.target.path,
-            (
-                (current_head, current_blob_paths),
-                (entry.sha, target_blob_paths),
-            ),
-            index_blob_paths,
+        final_tree_paths = (
+            (current_head, current_blob_paths),
+            (entry.sha, target_blob_paths),
+        )
+        final_index_paths = index_blob_paths
+        attributes_receipt, filter_selections = bind_checkout_filter_selection(
+            entry,
+            final_tree_paths,
+            final_index_paths,
         )
         if has_local_changes(entry.target.path, current_head):
             raise PlanError(
@@ -14674,10 +14818,11 @@ def capture_checkout_preflight(
         validate_managed_preflight_index(entry, current_head)
         probe_managed_checkout(entry.target.path, entry.sha)
     else:
-        filter_selections = reject_checkout_filters(
-            entry.source_git_dir,
-            entry.target.path,
-            ((entry.sha, target_blob_paths),),
+        final_tree_paths = ((entry.sha, target_blob_paths),)
+        final_index_paths = ()
+        attributes_receipt, filter_selections = bind_checkout_filter_selection(
+            entry,
+            final_tree_paths,
         )
     repeated_object_closure = target_object_closure(
         entry.source_git_dir,
@@ -14704,6 +14849,7 @@ def capture_checkout_preflight(
             index_digest=index_digest,
             index_entry_count=index_entry_count,
             target_blob_paths=target_blob_paths,
+            attributes_receipt=attributes_receipt,
             filter_selections=filter_selections,
             path_count=path_count,
             path_digest=path_digest,
@@ -14760,14 +14906,17 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
             entry.source_git_dir,
             current_head,
         )
-        filter_selections = reject_checkout_filters(
-            entry.source_git_dir,
-            entry.target.path,
-            (
-                (current_head, current_blob_paths),
-                (entry.sha, target_blob_paths),
-            ),
-            index_blob_paths,
+        final_tree_paths = (
+            (current_head, current_blob_paths),
+            (entry.sha, target_blob_paths),
+        )
+        final_index_paths = index_blob_paths
+        bind_checkout_filter_selection(
+            entry,
+            final_tree_paths,
+            final_index_paths,
+            expected_attributes=receipt.attributes_receipt,
+            expected_selections=receipt.filter_selections,
         )
         repeated_changes = parse_managed_tree_changes(
             entry.target.path,
@@ -14790,19 +14939,12 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
         validate_managed_preflight_index(entry, current_head)
         probe_managed_checkout(entry.target.path, entry.sha)
     elif receipt.kind == "new":
-        filter_selections = reject_checkout_filters(
-            entry.source_git_dir,
-            entry.target.path,
-            ((entry.sha, target_blob_paths),),
-        )
+        final_tree_paths = ((entry.sha, target_blob_paths),)
+        final_index_paths = ()
         digest_paths = target_blob_paths
     else:
         raise PlanError(
             f"checkout preflight has an invalid kind for {entry.submodule.path}"
-        )
-    if filter_selections != receipt.filter_selections:
-        raise PlanError(
-            f"checkout filter selection changed after preflight: {entry.submodule.path}"
         )
     path_count, path_digest = checkout_path_digest(digest_paths)
     if path_count != receipt.path_count or path_digest != receipt.path_digest:
@@ -14818,6 +14960,13 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
         repeated_object_closure,
         expected_object_closure,
         f"target checkout for {entry.submodule.path}",
+    )
+    bind_checkout_filter_selection(
+        entry,
+        final_tree_paths,
+        final_index_paths,
+        expected_attributes=receipt.attributes_receipt,
+        expected_selections=receipt.filter_selections,
     )
 
 
@@ -15806,6 +15955,16 @@ def apply_sync_plan(plan: SyncPlan) -> None:
         try:
             revalidate_recursive_metadata_for_entry(plan, index)
             lease = materialize_bound_target_directory(target)
+            caller_owns_materialization = True
+
+            def adopt_current_materialization() -> None:
+                nonlocal caller_owns_materialization
+                if not caller_owns_materialization:
+                    raise PlanError(
+                        "target materialization ownership was already transferred"
+                    )
+                caller_owns_materialization = False
+
             try:
                 # The fresh source lease is fingerprint-equal to both preflight
                 # source receipts before either managed checkout or new
@@ -15875,7 +16034,34 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                         lease=lease,
                         source_lease=source_lease,
                         finalize_checkout=finalize_current_checkout,
+                        pre_checkout=lambda current_entry=entry: (
+                            revalidate_checkout_preflight(current_entry)
+                        ),
+                        adopt_materialization=adopt_current_materialization,
                     )
+            except BaseException as exc:
+                cleanup_error: Optional[BaseException] = None
+                if (
+                    caller_owns_materialization
+                    and lease.materialization_target is not None
+                    and lease.created_nodes
+                ):
+                    try:
+                        cleanup_materialized_target_nodes(
+                            lease.materialization_target,
+                            lease.created_nodes,
+                        )
+                    except BaseException as cleanup_exc:
+                        cleanup_error = cleanup_exc
+                if cleanup_error is not None:
+                    cleanup_detail = (
+                        f"worktree/materialization rollback failed: {cleanup_error}"
+                    )
+                    if isinstance(exc, ForwardedProcessSignal):
+                        exc.add_cleanup_error(cleanup_detail)
+                        raise
+                    raise PlanError(f"{exc}\n{cleanup_detail}") from exc
+                raise
             finally:
                 lease.close()
         finally:

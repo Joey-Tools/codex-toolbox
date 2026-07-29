@@ -5702,6 +5702,91 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             registry_before,
         )
 
+    def test_new_worktree_rebinds_info_attributes_after_registration(self) -> None:
+        (self.remote / "payload.bin").write_text("payload\n", encoding="utf-8")
+        run_git(self.remote, "add", "payload.bin")
+        run_git(self.remote, "commit", "-m", "add unfiltered payload")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+
+        target_super = self.root / "late-info-attributes-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        marker = self.root / "late-filter-executed"
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "filter.late.process",
+            f"touch {marker}",
+        )
+        attributes_path = self.named_source_git_dir / "info" / "attributes"
+        self.assertFalse(attributes_path.exists())
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "custom-lib",
+                        "lib",
+                        str(self.remote),
+                    ),
+                    target_sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        self.addCleanup(plan.close)
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        original_checkpoint = MODULE.signal_checkpoint
+        injected = False
+
+        def inject_attributes_after_registration(stage: str) -> None:
+            nonlocal injected
+            if stage == "add-admin-ownership-complete" and not injected:
+                attributes_path.write_text(
+                    "payload.bin filter=late\n",
+                    encoding="utf-8",
+                )
+                injected = True
+            original_checkpoint(stage)
+
+        with mock.patch.object(
+            MODULE,
+            "signal_checkpoint",
+            side_effect=inject_attributes_after_registration,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "common checkout attributes presence changed after preflight",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(injected)
+        self.assertFalse(marker.exists())
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={self.named_source_git_dir}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
     def test_new_worktree_revalidates_temporarily_forged_path_selection(
         self,
     ) -> None:
@@ -10097,6 +10182,76 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertNotIn("recovery_schema", str(raised.exception))
         self.assertFalse((target_root / "one").exists())
 
+    def test_post_materialization_revalidation_failure_cleans_created_chain(
+        self,
+    ) -> None:
+        target_super = self.root / "post-materialization-cleanup"
+        target_super.mkdir()
+        module = MODULE.Submodule(
+            "custom-lib",
+            "created-parent/lib",
+            str(self.remote),
+        )
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        self.addCleanup(plan.close)
+        target = target_super / module.path
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        original_revalidate = MODULE.revalidate_checkout_preflight
+        failed_after_materialization = False
+
+        def fail_after_materialization(entry: object) -> None:
+            nonlocal failed_after_materialization
+            if target.exists():
+                failed_after_materialization = True
+                raise MODULE.PlanError(
+                    "injected final post-materialization revalidation failure"
+                )
+            original_revalidate(entry)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "revalidate_checkout_preflight",
+                side_effect=fail_after_materialization,
+            ),
+            mock.patch.object(MODULE, "add_worktree") as add_worktree,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "injected final post-materialization revalidation failure",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(failed_after_materialization)
+        add_worktree.assert_not_called()
+        self.assertFalse(target.exists())
+        self.assertFalse((target_super / "created-parent").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={self.named_source_git_dir}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
     def test_materialization_final_validation_failure_cleans_all_levels(
         self,
     ) -> None:
@@ -12643,10 +12798,16 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             lease: object | None = None,
             source_lease: object | None = None,
             finalize_checkout: object | None = None,
+            pre_checkout: object | None = None,
+            adopt_materialization: object | None = None,
         ) -> None:
             self.assertFalse(dry_run)
             self.assertIsNotNone(lease)
             self.assertIsNotNone(source_lease)
+            if callable(adopt_materialization):
+                adopt_materialization()
+            if callable(pre_checkout):
+                pre_checkout()
             events.append(f"add:{target.name}")
             if callable(finalize_checkout):
                 finalize_checkout(
