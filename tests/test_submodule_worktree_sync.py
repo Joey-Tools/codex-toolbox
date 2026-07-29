@@ -19,6 +19,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+import zlib
 from contextlib import ExitStack, redirect_stdout
 from unittest import mock
 
@@ -239,6 +240,46 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             str(self.root / f"{name}-standard"),
         )
         return source_git_dir
+
+    def ensure_loose_source_object(
+        self,
+        source_git_dir: Path,
+        object_id: str,
+    ) -> Path:
+        object_type = run_git(
+            self.root,
+            f"--git-dir={source_git_dir}",
+            "cat-file",
+            "-t",
+            object_id,
+        )
+        content = subprocess.run(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                f"--git-dir={source_git_dir}",
+                "cat-file",
+                object_type,
+                object_id,
+            ],
+            cwd=self.root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+        storage = f"{object_type} {len(content)}\0".encode("ascii") + content
+        digest = (
+            hashlib.sha1(storage).hexdigest()
+            if len(object_id) == 40
+            else hashlib.sha256(storage).hexdigest()
+        )
+        self.assertEqual(digest, object_id)
+        loose_path = source_git_dir / "objects" / object_id[:2] / object_id[2:]
+        loose_path.parent.mkdir(parents=True, exist_ok=True)
+        if not loose_path.exists():
+            loose_path.write_bytes(zlib.compress(storage))
+        return loose_path
 
     def create_relocated_fake_git(
         self,
@@ -3672,6 +3713,239 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             MODULE.capture_source_completeness_receipt(
                 self.named_source_git_dir,
             )
+
+    def test_present_commit_rejects_loose_fanout_symlink_dependency(self) -> None:
+        loose_commit = self.ensure_loose_source_object(
+            self.named_source_git_dir,
+            self.sha,
+        )
+        source_fanout = loose_commit.parent
+        outside = self.root / "present-commit-outside-fanout"
+        source_fanout.rename(outside)
+        source_fanout.symlink_to(outside, target_is_directory=True)
+
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "cat-file",
+            "-e",
+            f"{self.sha}^{{commit}}",
+        )
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "loose-object fanout completeness.*unsafe object type",
+        ):
+            MODULE.capture_source_completeness_receipt(
+                self.named_source_git_dir,
+            )
+
+    def test_present_commit_rejects_non_directory_loose_fanout(self) -> None:
+        source_objects = self.named_source_git_dir / "objects"
+        fanout_name = next(
+            name
+            for name in MODULE.LOOSE_OBJECT_FANOUT_NAMES
+            if not (source_objects / name).exists()
+        )
+        (source_objects / fanout_name).write_text(
+            "not a fanout directory\n",
+            encoding="utf-8",
+        )
+
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "cat-file",
+            "-e",
+            f"{self.sha}^{{commit}}",
+        )
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "loose-object fanout completeness.*unsafe object type",
+        ):
+            MODULE.capture_source_completeness_receipt(
+                self.named_source_git_dir,
+            )
+
+    def test_present_commit_rejects_loose_fanout_replacement_after_plan(
+        self,
+    ) -> None:
+        loose_commit = self.ensure_loose_source_object(
+            self.named_source_git_dir,
+            self.sha,
+        )
+        target, module, input_receipt = self.make_target_superproject(
+            "late-loose-fanout-replacement-target",
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[(module, self.sha)],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+            input_receipt=input_receipt,
+        )
+        source_fanout = loose_commit.parent
+        retained = self.root / "retained-present-commit-fanout"
+        try:
+            source_fanout.rename(retained)
+            shutil.copytree(retained, source_fanout)
+            run_git(
+                self.root,
+                f"--git-dir={self.named_source_git_dir}",
+                "cat-file",
+                "-e",
+                f"{self.sha}^{{commit}}",
+            )
+
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "loose-object fanout object identity changed",
+            ):
+                MODULE.apply_sync_plan(plan)
+            self.assertFalse((target / module.path).exists())
+        finally:
+            plan.close()
+
+    def test_source_completeness_rejects_loose_fanout_publication_after_plan(
+        self,
+    ) -> None:
+        source_objects = self.named_source_git_dir / "objects"
+        fanout_name = next(
+            name
+            for name in MODULE.LOOSE_OBJECT_FANOUT_NAMES
+            if not (source_objects / name).exists()
+        )
+        receipt = MODULE.capture_source_completeness_receipt(
+            self.named_source_git_dir,
+        )
+        (source_objects / fanout_name).mkdir()
+
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "loose-object fanout presence changed after preflight",
+        ):
+            MODULE.revalidate_source_completeness_receipt(
+                self.named_source_git_dir,
+                receipt,
+            )
+
+    def test_source_completeness_rejects_loose_fanout_access_policy_drift(
+        self,
+    ) -> None:
+        loose_commit = self.ensure_loose_source_object(
+            self.named_source_git_dir,
+            self.sha,
+        )
+        fanout = loose_commit.parent
+        original_mode = stat.S_IMODE(fanout.stat().st_mode)
+        receipt = MODULE.capture_source_completeness_receipt(
+            self.named_source_git_dir,
+        )
+        fanout.chmod(original_mode ^ stat.S_IRGRP)
+        try:
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "loose-object fanout access policy changed after preflight",
+            ):
+                MODULE.revalidate_source_completeness_receipt(
+                    self.named_source_git_dir,
+                    receipt,
+                )
+        finally:
+            fanout.chmod(original_mode)
+
+    def test_source_completeness_rejects_loose_fanout_descriptor_race(
+        self,
+    ) -> None:
+        loose_commit = self.ensure_loose_source_object(
+            self.named_source_git_dir,
+            self.sha,
+        )
+        fanout = loose_commit.parent
+        retained = self.root / "retained-raced-loose-fanout"
+        objects_descriptor = MODULE.open_directory_descriptor(
+            self.named_source_git_dir / "objects",
+            "test source objects",
+        )
+        original_fstat = MODULE.os.fstat
+        replacement_performed = False
+
+        def replace_name_before_child_fstat(
+            descriptor: int,
+        ) -> os.stat_result:
+            nonlocal replacement_performed
+            if descriptor != objects_descriptor and not replacement_performed:
+                replacement_performed = True
+                fanout.rename(retained)
+                shutil.copytree(retained, fanout)
+            return original_fstat(descriptor)
+
+        try:
+            with mock.patch.object(
+                MODULE.os,
+                "fstat",
+                side_effect=replace_name_before_child_fstat,
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "loose-object fanout completeness object identity changed "
+                    "during descriptor binding",
+                ):
+                    MODULE.capture_source_loose_fanout_entry_at(
+                        objects_descriptor,
+                        self.named_source_git_dir / "objects",
+                        fanout.name,
+                    )
+            self.assertTrue(replacement_performed)
+        finally:
+            os.close(objects_descriptor)
+
+    def test_source_completeness_excludes_fanout_child_churn(self) -> None:
+        loose_commit = self.ensure_loose_source_object(
+            self.named_source_git_dir,
+            self.sha,
+        )
+        receipt = MODULE.capture_source_completeness_receipt(
+            self.named_source_git_dir,
+        )
+        unrelated_child = loose_commit.parent / ("f" * (len(self.sha) - 2))
+        unrelated_child.write_bytes(b"not a Git object")
+
+        MODULE.revalidate_source_completeness_receipt(
+            self.named_source_git_dir,
+            receipt,
+        )
+
+    def test_object_closure_detects_loose_object_content_mutation(self) -> None:
+        loose_commit = self.ensure_loose_source_object(
+            self.named_source_git_dir,
+            self.sha,
+        )
+        receipt = MODULE.capture_source_completeness_receipt(
+            self.named_source_git_dir,
+        )
+        original_content = loose_commit.read_bytes()
+        original_mode = stat.S_IMODE(loose_commit.stat().st_mode)
+        loose_commit.chmod(original_mode | stat.S_IWUSR)
+        loose_commit.write_bytes(b"not a valid loose Git object")
+        try:
+            MODULE.revalidate_source_completeness_receipt(
+                self.named_source_git_dir,
+                receipt,
+            )
+            with self.assertRaises(MODULE.GitError):
+                MODULE.target_object_closure(
+                    self.named_source_git_dir,
+                    self.sha,
+                    receipt,
+                )
+        finally:
+            loose_commit.write_bytes(original_content)
+            loose_commit.chmod(original_mode)
 
     def test_late_commondir_cannot_redirect_worktree_registry_write(self) -> None:
         target, module, input_receipt = self.make_target_superproject(
@@ -11856,6 +12130,10 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         def fetch(*args: object, **kwargs: object) -> bool:
             submodule = args[2]
             events.append(f"fetch:{submodule.name}")
+            terminal_receipts = kwargs["terminal_completeness_receipts"]
+            self.assertIsInstance(terminal_receipts, list)
+            terminal_receipts.append(f"terminal-receipt:{args[0].name}")
+            events.append(f"terminal:{args[0].name}")
             return True
 
         def capture(entry: object) -> tuple[object, tuple[object, ...]]:
@@ -11893,7 +12171,11 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 )
 
         lease = mock.MagicMock()
-        with mock.patch.object(MODULE, "validate_sync_plan", side_effect=validate):
+        with mock.patch.object(
+            MODULE,
+            "validate_sync_plan",
+            side_effect=validate,
+        ):
             with mock.patch.object(
                 MODULE,
                 "revalidate_runtime_source_access",
@@ -11965,13 +12247,24 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 "full",
                 "source:module-0",
                 "fetch:module-0",
+                "terminal:source-0",
                 "source:module-1",
                 "fetch:module-1",
+                "terminal:source-1",
                 "source:module-2",
                 "fetch:module-2",
+                "terminal:source-2",
                 "capture:module-0",
                 "capture:module-1",
                 "capture:module-2",
+            ],
+        )
+        self.assertEqual(
+            [entry.source_completeness for entry in entries],
+            [
+                "terminal-receipt:source-0",
+                "terminal-receipt:source-1",
+                "terminal-receipt:source-2",
             ],
         )
 

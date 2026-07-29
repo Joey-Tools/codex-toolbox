@@ -255,6 +255,20 @@ class FsFingerprint:
     permissions: int
 
 
+@dataclass(frozen=True)
+class FsObjectIdentity:
+    device: int
+    inode: int
+    kind: int
+
+
+@dataclass(frozen=True)
+class PosixAccessPolicy:
+    owner: int
+    group: int
+    permissions: int
+
+
 class TargetMaterializationCleanupError(PlanError):
     def __init__(
         self,
@@ -422,6 +436,14 @@ class AccessBinding:
 
 
 @dataclass(frozen=True)
+class LooseFanoutBinding:
+    name: str
+    identity: FsObjectIdentity
+    access_policy: PosixAccessPolicy
+    required_mode: int
+
+
+@dataclass(frozen=True)
 class FileContentBinding:
     path: Path
     fingerprint: FsFingerprint
@@ -514,6 +536,10 @@ class SourceCompletenessReceipt:
     gitdir_binding: AccessBinding
     config_binding: FileContentBinding
     objects_binding: AccessBinding
+    loose_fanout_inventory: tuple[
+        tuple[str, Optional[LooseFanoutBinding]],
+        ...,
+    ]
     alternates_parent_binding: AccessBinding
     pack_binding: Optional[AccessBinding]
 
@@ -3554,6 +3580,22 @@ def fingerprint_from_stat(path_stat: os.stat_result) -> FsFingerprint:
     )
 
 
+def object_identity(fingerprint: FsFingerprint) -> FsObjectIdentity:
+    return FsObjectIdentity(
+        device=fingerprint.device,
+        inode=fingerprint.inode,
+        kind=fingerprint.kind,
+    )
+
+
+def posix_access_policy(fingerprint: FsFingerprint) -> PosixAccessPolicy:
+    return PosixAccessPolicy(
+        owner=fingerprint.owner,
+        group=fingerprint.group,
+        permissions=fingerprint.permissions,
+    )
+
+
 def filesystem_fingerprint(path: Path) -> FsFingerprint:
     try:
         path_stat = os.stat(path, follow_symlinks=False)
@@ -6307,6 +6349,259 @@ def reject_source_promisor_markers(source_git_dir: Path) -> None:
         os.close(descriptor)
 
 
+def capture_source_loose_fanout_entry_at(
+    directory_descriptor: int,
+    object_directory: Path,
+    name: str,
+) -> Optional[LooseFanoutBinding]:
+    purpose = "source loose-object fanout completeness"
+    required_mode = os.R_OK | os.X_OK
+    if name not in LOOSE_OBJECT_FANOUT_NAMES:
+        raise PlanError(f"{purpose} has an invalid entry name: {name!r}")
+    try:
+        before = fingerprint_from_stat(
+            os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PlanError(
+            f"cannot inspect {purpose}\n"
+            f"  path: {object_directory / name}\n"
+            f"  error: {exc}"
+        ) from exc
+    if before.kind != stat.S_IFDIR:
+        raise PlanError(
+            f"{purpose} has an unsafe object type\n  path: {object_directory / name}"
+        )
+    if (
+        not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+        or os.open not in os.supports_dir_fd
+    ):
+        raise PlanError(
+            f"cannot safely bind {purpose}: descriptor-relative "
+            "O_NOFOLLOW and O_DIRECTORY are required"
+        )
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as exc:
+        raise PlanError(
+            f"cannot open {purpose} without following links\n"
+            f"  path: {object_directory / name}\n"
+            f"  error: {exc}"
+        ) from exc
+    try:
+        opened = fingerprint_from_stat(os.fstat(descriptor))
+        try:
+            after = fingerprint_from_stat(
+                os.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+        except OSError as exc:
+            raise PlanError(
+                f"{purpose} name became unavailable during descriptor binding\n"
+                f"  path: {object_directory / name}\n"
+                f"  error: {exc}"
+            ) from exc
+        identities = tuple(object_identity(item) for item in (before, opened, after))
+        if identities[1:] != identities[:-1]:
+            raise PlanError(
+                f"{purpose} object identity changed during descriptor binding\n"
+                f"  path: {object_directory / name}"
+            )
+        access_policies = tuple(
+            posix_access_policy(item) for item in (before, opened, after)
+        )
+        if access_policies[1:] != access_policies[:-1]:
+            raise PlanError(
+                f"{purpose} access policy changed during descriptor binding\n"
+                f"  path: {object_directory / name}"
+            )
+        if not probe_access_at(descriptor, ".", required_mode):
+            raise PlanError(
+                f"{purpose} denies object reads\n  path: {object_directory / name}"
+            )
+        return LooseFanoutBinding(
+            name=name,
+            identity=identities[0],
+            access_policy=access_policies[0],
+            required_mode=required_mode,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def source_loose_fanout_inventory_at(
+    directory_descriptor: int,
+    object_directory: Path,
+) -> tuple[tuple[str, Optional[LooseFanoutBinding]], ...]:
+    inventory: list[tuple[str, Optional[LooseFanoutBinding]]] = []
+    for name in LOOSE_OBJECT_FANOUT_NAMES:
+        inventory.append(
+            (
+                name,
+                capture_source_loose_fanout_entry_at(
+                    directory_descriptor,
+                    object_directory,
+                    name,
+                ),
+            )
+        )
+    return tuple(inventory)
+
+
+def capture_source_loose_fanout_inventory(
+    objects_binding: AccessBinding,
+) -> tuple[tuple[str, Optional[LooseFanoutBinding]], ...]:
+    object_descriptor = open_directory_descriptor(
+        objects_binding.path,
+        "source loose-object fanout completeness",
+    )
+    try:
+        revalidate_directory_descriptor(objects_binding, object_descriptor)
+        first = source_loose_fanout_inventory_at(
+            object_descriptor,
+            objects_binding.path,
+        )
+        second = source_loose_fanout_inventory_at(
+            object_descriptor,
+            objects_binding.path,
+        )
+        revalidate_directory_descriptor(objects_binding, object_descriptor)
+        if first != second:
+            raise PlanError(
+                "source loose-object fanout completeness changed during binding"
+            )
+        return first
+    finally:
+        os.close(object_descriptor)
+
+
+def revalidate_source_loose_fanout_inventory(
+    objects_binding: AccessBinding,
+    expected: tuple[tuple[str, Optional[LooseFanoutBinding]], ...],
+) -> None:
+    if tuple(name for name, _ in expected) != LOOSE_OBJECT_FANOUT_NAMES:
+        raise PlanError(
+            "source loose-object fanout completeness has an invalid receipt shape"
+        )
+    if any(binding is not None and binding.name != name for name, binding in expected):
+        raise PlanError(
+            "source loose-object fanout completeness has a mismatched entry binding"
+        )
+    current = capture_source_loose_fanout_inventory(objects_binding)
+    for (name, expected_binding), (_, current_binding) in zip(expected, current):
+        if expected_binding is None or current_binding is None:
+            if expected_binding != current_binding:
+                raise PlanError(
+                    "source loose-object fanout presence changed after preflight\n"
+                    f"  path: {objects_binding.path / name}"
+                )
+            continue
+        if current_binding.identity != expected_binding.identity:
+            raise PlanError(
+                "source loose-object fanout object identity changed after preflight\n"
+                f"  path: {objects_binding.path / name}"
+            )
+        if (
+            current_binding.access_policy != expected_binding.access_policy
+            or current_binding.required_mode != expected_binding.required_mode
+        ):
+            raise PlanError(
+                "source loose-object fanout access policy changed after preflight\n"
+                f"  path: {objects_binding.path / name}"
+            )
+
+
+def require_source_completeness_fetch_transition(
+    prior: SourceCompletenessReceipt,
+    terminal: SourceCompletenessReceipt,
+) -> None:
+    unchanged_bindings = (
+        (
+            "source gitdir",
+            prior.gitdir_binding,
+            terminal.gitdir_binding,
+        ),
+        (
+            "source config",
+            prior.config_binding,
+            terminal.config_binding,
+        ),
+        (
+            "source object directory",
+            prior.objects_binding,
+            terminal.objects_binding,
+        ),
+        (
+            "source alternate-object policy parent",
+            prior.alternates_parent_binding,
+            terminal.alternates_parent_binding,
+        ),
+    )
+    for purpose, expected, current in unchanged_bindings:
+        if current != expected:
+            raise PlanError(f"{purpose} changed during authorized fetch")
+    if prior.pack_binding is not None and terminal.pack_binding != prior.pack_binding:
+        raise PlanError("source pack directory changed during authorized fetch")
+    prior_fanouts = dict(prior.loose_fanout_inventory)
+    terminal_fanouts = dict(terminal.loose_fanout_inventory)
+    if (
+        tuple(prior_fanouts) != LOOSE_OBJECT_FANOUT_NAMES
+        or tuple(terminal_fanouts) != LOOSE_OBJECT_FANOUT_NAMES
+        or any(
+            binding is not None and binding.name != name
+            for name, binding in prior.loose_fanout_inventory
+        )
+        or any(
+            binding is not None and binding.name != name
+            for name, binding in terminal.loose_fanout_inventory
+        )
+    ):
+        raise PlanError(
+            "source loose-object fanout completeness has an invalid receipt shape"
+        )
+    for name in LOOSE_OBJECT_FANOUT_NAMES:
+        expected = prior_fanouts[name]
+        current = terminal_fanouts[name]
+        if expected is not None and current is None:
+            raise PlanError(
+                "source loose-object fanout disappeared during authorized fetch\n"
+                f"  path: {prior.objects_binding.path / name}"
+            )
+        if expected is None:
+            continue
+        if current is None:
+            raise AssertionError("present fanout was checked above")
+        if current.identity != expected.identity:
+            raise PlanError(
+                "source loose-object fanout object identity changed during "
+                "authorized fetch\n"
+                f"  path: {prior.objects_binding.path / name}"
+            )
+        if (
+            current.access_policy != expected.access_policy
+            or current.required_mode != expected.required_mode
+        ):
+            raise PlanError(
+                "source loose-object fanout access policy changed during "
+                "authorized fetch\n"
+                f"  path: {prior.objects_binding.path / name}"
+            )
+
+
 def capture_source_completeness_receipt(
     source_git_dir: Path,
 ) -> SourceCompletenessReceipt:
@@ -6338,6 +6633,9 @@ def capture_source_completeness_receipt(
         "source completeness object directory",
         stat.S_IFDIR,
     )
+    loose_fanout_inventory = capture_source_loose_fanout_inventory(
+        objects_binding,
+    )
     info_dir = source_git_dir / "objects" / "info"
     alternates_parent = (
         info_dir if path_entry_exists(info_dir) else source_git_dir / "objects"
@@ -6365,6 +6663,10 @@ def capture_source_completeness_receipt(
     revalidate_access(gitdir_binding)
     revalidate_file_content_binding(config_binding)
     revalidate_access(objects_binding)
+    revalidate_source_loose_fanout_inventory(
+        objects_binding,
+        loose_fanout_inventory,
+    )
     revalidate_access(alternates_parent_binding)
     if pack_binding is not None:
         revalidate_access(pack_binding)
@@ -6375,6 +6677,7 @@ def capture_source_completeness_receipt(
         gitdir_binding=gitdir_binding,
         config_binding=config_binding,
         objects_binding=objects_binding,
+        loose_fanout_inventory=loose_fanout_inventory,
         alternates_parent_binding=alternates_parent_binding,
         pack_binding=pack_binding,
     )
@@ -6388,10 +6691,16 @@ def revalidate_source_completeness_receipt(
         raise PlanError("source completeness receipt does not match the source gitdir")
     if receipt.gitdir_binding.path != source_git_dir:
         raise PlanError("source completeness receipt names the wrong source gitdir")
+    if receipt.objects_binding.path != source_git_dir / "objects":
+        raise PlanError("source completeness receipt names the wrong object directory")
     revalidate_access(receipt.gitdir_binding)
     reject_source_commondir(source_git_dir)
     revalidate_file_content_binding(receipt.config_binding)
     revalidate_access(receipt.objects_binding)
+    revalidate_source_loose_fanout_inventory(
+        receipt.objects_binding,
+        receipt.loose_fanout_inventory,
+    )
     revalidate_access(receipt.alternates_parent_binding)
     current_pack = source_git_dir / "objects" / "pack"
     if receipt.pack_binding is None:
@@ -6778,8 +7087,17 @@ def commit_exists(
     sha: str,
     *,
     transaction: Optional[SourceFetchTransaction] = None,
+    completeness: Optional[SourceCompletenessReceipt] = None,
 ) -> bool:
     del work_tree
+    revalidate_source_object_admission(source_git_dir, transaction)
+    source_completeness = completeness or capture_source_completeness_receipt(
+        source_git_dir
+    )
+    revalidate_source_completeness_receipt(
+        source_git_dir,
+        source_completeness,
+    )
     revalidate_source_object_admission(source_git_dir, transaction)
     result = read_git(
         [
@@ -6789,6 +7107,10 @@ def commit_exists(
             f"{sha}^{{commit}}",
         ],
         check=False,
+    )
+    revalidate_source_completeness_receipt(
+        source_git_dir,
+        source_completeness,
     )
     revalidate_source_object_admission(source_git_dir, transaction)
     return result.returncode == 0
@@ -9392,8 +9714,21 @@ def fetch_missing_commit(
     transport_receipt: Optional[TransportReceipt] = None,
     source_completeness: Optional[SourceCompletenessReceipt] = None,
     fetch_missing: bool = False,
+    terminal_completeness_receipts: Optional[list[SourceCompletenessReceipt]] = None,
 ) -> bool:
-    if commit_exists(source_git_dir, work_tree, sha):
+    if terminal_completeness_receipts is not None and terminal_completeness_receipts:
+        raise PlanError("terminal source-completeness receipt output is not empty")
+    completeness = source_completeness or capture_source_completeness_receipt(
+        source_git_dir
+    )
+    if commit_exists(
+        source_git_dir,
+        work_tree,
+        sha,
+        completeness=completeness,
+    ):
+        if terminal_completeness_receipts is not None:
+            terminal_completeness_receipts.append(completeness)
         return True
     receipt = transport_receipt
     if receipt is None and fetch_missing:
@@ -9437,9 +9772,6 @@ def fetch_missing_commit(
         raise PlanError(
             f"authorized fetch for {submodule.path} lacks a bound transport receipt"
         )
-    completeness = source_completeness or capture_source_completeness_receipt(
-        source_git_dir
-    )
     revalidate_source_completeness_receipt(source_git_dir, completeness)
     revalidate_transport_receipt(receipt, submodule)
     expected_object_binding = access_binding_for_path(
@@ -9535,11 +9867,19 @@ def fetch_missing_commit(
             stdout=os.fsdecode(bounded_result.stdout),
             stderr=os.fsdecode(bounded_result.stderr),
         )
-        commit_available = result.returncode == 0 and commit_exists(
+        terminal_completeness: Optional[SourceCompletenessReceipt] = None
+        if result.returncode == 0:
+            terminal_completeness = capture_source_completeness_receipt(source_git_dir)
+            require_source_completeness_fetch_transition(
+                completeness,
+                terminal_completeness,
+            )
+        commit_available = terminal_completeness is not None and commit_exists(
             source_git_dir,
             work_tree,
             sha,
             transaction=transaction,
+            completeness=terminal_completeness,
         )
         signal_checkpoint("fetch-post-fetch-object-available")
         if commit_available:
@@ -9549,14 +9889,18 @@ def fetch_missing_commit(
             target_object_closure(
                 source_git_dir,
                 sha,
-                completeness,
+                terminal_completeness,
                 transaction=transaction,
             )
             signal_checkpoint("fetch-object-closure-validated")
+            if terminal_completeness_receipts is not None:
+                terminal_completeness_receipts.append(terminal_completeness)
             complete_source_fetch_transaction(transaction)
             signal_checkpoint("fetch-fence-cleared")
             return True
     except BaseException as exc:
+        if terminal_completeness_receipts is not None:
+            terminal_completeness_receipts.clear()
         if transaction.active:
             recovery_error = retain_source_fetch_transaction(
                 transaction,
@@ -14324,7 +14668,12 @@ def build_sync_plan(
             )
         source_identities[source_identity] = (submodule, source_git_dir)
         state = classify_planned_target(target, source_git_dir, force_replace_empty)
-        commit_available = commit_exists(source_git_dir, target.path, sha)
+        commit_available = commit_exists(
+            source_git_dir,
+            target.path,
+            sha,
+            completeness=source_completeness,
+        )
         if not commit_available and not fetch_missing:
             raise missing_commit_error(source_git_dir, submodule, sha, depth)
         if not commit_available and recursive:
@@ -14604,6 +14953,7 @@ def revalidate_planned_entry(
         entry.source_git_dir,
         target.path,
         entry.sha,
+        completeness=entry.source_completeness,
     ):
         raise PlanError(
             f"target commit disappeared after preflight for {entry.submodule.path}: "
@@ -15064,6 +15414,7 @@ def apply_sync_plan(plan: SyncPlan) -> None:
             continue
         revalidate_plan_input_receipt(plan)
         revalidate_runtime_source_access(entry)
+        terminal_completeness_receipts: list[SourceCompletenessReceipt] = []
         fetch_missing_commit(
             entry.source_git_dir,
             entry.target.path,
@@ -15074,7 +15425,14 @@ def apply_sync_plan(plan: SyncPlan) -> None:
             transport_receipt=getattr(entry, "transport_receipt", None),
             source_completeness=entry.source_completeness,
             fetch_missing=True,
+            terminal_completeness_receipts=terminal_completeness_receipts,
         )
+        if len(terminal_completeness_receipts) != 1:
+            raise PlanError(
+                "authorized fetch returned no exact terminal "
+                "source-completeness receipt"
+            )
+        entry.source_completeness = terminal_completeness_receipts[0]
         entry.needs_fetch = False
         plan_state_changed = True
 
