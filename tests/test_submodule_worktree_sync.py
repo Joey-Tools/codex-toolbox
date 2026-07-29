@@ -246,6 +246,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         source_git_dir: Path,
         submodule_path: str = "test-checkout",
         object_roots: tuple[str, ...] | None = None,
+        managed_index_content: bytes | None = None,
     ) -> MODULE.CheckoutExecutionView:
         completeness = MODULE.capture_source_completeness_receipt(
             source_git_dir,
@@ -259,9 +260,30 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             attributes,
             submodule_path,
             object_roots or (self.sha,),
+            managed_index_content,
         )
         self.addCleanup(view.close)
         return view
+
+    def capture_managed_preflight_resources(
+        self,
+        source_git_dir: Path,
+        target: Path,
+        submodule_path: str,
+        object_roots: tuple[str, ...] | None = None,
+    ) -> tuple[MODULE.ManagedPreflightReceipt, MODULE.CheckoutExecutionView]:
+        receipt = MODULE.capture_managed_preflight_receipt(
+            target,
+            source_git_dir,
+        )
+        self.addCleanup(receipt.close)
+        view = self.capture_checkout_execution_view(
+            source_git_dir,
+            submodule_path,
+            object_roots,
+            receipt.index_lease.content,
+        )
+        return receipt, view
 
     def ensure_loose_source_object(
         self,
@@ -2732,6 +2754,61 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         popen.assert_not_called()
 
+    def test_zlib_compress_bound_covers_shift_and_stored_block_boundaries(
+        self,
+    ) -> None:
+        for source_size in (
+            0,
+            1,
+            (1 << 12) - 1,
+            1 << 12,
+            (1 << 12) + 1,
+            (1 << 14) - 1,
+            1 << 14,
+            (1 << 14) + 1,
+            (1 << 16) - 1,
+            1 << 16,
+            (1 << 16) + 1,
+            (1 << 25) - 1,
+            1 << 25,
+            (1 << 25) + 1,
+        ):
+            with self.subTest(source_size=source_size):
+                self.assertEqual(
+                    MODULE.zlib_compress_bound(source_size),
+                    source_size
+                    + (source_size >> 12)
+                    + (source_size >> 14)
+                    + (source_size >> 25)
+                    + 13,
+                )
+
+    def test_checkout_pack_bound_handles_large_blob_without_allocation(
+        self,
+    ) -> None:
+        large_blob_size = 13 * 1024 * 1024 * 1024
+        expected = (
+            MODULE.GIT_PACK_HEADER_BYTES
+            + MODULE.git_pack_object_header_size(large_blob_size)
+            + MODULE.zlib_compress_bound(large_blob_size)
+            + 20
+        )
+        safety_limit = MODULE.checkout_pack_output_safety_limit(20)
+        self.assertEqual(
+            MODULE.checkout_pack_size_bound(
+                (large_blob_size,),
+                20,
+                maximum_output_bytes=safety_limit,
+            ),
+            expected,
+        )
+        with self.assertRaisesRegex(MODULE.PlanError, "safety limit"):
+            MODULE.checkout_pack_size_bound(
+                (large_blob_size,),
+                20,
+                maximum_output_bytes=expected - 1,
+            )
+
     def test_tracked_status_is_bounded_and_skips_untracked_inventory(self) -> None:
         completed = subprocess.CompletedProcess(
             ["git"],
@@ -2739,25 +2816,44 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             stdout=b"",
             stderr=b"",
         )
-        checkout_view = self.capture_checkout_execution_view(
+        target = self.root / "tracked-status-target"
+        self.add_managed_worktree(
             self.named_source_git_dir,
+            target,
+            self.sha,
+        )
+        managed_preflight, checkout_view = self.capture_managed_preflight_resources(
+            self.named_source_git_dir,
+            target,
             "tracked-status",
         )
-        with mock.patch.object(
-            MODULE,
-            "read_git_bounded",
-            return_value=completed,
-        ) as bounded_git:
+        with (
+            mock.patch.object(
+                MODULE,
+                "revalidate_managed_preflight_receipt",
+            ),
+            mock.patch.object(
+                MODULE,
+                "read_git_bounded",
+                return_value=completed,
+            ) as bounded_git,
+        ):
             self.assertFalse(
                 MODULE.has_local_changes(
-                    self.root,
+                    target,
                     self.sha,
                     checkout_view,
+                    managed_preflight,
                 )
             )
 
         args = bounded_git.call_args.args[0]
         self.assertIn("status", args)
+        self.assertNotIn("-C", args)
+        self.assertEqual(
+            args[0],
+            f"--git-dir={managed_preflight.control.admin_git_dir}",
+        )
         self.assertIn("--untracked-files=no", args)
         self.assertIn("--no-renames", args)
         self.assertEqual(
@@ -2768,8 +2864,15 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
+            bounded_git.call_args.kwargs["directory_descriptor"],
+            managed_preflight.target_descriptor,
+        )
+        self.assertEqual(
             bounded_git.call_args.kwargs["directory_identity_leases"],
-            checkout_view.directory_leases,
+            (
+                managed_preflight.control.admin_lease,
+                *checkout_view.directory_leases,
+            ),
         )
         self.assertEqual(
             bounded_git.call_args.kwargs["directory_exact_inventory_leases"],
@@ -2795,24 +2898,43 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             stdout=b"",
             stderr=b"",
         )
-        checkout_view = self.capture_checkout_execution_view(
+        target = self.root / "managed-probe-target"
+        self.add_managed_worktree(
             self.named_source_git_dir,
+            target,
+            self.sha,
+        )
+        managed_preflight, checkout_view = self.capture_managed_preflight_resources(
+            self.named_source_git_dir,
+            target,
             "managed-probe",
         )
-        with mock.patch.object(
-            MODULE,
-            "read_git_bounded",
-            return_value=completed,
-        ) as bounded_git:
+        with (
+            mock.patch.object(
+                MODULE,
+                "revalidate_managed_preflight_receipt",
+            ),
+            mock.patch.object(
+                MODULE,
+                "read_git_bounded",
+                return_value=completed,
+            ) as bounded_git,
+        ):
             MODULE.probe_managed_checkout(
-                self.root,
+                target,
                 self.sha,
                 checkout_view,
+                managed_preflight,
             )
 
         args = bounded_git.call_args.args[0]
         self.assertIn("read-tree", args)
         self.assertIn("--dry-run", args)
+        self.assertNotIn("-C", args)
+        self.assertEqual(
+            args[0],
+            f"--git-dir={managed_preflight.control.admin_git_dir}",
+        )
         self.assertEqual(
             bounded_git.call_args.kwargs["extra_env"],
             MODULE.checkout_execution_environment(
@@ -2821,8 +2943,15 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
+            bounded_git.call_args.kwargs["directory_descriptor"],
+            managed_preflight.target_descriptor,
+        )
+        self.assertEqual(
             bounded_git.call_args.kwargs["directory_identity_leases"],
-            checkout_view.directory_leases,
+            (
+                managed_preflight.control.admin_lease,
+                *checkout_view.directory_leases,
+            ),
         )
         self.assertEqual(
             bounded_git.call_args.kwargs["directory_exact_inventory_leases"],
@@ -2852,9 +2981,21 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             "locally modified\n",
             encoding="utf-8",
         )
-        checkout_view = self.capture_checkout_execution_view(
+        managed_preflight, checkout_view = self.capture_managed_preflight_resources(
             self.named_source_git_dir,
+            target,
             "isolated-status",
+        )
+        self.assertIsNotNone(checkout_view.private_index_path)
+        private_index_path = checkout_view.private_index_path
+        assert private_index_path is not None
+        self.assertEqual(
+            private_index_path.read_bytes(),
+            managed_preflight.index_lease.content,
+        )
+        self.assertEqual(
+            stat.S_IMODE(private_index_path.stat().st_mode),
+            0o400,
         )
 
         self.assertTrue(
@@ -2862,7 +3003,91 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 target,
                 self.sha,
                 checkout_view,
+                managed_preflight,
             )
+        )
+
+    def test_isolated_status_ignores_live_index_assume_valid_aba(self) -> None:
+        (self.remote / "TARGET_ONLY.md").write_text(
+            "target only\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "TARGET_ONLY.md")
+        run_git(self.remote, "commit", "-m", "add target-only path")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+
+        target = self.root / "status-index-aba-target"
+        self.add_managed_worktree(
+            self.named_source_git_dir,
+            target,
+            self.sha,
+        )
+        dirty_content = "dirty path unchanged by target\n"
+        (target / "README.md").write_text(dirty_content, encoding="utf-8")
+        managed_preflight, checkout_view = self.capture_managed_preflight_resources(
+            self.named_source_git_dir,
+            target,
+            "status-index-aba",
+            (self.sha, target_sha),
+        )
+        index_path = managed_preflight.control.admin_git_dir / "index"
+        original_index = index_path.read_bytes()
+        chunks, paths, extensions_offset = split_v2_index_entries(original_index)
+        readme_index = paths.index(b"README.md")
+        modified_chunks = list(chunks)
+        modified_entry = bytearray(modified_chunks[readme_index])
+        flags = int.from_bytes(modified_entry[60:62], "big")
+        modified_entry[60:62] = (flags | 0x8000).to_bytes(2, "big")
+        modified_chunks[readme_index] = bytes(modified_entry)
+        modified_body = (
+            original_index[:12]
+            + b"".join(modified_chunks)
+            + original_index[extensions_offset:-20]
+        )
+        assume_valid_index = modified_body + hashlib.sha1(modified_body).digest()
+        self.assertEqual(len(assume_valid_index), len(original_index))
+
+        original_popen = MODULE.subprocess.Popen
+        status_runs = 0
+
+        def run_status_during_index_aba(
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            nonlocal status_runs
+            command = args[0] if args else kwargs.get("args")
+            if isinstance(command, (list, tuple)) and "status" in command:
+                index_path.write_bytes(assume_valid_index)
+                process = original_popen(*args, **kwargs)
+                try:
+                    process.wait(timeout=10)
+                finally:
+                    index_path.write_bytes(original_index)
+                status_runs += 1
+                return process
+            return original_popen(*args, **kwargs)
+
+        with mock.patch.object(
+            MODULE.subprocess,
+            "Popen",
+            side_effect=run_status_during_index_aba,
+        ):
+            for _probe in range(2):
+                self.assertTrue(
+                    MODULE.has_local_changes(
+                        target,
+                        self.sha,
+                        checkout_view,
+                        managed_preflight,
+                    )
+                )
+
+        self.assertEqual(status_runs, 2)
+        self.assertEqual(index_path.read_bytes(), original_index)
+        self.assertEqual(
+            (target / "README.md").read_text(encoding="utf-8"),
+            dirty_content,
         )
 
     def test_isolated_status_exec_gate_rejects_private_object_injection(
@@ -2870,9 +3095,18 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
     ) -> None:
         for injection_kind in ("extra-pack-entry", "loose-object-fanout"):
             with self.subTest(injection_kind=injection_kind):
-                checkout_view = self.capture_checkout_execution_view(
+                target = self.root / f"private-object-target-{injection_kind}"
+                self.add_managed_worktree(
                     self.named_source_git_dir,
-                    f"private-object-injection-{injection_kind}",
+                    target,
+                    self.sha,
+                )
+                managed_preflight, checkout_view = (
+                    self.capture_managed_preflight_resources(
+                        self.named_source_git_dir,
+                        target,
+                        f"private-object-injection-{injection_kind}",
+                    )
                 )
                 if injection_kind == "extra-pack-entry":
                     injected_path = (
@@ -2915,9 +3149,10 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 ):
                     with self.assertRaises((MODULE.GitError, MODULE.PlanError)):
                         MODULE.has_local_changes(
-                            self.root,
+                            target,
                             self.sha,
                             checkout_view,
+                            managed_preflight,
                         )
 
                 self.assertTrue(injected)
@@ -2926,8 +3161,15 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
     def test_isolated_status_final_inventory_gate_rejects_digest_window_injection(
         self,
     ) -> None:
-        checkout_view = self.capture_checkout_execution_view(
+        target = self.root / "private-object-digest-window-target"
+        self.add_managed_worktree(
             self.named_source_git_dir,
+            target,
+            self.sha,
+        )
+        managed_preflight, checkout_view = self.capture_managed_preflight_resources(
+            self.named_source_git_dir,
+            target,
             "private-object-digest-window-injection",
         )
         pack_lease = checkout_view.digest_file_leases[0]
@@ -2957,9 +3199,10 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             ):
                 with self.assertRaises((MODULE.GitError, MODULE.PlanError)):
                     MODULE.has_local_changes(
-                        self.root,
+                        target,
                         self.sha,
                         checkout_view,
+                        managed_preflight,
                     )
             self.assertTrue(injected_path.is_file())
         finally:
@@ -6239,6 +6482,10 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 environment["GIT_OBJECT_DIRECTORY"],
                 str(private_common / "objects"),
             )
+            self.assertEqual(
+                environment["GIT_INDEX_FILE"],
+                str(private_common / "index"),
+            )
             self.assertEqual(environment["GIT_ATTR_SOURCE"], self.sha)
 
             directory_leases = kwargs["directory_identity_leases"]
@@ -6264,6 +6511,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 {
                     config_path.resolve(),
                     private_common / "config",
+                    private_common / "index",
                 }.issubset(file_paths)
             )
             digest_leases = kwargs["digest_file_leases"]
@@ -6287,7 +6535,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             }
             self.assertEqual(
                 exact_inventories[private_common],
-                ("HEAD", "config", "info", "objects", "refs"),
+                ("HEAD", "config", "index", "info", "objects", "refs"),
             )
             self.assertEqual(
                 exact_inventories[private_common / "info"],
@@ -6924,6 +7172,12 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         staged_payload = target / "staged.bin"
         staged_payload.write_text("staged\n", encoding="utf-8")
         run_git(target, "add", ".gitattributes", "staged.bin")
+        run_git(
+            target,
+            "update-index",
+            "--no-untracked-cache",
+            "--force-write-index",
+        )
 
         marker = self.root / "index-clean-filter-executed"
         run_git(
@@ -6937,7 +7191,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.PlanError,
-            "tree: index",
+            "stage-0 mode/OID/path set.*does not match",
         ):
             MODULE.build_sync_plan(
                 root=target_super,

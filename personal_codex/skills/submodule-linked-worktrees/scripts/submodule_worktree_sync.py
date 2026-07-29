@@ -57,6 +57,9 @@ MAX_CHECKOUT_OBJECTS = 500_000
 MAX_CHECKOUT_LOGICAL_BYTES = 64 * 1024 * 1024 * 1024
 MAX_CHECKOUT_OBJECT_ROOTS = 2
 MAX_CHECKOUT_PACK_INDEX_OVERHEAD_BYTES = 1024 * 1024
+MAX_SIGNED_FILE_SIZE_BYTES = (1 << 63) - 1
+GIT_PACK_HEADER_BYTES = 12
+ZLIB_COMPRESS_BOUND_FIXED_BYTES = 13
 MAX_NAME_POLICY_PROBE_ENTRIES = 256
 MAX_REGISTERED_WORKTREE_FIELDS = 1_000_000
 MAX_WORKTREE_ADMIN_ENTRIES = 250_000
@@ -561,7 +564,7 @@ class ObjectClosureReceipt:
 class ObjectClosureManifest:
     root: str
     receipt: ObjectClosureReceipt
-    objects: tuple[tuple[str, str], ...]
+    objects: tuple[tuple[str, str, int], ...]
 
 
 @dataclass(frozen=True)
@@ -742,6 +745,7 @@ class FetchControlLease:
 class CheckoutExecutionView:
     common_git_dir: Path
     object_directory: Path
+    private_index_path: Optional[Path]
     directory_leases: tuple[DirectoryEntryLease, ...]
     exact_inventory_leases: tuple[DirectoryExactInventoryLease, ...]
     file_leases: tuple[DescriptorBoundFileLease, ...]
@@ -844,6 +848,42 @@ class ManagedControlReceipt:
         if first_error is not None:
             raise PlanError(
                 f"managed control receipt cleanup failed: {first_error}"
+            ) from first_error
+
+
+@dataclass
+class ManagedPreflightReceipt:
+    target_descriptor: int
+    control: ManagedControlReceipt
+    index_lease: DescriptorBoundFileLease
+    current_head: str
+    index_digest: str
+    index_entry_count: int
+    index_blob_paths: tuple[tuple[str, ...], ...]
+    active: bool = True
+
+    def close(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        first_error: Optional[BaseException] = None
+        try:
+            os.close(self.index_lease.descriptor)
+        except OSError as exc:
+            first_error = exc
+        try:
+            self.control.close()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        try:
+            os.close(self.target_descriptor)
+        except OSError as exc:
+            if first_error is None:
+                first_error = exc
+        if first_error is not None:
+            raise PlanError(
+                f"managed preflight receipt cleanup failed: {first_error}"
             ) from first_error
 
 
@@ -1262,6 +1302,7 @@ def git_environment(
         unsupported = set(extra_env) - {
             "GIT_ATTR_SOURCE",
             "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
             "GIT_LITERAL_PATHSPECS",
             "GIT_OBJECT_DIRECTORY",
         }
@@ -1276,6 +1317,9 @@ def git_environment(
         object_directory = extra_env.get("GIT_OBJECT_DIRECTORY")
         if object_directory is not None and not Path(object_directory).is_absolute():
             raise PlanError("GIT_OBJECT_DIRECTORY override must be an absolute path")
+        index_file = extra_env.get("GIT_INDEX_FILE")
+        if index_file is not None and not Path(index_file).is_absolute():
+            raise PlanError("GIT_INDEX_FILE override must be an absolute path")
         environment.update(extra_env)
     return environment
 
@@ -3743,6 +3787,7 @@ def read_git_bounded(
     fixed_env: Optional[dict[str, str]] = None,
     timeout_seconds: float = GIT_ENUMERATION_TIMEOUT_SECONDS,
     preserve_split_index: bool = False,
+    directory_descriptor: Optional[int] = None,
     directory_identity_leases: tuple[DirectoryEntryLease, ...] = (),
     directory_exact_inventory_leases: tuple[DirectoryExactInventoryLease, ...] = (),
     directory_absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...] = (),
@@ -3760,6 +3805,7 @@ def read_git_bounded(
         fixed_env=fixed_env,
         timeout_seconds=timeout_seconds,
         preserve_split_index=preserve_split_index,
+        directory_descriptor=directory_descriptor,
         directory_identity_leases=directory_identity_leases,
         directory_exact_inventory_leases=directory_exact_inventory_leases,
         directory_absent_entry_leases=directory_absent_entry_leases,
@@ -9113,7 +9159,15 @@ def install_post_fetch_shallow_state(receipt: TransportReceipt) -> None:
         os.close(private_directory_descriptor)
 
 
-def write_owner_private_file(path: Path, content: bytes, purpose: str) -> None:
+def write_owner_private_file(
+    path: Path,
+    content: bytes,
+    purpose: str,
+    *,
+    final_mode: int = 0o600,
+) -> None:
+    if final_mode not in {0o400, 0o600}:
+        raise PlanError(f"{purpose} requested an unsupported private-file mode")
     descriptor = -1
     try:
         descriptor = os.open(
@@ -9131,6 +9185,7 @@ def write_owner_private_file(path: Path, content: bytes, purpose: str) -> None:
             if written <= 0:
                 raise PlanError(f"cannot write {purpose}: {path}")
             remaining = remaining[written:]
+        os.fchmod(descriptor, final_mode)
         os.fsync(descriptor)
     except OSError as exc:
         raise PlanError(f"cannot create {purpose}: {path}\n  error: {exc}") from exc
@@ -11201,31 +11256,103 @@ def has_local_changes(
     worktree_path: Path,
     current_head: str,
     checkout_view: CheckoutExecutionView,
+    managed_preflight: ManagedPreflightReceipt,
 ) -> bool:
-    environment = checkout_execution_environment(checkout_view, current_head)
-    result = read_git_bounded(
+    result = run_managed_preflight_probe(
+        worktree_path,
+        current_head,
+        checkout_view,
+        managed_preflight,
         [
-            "-C",
-            str(worktree_path),
-            "--work-tree=.",
             "status",
             "--porcelain=v1",
             "-z",
             "--untracked-files=no",
             "--no-renames",
         ],
-        extra_env=environment,
-        directory_identity_leases=checkout_view.directory_leases,
-        directory_exact_inventory_leases=checkout_view.exact_inventory_leases,
-        directory_absent_entry_leases=checkout_view.absent_entry_leases,
-        file_content_leases=checkout_view.file_leases,
-        digest_file_leases=checkout_view.digest_file_leases,
     )
     records = bounded_records(
         result.stdout,
         "managed worktree tracked-status inventory",
     )
     return bool(records)
+
+
+def run_managed_preflight_probe(
+    worktree_path: Path,
+    attribute_source: str,
+    checkout_view: CheckoutExecutionView,
+    managed_preflight: ManagedPreflightReceipt,
+    args: list[str],
+    *,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    expected_worktree = managed_preflight.control.git_file_binding.path.parent
+    if worktree_path.resolve(strict=True) != expected_worktree.resolve(strict=True):
+        raise PlanError("managed preflight probe names a different worktree")
+    if checkout_view.private_index_path is None:
+        raise PlanError("managed preflight probe lacks an isolated index snapshot")
+
+    revalidate_managed_preflight_receipt(managed_preflight)
+    revalidate_checkout_execution_view(checkout_view)
+    environment = checkout_execution_environment(
+        checkout_view,
+        attribute_source,
+    )
+    result: Optional[subprocess.CompletedProcess[bytes]] = None
+    outcome_exception: Optional[BaseException] = None
+    try:
+        result = read_git_bounded(
+            [
+                f"--git-dir={managed_preflight.control.admin_git_dir}",
+                "--work-tree=.",
+                *args,
+            ],
+            check=check,
+            extra_env=environment,
+            directory_descriptor=managed_preflight.target_descriptor,
+            directory_identity_leases=(
+                managed_preflight.control.admin_lease,
+                *checkout_view.directory_leases,
+            ),
+            directory_exact_inventory_leases=(checkout_view.exact_inventory_leases),
+            directory_absent_entry_leases=checkout_view.absent_entry_leases,
+            file_content_leases=checkout_view.file_leases,
+            digest_file_leases=checkout_view.digest_file_leases,
+        )
+    except BaseException as exc:
+        outcome_exception = exc
+
+    terminal_errors: list[str] = []
+    for purpose, revalidator in (
+        (
+            "managed worktree control/index",
+            lambda: revalidate_managed_preflight_receipt(managed_preflight),
+        ),
+        (
+            "isolated checkout execution view",
+            lambda: revalidate_checkout_execution_view(checkout_view),
+        ),
+    ):
+        try:
+            revalidator()
+        except BaseException as exc:
+            terminal_errors.append(
+                f"{purpose} terminal revalidation failed: {type(exc).__name__}: {exc}"
+            )
+    if terminal_errors:
+        detail = "\n".join(terminal_errors)
+        if isinstance(outcome_exception, ForwardedProcessSignal):
+            outcome_exception.add_cleanup_error(detail)
+            raise outcome_exception
+        if outcome_exception is not None:
+            raise PlanError(f"{outcome_exception}\n{detail}") from outcome_exception
+        raise PlanError(detail)
+    if outcome_exception is not None:
+        raise outcome_exception
+    if result is None:
+        raise PlanError("managed preflight probe returned no process result")
+    return result
 
 
 def revalidate_source_registry_lease(
@@ -13602,8 +13729,8 @@ def target_tree_index_entries(
 def validate_captured_index_matches_tree(
     entry: PlannedWorktree,
     index_content: bytes,
-) -> None:
-    validate_captured_index_matches_commit(
+) -> tuple[tuple[bytes, bytes, bytes], ...]:
+    return validate_captured_index_matches_commit(
         entry.source_git_dir,
         entry.sha,
         entry.target.path,
@@ -13616,7 +13743,7 @@ def validate_captured_index_matches_commit(
     target_sha: str,
     worktree_path: Path,
     index_content: bytes,
-) -> None:
+) -> tuple[tuple[bytes, bytes, bytes], ...]:
     object_id_bytes = len(target_sha) // 2
     expected, expected_cache_tree = target_tree_index_semantics(
         source_git_dir,
@@ -13638,27 +13765,70 @@ def validate_captured_index_matches_commit(
             f"  worktree: {worktree_path}\n"
             f"  target: {target_sha}"
         )
+    return captured
 
 
-def validate_managed_preflight_index(
-    entry: PlannedWorktree,
-    current_head: str,
-) -> None:
-    """Reject hidden raw-index state before any managed checkout probe."""
+def managed_head_from_control(
+    worktree_path: Path,
+    target_descriptor: int,
+    control: ManagedControlReceipt,
+    index_lease: DescriptorBoundFileLease,
+) -> str:
+    revalidate_managed_control_receipt(control, target_descriptor)
+    revalidate_descriptor_bound_file_lease(index_lease)
+    result = read_git_bounded(
+        [
+            f"--git-dir={control.admin_git_dir}",
+            "--work-tree=.",
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        ],
+        stdout_limit=256,
+        directory_descriptor=target_descriptor,
+        directory_identity_leases=(control.admin_lease,),
+        file_content_leases=(index_lease,),
+    )
+    revalidate_descriptor_bound_file_lease(index_lease)
+    revalidate_managed_control_receipt(control, target_descriptor)
+    value = os.fsdecode(result.stdout).strip()
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
+        raise PlanError(f"managed worktree returned an invalid HEAD: {worktree_path}")
+    return value
+
+
+def managed_index_semantic_digest(
+    entries: tuple[tuple[bytes, bytes, bytes], ...],
+) -> str:
+    digest = hashlib.sha256()
+    for raw_path, mode, object_id in entries:
+        digest.update(raw_path)
+        digest.update(b"\0")
+        digest.update(mode)
+        digest.update(b"\0")
+        digest.update(object_id)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def capture_managed_preflight_receipt(
+    worktree_path: Path,
+    source_git_dir: Path,
+) -> ManagedPreflightReceipt:
+    """Bind and parse the original raw index before any status/read-tree probe."""
 
     target_descriptor = open_directory_descriptor(
-        entry.target.path,
+        worktree_path,
         "managed worktree preflight target",
     )
     control: Optional[ManagedControlReceipt] = None
     index_descriptor = -1
     try:
         control = capture_managed_control_receipt(
-            entry.target.path,
-            entry.source_git_dir,
+            worktree_path,
+            source_git_dir,
             target_descriptor,
         )
-        revalidate_managed_control_receipt(control, target_descriptor)
         (
             index_descriptor,
             index_binding,
@@ -13674,43 +13844,84 @@ def validate_managed_preflight_index(
         )
         if index_content is None:
             raise PlanError("managed worktree preflight index returned no content")
-        # The protected property is the raw index's supported semantic state:
-        # checksum, format/extensions, and stage-0 mode/OID/path values. The
-        # parser intentionally ignores stat-cache timestamps, while the held
-        # descriptor and rebind prove object identity, bytes, and access policy
-        # did not change around that semantic validation.
-        validate_captured_index_matches_commit(
-            entry.source_git_dir,
+        index_lease = DescriptorBoundFileLease(
+            directory_binding=control.admin_lease.binding,
+            directory_descriptor=control.admin_lease.descriptor,
+            entry_name="index",
+            descriptor=index_descriptor,
+            binding=index_binding,
+            content=index_content,
+        )
+        current_head = managed_head_from_control(
+            worktree_path,
+            target_descriptor,
+            control,
+            index_lease,
+        )
+        # Protected property: the raw index's supported semantic state,
+        # object identity, bytes, and read policy are fixed before a status
+        # process exists. Stat-cache timestamps are intentionally ignored.
+        entries = validate_captured_index_matches_commit(
+            source_git_dir,
             current_head,
-            entry.target.path,
+            worktree_path,
             index_content,
         )
-        observed_index, _ = bind_regular_file_descriptor_at(
-            index_descriptor,
-            control.admin_lease.descriptor,
-            "index",
-            index_binding.path,
-            maximum_bytes=MAX_SUPERPROJECT_INDEX_BYTES,
-            mode=os.R_OK,
-            purpose="managed worktree preflight index",
-            retain_content=False,
+        index_blob_paths = tuple(
+            validate_checkout_path(raw_path, "managed worktree preflight index")
+            for raw_path, mode, _object_id in entries
+            if mode.startswith(b"100")
         )
-        require_matching_file_binding(
-            index_binding,
-            observed_index,
-            "managed worktree preflight index",
-        )
+        revalidate_descriptor_bound_file_lease(index_lease)
         revalidate_managed_control_receipt(control, target_descriptor)
+        receipt = ManagedPreflightReceipt(
+            target_descriptor=target_descriptor,
+            control=control,
+            index_lease=index_lease,
+            current_head=current_head,
+            index_digest=managed_index_semantic_digest(entries),
+            index_entry_count=len(entries),
+            index_blob_paths=index_blob_paths,
+        )
+        target_descriptor = -1
+        control = None
+        index_descriptor = -1
+        return receipt
     finally:
-        try:
-            if index_descriptor >= 0:
-                os.close(index_descriptor)
-        finally:
-            try:
-                if control is not None:
-                    control.close()
-            finally:
-                os.close(target_descriptor)
+        if index_descriptor >= 0:
+            os.close(index_descriptor)
+        if control is not None:
+            control.close()
+        if target_descriptor >= 0:
+            os.close(target_descriptor)
+
+
+def revalidate_managed_preflight_receipt(
+    receipt: ManagedPreflightReceipt,
+) -> None:
+    if not receipt.active:
+        raise PlanError("managed preflight receipt is inactive")
+    revalidate_managed_control_receipt(
+        receipt.control,
+        receipt.target_descriptor,
+    )
+    revalidate_descriptor_bound_file_lease(receipt.index_lease)
+    current_head = managed_head_from_control(
+        receipt.control.git_file_binding.path.parent,
+        receipt.target_descriptor,
+        receipt.control,
+        receipt.index_lease,
+    )
+    if current_head != receipt.current_head:
+        raise PlanError(
+            "managed worktree HEAD changed during preflight\n"
+            f"  worktree: {receipt.control.git_file_binding.path.parent}"
+        )
+    revalidate_descriptor_bound_file_lease(receipt.index_lease)
+    revalidate_managed_control_receipt(
+        receipt.control,
+        receipt.target_descriptor,
+    )
 
 
 def managed_head(worktree_path: Path) -> str:
@@ -13722,48 +13933,6 @@ def managed_head(worktree_path: Path) -> str:
     if not value or any(character not in "0123456789abcdef" for character in value):
         raise PlanError(f"managed worktree returned an invalid HEAD: {worktree_path}")
     return value
-
-
-def managed_index_snapshot(
-    worktree_path: Path,
-) -> tuple[str, int, tuple[tuple[str, ...], ...]]:
-    result = read_git_bounded(
-        ["-C", str(worktree_path), "ls-files", "--stage", "-v", "-z"]
-    )
-    records = bounded_records(result.stdout, "managed worktree index")
-    regular_paths: list[tuple[str, ...]] = []
-    for record in records:
-        if not record.startswith(b"H "):
-            tag = os.fsdecode(record[:1]) if record else "<empty>"
-            raise PlanError(
-                "managed worktree index has unsupported sparse or hidden state\n"
-                f"  worktree: {worktree_path}\n"
-                f"  tag: {tag}"
-            )
-        try:
-            metadata, raw_path = record[2:].split(b"\t", 1)
-        except ValueError as exc:
-            raise PlanError(
-                "managed worktree index has an invalid stage record"
-            ) from exc
-        fields = metadata.split()
-        if len(fields) != 3:
-            raise PlanError("managed worktree index has an invalid stage header")
-        mode, _object_id, stage_value = fields
-        if stage_value != b"0":
-            raise PlanError(
-                "managed worktree index has unresolved entries; resolve conflicts "
-                "before syncing"
-            )
-        if mode.startswith(b"100"):
-            regular_paths.append(
-                validate_checkout_path(raw_path, "managed worktree index")
-            )
-    return (
-        hashlib.sha256(result.stdout).hexdigest(),
-        len(records),
-        tuple(regular_paths),
-    )
 
 
 def parse_managed_tree_changes(
@@ -13855,7 +14024,7 @@ def verify_target_object_payloads(
     source_git_dir: Path,
     ordered: list[str],
     expected_types: dict[str, str],
-) -> ObjectClosureReceipt:
+) -> tuple[ObjectClosureReceipt, tuple[int, ...]]:
     # `cat-file --batch-check` can read a corrupt loose object's header while
     # never decompressing its payload. Stream every required object instead,
     # independently recompute its object id, and discard payload bytes after
@@ -14034,6 +14203,7 @@ def verify_target_object_payloads(
     maximum_producer_bytes = MAX_CHECKOUT_LOGICAL_BYTES + len(ordered) * 256 + 1
     deadline = time.monotonic() + GIT_ENUMERATION_TIMEOUT_SECONDS
     inventory_digest = hashlib.sha256()
+    observed_sizes: list[int] = []
     logical_bytes = 0
     object_index = 0
     current_id: Optional[str] = None
@@ -14152,6 +14322,7 @@ def verify_target_object_payloads(
             inventory_digest.update(b"\0")
             inventory_digest.update(str(current_size).encode("ascii"))
             inventory_digest.update(b"\0")
+            observed_sizes.append(current_size)
             object_index += 1
             current_id = None
             current_type = None
@@ -14321,10 +14492,13 @@ def verify_target_object_payloads(
             "target checkout object payload verification failed"
             + (f": {detail}" if detail else "")
         )
-    return ObjectClosureReceipt(
-        object_count=len(ordered),
-        logical_bytes=logical_bytes,
-        digest=inventory_digest.hexdigest(),
+    return (
+        ObjectClosureReceipt(
+            object_count=len(ordered),
+            logical_bytes=logical_bytes,
+            digest=inventory_digest.hexdigest(),
+        ),
+        tuple(observed_sizes),
     )
 
 
@@ -14416,7 +14590,7 @@ def target_object_manifest(
         )
 
     ordered = sorted(expected_types)
-    receipt = verify_target_object_payloads(
+    receipt, object_sizes = verify_target_object_payloads(
         source_git_dir,
         ordered,
         expected_types,
@@ -14426,7 +14600,10 @@ def target_object_manifest(
     return ObjectClosureManifest(
         root=target_sha,
         receipt=receipt,
-        objects=tuple((object_id, expected_types[object_id]) for object_id in ordered),
+        objects=tuple(
+            (object_id, expected_types[object_id], object_size)
+            for object_id, object_size in zip(ordered, object_sizes)
+        ),
     )
 
 
@@ -14870,6 +15047,157 @@ def normalize_checkout_object_roots(
     return roots
 
 
+def checked_bounded_size_add(
+    total: int,
+    addition: int,
+    maximum: int,
+    purpose: str,
+) -> int:
+    """Add non-negative sizes without relying on machine-integer wraparound."""
+
+    if total < 0 or addition < 0 or maximum < 0 or total > maximum:
+        raise PlanError(f"{purpose} has an invalid size bound")
+    if addition > maximum - total:
+        raise PlanError(f"{purpose} exceeds its {maximum}-byte safety limit")
+    return total + addition
+
+
+def zlib_compress_bound(
+    source_size: int,
+    *,
+    maximum_output_bytes: int = MAX_SIGNED_FILE_SIZE_BYTES,
+) -> int:
+    """Return zlib's default-parameter compressBound without integer overflow."""
+
+    if source_size < 0:
+        raise PlanError("zlib input size is negative")
+    bound = source_size
+    for addition in (
+        source_size >> 12,
+        source_size >> 14,
+        source_size >> 25,
+        ZLIB_COMPRESS_BOUND_FIXED_BYTES,
+    ):
+        bound = checked_bounded_size_add(
+            bound,
+            addition,
+            maximum_output_bytes,
+            "zlib compressed object",
+        )
+    return bound
+
+
+def git_pack_object_header_size(object_size: int) -> int:
+    if object_size < 0:
+        raise PlanError("Git pack object size is negative")
+    header_bytes = 1
+    remaining = object_size >> 4
+    while remaining:
+        header_bytes += 1
+        remaining >>= 7
+    return header_bytes
+
+
+def checkout_pack_output_safety_limit(object_id_bytes: int) -> int:
+    if object_id_bytes not in {20, 32}:
+        raise PlanError("checkout pack uses an unsupported object-id width")
+    maximum_objects = MAX_CHECKOUT_OBJECTS * MAX_CHECKOUT_OBJECT_ROOTS
+    maximum_logical_bytes = MAX_CHECKOUT_LOGICAL_BYTES * MAX_CHECKOUT_OBJECT_ROOTS
+    total = GIT_PACK_HEADER_BYTES
+    for addition in (
+        maximum_logical_bytes,
+        maximum_logical_bytes >> 12,
+        maximum_logical_bytes >> 14,
+        maximum_logical_bytes >> 25,
+        maximum_objects * ZLIB_COMPRESS_BOUND_FIXED_BYTES,
+        maximum_objects * git_pack_object_header_size(MAX_CHECKOUT_LOGICAL_BYTES),
+        object_id_bytes,
+    ):
+        total = checked_bounded_size_add(
+            total,
+            addition,
+            MAX_SIGNED_FILE_SIZE_BYTES,
+            "checkout pack aggregate",
+        )
+    return total
+
+
+def checkout_pack_size_bound(
+    object_sizes: Iterable[int],
+    object_id_bytes: int,
+    *,
+    maximum_output_bytes: int,
+) -> int:
+    """Bound one undeltified pack using exact headers and per-object zlib bounds."""
+
+    if object_id_bytes not in {20, 32}:
+        raise PlanError("checkout pack uses an unsupported object-id width")
+    total = checked_bounded_size_add(
+        0,
+        GIT_PACK_HEADER_BYTES,
+        maximum_output_bytes,
+        "checkout pack",
+    )
+    object_count = 0
+    logical_bytes = 0
+    for object_size in object_sizes:
+        if object_size < 0 or object_size > MAX_CHECKOUT_LOGICAL_BYTES:
+            raise PlanError("checkout pack object has an invalid logical size")
+        object_count += 1
+        if object_count > MAX_CHECKOUT_OBJECTS * MAX_CHECKOUT_OBJECT_ROOTS:
+            raise PlanError("checkout pack exceeds its aggregate object-count limit")
+        logical_bytes = checked_bounded_size_add(
+            logical_bytes,
+            object_size,
+            MAX_CHECKOUT_LOGICAL_BYTES * MAX_CHECKOUT_OBJECT_ROOTS,
+            "checkout pack logical payload",
+        )
+        total = checked_bounded_size_add(
+            total,
+            git_pack_object_header_size(object_size),
+            maximum_output_bytes,
+            "checkout pack",
+        )
+        compressed_bound = zlib_compress_bound(
+            object_size,
+            maximum_output_bytes=maximum_output_bytes - total,
+        )
+        total = checked_bounded_size_add(
+            total,
+            compressed_bound,
+            maximum_output_bytes,
+            "checkout pack",
+        )
+    if object_count == 0:
+        raise PlanError("checkout pack object inventory is empty")
+    return checked_bounded_size_add(
+        total,
+        object_id_bytes,
+        maximum_output_bytes,
+        "checkout pack",
+    )
+
+
+def checkout_pack_index_size_bound(
+    object_count: int,
+    object_id_bytes: int,
+) -> int:
+    if (
+        object_count < 0
+        or object_count > MAX_CHECKOUT_OBJECTS * MAX_CHECKOUT_OBJECT_ROOTS
+        or object_id_bytes not in {20, 32}
+    ):
+        raise PlanError("checkout pack index has an invalid bound input")
+    # Version 2 header/fanout, OIDs, CRCs, 32-bit offsets, worst-case 64-bit
+    # offsets, and the pack/index checksums.
+    return (
+        8
+        + (256 * 4)
+        + object_count * (object_id_bytes + 4 + 4 + 8)
+        + (2 * object_id_bytes)
+    )
+
+
 def parse_checkout_pack_index(
     content: bytes,
     object_id_bytes: int,
@@ -14961,37 +15289,39 @@ def materialize_checkout_object_pack(
         )
         for root in roots
     )
-    expected_types: dict[str, str] = {}
+    expected_objects: dict[str, tuple[str, int]] = {}
     for manifest in manifests:
-        for object_id, object_type in manifest.objects:
-            prior = expected_types.setdefault(object_id, object_type)
-            if prior != object_type:
+        for object_id, object_type, object_size in manifest.objects:
+            prior = expected_objects.setdefault(
+                object_id,
+                (object_type, object_size),
+            )
+            if prior != (object_type, object_size):
                 raise PlanError(
-                    "checkout object roots contain a conflicting object type"
+                    "checkout object roots contain conflicting object metadata"
                 )
     maximum_objects = MAX_CHECKOUT_OBJECTS * len(manifests)
-    if len(expected_types) > maximum_objects:
+    if len(expected_objects) > maximum_objects:
         raise PlanError(
             "checkout execution view exceeds the aggregate "
             f"{maximum_objects}-object safety limit"
         )
-    ordered = tuple(sorted(expected_types))
+    ordered = tuple(sorted(expected_objects))
     object_input = b"".join(object_id.encode("ascii") + b"\n" for object_id in ordered)
     if len(object_input) > GIT_INPUT_LIMIT_BYTES:
         raise PlanError(
             "checkout execution view exceeds the "
             f"{GIT_INPUT_LIMIT_BYTES}-byte pack input limit"
         )
-    maximum_pack_bytes = (
-        sum(manifest.receipt.logical_bytes for manifest in manifests)
-        + (len(ordered) * 256)
-        + MAX_CHECKOUT_PACK_INDEX_OVERHEAD_BYTES
-    )
     object_id_bytes = len(roots[0]) // 2
-    maximum_index_bytes = (
-        MAX_CHECKOUT_PACK_INDEX_OVERHEAD_BYTES
-        + len(ordered) * (object_id_bytes + 32)
-        + (2 * object_id_bytes)
+    maximum_pack_bytes = checkout_pack_size_bound(
+        (expected_objects[object_id][1] for object_id in ordered),
+        object_id_bytes,
+        maximum_output_bytes=checkout_pack_output_safety_limit(object_id_bytes),
+    )
+    maximum_index_bytes = checkout_pack_index_size_bound(
+        len(ordered),
+        object_id_bytes,
     )
     pack_base = private_pack / "checkout"
     result = read_git_bounded(
@@ -15016,7 +15346,7 @@ def materialize_checkout_object_pack(
         stdout_limit=256,
         directory_identity_leases=source_directory_leases,
         file_content_leases=source_file_leases,
-        file_size_limit_bytes=maximum_pack_bytes,
+        file_size_limit_bytes=max(maximum_pack_bytes, maximum_index_bytes),
     )
     pack_id = os.fsdecode(result.stdout).strip()
     if not re.fullmatch(rf"[0-9a-f]{{{len(roots[0])}}}", pack_id):
@@ -15082,12 +15412,20 @@ def capture_checkout_execution_view(
     attributes_receipt: CheckoutAttributesReceipt,
     submodule_path: str,
     object_roots: tuple[str, ...],
+    managed_index_content: Optional[bytes] = None,
 ) -> CheckoutExecutionView:
     # The actual checkout reads config, common info/attributes, and every
     # required object only from this owner-private snapshot. The exact private
     # pack is content-bound again in the child pre-exec gate; live source
     # object bytes can no longer influence checkout after materialization.
     roots = normalize_checkout_object_roots(object_roots)
+    if managed_index_content is not None and (
+        not managed_index_content
+        or len(managed_index_content) > MAX_SUPERPROJECT_INDEX_BYTES
+    ):
+        raise PlanError(
+            f"managed checkout index snapshot is invalid for {submodule_path}"
+        )
     resolved_source_git_dir = source_git_dir.resolve(strict=True)
     if (
         source_completeness.gitdir_binding.path.resolve(strict=True)
@@ -15260,6 +15598,14 @@ def capture_checkout_execution_view(
             b"ref: refs/heads/checkout-isolated\n",
             f"isolated checkout HEAD for {submodule_path}",
         )
+        private_managed_index = private_root / "index"
+        if managed_index_content is not None:
+            write_owner_private_file(
+                private_managed_index,
+                managed_index_content,
+                f"isolated checkout managed index for {submodule_path}",
+                final_mode=0o400,
+            )
         private_attributes = private_info / "attributes"
         if source_attributes_content is not None:
             write_owner_private_file(
@@ -15329,6 +15675,26 @@ def capture_checkout_execution_view(
             retain_content=False,
         )[0]
         capture_file(private_root_lease, private_head_binding)
+        if managed_index_content is not None:
+            private_managed_index_binding = read_bound_regular_file(
+                private_managed_index,
+                maximum_bytes=MAX_SUPERPROJECT_INDEX_BYTES,
+                mode=os.R_OK,
+                purpose=f"isolated checkout managed index for {submodule_path}",
+                retain_content=False,
+            )[0]
+            (
+                _private_managed_index_lease,
+                private_managed_index_content,
+            ) = capture_file(private_root_lease, private_managed_index_binding)
+            if (
+                private_managed_index_binding.fingerprint.permissions != 0o400
+                or private_managed_index_content != managed_index_content
+            ):
+                raise PlanError(
+                    f"isolated checkout managed index changed during capture for "
+                    f"{submodule_path}"
+                )
         if source_attributes_content is None:
             absent_entry_leases.append(
                 capture_directory_absent_entry_lease(
@@ -15367,7 +15733,14 @@ def capture_checkout_execution_view(
             (
                 capture_directory_exact_inventory_lease(
                     private_root_lease,
-                    ("HEAD", "config", "info", "objects", "refs"),
+                    (
+                        "HEAD",
+                        "config",
+                        *(("index",) if managed_index_content is not None else ()),
+                        "info",
+                        "objects",
+                        "refs",
+                    ),
                     f"isolated checkout exact common-gitdir inventory for "
                     f"{submodule_path}",
                 ),
@@ -15409,7 +15782,7 @@ def capture_checkout_execution_view(
                 {
                     object_id
                     for manifest in expected_manifests
-                    for object_id, _object_type in manifest.objects
+                    for object_id, _object_type, _object_size in manifest.objects
                 }
             )
         )
@@ -15425,6 +15798,9 @@ def capture_checkout_execution_view(
         view = CheckoutExecutionView(
             common_git_dir=private_root,
             object_directory=private_objects,
+            private_index_path=(
+                private_managed_index if managed_index_content is not None else None
+            ),
             directory_leases=tuple(directory_leases),
             exact_inventory_leases=tuple(exact_inventory_leases),
             file_leases=tuple(file_leases),
@@ -15484,6 +15860,15 @@ def revalidate_checkout_execution_view(view: CheckoutExecutionView) -> None:
         != 1
     ):
         raise PlanError("checkout execution view has an invalid directory shape")
+    if view.private_index_path is not None and (
+        not view.private_index_path.is_absolute()
+        or view.private_index_path.parent != view.common_git_dir
+        or sum(
+            lease.binding.path == view.private_index_path for lease in view.file_leases
+        )
+        != 1
+    ):
+        raise PlanError("checkout execution view has an unbound private index")
     for directory_lease in view.directory_leases:
         revalidate_directory_entry_lease(directory_lease)
     for inventory_lease in view.exact_inventory_leases:
@@ -15507,11 +15892,14 @@ def checkout_execution_environment(
     sha: str,
 ) -> dict[str, str]:
     revalidate_checkout_execution_view(view)
-    return {
+    environment = {
         "GIT_ATTR_SOURCE": sha,
         "GIT_COMMON_DIR": str(view.common_git_dir),
         "GIT_OBJECT_DIRECTORY": str(view.object_directory),
     }
+    if view.private_index_path is not None:
+        environment["GIT_INDEX_FILE"] = str(view.private_index_path)
+    return environment
 
 
 def checkout_write_access_bindings(
@@ -15784,13 +16172,14 @@ def probe_managed_checkout(
     worktree_path: Path,
     target_sha: str,
     checkout_view: CheckoutExecutionView,
+    managed_preflight: ManagedPreflightReceipt,
 ) -> None:
-    environment = checkout_execution_environment(checkout_view, target_sha)
-    result = read_git_bounded(
+    result = run_managed_preflight_probe(
+        worktree_path,
+        target_sha,
+        checkout_view,
+        managed_preflight,
         [
-            "-C",
-            str(worktree_path),
-            "--work-tree=.",
             "read-tree",
             "--dry-run",
             "-m",
@@ -15799,12 +16188,6 @@ def probe_managed_checkout(
             target_sha,
         ],
         check=False,
-        extra_env=environment,
-        directory_identity_leases=checkout_view.directory_leases,
-        directory_exact_inventory_leases=checkout_view.exact_inventory_leases,
-        directory_absent_entry_leases=checkout_view.absent_entry_leases,
-        file_content_leases=checkout_view.file_leases,
-        digest_file_leases=checkout_view.digest_file_leases,
     )
     if result.returncode != 0:
         detail = os.fsdecode(result.stderr).strip()
@@ -15866,71 +16249,90 @@ def capture_checkout_preflight(
         entry.sha,
     )
     if entry.state == "managed":
-        current_head = managed_head(entry.target.path)
-        (
-            index_digest,
-            index_entry_count,
-            index_blob_paths,
-        ) = managed_index_snapshot(entry.target.path)
-        changes = parse_managed_tree_changes(
+        managed_preflight = capture_managed_preflight_receipt(
             entry.target.path,
-            current_head,
-            entry.sha,
-        )
-        current_blob_paths = target_tree_blob_paths(
             entry.source_git_dir,
-            current_head,
         )
-        final_tree_paths = (
-            (current_head, current_blob_paths),
-            (entry.sha, target_blob_paths),
-        )
-        final_index_paths = index_blob_paths
-        attributes_receipt, filter_selections = bind_checkout_filter_selection(
-            entry,
-            final_tree_paths,
-            final_index_paths,
-        )
-        # Status and read-tree can invoke clean/process conversion even during
-        # plan-only preflight. Keep both on the captured control bytes and put
-        # every source/private lease in their child-side exec gate.
-        checkout_view = capture_checkout_execution_view(
-            entry.source_git_dir,
-            entry.source_completeness,
-            attributes_receipt,
-            entry.submodule.path,
-            (current_head, entry.sha),
-        )
-        checkout_view_outcome: Optional[BaseException] = None
+        managed_preflight_outcome: Optional[BaseException] = None
         try:
-            if has_local_changes(
+            current_head = managed_preflight.current_head
+            index_digest = managed_preflight.index_digest
+            index_entry_count = managed_preflight.index_entry_count
+            changes = parse_managed_tree_changes(
                 entry.target.path,
                 current_head,
-                checkout_view,
-            ):
-                raise PlanError(
-                    f"{entry.target.path} has local changes; clean it before syncing"
-                )
-            write_bindings = checkout_write_access_bindings(
-                entry.target.path,
-                changes,
-            )
-            reject_managed_ignored_conflicts(entry.target.path, changes)
-            validate_managed_preflight_index(entry, current_head)
-            probe_managed_checkout(
-                entry.target.path,
                 entry.sha,
-                checkout_view,
             )
+            current_blob_paths = target_tree_blob_paths(
+                entry.source_git_dir,
+                current_head,
+            )
+            final_tree_paths = (
+                (current_head, current_blob_paths),
+                (entry.sha, target_blob_paths),
+            )
+            final_index_paths = managed_preflight.index_blob_paths
+            attributes_receipt, filter_selections = bind_checkout_filter_selection(
+                entry,
+                final_tree_paths,
+                final_index_paths,
+            )
+            # Status and read-tree can invoke clean/process conversion even
+            # during plan-only preflight. The explicit admin binding selects
+            # the worktree, while an owner-private exact index snapshot makes
+            # live assume-unchanged ABA irrelevant to both probes.
+            checkout_view = capture_checkout_execution_view(
+                entry.source_git_dir,
+                entry.source_completeness,
+                attributes_receipt,
+                entry.submodule.path,
+                (current_head, entry.sha),
+                managed_preflight.index_lease.content,
+            )
+            checkout_view_outcome: Optional[BaseException] = None
+            try:
+                if has_local_changes(
+                    entry.target.path,
+                    current_head,
+                    checkout_view,
+                    managed_preflight,
+                ):
+                    raise PlanError(
+                        f"{entry.target.path} has local changes; clean it before syncing"
+                    )
+                write_bindings = checkout_write_access_bindings(
+                    entry.target.path,
+                    changes,
+                )
+                reject_managed_ignored_conflicts(entry.target.path, changes)
+                probe_managed_checkout(
+                    entry.target.path,
+                    entry.sha,
+                    checkout_view,
+                    managed_preflight,
+                )
+                revalidate_managed_preflight_receipt(managed_preflight)
+            except BaseException as exc:
+                checkout_view_outcome = exc
+                raise
+            finally:
+                finish_explicit_cleanup(
+                    checkout_view.close,
+                    outcome_exception=checkout_view_outcome,
+                    purpose="managed preflight checkout execution view",
+                    recovery_identity=str(checkout_view.common_git_dir),
+                )
         except BaseException as exc:
-            checkout_view_outcome = exc
+            managed_preflight_outcome = exc
             raise
         finally:
             finish_explicit_cleanup(
-                checkout_view.close,
-                outcome_exception=checkout_view_outcome,
-                purpose="managed preflight checkout execution view",
-                recovery_identity=str(checkout_view.common_git_dir),
+                managed_preflight.close,
+                outcome_exception=managed_preflight_outcome,
+                purpose="managed preflight control/index receipt",
+                recovery_identity=str(
+                    managed_preflight.control.git_file_binding.path.parent
+                ),
             )
     else:
         final_tree_paths = ((entry.sha, target_blob_paths),)
@@ -16002,81 +16404,105 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
             f"{entry.submodule.path}"
         )
     if receipt.kind == "managed":
-        current_head = managed_head(entry.target.path)
-        if current_head != receipt.current_head:
-            raise PlanError(
-                f"managed worktree HEAD changed after preflight: {entry.target.path}"
-            )
-        current_digest, current_count, index_blob_paths = managed_index_snapshot(
-            entry.target.path
-        )
-        if (
-            current_digest != receipt.index_digest
-            or current_count != receipt.index_entry_count
-        ):
-            raise PlanError(
-                f"managed worktree index changed after preflight: {entry.target.path}"
-            )
-        current_blob_paths = target_tree_blob_paths(
+        managed_preflight = capture_managed_preflight_receipt(
+            entry.target.path,
             entry.source_git_dir,
-            current_head,
         )
-        final_tree_paths = (
-            (current_head, current_blob_paths),
-            (entry.sha, target_blob_paths),
-        )
-        final_index_paths = index_blob_paths
-        bind_checkout_filter_selection(
-            entry,
-            final_tree_paths,
-            final_index_paths,
-            expected_attributes=receipt.attributes_receipt,
-            expected_selections=receipt.filter_selections,
-        )
-        checkout_view = capture_checkout_execution_view(
-            entry.source_git_dir,
-            entry.source_completeness,
-            receipt.attributes_receipt,
-            entry.submodule.path,
-            (current_head, entry.sha),
-        )
-        checkout_view_outcome: Optional[BaseException] = None
+        managed_preflight_outcome: Optional[BaseException] = None
         try:
-            repeated_changes = parse_managed_tree_changes(
-                entry.target.path,
-                current_head,
-                entry.sha,
-            )
-            if repeated_changes != receipt.changes:
+            current_head = managed_preflight.current_head
+            if current_head != receipt.current_head:
                 raise PlanError(
-                    f"managed checkout write set changed after preflight: "
+                    f"managed worktree HEAD changed after preflight: "
                     f"{entry.target.path}"
                 )
-            digest_paths = (change.relative_parts for change in repeated_changes)
-            if has_local_changes(
-                entry.target.path,
-                current_head,
-                checkout_view,
+            if (
+                managed_preflight.index_digest != receipt.index_digest
+                or managed_preflight.index_entry_count != receipt.index_entry_count
             ):
                 raise PlanError(
-                    f"{entry.target.path} has local changes; clean it before syncing"
+                    f"managed worktree index changed after preflight: "
+                    f"{entry.target.path}"
                 )
-            reject_managed_ignored_conflicts(entry.target.path, receipt.changes)
-            validate_managed_preflight_index(entry, current_head)
-            probe_managed_checkout(
-                entry.target.path,
-                entry.sha,
-                checkout_view,
+            current_blob_paths = target_tree_blob_paths(
+                entry.source_git_dir,
+                current_head,
             )
+            final_tree_paths = (
+                (current_head, current_blob_paths),
+                (entry.sha, target_blob_paths),
+            )
+            final_index_paths = managed_preflight.index_blob_paths
+            bind_checkout_filter_selection(
+                entry,
+                final_tree_paths,
+                final_index_paths,
+                expected_attributes=receipt.attributes_receipt,
+                expected_selections=receipt.filter_selections,
+            )
+            checkout_view = capture_checkout_execution_view(
+                entry.source_git_dir,
+                entry.source_completeness,
+                receipt.attributes_receipt,
+                entry.submodule.path,
+                (current_head, entry.sha),
+                managed_preflight.index_lease.content,
+            )
+            checkout_view_outcome: Optional[BaseException] = None
+            try:
+                repeated_changes = parse_managed_tree_changes(
+                    entry.target.path,
+                    current_head,
+                    entry.sha,
+                )
+                if repeated_changes != receipt.changes:
+                    raise PlanError(
+                        f"managed checkout write set changed after preflight: "
+                        f"{entry.target.path}"
+                    )
+                digest_paths = (change.relative_parts for change in repeated_changes)
+                if has_local_changes(
+                    entry.target.path,
+                    current_head,
+                    checkout_view,
+                    managed_preflight,
+                ):
+                    raise PlanError(
+                        f"{entry.target.path} has local changes; "
+                        "clean it before syncing"
+                    )
+                reject_managed_ignored_conflicts(
+                    entry.target.path,
+                    receipt.changes,
+                )
+                probe_managed_checkout(
+                    entry.target.path,
+                    entry.sha,
+                    checkout_view,
+                    managed_preflight,
+                )
+                revalidate_managed_preflight_receipt(managed_preflight)
+            except BaseException as exc:
+                checkout_view_outcome = exc
+                raise
+            finally:
+                finish_explicit_cleanup(
+                    checkout_view.close,
+                    outcome_exception=checkout_view_outcome,
+                    purpose="managed preflight checkout execution view",
+                    recovery_identity=str(checkout_view.common_git_dir),
+                )
         except BaseException as exc:
-            checkout_view_outcome = exc
+            managed_preflight_outcome = exc
             raise
         finally:
             finish_explicit_cleanup(
-                checkout_view.close,
-                outcome_exception=checkout_view_outcome,
-                purpose="managed preflight checkout execution view",
-                recovery_identity=str(checkout_view.common_git_dir),
+                managed_preflight.close,
+                outcome_exception=managed_preflight_outcome,
+                purpose="managed preflight control/index receipt",
+                recovery_identity=str(
+                    managed_preflight.control.git_file_binding.path.parent
+                ),
             )
     elif receipt.kind == "new":
         final_tree_paths = ((entry.sha, target_blob_paths),)
