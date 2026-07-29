@@ -8,6 +8,7 @@ from contextlib import ExitStack
 import ctypes
 from dataclasses import dataclass, field as dataclass_field, replace
 import errno
+import functools
 import hashlib
 import json
 import os
@@ -304,6 +305,73 @@ class WorktreeRegistrationRecoveryError(PlanError):
             f"  recovery_location: {location}\n"
             f"  recovery_detail: {detail}"
         )
+
+
+@dataclass(frozen=True)
+class ActiveGuardRecord:
+    token: str
+    purpose: str
+    recovery_identity: str
+    guard: object = dataclass_field(repr=False, compare=False)
+
+
+class ActiveGuardRegistry:
+    """Retain active cleanup guards until their explicit owner releases them."""
+
+    def __init__(self) -> None:
+        self._records: dict[str, ActiveGuardRecord] = {}
+
+    def register(
+        self,
+        guard: object,
+        *,
+        purpose: str,
+        recovery_identity: str,
+    ) -> str:
+        token = secrets.token_hex(16)
+        self._records[token] = ActiveGuardRecord(
+            token=token,
+            purpose=purpose,
+            recovery_identity=recovery_identity,
+            guard=guard,
+        )
+        return token
+
+    def unregister(self, token: Optional[str]) -> None:
+        if token is not None:
+            self._records.pop(token, None)
+
+    def cleanup_all(self) -> list[str]:
+        cleanup_errors: list[str] = []
+        for token in reversed(tuple(self._records)):
+            record = self._records.pop(token, None)
+            if record is None:
+                continue
+            cleanup = getattr(record.guard, "cleanup", None)
+            if cleanup is None:
+                cleanup_errors.append(
+                    "active guard cleanup-incomplete\n"
+                    f"  purpose: {record.purpose}\n"
+                    f"  recovery_identity: {record.recovery_identity}\n"
+                    "  detail: registered guard has no cleanup method"
+                )
+                continue
+            try:
+                cleanup()
+            except BaseException as exc:
+                cleanup_errors.append(
+                    "active guard cleanup-incomplete\n"
+                    f"  purpose: {record.purpose}\n"
+                    f"  recovery_identity: {record.recovery_identity}\n"
+                    f"  detail: {type(exc).__name__}: {exc}"
+                )
+        return cleanup_errors
+
+    def active_count(self) -> int:
+        return len(self._records)
+
+
+_ACTIVE_GUARDS = ActiveGuardRegistry()
 
 
 @dataclass(frozen=True)
@@ -697,6 +765,28 @@ class SourceFetchTransaction:
     fence_descriptor: int
     transaction_id: str
     active: bool = True
+    guard_registration: Optional[str] = dataclass_field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        recovery_identity = json.dumps(
+            {
+                "fence": str(self.source_git_dir / SOURCE_FETCH_TRANSACTION_NAME),
+                "profile": "source-fetch-transaction-descriptor-guard-v1",
+                "source_git_dir": str(self.source_git_dir),
+                "transaction_id": self.transaction_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.guard_registration = _ACTIVE_GUARDS.register(
+            self,
+            purpose="source fetch transaction descriptors",
+            recovery_identity=recovery_identity,
+        )
 
     def close_descriptors(self) -> None:
         descriptors = (self.fence_descriptor, self.directory_descriptor)
@@ -711,16 +801,35 @@ class SourceFetchTransaction:
             except OSError as exc:
                 if first_error is None:
                     first_error = exc
+        _ACTIVE_GUARDS.unregister(self.guard_registration)
+        self.guard_registration = None
         if first_error is not None:
             raise PlanError(
                 f"source fetch descriptor cleanup failed: {first_error}"
             ) from first_error
 
-    def __del__(self) -> None:
-        try:
-            self.close_descriptors()
-        except Exception:
-            pass
+    def cleanup(self) -> None:
+        """Close transaction descriptors while retaining any active fence."""
+
+        was_active = self.active
+        self.close_descriptors()
+        if was_active:
+            raise PlanError(
+                "active source fetch transaction retained its recovery fence\n"
+                "  recovery_identity: "
+                + json.dumps(
+                    {
+                        "fence": str(
+                            self.source_git_dir / SOURCE_FETCH_TRANSACTION_NAME
+                        ),
+                        "profile": ("source-fetch-transaction-descriptor-guard-v1"),
+                        "source_git_dir": str(self.source_git_dir),
+                        "transaction_id": self.transaction_id,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
 
 
 @dataclass(frozen=True)
@@ -744,7 +853,7 @@ class SourceShallowCreationPolicy:
     permissions: int
 
 
-@dataclass(frozen=True)
+@dataclass
 class TransportReceipt:
     config_binding: FileContentBinding
     fetch_object_policy: tuple[tuple[str, str], ...]
@@ -767,12 +876,19 @@ class TransportReceipt:
     git_runtime_receipt: GitRuntime = dataclass_field(repr=False, compare=False)
     git_environment: tuple[tuple[str, str], ...]
     fetch_guard: object = dataclass_field(repr=False, compare=False)
+    active: bool = dataclass_field(default=True, repr=False, compare=False)
 
-    def __del__(self) -> None:
-        guard = getattr(self, "fetch_guard", None)
-        cleanup = getattr(guard, "cleanup", None)
-        if cleanup is not None:
-            cleanup()
+    def close(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        cleanup = getattr(self.fetch_guard, "cleanup", None)
+        if cleanup is None:
+            raise PlanError(
+                "transport receipt guard has no explicit cleanup method\n"
+                f"  recovery_identity: {self.fetch_git_dir}"
+            )
+        cleanup()
 
 
 @dataclass(frozen=True)
@@ -875,6 +991,30 @@ class SyncPlan:
     applied_target_roots: dict[int, AppliedTargetRoot] = dataclass_field(
         default_factory=dict
     )
+    active: bool = dataclass_field(default=True, repr=False)
+
+    def close(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        cleanup_errors: list[str] = []
+        seen: set[int] = set()
+        for entry in reversed(self.entries):
+            receipt = entry.transport_receipt
+            if receipt is None or id(receipt) in seen:
+                continue
+            seen.add(id(receipt))
+            try:
+                receipt.close()
+            except BaseException as exc:
+                cleanup_errors.append(
+                    "transport receipt cleanup failed\n"
+                    f"  source_git_dir: {entry.source_git_dir}\n"
+                    f"  recovery_identity: {receipt.fetch_git_dir}\n"
+                    f"  detail: {exc}"
+                )
+        if cleanup_errors:
+            raise PlanError("\n".join(cleanup_errors))
 
 
 class TargetCollisionNode:
@@ -1806,6 +1946,39 @@ def git_runtime(*, require_transport_helpers: bool = False) -> GitRuntime:
     return _GIT_RUNTIME
 
 
+def cleanup_cached_git_runtime() -> None:
+    """Explicitly release the cached executable and helper snapshots."""
+
+    global _GIT_RUNTIME
+    runtime = _GIT_RUNTIME
+    _GIT_RUNTIME = None
+    if runtime is None:
+        return
+    cleanup = getattr(runtime.snapshot_guard, "cleanup", None)
+    if cleanup is None:
+        raise PlanError(
+            "cached Git runtime has no explicit cleanup method\n"
+            f"  recovery_identity: {runtime.executable.parent}"
+        )
+    cleanup()
+
+
+def cleanup_cli_resources() -> None:
+    """Release every runtime/guard resource before the CLI returns."""
+
+    cleanup_errors: list[str] = []
+    try:
+        cleanup_cached_git_runtime()
+    except BaseException as exc:
+        cleanup_errors.append(
+            "cached Git runtime cleanup-incomplete\n"
+            f"  detail: {type(exc).__name__}: {exc}"
+        )
+    cleanup_errors.extend(_ACTIVE_GUARDS.cleanup_all())
+    if cleanup_errors:
+        raise PlanError("\n".join(cleanup_errors))
+
+
 def safe_git_command_for_runtime(
     runtime: GitRuntime,
     args: list[str],
@@ -2033,7 +2206,7 @@ def wait_for_process_reap(
     process: subprocess.Popen[bytes],
     timeout_seconds: float,
 ) -> bool:
-    if process.poll() is not None:
+    if getattr(process, "returncode", None) is not None:
         return True
     try:
         process.wait(timeout=max(0.0, timeout_seconds))
@@ -2056,6 +2229,7 @@ class ChildSignalGate:
         self._armed = False
         self._raised = False
         self._pending: Optional[int] = None
+        self._defer_depth = 0
 
     def handle(self, signum: int, _frame: object) -> None:
         if self._pending is None:
@@ -2064,10 +2238,49 @@ class ChildSignalGate:
     def arm(self) -> None:
         self._armed = True
 
+    def defer_delivery(self) -> None:
+        self._defer_depth += 1
+
+    def resume_delivery(self) -> None:
+        if self._defer_depth <= 0:
+            raise PlanError("managed signal delivery deferral is unbalanced")
+        self._defer_depth -= 1
+
+    @property
+    def pending(self) -> Optional[int]:
+        return self._pending
+
+    @property
+    def delivery_deferred(self) -> bool:
+        return self._defer_depth > 0
+
     def raise_if_pending(self) -> None:
-        if self._armed and not self._raised and self._pending is not None:
+        if (
+            self._armed
+            and not self._raised
+            and not self.delivery_deferred
+            and self._pending is not None
+        ):
             self._raised = True
             raise ForwardedProcessSignal(self._pending)
+
+    def claim_pending_at_scope_exit(self) -> Optional[ForwardedProcessSignal]:
+        if not self._armed or self._raised or self._pending is None:
+            return None
+        self._raised = True
+        return ForwardedProcessSignal(self._pending)
+
+
+@dataclass
+class ChildSignalOwnership:
+    gate: ChildSignalGate
+    previous_handlers: dict[int, signal.Handlers]
+    inherited_mask: set[signal.Signals]
+    supervisor_mask: set[signal.Signals]
+    depth: int = 1
+
+
+_ACTIVE_SIGNAL_OWNERSHIP: Optional[ChildSignalOwnership] = None
 
 
 def start_child_signal_supervision() -> tuple[
@@ -2129,34 +2342,70 @@ def finish_child_signal_supervision(
     outcome_exception: Optional[BaseException],
 ) -> None:
     late_signal: Optional[ForwardedProcessSignal] = None
-    cleanup_error: Optional[PlanError] = None
+    cleanup_errors: list[str] = []
     try:
         signal.pthread_sigmask(signal.SIG_BLOCK, MANAGED_CHILD_SIGNALS)
+        if gate.delivery_deferred:
+            cleanup_errors.append(
+                "managed signal delivery deferral remained active at scope exit"
+            )
+            late_signal = gate.claim_pending_at_scope_exit()
+        else:
+            try:
+                gate.raise_if_pending()
+            except ForwardedProcessSignal as signal_exc:
+                late_signal = signal_exc
+    except BaseException as exc:
+        cleanup_errors.append(
+            "managed signal latch finalization failed before handler restoration: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        if not isinstance(outcome_exception, ForwardedProcessSignal):
+            late_signal = gate.claim_pending_at_scope_exit()
+
+    signal_is_terminal = (
+        isinstance(outcome_exception, ForwardedProcessSignal) or late_signal is not None
+    )
+    if signal_is_terminal:
         try:
-            gate.raise_if_pending()
-        except ForwardedProcessSignal as signal_exc:
-            late_signal = signal_exc
+            cleanup_cached_git_runtime()
+        except BaseException as exc:
+            cleanup_errors.append(
+                "cached Git runtime signal cleanup-incomplete\n"
+                "  recovery_identity: Git executable and transport-helper "
+                "snapshot roots\n"
+                f"  detail: {type(exc).__name__}: {exc}"
+            )
+        cleanup_errors.extend(_ACTIVE_GUARDS.cleanup_all())
+    try:
         restore_child_signal_supervision(
             previous_handlers,
             inherited_mask,
         )
-    except PlanError as exc:
-        cleanup_error = exc
+    except BaseException as exc:
+        cleanup_errors.append(
+            f"managed signal handler restoration failed: {type(exc).__name__}: {exc}"
+        )
 
     active_signal = (
         outcome_exception
         if isinstance(outcome_exception, ForwardedProcessSignal)
         else late_signal
     )
-    if cleanup_error is not None:
-        if active_signal is not None:
-            active_signal.add_cleanup_error(str(cleanup_error))
-        elif outcome_exception is not None:
-            raise PlanError(
-                f"{outcome_exception}\n{cleanup_error}"
-            ) from outcome_exception
-        else:
-            raise cleanup_error
+    if late_signal is not None and outcome_exception is not None:
+        late_signal.add_recovery_detail(
+            "operation outcome completed before latched signal delivery: "
+            f"{type(outcome_exception).__name__}: {outcome_exception}"
+        )
+    if active_signal is not None:
+        for cleanup_error in cleanup_errors:
+            active_signal.add_cleanup_error(cleanup_error)
+    elif cleanup_errors and outcome_exception is not None:
+        raise PlanError(
+            f"{outcome_exception}\n" + "\n".join(cleanup_errors)
+        ) from outcome_exception
+    elif cleanup_errors:
+        raise PlanError("\n".join(cleanup_errors))
     if late_signal is not None and not isinstance(
         outcome_exception,
         ForwardedProcessSignal,
@@ -2164,22 +2413,162 @@ def finish_child_signal_supervision(
         raise late_signal from outcome_exception
 
 
+class SignalOwnershipLease:
+    """Keep one signal latch installed across nested mutation phases."""
+
+    def __init__(self) -> None:
+        self.ownership: Optional[ChildSignalOwnership] = None
+        self.active = False
+
+    def __enter__(self) -> ChildSignalOwnership:
+        global _ACTIVE_SIGNAL_OWNERSHIP
+        if self.active:
+            raise PlanError("managed signal ownership lease cannot be reused")
+        if _ACTIVE_SIGNAL_OWNERSHIP is not None:
+            _ACTIVE_SIGNAL_OWNERSHIP.depth += 1
+            self.ownership = _ACTIVE_SIGNAL_OWNERSHIP
+            self.active = True
+            return _ACTIVE_SIGNAL_OWNERSHIP
+        (
+            gate,
+            previous_handlers,
+            inherited_mask,
+            supervisor_mask,
+        ) = start_child_signal_supervision()
+        ownership = ChildSignalOwnership(
+            gate=gate,
+            previous_handlers=previous_handlers,
+            inherited_mask=inherited_mask,
+            supervisor_mask=supervisor_mask,
+        )
+        gate.arm()
+        _ACTIVE_SIGNAL_OWNERSHIP = ownership
+        self.ownership = ownership
+        self.active = True
+        try:
+            signal.pthread_sigmask(
+                signal.SIG_SETMASK,
+                supervisor_mask,
+            )
+        except BaseException:
+            _ACTIVE_SIGNAL_OWNERSHIP = None
+            self.active = False
+            self.ownership = None
+            restore_child_signal_supervision(
+                previous_handlers,
+                inherited_mask,
+            )
+            raise
+        return ownership
+
+    def finish(self, outcome_exception: Optional[BaseException]) -> None:
+        global _ACTIVE_SIGNAL_OWNERSHIP
+        if not self.active or self.ownership is None:
+            return
+        ownership = self.ownership
+        self.active = False
+        self.ownership = None
+        ownership.depth -= 1
+        if ownership.depth < 0:
+            raise PlanError("managed signal ownership depth became negative")
+        if ownership.depth:
+            return
+        if _ACTIVE_SIGNAL_OWNERSHIP is not ownership:
+            raise PlanError("managed signal ownership changed before final release")
+        _ACTIVE_SIGNAL_OWNERSHIP = None
+        finish_child_signal_supervision(
+            ownership.gate,
+            ownership.previous_handlers,
+            ownership.inherited_mask,
+            outcome_exception,
+        )
+
+    def __exit__(
+        self,
+        _exception_type: object,
+        exception: Optional[BaseException],
+        _traceback: object,
+    ) -> bool:
+        self.finish(exception)
+        return False
+
+
+def signal_owned_operation(function: Callable[..., object]) -> Callable[..., object]:
+    @functools.wraps(function)
+    def wrapped(*args: object, **kwargs: object) -> object:
+        with SignalOwnershipLease():
+            return function(*args, **kwargs)
+
+    return wrapped
+
+
+def signal_checkpoint(_stage: str) -> None:
+    ownership = _ACTIVE_SIGNAL_OWNERSHIP
+    if ownership is not None:
+        ownership.gate.raise_if_pending()
+
+
+def defer_managed_signal_delivery() -> bool:
+    ownership = _ACTIVE_SIGNAL_OWNERSHIP
+    if ownership is None:
+        return False
+    ownership.gate.defer_delivery()
+    return True
+
+
+def resume_managed_signal_delivery(deferred: bool) -> None:
+    if not deferred:
+        return
+    ownership = _ACTIVE_SIGNAL_OWNERSHIP
+    if ownership is None:
+        raise PlanError("managed signal ownership ended during deferred recovery")
+    ownership.gate.resume_delivery()
+
+
+def finish_explicit_cleanup(
+    cleanup: Callable[[], None],
+    *,
+    outcome_exception: Optional[BaseException],
+    purpose: str,
+    recovery_identity: str,
+) -> None:
+    """Run one authoritative cleanup without masking an active signal."""
+
+    try:
+        cleanup()
+    except BaseException as cleanup_exc:
+        detail = (
+            f"{purpose} cleanup-incomplete\n"
+            f"  recovery_identity: {recovery_identity}\n"
+            f"  detail: {type(cleanup_exc).__name__}: {cleanup_exc}"
+        )
+        if isinstance(outcome_exception, ForwardedProcessSignal):
+            outcome_exception.add_cleanup_error(detail)
+            return
+        if outcome_exception is not None:
+            raise PlanError(f"{outcome_exception}\n{detail}") from outcome_exception
+        raise PlanError(detail) from cleanup_exc
+
+
 def drain_process_pipes_until(
     selector: Optional[selectors.BaseSelector],
     deadline: float,
-) -> None:
+) -> bool:
     if selector is None:
-        while time.monotonic() < deadline:
-            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
-        return
+        return True
     while selector.get_map() and time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
-        events = selector.select(min(0.02, max(0.0, remaining)))
+        try:
+            events = selector.select(min(0.02, max(0.0, remaining)))
+        except (OSError, ValueError):
+            return False
         for key, _ in events:
             try:
                 chunk = os.read(key.fd, 64 * 1024)
-            except OSError:
-                chunk = b""
+            except OSError as exc:
+                if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR}:
+                    continue
+                return False
             if not chunk:
                 try:
                     selector.unregister(key.fileobj)
@@ -2189,6 +2578,7 @@ def drain_process_pipes_until(
                     key.fileobj.close()
                 except OSError:
                     pass
+    return not selector.get_map()
 
 
 def terminate_process_group(
@@ -2201,13 +2591,45 @@ def terminate_process_group(
 ) -> None:
     """Forward the original signal, then bound group cleanup and direct reap."""
     cleanup_deadline = time.monotonic() + max(0.0, cleanup_timeout_seconds)
-    # poll() also reaps an exited direct child. Once that leader is reaped,
-    # its numeric PID/PGID may be reused, so a later killpg() would no longer
-    # be identity-safe. Bounded commands drain their pipes before the normal
-    # wait path; an already-complete child therefore needs no signal cleanup.
-    if process.poll() is not None:
-        return
-    group_cleanup_error: Optional[str] = None
+    cleanup_details: list[str] = []
+
+    def raise_cleanup_incomplete(
+        *,
+        direct_child_reaped: bool,
+        inherited_streams_closed: bool,
+    ) -> NoReturn:
+        detail = (
+            "; ".join(cleanup_details)
+            if cleanup_details
+            else "the bounded cleanup proof did not reach a complete terminal state"
+        )
+        raise PlanError(
+            "process cleanup-incomplete\n"
+            "  recovery_schema: process-group-cleanup-v1\n"
+            f"  process_group_id: {process.pid}\n"
+            f"  direct_child_reaped: {str(direct_child_reaped).lower()}\n"
+            "  inherited_streams_closed: "
+            f"{str(inherited_streams_closed).lower()}\n"
+            f"  recovery_detail: {detail}"
+        )
+
+    # Reading returncode does not reap. If another owner already reaped the
+    # leader, its numeric PID/PGID can be reused, so signalling that group is
+    # no longer identity-safe. We may still prove inherited pipe EOF; otherwise
+    # the caller receives a structured incomplete-cleanup receipt.
+    if getattr(process, "returncode", None) is not None:
+        streams_closed = drain_process_pipes_until(selector, cleanup_deadline)
+        if streams_closed:
+            return
+        cleanup_details.append(
+            "the direct child was already reaped before inherited streams closed; "
+            "the original process-group identity can no longer be signalled safely"
+        )
+        raise_cleanup_incomplete(
+            direct_child_reaped=True,
+            inherited_streams_closed=False,
+        )
+
     initial_sent = False
     try:
         if os.name == "posix":
@@ -2218,7 +2640,7 @@ def terminate_process_group(
     except ProcessLookupError:
         pass
     except OSError as exc:
-        group_cleanup_error = (
+        cleanup_details.append(
             f"cannot forward signal {initial_signal} to the process group: {exc}"
         )
         try:
@@ -2234,10 +2656,13 @@ def terminate_process_group(
             # Do not reap the group leader before KILL. Retaining the zombie
             # prevents PID/PGID reuse during the TERM grace window.
             first_grace = grace if initial_signal == signal.SIGTERM else grace / 2
-            drain_process_pipes_until(
-                selector,
-                time.monotonic() + first_grace,
-            )
+            if selector is None:
+                time.sleep(first_grace)
+            else:
+                drain_process_pipes_until(
+                    selector,
+                    time.monotonic() + first_grace,
+                )
             if initial_signal != signal.SIGTERM:
                 try:
                     if os.name == "posix":
@@ -2247,15 +2672,21 @@ def terminate_process_group(
                 except ProcessLookupError:
                     pass
                 except OSError as exc:
-                    if group_cleanup_error is None:
-                        group_cleanup_error = (
-                            "cannot signal the process group with TERM after "
-                            f"forwarding signal {initial_signal}: {exc}"
-                        )
-                drain_process_pipes_until(
-                    selector,
-                    min(cleanup_deadline, time.monotonic() + (grace - first_grace)),
+                    cleanup_details.append(
+                        "cannot signal the process group with TERM after "
+                        f"forwarding signal {initial_signal}: {exc}"
+                    )
+                second_grace = min(
+                    max(0.0, grace - first_grace),
+                    max(0.0, cleanup_deadline - time.monotonic()),
                 )
+                if selector is None:
+                    time.sleep(second_grace)
+                else:
+                    drain_process_pipes_until(
+                        selector,
+                        time.monotonic() + second_grace,
+                    )
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGKILL)
@@ -2264,23 +2695,29 @@ def terminate_process_group(
     except ProcessLookupError:
         pass
     except OSError as exc:
-        if group_cleanup_error is None:
-            group_cleanup_error = f"cannot signal the process group with KILL: {exc}"
+        cleanup_details.append(f"cannot signal the process group with KILL: {exc}")
         try:
             process.kill()
         except (OSError, ProcessLookupError):
             pass
 
-    drain_process_pipes_until(selector, cleanup_deadline)
+    streams_closed = drain_process_pipes_until(selector, cleanup_deadline)
     remaining = cleanup_deadline - time.monotonic()
     reaped = wait_for_process_reap(process, max(0.0, remaining))
     if not reaped:
-        raise PlanError(
-            "process cleanup-incomplete: direct child could not be reaped within "
+        cleanup_details.append(
+            "the direct child could not be reaped within "
             f"{cleanup_timeout_seconds:g} seconds"
         )
-    if group_cleanup_error is not None:
-        raise PlanError(f"process cleanup-incomplete: {group_cleanup_error}")
+    if not streams_closed:
+        cleanup_details.append(
+            "stdout/stderr inherited by process-group descendants did not reach EOF"
+        )
+    if cleanup_details or not reaped or not streams_closed:
+        raise_cleanup_incomplete(
+            direct_child_reaped=reaped,
+            inherited_streams_closed=streams_closed,
+        )
 
 
 def run_bounded_bytes(
@@ -2756,21 +3193,21 @@ def run_bounded_bytes(
         inherited_descriptors.add(executable_lease.parent_descriptor)
         inherited_descriptors.add(executable_lease.descriptor)
 
+    signal_lease = SignalOwnershipLease()
     try:
-        (
-            signal_gate,
-            previous_signal_handlers,
-            inherited_signal_mask,
-            supervisor_signal_mask,
-        ) = start_child_signal_supervision()
+        signal_ownership = signal_lease.__enter__()
     except BaseException:
         close_executable_execution_leases(executable_lease, helper_leases)
         input_file.close()
         raise
+    signal_gate = signal_ownership.gate
+    supervisor_signal_mask = signal_ownership.supervisor_mask
+    spawn_signals_blocked = False
     process: Optional[subprocess.Popen[bytes]] = None
     stdout_pipe: Optional[BinaryIO] = None
     stderr_pipe: Optional[BinaryIO] = None
     selector: Optional[selectors.BaseSelector] = None
+    pipe_tracking_complete = False
     main_lease_open = executable_lease is not None
     helper_leases_open = bool(helper_leases)
     outcome_exception: Optional[BaseException] = None
@@ -2778,6 +3215,9 @@ def run_bounded_bytes(
     stderr = bytearray()
     try:
         try:
+            signal_checkpoint("bounded-command-before-spawn")
+            signal.pthread_sigmask(signal.SIG_BLOCK, MANAGED_CHILD_SIGNALS)
+            spawn_signals_blocked = True
             try:
                 process = subprocess.Popen(
                     command,
@@ -2798,11 +3238,19 @@ def run_bounded_bytes(
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 raise GitError(f"failed to start {shell_join(command)}: {exc}") from exc
 
-            signal_gate.arm()
+            stdout_pipe = process.stdout
+            stderr_pipe = process.stderr
+            if stdout_pipe is None or stderr_pipe is None:
+                raise GitError(f"{shell_join(command)} did not provide capture pipes")
+            selector = selectors.DefaultSelector()
+            selector.register(stdout_pipe, selectors.EVENT_READ, "stdout")
+            selector.register(stderr_pipe, selectors.EVENT_READ, "stderr")
+            pipe_tracking_complete = True
             signal.pthread_sigmask(
                 signal.SIG_SETMASK,
                 supervisor_signal_mask,
             )
+            spawn_signals_blocked = False
             signal_gate.raise_if_pending()
             close_executable_execution_leases(
                 executable_lease,
@@ -2811,13 +3259,6 @@ def run_bounded_bytes(
             main_lease_open = False
             signal_gate.raise_if_pending()
 
-            stdout_pipe = process.stdout
-            stderr_pipe = process.stderr
-            if stdout_pipe is None or stderr_pipe is None:
-                raise GitError(f"{shell_join(command)} did not provide capture pipes")
-            selector = selectors.DefaultSelector()
-            selector.register(stdout_pipe, selectors.EVENT_READ, "stdout")
-            selector.register(stderr_pipe, selectors.EVENT_READ, "stderr")
             deadline = time.monotonic() + timeout_seconds
             failure: Optional[str] = None
             while selector.get_map():
@@ -2865,12 +3306,24 @@ def run_bounded_bytes(
                 helper_leases_open = False
         except BaseException as exc:
             effective_exception = exc
+            cleanup_errors: list[str] = []
+            if spawn_signals_blocked:
+                try:
+                    signal.pthread_sigmask(
+                        signal.SIG_SETMASK,
+                        supervisor_signal_mask,
+                    )
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(
+                        "cannot restore the supervisor signal mask after child "
+                        f"spawn: {cleanup_exc}"
+                    )
+                spawn_signals_blocked = False
             try:
                 signal_gate.raise_if_pending()
             except ForwardedProcessSignal as signal_exc:
                 effective_exception = signal_exc
 
-            cleanup_errors: list[str] = []
             if main_lease_open:
                 try:
                     close_executable_execution_leases(
@@ -2881,6 +3334,11 @@ def run_bounded_bytes(
                     cleanup_errors.append(str(cleanup_exc))
                 main_lease_open = False
             if process is not None:
+                if not pipe_tracking_complete:
+                    cleanup_errors.append(
+                        "process cleanup-incomplete: stdout/stderr pipe tracking "
+                        "was not established before supervisor unblocking"
+                    )
                 try:
                     terminate_process_group(
                         process,
@@ -2953,12 +3411,12 @@ def run_bounded_bytes(
         outcome_exception = exc
         raise
     finally:
-        finish_child_signal_supervision(
-            signal_gate,
-            previous_signal_handlers,
-            inherited_signal_mask,
-            outcome_exception,
-        )
+        if spawn_signals_blocked:
+            signal.pthread_sigmask(
+                signal.SIG_SETMASK,
+                supervisor_signal_mask,
+            )
+        signal_lease.finish(outcome_exception)
 
 
 def run_git_at_directory_descriptor(
@@ -6071,6 +6529,7 @@ def begin_source_fetch_transaction(
         "source fetch transaction directory",
     )
     fence_descriptor = -1
+    transaction: Optional[SourceFetchTransaction] = None
     try:
         revalidate_directory_descriptor(
             receipt.source_shallow_parent_binding,
@@ -6128,13 +6587,21 @@ def begin_source_fetch_transaction(
             fence_descriptor=fence_descriptor,
             transaction_id=transaction_id,
         )
+        directory_descriptor = -1
+        fence_descriptor = -1
         revalidate_source_object_admission(source_git_dir, transaction)
         return transaction
     except BaseException as exc:
+        descriptor_cleanup_error: Optional[str] = None
+        recovery_descriptor = (
+            transaction.directory_descriptor
+            if transaction is not None
+            else directory_descriptor
+        )
         try:
             recovery_identity = unresolved_source_transaction_payload(
                 source_git_dir,
-                directory_descriptor,
+                recovery_descriptor,
                 detail=f"source fetch transaction creation failed: {exc}",
             )
         except BaseException as inspection_exc:
@@ -6151,12 +6618,26 @@ def begin_source_fetch_transaction(
                 separators=(",", ":"),
             )
         finally:
-            if fence_descriptor >= 0:
-                os.close(fence_descriptor)
-            os.close(directory_descriptor)
+            try:
+                if transaction is not None:
+                    transaction.close_descriptors()
+                else:
+                    if fence_descriptor >= 0:
+                        os.close(fence_descriptor)
+                    if directory_descriptor >= 0:
+                        os.close(directory_descriptor)
+            except BaseException as cleanup_exc:
+                descriptor_cleanup_error = (
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
         raise PlanError(
             "source fetch transaction could not be established cleanly\n"
             f"  recovery_identity: {recovery_identity}"
+            + (
+                f"\n  descriptor_cleanup_error: {descriptor_cleanup_error}"
+                if descriptor_cleanup_error is not None
+                else ""
+            )
         ) from exc
 
 
@@ -8029,12 +8510,6 @@ class CleanupGuardGroup:
                 f"temporary executable/control cleanup failed: {first_error}"
             ) from first_error
 
-    def __del__(self) -> None:
-        try:
-            self.cleanup()
-        except Exception:
-            pass
-
 
 class OwnerPrivateTemporaryDirectory:
     """Descriptor-bind and conditionally remove one owner-private temp root.
@@ -8064,6 +8539,7 @@ class OwnerPrivateTemporaryDirectory:
         self._parent_descriptor = -1
         self._descriptor = -1
         self._active = True
+        self._guard_registration: Optional[str] = None
         try:
             if self._binding.fingerprint != self._fingerprint:
                 raise PlanError(
@@ -8084,6 +8560,27 @@ class OwnerPrivateTemporaryDirectory:
             revalidate_directory_descriptor(
                 self._binding,
                 self._descriptor,
+            )
+            recovery_identity = json.dumps(
+                {
+                    "expected_identity": {
+                        "device": self._fingerprint.device,
+                        "group": self._fingerprint.group,
+                        "inode": self._fingerprint.inode,
+                        "kind": self._fingerprint.kind,
+                        "mode": self._fingerprint.permissions,
+                        "owner": self._fingerprint.owner,
+                    },
+                    "path": str(created_path),
+                    "profile": "owner-private-temporary-cleanup-v1",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            self._guard_registration = _ACTIVE_GUARDS.register(
+                self,
+                purpose=f"owner-private temporary root {prefix}",
+                recovery_identity=recovery_identity,
             )
         except BaseException as exc:
             self._active = False
@@ -8267,6 +8764,8 @@ class OwnerPrivateTemporaryDirectory:
 
     def cleanup(self) -> None:
         if not self._active:
+            _ACTIVE_GUARDS.unregister(self._guard_registration)
+            self._guard_registration = None
             return
         quarantine_name: Optional[str] = None
         recovery_location = self._path
@@ -8384,6 +8883,8 @@ class OwnerPrivateTemporaryDirectory:
         except BaseException as exc:
             self._active = False
             self._close_descriptors()
+            _ACTIVE_GUARDS.unregister(self._guard_registration)
+            self._guard_registration = None
             raise TemporaryDirectoryCleanupError(
                 status=status,
                 location=recovery_location,
@@ -8392,12 +8893,8 @@ class OwnerPrivateTemporaryDirectory:
             ) from exc
         self._active = False
         self._close_descriptors()
-
-    def __del__(self) -> None:
-        try:
-            self.cleanup()
-        except Exception:
-            pass
+        _ACTIVE_GUARDS.unregister(self._guard_registration)
+        self._guard_registration = None
 
 
 def capture_fetch_control_gitdir(
@@ -8884,6 +9381,7 @@ def transport_fetch_command(
     ]
 
 
+@signal_owned_operation
 def fetch_missing_commit(
     source_git_dir: Path,
     work_tree: Path,
@@ -9006,6 +9504,7 @@ def fetch_missing_commit(
             file_content_leases=fetch_control_lease.file_leases,
             git_runtime_receipt=receipt.git_runtime_receipt,
         )
+        signal_checkpoint("fetch-process-complete")
     except BaseException as exc:
         failure_detail = str(exc)
         try:
@@ -9030,32 +9529,22 @@ def fetch_missing_commit(
             source_object_lease,
             fetch_control_lease,
         )
-    except BaseException as exc:
-        raise retain_source_fetch_transaction(
-            transaction,
-            f"fetch exec-lease cleanup failed: {exc}",
-        ) from exc
-    result = subprocess.CompletedProcess(
-        args=bounded_result.args,
-        returncode=bounded_result.returncode,
-        stdout=os.fsdecode(bounded_result.stdout),
-        stderr=os.fsdecode(bounded_result.stderr),
-    )
-    try:
+        result = subprocess.CompletedProcess(
+            args=bounded_result.args,
+            returncode=bounded_result.returncode,
+            stdout=os.fsdecode(bounded_result.stdout),
+            stderr=os.fsdecode(bounded_result.stderr),
+        )
         commit_available = result.returncode == 0 and commit_exists(
             source_git_dir,
             work_tree,
             sha,
             transaction=transaction,
         )
-    except BaseException as exc:
-        raise retain_source_fetch_transaction(
-            transaction,
-            f"post-fetch object verification failed: {exc}",
-        ) from exc
-    if commit_available:
-        try:
+        signal_checkpoint("fetch-post-fetch-object-available")
+        if commit_available:
             install_post_fetch_shallow_state(receipt)
+            signal_checkpoint("fetch-shallow-boundary-installed")
             revalidate_source_object_admission(source_git_dir, transaction)
             target_object_closure(
                 source_git_dir,
@@ -9063,16 +9552,22 @@ def fetch_missing_commit(
                 completeness,
                 transaction=transaction,
             )
+            signal_checkpoint("fetch-object-closure-validated")
             complete_source_fetch_transaction(transaction)
-        except BaseException as exc:
-            if transaction.active:
-                raise retain_source_fetch_transaction(
-                    transaction,
-                    "post-fetch shallow installation or complete object "
-                    f"verification failed: {exc}",
-                ) from exc
-            raise
-        return True
+            signal_checkpoint("fetch-fence-cleared")
+            return True
+    except BaseException as exc:
+        if transaction.active:
+            recovery_error = retain_source_fetch_transaction(
+                transaction,
+                "fetch postprocess failed before a clean boundary/object terminal "
+                f"state: {type(exc).__name__}: {exc}",
+            )
+            if isinstance(exc, ForwardedProcessSignal):
+                exc.add_recovery_detail(str(recovery_error))
+                raise
+            raise recovery_error from exc
+        raise
     stderr = (result.stderr or "").strip()
     branch_fetch_command = transport_fetch_command(
         source_git_dir,
@@ -10372,6 +10867,7 @@ def prepare_target_path(
     )
 
 
+@signal_owned_operation
 def checkout_existing_worktree(
     worktree_path: Path,
     sha: str,
@@ -10432,6 +10928,7 @@ def checkout_existing_worktree(
                 control.admin_lease,
             ),
         )
+        signal_checkpoint("checkout-git-complete")
         revalidate_managed_control_receipt(control, target_descriptor)
         revalidate_directory_entry_lease(source_lease)
         if finalize_checkout is not None:
@@ -10465,7 +10962,35 @@ def checkout_existing_worktree(
             )
         raise
     else:
-        control.close()
+        outcome_exception: Optional[BaseException] = None
+        try:
+            signal_checkpoint("checkout-final-validation-complete")
+            signal_checkpoint("checkout-receipt-published")
+        except BaseException as exc:
+            outcome_exception = exc
+            if isinstance(exc, ForwardedProcessSignal):
+                exc.add_recovery_detail(
+                    json.dumps(
+                        {
+                            "operation": "managed-worktree-checkout",
+                            "profile": "worktree-signal-recovery-v1",
+                            "recovery_status": "completed-checkout-published",
+                            "source_git_dir": str(source_git_dir),
+                            "target": str(worktree_path),
+                            "target_commit": sha,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            raise
+        finally:
+            finish_explicit_cleanup(
+                control.close,
+                outcome_exception=outcome_exception,
+                purpose="managed control receipt",
+                recovery_identity=str(control.admin_git_dir),
+            )
 
 
 def stage_retained_control_file_for_rollback(
@@ -10951,6 +11476,7 @@ def rollback_added_worktree(
         )
 
 
+@signal_owned_operation
 def add_worktree(
     source_git_dir: Path,
     worktree_path: Path,
@@ -10985,6 +11511,7 @@ def add_worktree(
     admin_inventory_after: Optional[WorktreeAdminInventory] = None
     admin_ownership_proven = False
     registration_attempted = False
+    rollback_delivery_deferred = False
     try:
         revalidate_materialized_target_lease(lease)
         revalidate_directory_entry_lease(source_lease)
@@ -11012,6 +11539,7 @@ def add_worktree(
             extra_env={"GIT_COMMON_DIR": str(source_git_dir)},
             directory_identity_leases=(source_lease,),
         )
+        signal_checkpoint("add-registration-git-complete")
         revalidate_materialized_target_lease(lease)
         revalidate_directory_entry_lease(source_lease)
         admin_inventory_after = capture_worktree_admin_inventory(
@@ -11031,6 +11559,7 @@ def add_worktree(
             control,
         )
         admin_ownership_proven = True
+        signal_checkpoint("add-admin-ownership-complete")
         run_git_at_directory_descriptor(
             [
                 "git",
@@ -11052,12 +11581,15 @@ def add_worktree(
                 control.admin_lease,
             ),
         )
+        signal_checkpoint("add-checkout-git-complete")
         revalidate_managed_control_receipt(control, lease.target_descriptor)
         revalidate_directory_entry_lease(source_lease)
         revalidate_materialized_target_lease(lease)
         if finalize_checkout is not None:
             finalize_checkout(control, source_lease)
     except BaseException as exc:
+        rollback_delivery_deferred = defer_managed_signal_delivery()
+        signal_checkpoint("add-rollback-enter")
         rollback_error: Optional[BaseException] = None
         should_rollback = False
         registry_known_clean = not registration_attempted
@@ -11283,6 +11815,16 @@ def add_worktree(
             cleanup_details.append(
                 f"worktree/materialization rollback failed: {rollback_error}"
             )
+        try:
+            resume_managed_signal_delivery(rollback_delivery_deferred)
+            rollback_delivery_deferred = False
+            signal_checkpoint("add-rollback-complete")
+        except ForwardedProcessSignal as signal_exc:
+            exc = signal_exc
+        except BaseException as signal_cleanup_exc:
+            cleanup_details.append(
+                f"managed signal rollback release failed: {signal_cleanup_exc}"
+            )
         if isinstance(exc, ForwardedProcessSignal):
             exc.add_recovery_detail(
                 json.dumps(
@@ -11305,11 +11847,47 @@ def add_worktree(
             )
             for cleanup_detail in cleanup_details:
                 exc.add_cleanup_error(cleanup_detail)
-            raise
+            raise exc
         if cleanup_details:
             raise PlanError(f"{exc}\n" + "\n".join(cleanup_details)) from exc
         raise
+    else:
+        published_control = control
+        control = None
+        if published_control is None:
+            raise PlanError("published worktree lacks its managed control receipt")
+        outcome_exception: Optional[BaseException] = None
+        try:
+            signal_checkpoint("add-final-validation-complete")
+            signal_checkpoint("add-receipt-published")
+        except BaseException as exc:
+            outcome_exception = exc
+            if isinstance(exc, ForwardedProcessSignal):
+                exc.add_recovery_detail(
+                    json.dumps(
+                        {
+                            "operation": "worktree-add",
+                            "profile": "worktree-signal-recovery-v1",
+                            "recovery_status": "completed-checkout-published",
+                            "source_git_dir": str(source_git_dir),
+                            "target": str(worktree_path),
+                            "target_commit": sha,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            raise
+        finally:
+            finish_explicit_cleanup(
+                published_control.close,
+                outcome_exception=outcome_exception,
+                purpose="managed control receipt",
+                recovery_identity=str(published_control.admin_git_dir),
+            )
     finally:
+        if rollback_delivery_deferred:
+            resume_managed_signal_delivery(True)
         if control is not None:
             control.close()
 
@@ -12465,13 +13043,9 @@ def verify_target_object_payloads(
         inherited_descriptor_set.add(executable_lease.parent_descriptor)
         inherited_descriptor_set.add(executable_lease.descriptor)
     inherited_descriptors = tuple(sorted(inherited_descriptor_set))
+    signal_lease = SignalOwnershipLease()
     try:
-        (
-            signal_gate,
-            previous_signal_handlers,
-            inherited_signal_mask,
-            supervisor_signal_mask,
-        ) = start_child_signal_supervision()
+        signal_ownership = signal_lease.__enter__()
     except BaseException:
         close_executable_execution_leases(
             executable_lease,
@@ -12479,6 +13053,8 @@ def verify_target_object_payloads(
         )
         input_file.close()
         raise
+    signal_gate = signal_ownership.gate
+    supervisor_signal_mask = signal_ownership.supervisor_mask
 
     def supervised_executable_gate() -> None:
         executable_gate()
@@ -12486,7 +13062,16 @@ def verify_target_object_payloads(
             signal.signal(signum, signal.SIG_DFL)
         signal.pthread_sigmask(signal.SIG_SETMASK, supervisor_signal_mask)
 
+    process: Optional[subprocess.Popen[bytes]] = None
+    stdout_pipe: Optional[BinaryIO] = None
+    stderr_pipe: Optional[BinaryIO] = None
+    selector: Optional[selectors.BaseSelector] = None
+    pipe_tracking_complete = False
+    spawn_signals_blocked = False
     try:
+        signal_checkpoint("object-payload-before-spawn")
+        signal.pthread_sigmask(signal.SIG_BLOCK, MANAGED_CHILD_SIGNALS)
+        spawn_signals_blocked = True
         process = subprocess.Popen(
             command,
             env=git_environment(
@@ -12505,37 +13090,85 @@ def verify_target_object_payloads(
             ),
             preexec_fn=supervised_executable_gate,
         )
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        stdout_pipe = process.stdout
+        stderr_pipe = process.stderr
+        if stdout_pipe is None or stderr_pipe is None:
+            raise GitError("target object payload verification lacks capture pipes")
+        selector = selectors.DefaultSelector()
+        selector.register(stdout_pipe, selectors.EVENT_READ, "stdout")
+        selector.register(stderr_pipe, selectors.EVENT_READ, "stderr")
+        pipe_tracking_complete = True
+        signal.pthread_sigmask(
+            signal.SIG_SETMASK,
+            supervisor_signal_mask,
+        )
+        spawn_signals_blocked = False
+        signal_gate.raise_if_pending()
+    except BaseException as exc:
         start_error = GitError(
             f"failed to start target object payload verification: {exc}"
         )
-        lease_cleanup_error: Optional[BaseException] = None
+        cleanup_errors: list[str] = []
+        if spawn_signals_blocked:
+            try:
+                signal.pthread_sigmask(
+                    signal.SIG_SETMASK,
+                    supervisor_signal_mask,
+                )
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(
+                    "cannot restore the supervisor signal mask after object "
+                    f"verification spawn: {cleanup_exc}"
+                )
+            spawn_signals_blocked = False
+        if process is not None:
+            if not pipe_tracking_complete:
+                cleanup_errors.append(
+                    "process cleanup-incomplete: target object verifier did not "
+                    "establish both inherited-pipe receipts"
+                )
+            try:
+                terminate_process_group(
+                    process,
+                    initial_signal=(
+                        exc.signum
+                        if isinstance(exc, ForwardedProcessSignal)
+                        else signal.SIGTERM
+                    ),
+                    selector=selector,
+                )
+            except PlanError as cleanup_exc:
+                cleanup_errors.append(str(cleanup_exc))
         try:
             close_executable_execution_leases(
                 executable_lease,
                 helper_leases,
             )
         except BaseException as cleanup_exc:
-            lease_cleanup_error = cleanup_exc
+            cleanup_errors.append(str(cleanup_exc))
+        if selector is not None:
+            selector.close()
+        if stdout_pipe is not None:
+            stdout_pipe.close()
+        if stderr_pipe is not None:
+            stderr_pipe.close()
         input_file.close()
-        finish_child_signal_supervision(
-            signal_gate,
-            previous_signal_handlers,
-            inherited_signal_mask,
-            start_error,
+        effective_error: BaseException = (
+            exc if isinstance(exc, ForwardedProcessSignal) else start_error
         )
-        if lease_cleanup_error is not None:
-            raise GitError(
-                "failed to start target object payload verification: "
-                f"{exc}; executable lease cleanup failed: {lease_cleanup_error}"
-            ) from exc
-        raise GitError(
-            f"failed to start target object payload verification: {exc}"
-        ) from exc
+        if isinstance(effective_error, ForwardedProcessSignal):
+            for cleanup_error in cleanup_errors:
+                effective_error.add_cleanup_error(cleanup_error)
+        elif cleanup_errors:
+            effective_error = GitError(
+                f"{start_error}; executable/process cleanup failed: "
+                + "; ".join(cleanup_errors)
+            )
+        signal_lease.finish(effective_error)
+        raise effective_error from (None if effective_error is exc else exc)
 
-    stdout_pipe = process.stdout
-    stderr_pipe = process.stderr
-    selector: Optional[selectors.BaseSelector] = None
+    if process is None or stdout_pipe is None or stderr_pipe is None:
+        raise PlanError("object payload verifier did not retain its child process")
     stdout_buffer = bytearray()
     retained_stderr = bytearray()
     producer_stdout_bytes = 0
@@ -12668,11 +13301,6 @@ def verify_target_object_payloads(
             current_object_digest = None
 
     try:
-        signal_gate.arm()
-        signal.pthread_sigmask(
-            signal.SIG_SETMASK,
-            supervisor_signal_mask,
-        )
         signal_gate.raise_if_pending()
         close_executable_execution_leases(
             executable_lease,
@@ -12680,11 +13308,6 @@ def verify_target_object_payloads(
         )
         main_lease_open = False
         signal_gate.raise_if_pending()
-        if stdout_pipe is None or stderr_pipe is None:
-            raise GitError("target object payload verification lacks capture pipes")
-        selector = selectors.DefaultSelector()
-        selector.register(stdout_pipe, selectors.EVENT_READ, "stdout")
-        selector.register(stderr_pipe, selectors.EVENT_READ, "stderr")
         while selector.get_map() and failure is None:
             signal_gate.raise_if_pending()
             remaining = deadline - time.monotonic()
@@ -12826,12 +13449,12 @@ def verify_target_object_payloads(
         if stderr_pipe is not None:
             stderr_pipe.close()
         input_file.close()
-        finish_child_signal_supervision(
-            signal_gate,
-            previous_signal_handlers,
-            inherited_signal_mask,
-            outcome_exception,
-        )
+        if spawn_signals_blocked:
+            signal.pthread_sigmask(
+                signal.SIG_SETMASK,
+                supervisor_signal_mask,
+            )
+        signal_lease.finish(outcome_exception)
 
     if returncode != 0:
         detail = os.fsdecode(retained_stderr).strip()
@@ -13640,6 +14263,7 @@ def build_sync_plan(
     collision_index = TargetCollisionIndex()
     active_ancestor_indexes: set[int] = set()
     planned_path_components = 0
+    pending_transport_receipts: list[TransportReceipt] = []
 
     def add_entry(
         submodule: Submodule,
@@ -13714,11 +14338,13 @@ def build_sync_plan(
             )
 
         needs_fetch = not commit_available
-        transport_receipt = (
-            capture_transport_receipt(source_git_dir, submodule)
-            if needs_fetch
-            else None
-        )
+        transport_receipt: Optional[TransportReceipt] = None
+        if needs_fetch:
+            transport_receipt = capture_transport_receipt(
+                source_git_dir,
+                submodule,
+            )
+            pending_transport_receipts.append(transport_receipt)
         source_bindings = tuple(source_access_bindings(source_git_dir, needs_fetch))
         target_bindings = tuple(target_access_bindings(target, state, source_git_dir))
         entry = PlannedWorktree(
@@ -13747,6 +14373,8 @@ def build_sync_plan(
         collision_index.add(entries, entry, active_ancestor_indexes)
         current_index = len(entries)
         entries.append(entry)
+        if transport_receipt is not None:
+            pending_transport_receipts.remove(transport_receipt)
         planned_path_components += candidate_component_count
 
         if not recursive:
@@ -13775,24 +14403,55 @@ def build_sync_plan(
         finally:
             active_ancestor_indexes.remove(current_index)
 
-    for module, sha in planned_modules:
-        add_entry(
-            module,
-            sha,
-            base_relative_parts,
-            parent_source_git_dir,
-            None,
+    try:
+        for module, sha in planned_modules:
+            add_entry(
+                module,
+                sha,
+                base_relative_parts,
+                parent_source_git_dir,
+                None,
+            )
+        return SyncPlan(
+            root=root,
+            display_root=display_root or root,
+            entries=entries,
+            depth=depth,
+            force_replace_empty=force_replace_empty,
+            fetch_missing=fetch_missing,
+            input_receipt=input_receipt,
+            shared_missing_ancestors=capture_shared_missing_ancestors(entries),
         )
-    return SyncPlan(
-        root=root,
-        display_root=display_root or root,
-        entries=entries,
-        depth=depth,
-        force_replace_empty=force_replace_empty,
-        fetch_missing=fetch_missing,
-        input_receipt=input_receipt,
-        shared_missing_ancestors=capture_shared_missing_ancestors(entries),
-    )
+    except BaseException as exc:
+        cleanup_errors: list[str] = []
+        seen: set[int] = set()
+        receipts = [
+            *pending_transport_receipts,
+            *(
+                entry.transport_receipt
+                for entry in entries
+                if entry.transport_receipt is not None
+            ),
+        ]
+        for receipt in reversed(receipts):
+            if id(receipt) in seen:
+                continue
+            seen.add(id(receipt))
+            try:
+                receipt.close()
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(
+                    "transport receipt cleanup failed while abandoning sync plan\n"
+                    f"  recovery_identity: {receipt.fetch_git_dir}\n"
+                    f"  detail: {type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+        if isinstance(exc, ForwardedProcessSignal):
+            for cleanup_error in cleanup_errors:
+                exc.add_cleanup_error(cleanup_error)
+            raise
+        if cleanup_errors:
+            raise PlanError(f"{exc}\n" + "\n".join(cleanup_errors)) from exc
+        raise
 
 
 def fetch_command(entry: PlannedWorktree, depth: int) -> list[str]:
@@ -14396,6 +15055,7 @@ def finalize_recursive_parent_checkout(
             final_state.close()
 
 
+@signal_owned_operation
 def apply_sync_plan(plan: SyncPlan) -> None:
     validate_sync_plan(plan)
     plan_state_changed = False
@@ -14520,6 +15180,7 @@ def apply_sync_plan(plan: SyncPlan) -> None:
             source_lease.close()
 
 
+@signal_owned_operation
 def sync_one(
     *,
     root: Path,
@@ -14555,11 +15216,24 @@ def sync_one(
         parent_source_git_dir=parent_source_git_dir,
         display_root=root,
     )
-    print_sync_plan(plan)
-    if not dry_run:
-        apply_sync_plan(plan)
+    outcome_exception: Optional[BaseException] = None
+    try:
+        print_sync_plan(plan)
+        if not dry_run:
+            apply_sync_plan(plan)
+    except BaseException as exc:
+        outcome_exception = exc
+        raise
+    finally:
+        finish_explicit_cleanup(
+            plan.close,
+            outcome_exception=outcome_exception,
+            purpose="sync plan transport",
+            recovery_identity=str(plan.display_root),
+        )
 
 
+@signal_owned_operation
 def execute_sync_plan(
     *,
     root: Path,
@@ -14588,14 +15262,26 @@ def execute_sync_plan(
         gitmodules_budget=gitmodules_budget,
         input_receipt=input_receipt,
     )
-    print_sync_plan(plan)
+    outcome_exception: Optional[BaseException] = None
+    try:
+        print_sync_plan(plan)
 
-    if dry_run:
-        print("preflight complete; no worktrees changed", flush=True)
-        return
+        if dry_run:
+            print("preflight complete; no worktrees changed", flush=True)
+            return
 
-    print("preflight complete; applying plan", flush=True)
-    apply_sync_plan(plan)
+        print("preflight complete; applying plan", flush=True)
+        apply_sync_plan(plan)
+    except BaseException as exc:
+        outcome_exception = exc
+        raise
+    finally:
+        finish_explicit_cleanup(
+            plan.close,
+            outcome_exception=outcome_exception,
+            purpose="sync plan transport",
+            recovery_identity=str(plan.display_root),
+        )
 
 
 def normalize_requested_paths(
@@ -14732,7 +15418,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main() -> int:
+def _main_impl() -> int:
     args = parse_args()
     git_runtime()
     if args.depth < 1:
@@ -14780,6 +15466,26 @@ def main() -> int:
         input_receipt=input_receipt,
     )
     return 0
+
+
+@signal_owned_operation
+def main() -> int:
+    outcome_exception: Optional[BaseException] = None
+    try:
+        return _main_impl()
+    except BaseException as exc:
+        outcome_exception = exc
+        raise
+    finally:
+        finish_explicit_cleanup(
+            cleanup_cli_resources,
+            outcome_exception=outcome_exception,
+            purpose="CLI runtime and active guards",
+            recovery_identity=(
+                "Git executable/helper snapshots, transport roots, and "
+                "source-transaction descriptors"
+            ),
+        )
 
 
 def redeliver_forwarded_signal(forwarded: ForwardedProcessSignal) -> NoReturn:

@@ -213,6 +213,20 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
 
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cleanup_errors: list[str] = []
+        try:
+            MODULE.cleanup_cached_git_runtime()
+        except BaseException as exc:
+            cleanup_errors.append(str(exc))
+        cleanup_errors.extend(MODULE._ACTIVE_GUARDS.cleanup_all())
+        if cleanup_errors:
+            raise AssertionError(
+                "test class left active cleanup guards in an incomplete state:\n"
+                + "\n".join(cleanup_errors)
+            )
+
     def clone_named_source(self, name: str) -> Path:
         source_git_dir = self.named_common_git_dir / "modules" / name
         source_git_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -1024,11 +1038,14 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             "third_party/scp-style-ssh",
             approved_url,
         )
+        original_which = shutil.which
 
         with mock.patch.object(
             MODULE.shutil,
             "which",
-            return_value=str(ssh_source),
+            side_effect=lambda command: (
+                str(ssh_source) if command == "ssh" else original_which(command)
+            ),
         ):
             receipt = MODULE.capture_transport_receipt(source, submodule)
         self.addCleanup(receipt.fetch_guard.cleanup)
@@ -2201,6 +2218,93 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 supervisor.kill()
                 supervisor.wait(timeout=3)
 
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "fork"),
+        "requires POSIX process groups and fork",
+    )
+    def test_bounded_command_reaps_exited_leader_and_closes_descendant_pipes(
+        self,
+    ) -> None:
+        descendant_pid_path = self.root / "orphan-descendant.pid"
+        child_code = (
+            "import os,signal,sys,time\n"
+            "leader=os.getpid()\n"
+            "descendant=os.fork()\n"
+            "if descendant:\n"
+            " os._exit(0)\n"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+            "signal.signal(signal.SIGHUP,signal.SIG_IGN)\n"
+            "deadline=time.monotonic()+5\n"
+            "while os.getppid()==leader and time.monotonic()<deadline:\n"
+            " time.sleep(0.01)\n"
+            "if os.getppid()==leader:\n"
+            " os._exit(91)\n"
+            "temporary=sys.argv[1]+'.tmp'\n"
+            "with open(temporary,'w',encoding='ascii') as stream:\n"
+            " stream.write(str(os.getpid()))\n"
+            "os.replace(temporary,sys.argv[1])\n"
+            "os.write(1,b'descendant-ready\\n')\n"
+            "time.sleep(30)\n"
+        )
+        driver_code = (
+            "import importlib.util,sys\n"
+            f"path={str(SCRIPT_PATH)!r}\n"
+            "spec=importlib.util.spec_from_file_location('orphan_sync',path)\n"
+            "module=importlib.util.module_from_spec(spec)\n"
+            "sys.modules[spec.name]=module\n"
+            "spec.loader.exec_module(module)\n"
+            "try:\n"
+            " module.run_bounded_bytes("
+            "[sys.executable,'-c',sys.argv[2],sys.argv[1]],"
+            "prepare_git_command=False,timeout_seconds=30)\n"
+            "except module.ForwardedProcessSignal as exc:\n"
+            " module.redeliver_forwarded_signal(exc)\n"
+        )
+        supervisor = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                driver_code,
+                str(descendant_pid_path),
+                child_code,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while (
+                not descendant_pid_path.exists()
+                and supervisor.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            self.assertTrue(descendant_pid_path.exists())
+            descendant_pid = int(descendant_pid_path.read_text(encoding="ascii"))
+            os.kill(supervisor.pid, signal.SIGTERM)
+            stdout, stderr = supervisor.communicate(timeout=8)
+            self.assertEqual(
+                supervisor.returncode,
+                -signal.SIGTERM,
+                (stdout, stderr),
+            )
+            descendant_deadline = time.monotonic() + 3
+            while time.monotonic() < descendant_deadline:
+                try:
+                    os.kill(descendant_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail(
+                    "descendant retaining inherited pipes remained alive: "
+                    f"{descendant_pid}"
+                )
+        finally:
+            if supervisor.poll() is None:
+                supervisor.kill()
+                supervisor.wait(timeout=3)
+
     def test_owner_private_temporary_cleanup_removes_nested_entries(self) -> None:
         guard = MODULE.OwnerPrivateTemporaryDirectory(prefix="owner-private-cleanup.")
         root = Path(guard.name)
@@ -2291,6 +2395,97 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             shutil.rmtree(original, ignore_errors=True)
             shutil.rmtree(held, ignore_errors=True)
 
+    def test_signal_cleanup_releases_runtime_transport_and_ssh_guards(
+        self,
+    ) -> None:
+        ssh_url = "ssh://example.invalid/custom-lib.git"
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "remote.origin.url",
+            ssh_url,
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            MODULE.Submodule(
+                name="custom-lib",
+                path="third_party/libexample",
+                url=ssh_url,
+            ),
+        )
+        runtime = receipt.git_runtime_receipt
+        ssh_snapshot = receipt.ssh_executable_snapshot
+        self.assertIsNotNone(ssh_snapshot)
+        roots = (
+            receipt.fetch_git_dir,
+            ssh_snapshot.executable.parent,
+            runtime.executable.parent,
+            runtime.exec_path,
+        )
+
+        with self.assertRaises(MODULE.ForwardedProcessSignal) as raised:
+            with MODULE.SignalOwnershipLease() as ownership:
+                ownership.gate.handle(signal.SIGTERM, None)
+                MODULE.signal_checkpoint("guard-cleanup-test")
+
+        self.assertEqual(raised.exception.cleanup_errors, [])
+        self.assertIsNone(MODULE._GIT_RUNTIME)
+        for root in roots:
+            self.assertFalse(root.exists(), root)
+        receipt.close()
+
+    def test_signal_cleanup_reports_replacement_recovery_identity(
+        self,
+    ) -> None:
+        guard = MODULE.OwnerPrivateTemporaryDirectory(
+            prefix="signal-cleanup-replacement."
+        )
+        original = Path(guard.name)
+        held = self.root / "held-signal-cleanup-directory"
+        original.rename(held)
+        original.mkdir(mode=0o700)
+        sentinel = original / "sentinel"
+        sentinel.write_text("replacement\n", encoding="utf-8")
+        try:
+            with self.assertRaises(MODULE.ForwardedProcessSignal) as raised:
+                with MODULE.SignalOwnershipLease() as ownership:
+                    ownership.gate.handle(signal.SIGHUP, None)
+                    MODULE.signal_checkpoint("guard-replacement-test")
+            cleanup_text = "\n".join(raised.exception.cleanup_errors)
+            self.assertIn("active guard cleanup-incomplete", cleanup_text)
+            self.assertIn("recovery_identity:", cleanup_text)
+            self.assertIn(str(original), cleanup_text)
+            self.assertEqual(
+                sentinel.read_text(encoding="utf-8"),
+                "replacement\n",
+            )
+            self.assertTrue(held.is_dir())
+        finally:
+            shutil.rmtree(original, ignore_errors=True)
+            shutil.rmtree(held, ignore_errors=True)
+
+    def test_main_explicitly_closes_residual_active_guards(self) -> None:
+        root: Path | None = None
+
+        def create_residual_guard() -> int:
+            nonlocal root
+            guard = MODULE.OwnerPrivateTemporaryDirectory(
+                prefix="main-explicit-cleanup."
+            )
+            root = Path(guard.name)
+            return 0
+
+        with mock.patch.object(
+            MODULE,
+            "_main_impl",
+            side_effect=create_residual_guard,
+        ):
+            self.assertEqual(MODULE.main(), 0)
+
+        self.assertIsNotNone(root)
+        self.assertFalse(root.exists())
+
     def test_process_cleanup_reports_an_unreapable_direct_child(self) -> None:
         class UnreapableProcess:
             pid = 424242
@@ -2368,9 +2563,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
     ) -> None:
         class ReapedProcess:
             pid = 424244
-
-            def poll(self) -> int:
-                return 0
+            returncode = 0
 
             def wait(self, timeout: float | None = None) -> int:
                 del timeout
@@ -2390,6 +2583,38 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 term_grace_seconds=0.02,
             )
 
+        kill_process_group.assert_not_called()
+
+    def test_process_cleanup_reports_reaped_leader_with_open_streams(
+        self,
+    ) -> None:
+        class ReapedProcess:
+            pid = 424245
+            returncode = 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                raise AssertionError("an already reaped child must not be waited again")
+
+        selector = mock.Mock()
+        selector.get_map.return_value = {"stdout": object()}
+        selector.select.return_value = []
+        with mock.patch.object(MODULE.os, "killpg") as kill_process_group:
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "direct_child_reaped: true",
+            ) as raised:
+                MODULE.terminate_process_group(
+                    ReapedProcess(),
+                    selector=selector,
+                    cleanup_timeout_seconds=0.01,
+                    term_grace_seconds=0.005,
+                )
+
+        self.assertIn(
+            "inherited_streams_closed: false",
+            str(raised.exception),
+        )
         kill_process_group.assert_not_called()
 
     def test_bounded_command_rejects_oversized_input_before_spawn(self) -> None:
@@ -3976,7 +4201,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             directory_descriptor: int,
             **kwargs: object,
         ) -> subprocess.CompletedProcess[str]:
-            result = original_run(
+            original_run(
                 args,
                 directory_descriptor,
                 **kwargs,
@@ -4009,6 +4234,84 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 source_lease.close()
             finally:
                 os.close(target_descriptor)
+
+    def test_checkout_signal_latch_covers_validation_and_receipt_phases(
+        self,
+    ) -> None:
+        for stage in (
+            "checkout-git-complete",
+            "checkout-final-validation-complete",
+            "checkout-receipt-published",
+        ):
+            with self.subTest(stage=stage):
+                target = self.root / f"checkout-phase-{stage}"
+                self.add_managed_worktree(
+                    self.source_git_dir,
+                    target,
+                    self.sha,
+                )
+                target_descriptor = os.open(
+                    target,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                )
+                source_lease = MODULE.capture_directory_entry_lease(
+                    self.source_git_dir,
+                    os.R_OK | os.W_OK | os.X_OK,
+                    "selected source common gitdir",
+                )
+                published = False
+                original_checkpoint = MODULE.signal_checkpoint
+
+                def finalize_checkout(
+                    _control: MODULE.ManagedControlReceipt,
+                    _source_lease: MODULE.DirectoryEntryLease,
+                ) -> None:
+                    nonlocal published
+                    published = True
+
+                def interrupt_at_stage(current_stage: str) -> None:
+                    if current_stage == stage:
+                        ownership = MODULE._ACTIVE_SIGNAL_OWNERSHIP
+                        self.assertIsNotNone(ownership)
+                        ownership.gate.handle(signal.SIGTERM, None)
+                    original_checkpoint(current_stage)
+
+                try:
+                    with mock.patch.object(
+                        MODULE,
+                        "signal_checkpoint",
+                        side_effect=interrupt_at_stage,
+                    ):
+                        with self.assertRaises(MODULE.ForwardedProcessSignal) as raised:
+                            MODULE.checkout_existing_worktree(
+                                target,
+                                self.sha,
+                                dry_run=False,
+                                target_descriptor=target_descriptor,
+                                source_git_dir=self.source_git_dir,
+                                source_lease=source_lease,
+                                finalize_checkout=finalize_checkout,
+                            )
+                    recovery_status = (
+                        "interrupted-checkout-retained"
+                        if stage == "checkout-git-complete"
+                        else "completed-checkout-published"
+                    )
+                    self.assertTrue(
+                        any(
+                            f'"recovery_status":"{recovery_status}"' in detail
+                            for detail in raised.exception.recovery_details
+                        )
+                    )
+                    self.assertEqual(
+                        published,
+                        stage != "checkout-git-complete",
+                    )
+                finally:
+                    try:
+                        source_lease.close()
+                    finally:
+                        os.close(target_descriptor)
 
     def test_add_signal_rolls_back_before_publishing_recovery(
         self,
@@ -4070,6 +4373,144 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             self.assertTrue(
                 any(
                     '"rollback_status":"complete"' in detail
+                    for detail in raised.exception.recovery_details
+                )
+            )
+        finally:
+            try:
+                source_lease.close()
+            finally:
+                lease.close()
+
+    def test_add_latched_signal_waits_for_failed_finalize_rollback(
+        self,
+    ) -> None:
+        target = MODULE.bind_target_path(
+            self.root,
+            ("latched-rollback-worktree",),
+            "latched rollback target",
+        )
+        lease = MODULE.materialize_bound_target_directory(target)
+        source_lease = MODULE.capture_directory_entry_lease(
+            self.source_git_dir,
+            os.R_OK | os.W_OK | os.X_OK,
+            "selected source common gitdir",
+        )
+        original_checkpoint = MODULE.signal_checkpoint
+        latched = False
+
+        def fail_finalize(
+            _control: MODULE.ManagedControlReceipt,
+            _source_lease: MODULE.DirectoryEntryLease,
+        ) -> None:
+            raise MODULE.PlanError("injected final receipt failure")
+
+        def latch_during_rollback(stage: str) -> None:
+            nonlocal latched
+            if stage == "add-rollback-enter" and not latched:
+                ownership = MODULE._ACTIVE_SIGNAL_OWNERSHIP
+                self.assertIsNotNone(ownership)
+                ownership.gate.handle(signal.SIGTERM, None)
+                latched = True
+            original_checkpoint(stage)
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "signal_checkpoint",
+                side_effect=latch_during_rollback,
+            ):
+                with self.assertRaises(MODULE.ForwardedProcessSignal) as raised:
+                    MODULE.add_worktree(
+                        self.source_git_dir,
+                        target.path,
+                        self.sha,
+                        dry_run=False,
+                        lease=lease,
+                        source_lease=source_lease,
+                        finalize_checkout=fail_finalize,
+                    )
+            self.assertTrue(latched)
+            self.assertFalse(target.path.exists())
+            self.assertIsNone(
+                MODULE.registered_target_path(
+                    self.source_git_dir,
+                    target.path,
+                    source_lease=source_lease,
+                )
+            )
+            self.assertTrue(
+                any(
+                    '"rollback_status":"complete"' in detail
+                    for detail in raised.exception.recovery_details
+                )
+            )
+        finally:
+            try:
+                source_lease.close()
+            finally:
+                lease.close()
+
+    def test_add_signal_after_receipt_publication_retains_committed_worktree(
+        self,
+    ) -> None:
+        target = MODULE.bind_target_path(
+            self.root,
+            ("published-signal-worktree",),
+            "published signal target",
+        )
+        lease = MODULE.materialize_bound_target_directory(target)
+        source_lease = MODULE.capture_directory_entry_lease(
+            self.source_git_dir,
+            os.R_OK | os.W_OK | os.X_OK,
+            "selected source common gitdir",
+        )
+        original_checkpoint = MODULE.signal_checkpoint
+        published = False
+
+        def publish_receipt(
+            _control: MODULE.ManagedControlReceipt,
+            _source_lease: MODULE.DirectoryEntryLease,
+        ) -> None:
+            nonlocal published
+            published = True
+
+        def interrupt_after_publication(stage: str) -> None:
+            if stage == "add-receipt-published":
+                ownership = MODULE._ACTIVE_SIGNAL_OWNERSHIP
+                self.assertIsNotNone(ownership)
+                ownership.gate.handle(signal.SIGTERM, None)
+            original_checkpoint(stage)
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "signal_checkpoint",
+                side_effect=interrupt_after_publication,
+            ):
+                with self.assertRaises(MODULE.ForwardedProcessSignal) as raised:
+                    MODULE.add_worktree(
+                        self.source_git_dir,
+                        target.path,
+                        self.sha,
+                        dry_run=False,
+                        lease=lease,
+                        source_lease=source_lease,
+                        finalize_checkout=publish_receipt,
+                    )
+            self.assertTrue(published)
+            self.assertTrue(target.path.is_dir())
+            self.assertEqual(
+                MODULE.registered_target_path(
+                    self.source_git_dir,
+                    target.path,
+                    source_lease=source_lease,
+                ),
+                target.path.resolve(),
+            )
+            self.assertTrue(
+                any(
+                    '"recovery_status":"completed-checkout-published"' in detail
                     for detail in raised.exception.recovery_details
                 )
             )
@@ -9478,6 +9919,167 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             )
         )
 
+    def test_fetch_signal_latch_covers_every_postprocess_phase(self) -> None:
+        stages = (
+            "fetch-process-complete",
+            "fetch-post-fetch-object-available",
+            "fetch-shallow-boundary-installed",
+            "fetch-object-closure-validated",
+            "fetch-fence-cleared",
+        )
+        for index, stage in enumerate(stages):
+            with self.subTest(stage=stage):
+                source_git_dir = self.clone_named_source(f"fetch-phase-{index}")
+                payload = self.remote / f"FETCH-PHASE-{index}.md"
+                payload.write_text(f"{stage}\n", encoding="utf-8")
+                run_git(self.remote, "add", payload.name)
+                run_git(self.remote, "commit", "-m", f"fetch phase {index}")
+                missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+                submodule = MODULE.Submodule(
+                    name=f"fetch-phase-{index}",
+                    path=f"third_party/fetch-phase-{index}",
+                    url=str(self.remote),
+                )
+                receipt = MODULE.capture_transport_receipt(
+                    source_git_dir,
+                    submodule,
+                )
+                original_checkpoint = MODULE.signal_checkpoint
+
+                def interrupt_at_stage(current_stage: str) -> None:
+                    if current_stage == stage:
+                        ownership = MODULE._ACTIVE_SIGNAL_OWNERSHIP
+                        self.assertIsNotNone(ownership)
+                        ownership.gate.handle(signal.SIGTERM, None)
+                    original_checkpoint(current_stage)
+
+                with mock.patch.object(
+                    MODULE,
+                    "signal_checkpoint",
+                    side_effect=interrupt_at_stage,
+                ):
+                    with redirect_stdout(io.StringIO()):
+                        with self.assertRaises(MODULE.ForwardedProcessSignal) as raised:
+                            MODULE.fetch_missing_commit(
+                                source_git_dir,
+                                self.root / f"unused-phase-target-{index}",
+                                submodule,
+                                missing_sha,
+                                1,
+                                dry_run=False,
+                                transport_receipt=receipt,
+                                fetch_missing=True,
+                            )
+
+                fence = source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME
+                if stage == "fetch-fence-cleared":
+                    self.assertFalse(fence.exists())
+                    self.assertFalse(
+                        any(
+                            "source-fetch-transaction-v1" in detail
+                            for detail in raised.exception.recovery_details
+                        )
+                    )
+                else:
+                    self.assertTrue(fence.is_file())
+                    self.assertTrue(
+                        any(
+                            "source-fetch-transaction-v1" in detail
+                            for detail in raised.exception.recovery_details
+                        )
+                    )
+                receipt.close()
+
+    def test_signal_cleanup_closes_source_fetch_transaction_descriptors(
+        self,
+    ) -> None:
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        transaction = MODULE.begin_source_fetch_transaction(receipt)
+        with self.assertRaises(MODULE.ForwardedProcessSignal) as raised:
+            with MODULE.SignalOwnershipLease() as ownership:
+                ownership.gate.handle(signal.SIGHUP, None)
+                MODULE.signal_checkpoint("source-fetch-descriptor-test")
+
+        self.assertEqual(transaction.directory_descriptor, -1)
+        self.assertEqual(transaction.fence_descriptor, -1)
+        self.assertTrue(transaction.active)
+        self.assertTrue(
+            any(
+                "source-fetch-transaction-descriptor-guard-v1" in detail
+                for detail in raised.exception.cleanup_errors
+            )
+        )
+        self.assertTrue(
+            (self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME).is_file()
+        )
+        receipt.close()
+
+    def test_failed_source_fetch_transaction_binding_closes_descriptors(
+        self,
+    ) -> None:
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        created_transactions: list[MODULE.SourceFetchTransaction] = []
+        original_transaction_class = MODULE.SourceFetchTransaction
+        original_revalidate = MODULE.revalidate_source_object_admission
+
+        def capture_transaction(
+            *args: object,
+            **kwargs: object,
+        ) -> MODULE.SourceFetchTransaction:
+            transaction = original_transaction_class(*args, **kwargs)
+            created_transactions.append(transaction)
+            return transaction
+
+        def reject_bound_transaction(
+            source_git_dir: Path,
+            transaction: MODULE.SourceFetchTransaction | None = None,
+        ) -> None:
+            if transaction is not None:
+                raise MODULE.PlanError("injected transaction binding failure")
+            original_revalidate(source_git_dir, transaction)
+
+        with mock.patch.object(
+            MODULE,
+            "SourceFetchTransaction",
+            side_effect=capture_transaction,
+        ):
+            with mock.patch.object(
+                MODULE,
+                "revalidate_source_object_admission",
+                side_effect=reject_bound_transaction,
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "could not be established cleanly",
+                ):
+                    MODULE.begin_source_fetch_transaction(receipt)
+
+        self.assertEqual(len(created_transactions), 1)
+        transaction = created_transactions[0]
+        self.assertEqual(transaction.directory_descriptor, -1)
+        self.assertEqual(transaction.fence_descriptor, -1)
+        self.assertIsNone(transaction.guard_registration)
+        self.assertTrue(
+            (self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME).is_file()
+        )
+        receipt.close()
+
     def test_fetch_transport_rejects_loose_object_fanout_symlink(self) -> None:
         source_objects = self.named_source_git_dir / "objects"
         fanout_name = next(
@@ -11378,7 +11980,10 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             "custom-lib", "third_party/libexample", str(self.remote)
         )
         calls: list[str] = []
-        sentinel = object()
+        sentinel = SimpleNamespace(
+            display_root=self.root,
+            close=lambda: calls.append("close"),
+        )
         original_build_sync_plan = MODULE.build_sync_plan
         original_print_sync_plan = MODULE.print_sync_plan
         original_apply_sync_plan = MODULE.apply_sync_plan
@@ -11417,7 +12022,48 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             MODULE.print_sync_plan = original_print_sync_plan
             MODULE.apply_sync_plan = original_apply_sync_plan
 
-        self.assertEqual(calls, ["build", "print", "apply"])
+        self.assertEqual(calls, ["build", "print", "apply", "close"])
+
+    def test_execute_sync_plan_closes_transport_plan_after_apply_failure(
+        self,
+    ) -> None:
+        module = MODULE.Submodule(
+            "custom-lib", "third_party/libexample", str(self.remote)
+        )
+        calls: list[str] = []
+        sentinel = SimpleNamespace(
+            display_root=self.root,
+            close=lambda: calls.append("close"),
+        )
+        with mock.patch.object(
+            MODULE,
+            "build_sync_plan",
+            return_value=sentinel,
+        ):
+            with mock.patch.object(MODULE, "print_sync_plan"):
+                with mock.patch.object(
+                    MODULE,
+                    "apply_sync_plan",
+                    side_effect=MODULE.PlanError("apply failed"),
+                ):
+                    with redirect_stdout(io.StringIO()):
+                        with self.assertRaisesRegex(
+                            MODULE.PlanError,
+                            "apply failed",
+                        ):
+                            MODULE.execute_sync_plan(
+                                root=self.root,
+                                common_git_dir=self.named_common_git_dir,
+                                source_superproject=None,
+                                planned_modules=[(module, self.sha)],
+                                depth=1,
+                                recursive=False,
+                                force_replace_empty=False,
+                                dry_run=False,
+                                fetch_missing=False,
+                            )
+
+        self.assertEqual(calls, ["close"])
 
     def test_execute_sync_plan_does_not_apply_after_failed_preflight(self) -> None:
         module = MODULE.Submodule(
