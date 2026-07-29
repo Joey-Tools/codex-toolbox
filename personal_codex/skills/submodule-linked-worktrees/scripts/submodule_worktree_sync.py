@@ -14,12 +14,18 @@ import json
 import os
 from pathlib import Path, PureWindowsPath
 import re
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - unavailable on non-POSIX runtimes
+    resource = None  # type: ignore[assignment]
 import secrets
 import selectors
 import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -49,6 +55,8 @@ MAX_CHECKOUT_PATH_COMPONENTS = 1_000_000
 MAX_CHECKOUT_ACCESS_BINDINGS = 500_000
 MAX_CHECKOUT_OBJECTS = 500_000
 MAX_CHECKOUT_LOGICAL_BYTES = 64 * 1024 * 1024 * 1024
+MAX_CHECKOUT_OBJECT_ROOTS = 2
+MAX_CHECKOUT_PACK_INDEX_OVERHEAD_BYTES = 1024 * 1024
 MAX_NAME_POLICY_PROBE_ENTRIES = 256
 MAX_REGISTERED_WORKTREE_FIELDS = 1_000_000
 MAX_WORKTREE_ADMIN_ENTRIES = 250_000
@@ -149,7 +157,11 @@ SAFE_GIT_CONFIG_ARGS = (
     "-c",
     "core.fsmonitor=false",
     "-c",
+    "core.commitGraph=false",
+    "-c",
     f"core.hooksPath={os.devnull}",
+    "-c",
+    "core.multiPackIndex=false",
     "-c",
     "core.splitIndex=false",
     "-c",
@@ -546,6 +558,13 @@ class ObjectClosureReceipt:
 
 
 @dataclass(frozen=True)
+class ObjectClosureManifest:
+    root: str
+    receipt: ObjectClosureReceipt
+    objects: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
 class CommitGitmodulesReceipt:
     commit: str
     entry_mode: Optional[str]
@@ -621,6 +640,14 @@ class DirectoryChildInventoryLease:
 
 
 @dataclass(frozen=True)
+class DirectoryExactInventoryLease:
+    directory_binding: AccessBinding
+    directory_descriptor: int
+    entries: tuple[tuple[str, FsFingerprint], ...]
+    purpose: str
+
+
+@dataclass(frozen=True)
 class DescriptorBoundFileLease:
     directory_binding: AccessBinding
     directory_descriptor: int
@@ -628,6 +655,15 @@ class DescriptorBoundFileLease:
     descriptor: int
     binding: FileContentBinding
     content: bytes
+
+
+@dataclass(frozen=True)
+class DescriptorBoundDigestFileLease:
+    directory_binding: AccessBinding
+    directory_descriptor: int
+    entry_name: str
+    descriptor: int
+    binding: FileContentBinding
 
 
 @dataclass(frozen=True)
@@ -705,9 +741,11 @@ class FetchControlLease:
 @dataclass
 class CheckoutExecutionView:
     common_git_dir: Path
-    source_object_directory: Path
+    object_directory: Path
     directory_leases: tuple[DirectoryEntryLease, ...]
+    exact_inventory_leases: tuple[DirectoryExactInventoryLease, ...]
     file_leases: tuple[DescriptorBoundFileLease, ...]
+    digest_file_leases: tuple[DescriptorBoundDigestFileLease, ...]
     absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...]
     guard: object = dataclass_field(repr=False, compare=False)
     active: bool = dataclass_field(default=True, repr=False, compare=False)
@@ -717,6 +755,11 @@ class CheckoutExecutionView:
             return
         self.active = False
         cleanup_errors: list[str] = []
+        for file_lease in reversed(self.digest_file_leases):
+            try:
+                os.close(file_lease.descriptor)
+            except OSError as exc:
+                cleanup_errors.append(str(exc))
         for file_lease in reversed(self.file_leases):
             try:
                 os.close(file_lease.descriptor)
@@ -2849,8 +2892,11 @@ def run_bounded_bytes(
         DirectoryChildInventoryLease,
         ...,
     ] = (),
+    directory_exact_inventory_leases: tuple[DirectoryExactInventoryLease, ...] = (),
     directory_absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...] = (),
     file_content_leases: tuple[DescriptorBoundFileLease, ...] = (),
+    digest_file_leases: tuple[DescriptorBoundDigestFileLease, ...] = (),
+    file_size_limit_bytes: Optional[int] = None,
     executable_snapshot_receipt: Optional[ExecutableSnapshotReceipt] = None,
     git_runtime_receipt: Optional[GitRuntime] = None,
 ) -> subprocess.CompletedProcess[bytes]:
@@ -2874,12 +2920,19 @@ def run_bounded_bytes(
         directory_descriptor is not None
         or directory_identity_leases
         or directory_child_inventory_leases
+        or directory_exact_inventory_leases
         or directory_absent_entry_leases
         or file_content_leases
+        or digest_file_leases
+        or file_size_limit_bytes is not None
     ) and os.name != "posix":
         raise PlanError("descriptor-anchored Git writes require a POSIX runtime")
-    if file_content_leases and not hasattr(os, "pread"):
+    if (file_content_leases or digest_file_leases) and not hasattr(os, "pread"):
         raise PlanError("descriptor-bound control-file exec gates require POSIX pread")
+    if file_size_limit_bytes is not None and (
+        file_size_limit_bytes <= 0 or resource is None
+    ):
+        raise PlanError("file-size-limited Git writes require POSIX resource limits")
     for lease in file_content_leases:
         validate_descriptor_entry_name(lease.entry_name)
         if len(lease.content) != lease.binding.size or (
@@ -2887,6 +2940,15 @@ def run_bounded_bytes(
         ):
             raise PlanError(
                 f"{lease.binding.purpose} has an invalid exec-lease content receipt"
+            )
+    for lease in digest_file_leases:
+        validate_descriptor_entry_name(lease.entry_name)
+        if lease.binding.size < 0 or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            lease.binding.content_sha256,
+        ):
+            raise PlanError(
+                f"{lease.binding.purpose} has an invalid exec-lease digest receipt"
             )
     for lease in directory_absent_entry_leases:
         if not lease.entry_names or len(set(lease.entry_names)) != len(
@@ -2896,6 +2958,31 @@ def run_bounded_bytes(
         for entry_name in lease.entry_names:
             validate_descriptor_entry_name(entry_name)
         revalidate_directory_absent_entry_lease(lease)
+    for lease in directory_exact_inventory_leases:
+        entry_names = tuple(name for name, _fingerprint in lease.entries)
+        if entry_names != tuple(sorted(set(entry_names))):
+            raise PlanError(f"{lease.purpose} has an invalid exact inventory receipt")
+        for entry_name in entry_names:
+            validate_descriptor_entry_name(entry_name)
+        revalidate_directory_exact_inventory_lease(lease)
+    descriptor_file_leases = tuple(
+        (lease, lease.content) for lease in file_content_leases
+    ) + tuple((lease, None) for lease in digest_file_leases)
+    file_size_rlimit: Optional[tuple[int, int]] = None
+    if file_size_limit_bytes is not None:
+        assert resource is not None
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_FSIZE)
+        finite_inherited_limits = tuple(
+            limit
+            for limit in (soft_limit, hard_limit)
+            if limit != resource.RLIM_INFINITY
+        )
+        effective_limit = min(
+            (file_size_limit_bytes, *finite_inherited_limits),
+        )
+        if effective_limit <= 0:
+            raise PlanError("the inherited file-size resource limit blocks Git output")
+        file_size_rlimit = (effective_limit, hard_limit)
 
     input_file = tempfile.TemporaryFile()
     try:
@@ -2949,7 +3036,56 @@ def run_bounded_bytes(
         input_file.close()
         raise
 
+    command_deadline = time.monotonic() + timeout_seconds
+
     def enter_bound_directory() -> None:
+        if file_size_rlimit is not None:
+            assert resource is not None
+            resource.setrlimit(resource.RLIMIT_FSIZE, file_size_rlimit)
+            if hasattr(signal, "SIGXFSZ"):
+                signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
+
+        def require_exact_inventory_in_child(
+            lease: DirectoryExactInventoryLease,
+            phase: str,
+        ) -> None:
+            current = directory_exact_inventory_at(
+                lease.directory_descriptor,
+                lease.directory_binding.path,
+                lease.purpose,
+            )
+            if current != lease.entries:
+                raise OSError(
+                    errno.ESTALE,
+                    f"{lease.purpose} changed {phase}",
+                )
+            expected_directory = fingerprint_values(lease.directory_binding.fingerprint)
+            if (
+                fingerprint_stat_values(
+                    os.stat(
+                        lease.directory_binding.path,
+                        follow_symlinks=False,
+                    )
+                )
+                != expected_directory
+                or fingerprint_stat_values(os.fstat(lease.directory_descriptor))
+                != expected_directory
+            ):
+                raise OSError(
+                    errno.ESTALE,
+                    f"{lease.purpose} directory changed {phase}",
+                )
+            if not os.access(
+                lease.directory_binding.path,
+                lease.directory_binding.mode,
+                effective_ids=True,
+                follow_symlinks=False,
+            ):
+                raise OSError(
+                    errno.EACCES,
+                    f"{lease.purpose} access changed {phase}",
+                )
+
         for lease in directory_identity_leases:
             expected_parent = lease.parent_binding.fingerprint
             expected_entry = lease.binding.fingerprint
@@ -3097,6 +3233,8 @@ def run_bounded_bytes(
                         errno.ESTALE,
                         f"{lease.purpose} entry changed before exec",
                     )
+        for lease in directory_exact_inventory_leases:
+            require_exact_inventory_in_child(lease, "before exec")
         for lease in directory_absent_entry_leases:
             expected_directory = fingerprint_values(lease.directory_binding.fingerprint)
             directory_path_stat = os.stat(
@@ -3146,7 +3284,7 @@ def run_bounded_bytes(
                     errno.ESTALE,
                     f"{lease.purpose} directory changed before exec",
                 )
-        for lease in file_content_leases:
+        for lease, expected_content in descriptor_file_leases:
             expected_directory = lease.directory_binding.fingerprint
             expected_file = lease.binding.fingerprint
 
@@ -3210,8 +3348,15 @@ def run_bounded_bytes(
                     errno.EACCES,
                     f"{lease.binding.purpose} access changed before exec",
                 )
+            digest = hashlib.sha256() if expected_content is None else None
             offset = 0
             while offset < lease.binding.size:
+                if time.monotonic() >= command_deadline:
+                    raise OSError(
+                        errno.ETIMEDOUT,
+                        f"{lease.binding.purpose} digest gate exceeded the "
+                        "command deadline",
+                    )
                 chunk = os.pread(
                     lease.descriptor,
                     min(64 * 1024, lease.binding.size - offset),
@@ -3222,7 +3367,10 @@ def run_bounded_bytes(
                         errno.ESTALE,
                         f"{lease.binding.purpose} changed size before exec",
                     )
-                if chunk != lease.content[offset : offset + len(chunk)]:
+                if expected_content is None:
+                    assert digest is not None
+                    digest.update(chunk)
+                elif chunk != expected_content[offset : offset + len(chunk)]:
                     raise OSError(
                         errno.ESTALE,
                         f"{lease.binding.purpose} content changed before exec",
@@ -3232,6 +3380,13 @@ def run_bounded_bytes(
                 raise OSError(
                     errno.ESTALE,
                     f"{lease.binding.purpose} changed size before exec",
+                )
+            if digest is not None and (
+                digest.hexdigest() != lease.binding.content_sha256
+            ):
+                raise OSError(
+                    errno.ESTALE,
+                    f"{lease.binding.purpose} content changed before exec",
                 )
             entry_after = os.stat(
                 lease.entry_name,
@@ -3272,6 +3427,11 @@ def run_bounded_bytes(
                     errno.EACCES,
                     f"{lease.binding.purpose} access changed before exec",
                 )
+        for lease in directory_exact_inventory_leases:
+            require_exact_inventory_in_child(
+                lease,
+                "during the final exec gate",
+            )
         if directory_descriptor is not None:
             os.fchdir(directory_descriptor)
         for helper_lease in helper_leases:
@@ -3279,6 +3439,8 @@ def run_bounded_bytes(
         if executable_lease is not None:
             # Keep executable validation after every other filesystem gate.
             revalidate_executable_execution_lease_in_child(executable_lease)
+        if time.monotonic() >= command_deadline:
+            raise OSError(errno.ETIMEDOUT, "command launch gate exceeded its deadline")
         for signum in MANAGED_CHILD_SIGNALS:
             signal.signal(signum, signal.SIG_DFL)
         signal.pthread_sigmask(signal.SIG_SETMASK, supervisor_signal_mask)
@@ -3291,9 +3453,11 @@ def run_bounded_bytes(
         inherited_descriptors.add(lease.parent_descriptor)
     for lease in directory_child_inventory_leases:
         inherited_descriptors.add(lease.directory_descriptor)
+    for lease in directory_exact_inventory_leases:
+        inherited_descriptors.add(lease.directory_descriptor)
     for lease in directory_absent_entry_leases:
         inherited_descriptors.add(lease.directory_descriptor)
-    for lease in file_content_leases:
+    for lease, _expected_content in descriptor_file_leases:
         inherited_descriptors.add(lease.directory_descriptor)
         inherited_descriptors.add(lease.descriptor)
     for helper_lease in helper_leases:
@@ -3369,7 +3533,7 @@ def run_bounded_bytes(
             main_lease_open = False
             signal_gate.raise_if_pending()
 
-            deadline = time.monotonic() + timeout_seconds
+            deadline = command_deadline
             failure: Optional[str] = None
             while selector.get_map():
                 signal_gate.raise_if_pending()
@@ -3535,8 +3699,10 @@ def run_git_at_directory_descriptor(
     *,
     extra_env: Optional[dict[str, str]] = None,
     directory_identity_leases: tuple[DirectoryEntryLease, ...] = (),
+    directory_exact_inventory_leases: tuple[DirectoryExactInventoryLease, ...] = (),
     directory_absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...] = (),
     file_content_leases: tuple[DescriptorBoundFileLease, ...] = (),
+    digest_file_leases: tuple[DescriptorBoundDigestFileLease, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     result = run_bounded_bytes(
         args,
@@ -3546,8 +3712,10 @@ def run_git_at_directory_descriptor(
         extra_env=extra_env,
         directory_descriptor=directory_descriptor,
         directory_identity_leases=directory_identity_leases,
+        directory_exact_inventory_leases=directory_exact_inventory_leases,
         directory_absent_entry_leases=directory_absent_entry_leases,
         file_content_leases=file_content_leases,
+        digest_file_leases=digest_file_leases,
     )
     decoded = subprocess.CompletedProcess(
         args=result.args,
@@ -3576,8 +3744,11 @@ def read_git_bounded(
     timeout_seconds: float = GIT_ENUMERATION_TIMEOUT_SECONDS,
     preserve_split_index: bool = False,
     directory_identity_leases: tuple[DirectoryEntryLease, ...] = (),
+    directory_exact_inventory_leases: tuple[DirectoryExactInventoryLease, ...] = (),
     directory_absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...] = (),
     file_content_leases: tuple[DescriptorBoundFileLease, ...] = (),
+    digest_file_leases: tuple[DescriptorBoundDigestFileLease, ...] = (),
+    file_size_limit_bytes: Optional[int] = None,
 ) -> subprocess.CompletedProcess[bytes]:
     return run_bounded_bytes(
         ["git", "--no-optional-locks", *args],
@@ -3590,8 +3761,11 @@ def read_git_bounded(
         timeout_seconds=timeout_seconds,
         preserve_split_index=preserve_split_index,
         directory_identity_leases=directory_identity_leases,
+        directory_exact_inventory_leases=directory_exact_inventory_leases,
         directory_absent_entry_leases=directory_absent_entry_leases,
         file_content_leases=file_content_leases,
+        digest_file_leases=digest_file_leases,
+        file_size_limit_bytes=file_size_limit_bytes,
     )
 
 
@@ -10432,6 +10606,140 @@ def revalidate_descriptor_bound_file_lease(
     )
 
 
+def revalidate_descriptor_bound_digest_file_lease(
+    lease: DescriptorBoundDigestFileLease,
+) -> None:
+    # Protected properties are the same regular-file object, complete byte
+    # content, and read policy. The fingerprint binds identity plus POSIX
+    # owner/group/mode, size bounds the read, SHA-256 binds content, and the
+    # access probe covers effective-credential/ACL effects. Timestamps are not
+    # part of any selected property.
+    revalidate_directory_descriptor(
+        lease.directory_binding,
+        lease.directory_descriptor,
+    )
+    observed, _content = bind_regular_file_descriptor_at(
+        lease.descriptor,
+        lease.directory_descriptor,
+        lease.entry_name,
+        lease.binding.path,
+        maximum_bytes=lease.binding.maximum_bytes,
+        mode=lease.binding.mode,
+        purpose=lease.binding.purpose,
+        retain_content=False,
+    )
+    require_matching_file_binding(
+        lease.binding,
+        observed,
+        lease.binding.purpose,
+    )
+    revalidate_directory_descriptor(
+        lease.directory_binding,
+        lease.directory_descriptor,
+    )
+
+
+def directory_exact_inventory_at(
+    directory_descriptor: int,
+    directory_path: Path,
+    purpose: str,
+) -> tuple[tuple[str, FsFingerprint], ...]:
+    """Capture the exact direct-child identity and POSIX-policy inventory.
+
+    The protected property is the complete set of names plus each entry's
+    device/inode/type/owner/group/mode. Additions, removals, replacements, and
+    policy changes matter because stock Git may consume any published entry.
+    Timestamps and bytes inside a retained regular file do not define this
+    property; descriptor-bound content leases protect those bytes separately.
+    """
+    try:
+        names = sorted(os.listdir(directory_descriptor))
+    except OSError as exc:
+        raise PlanError(
+            f"cannot enumerate {purpose}\n  path: {directory_path}\n  error: {exc}"
+        ) from exc
+    if len(names) > MAX_CHECKOUT_OBJECTS:
+        raise PlanError(
+            f"{purpose} exceeds the {MAX_CHECKOUT_OBJECTS}-entry safety limit"
+        )
+    inventory: list[tuple[str, FsFingerprint]] = []
+    for name in names:
+        normalized = os.fsdecode(validate_descriptor_entry_name(name))
+        try:
+            fingerprint = fingerprint_from_stat(
+                os.stat(
+                    normalized,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+        except OSError as exc:
+            raise PlanError(
+                f"cannot inspect {purpose}\n"
+                f"  path: {directory_path / normalized}\n"
+                f"  error: {exc}"
+            ) from exc
+        inventory.append((normalized, fingerprint))
+    return tuple(inventory)
+
+
+def capture_directory_exact_inventory_lease(
+    directory_lease: DirectoryEntryLease,
+    expected_names: tuple[str, ...],
+    purpose: str,
+) -> DirectoryExactInventoryLease:
+    normalized_names = tuple(
+        sorted(
+            os.fsdecode(validate_descriptor_entry_name(name)) for name in expected_names
+        )
+    )
+    if len(set(normalized_names)) != len(normalized_names):
+        raise PlanError(f"{purpose} has an invalid expected inventory")
+    revalidate_directory_entry_lease(directory_lease)
+    first = directory_exact_inventory_at(
+        directory_lease.descriptor,
+        directory_lease.path,
+        purpose,
+    )
+    second = directory_exact_inventory_at(
+        directory_lease.descriptor,
+        directory_lease.path,
+        purpose,
+    )
+    revalidate_directory_entry_lease(directory_lease)
+    if (
+        tuple(name for name, _fingerprint in first) != normalized_names
+        or first != second
+    ):
+        raise PlanError(f"{purpose} changed or contains unexpected entries")
+    return DirectoryExactInventoryLease(
+        directory_binding=directory_lease.binding,
+        directory_descriptor=directory_lease.descriptor,
+        entries=first,
+        purpose=purpose,
+    )
+
+
+def revalidate_directory_exact_inventory_lease(
+    lease: DirectoryExactInventoryLease,
+) -> None:
+    revalidate_directory_descriptor(
+        lease.directory_binding,
+        lease.directory_descriptor,
+    )
+    current = directory_exact_inventory_at(
+        lease.directory_descriptor,
+        lease.directory_binding.path,
+        lease.purpose,
+    )
+    if current != lease.entries:
+        raise PlanError(f"{lease.purpose} changed after descriptor binding")
+    revalidate_directory_descriptor(
+        lease.directory_binding,
+        lease.directory_descriptor,
+    )
+
+
 def require_absent_directory_entries(
     directory_descriptor: int,
     directory_path: Path,
@@ -10908,8 +11216,10 @@ def has_local_changes(
         ],
         extra_env=environment,
         directory_identity_leases=checkout_view.directory_leases,
+        directory_exact_inventory_leases=checkout_view.exact_inventory_leases,
         directory_absent_entry_leases=checkout_view.absent_entry_leases,
         file_content_leases=checkout_view.file_leases,
+        digest_file_leases=checkout_view.digest_file_leases,
     )
     records = bounded_records(
         result.stdout,
@@ -11457,8 +11767,10 @@ def checkout_existing_worktree(
                 control.admin_lease,
                 *checkout_view.directory_leases,
             ),
+            directory_exact_inventory_leases=checkout_view.exact_inventory_leases,
             directory_absent_entry_leases=checkout_view.absent_entry_leases,
             file_content_leases=checkout_view.file_leases,
+            digest_file_leases=checkout_view.digest_file_leases,
         )
         signal_checkpoint("checkout-git-complete")
         revalidate_managed_control_receipt(control, target_descriptor)
@@ -12123,8 +12435,10 @@ def add_worktree(
                 control.admin_lease,
                 *checkout_view.directory_leases,
             ),
+            directory_exact_inventory_leases=checkout_view.exact_inventory_leases,
             directory_absent_entry_leases=checkout_view.absent_entry_leases,
             file_content_leases=checkout_view.file_leases,
+            digest_file_leases=checkout_view.digest_file_leases,
         )
         signal_checkpoint("add-checkout-git-complete")
         revalidate_managed_control_receipt(control, lease.target_descriptor)
@@ -14014,13 +14328,13 @@ def verify_target_object_payloads(
     )
 
 
-def target_object_closure(
+def target_object_manifest(
     source_git_dir: Path,
     target_sha: str,
     completeness: SourceCompletenessReceipt,
     *,
     transaction: Optional[SourceFetchTransaction] = None,
-) -> ObjectClosureReceipt:
+) -> ObjectClosureManifest:
     # Protected property: every commit/tree/blob byte needed by checkout is
     # already readable from this source object database without lazy fetch or
     # alternates. Count/size caps bound the proof; the digest binds the exact
@@ -14109,7 +14423,26 @@ def target_object_closure(
     )
     revalidate_source_completeness_receipt(source_git_dir, completeness)
     revalidate_source_object_admission(source_git_dir, transaction)
-    return receipt
+    return ObjectClosureManifest(
+        root=target_sha,
+        receipt=receipt,
+        objects=tuple((object_id, expected_types[object_id]) for object_id in ordered),
+    )
+
+
+def target_object_closure(
+    source_git_dir: Path,
+    target_sha: str,
+    completeness: SourceCompletenessReceipt,
+    *,
+    transaction: Optional[SourceFetchTransaction] = None,
+) -> ObjectClosureReceipt:
+    return target_object_manifest(
+        source_git_dir,
+        target_sha,
+        completeness,
+        transaction=transaction,
+    ).receipt
 
 
 def target_root_tree_id(source_git_dir: Path, target_sha: str) -> str:
@@ -14520,16 +14853,241 @@ def bind_checkout_filter_selection(
     return attributes, selections
 
 
+def normalize_checkout_object_roots(
+    object_roots: tuple[str, ...],
+) -> tuple[str, ...]:
+    roots = tuple(dict.fromkeys(object_roots))
+    if not roots or len(roots) > MAX_CHECKOUT_OBJECT_ROOTS:
+        raise PlanError(
+            "checkout execution view requires between one and "
+            f"{MAX_CHECKOUT_OBJECT_ROOTS} object roots"
+        )
+    object_id_widths = {len(root) for root in roots}
+    if object_id_widths not in ({40}, {64}) or any(
+        re.fullmatch(r"[0-9a-f]+", root) is None for root in roots
+    ):
+        raise PlanError("checkout execution view contains an invalid object root")
+    return roots
+
+
+def parse_checkout_pack_index(
+    content: bytes,
+    object_id_bytes: int,
+) -> tuple[str, ...]:
+    if object_id_bytes not in {20, 32}:
+        raise PlanError("checkout pack index uses an unsupported object-id width")
+    if len(content) < 8 + (256 * 4) + (2 * object_id_bytes):
+        raise PlanError("checkout pack index is truncated")
+    if content[:4] != b"\xfftOc" or struct.unpack(">I", content[4:8])[0] != 2:
+        raise PlanError("checkout pack index is not canonical version 2")
+    fanout = struct.unpack(">256I", content[8 : 8 + (256 * 4)])
+    if any(left > right for left, right in zip(fanout, fanout[1:])):
+        raise PlanError("checkout pack index has a non-monotonic fanout table")
+    object_count = fanout[-1]
+    if object_count > MAX_CHECKOUT_OBJECTS * MAX_CHECKOUT_OBJECT_ROOTS:
+        raise PlanError(
+            "checkout pack index exceeds the aggregate object-count safety limit"
+        )
+    object_table_start = 8 + (256 * 4)
+    object_table_end = object_table_start + (object_count * object_id_bytes)
+    crc_table_end = object_table_end + (object_count * 4)
+    offset_table_end = crc_table_end + (object_count * 4)
+    if offset_table_end > len(content):
+        raise PlanError("checkout pack index has truncated object tables")
+    raw_object_ids = tuple(
+        content[offset : offset + object_id_bytes]
+        for offset in range(
+            object_table_start,
+            object_table_end,
+            object_id_bytes,
+        )
+    )
+    if raw_object_ids != tuple(sorted(set(raw_object_ids))):
+        raise PlanError("checkout pack index object ids are not unique and sorted")
+    expected_fanout: list[int] = []
+    observed = 0
+    object_index = 0
+    for first_byte in range(256):
+        while (
+            object_index < len(raw_object_ids)
+            and raw_object_ids[object_index][0] == first_byte
+        ):
+            observed += 1
+            object_index += 1
+        expected_fanout.append(observed)
+    if tuple(expected_fanout) != fanout:
+        raise PlanError("checkout pack index fanout does not match its object table")
+    offset_words = struct.unpack(
+        f">{object_count}I",
+        content[crc_table_end:offset_table_end],
+    )
+    large_indexes = sorted(
+        word & 0x7FFFFFFF for word in offset_words if word & 0x80000000
+    )
+    large_offset_count = 0 if not large_indexes else large_indexes[-1] + 1
+    if large_indexes != list(range(large_offset_count)):
+        raise PlanError("checkout pack index has invalid large-offset references")
+    expected_size = offset_table_end + (large_offset_count * 8) + (2 * object_id_bytes)
+    if len(content) != expected_size:
+        raise PlanError("checkout pack index has trailing or truncated bytes")
+    index_digest = hashlib.sha1() if object_id_bytes == 20 else hashlib.sha256()
+    index_digest.update(content[:-object_id_bytes])
+    if index_digest.digest() != content[-object_id_bytes:]:
+        raise PlanError("checkout pack index checksum is invalid")
+    return tuple(object_id.hex() for object_id in raw_object_ids)
+
+
+def materialize_checkout_object_pack(
+    source_git_dir: Path,
+    source_completeness: SourceCompletenessReceipt,
+    object_roots: tuple[str, ...],
+    private_pack: Path,
+    source_directory_leases: tuple[DirectoryEntryLease, ...],
+    source_file_leases: tuple[DescriptorBoundFileLease, ...],
+    submodule_path: str,
+) -> tuple[
+    tuple[ObjectClosureManifest, ...],
+    Path,
+    Path,
+    int,
+    int,
+]:
+    roots = normalize_checkout_object_roots(object_roots)
+    manifests = tuple(
+        target_object_manifest(
+            source_git_dir,
+            root,
+            source_completeness,
+        )
+        for root in roots
+    )
+    expected_types: dict[str, str] = {}
+    for manifest in manifests:
+        for object_id, object_type in manifest.objects:
+            prior = expected_types.setdefault(object_id, object_type)
+            if prior != object_type:
+                raise PlanError(
+                    "checkout object roots contain a conflicting object type"
+                )
+    maximum_objects = MAX_CHECKOUT_OBJECTS * len(manifests)
+    if len(expected_types) > maximum_objects:
+        raise PlanError(
+            "checkout execution view exceeds the aggregate "
+            f"{maximum_objects}-object safety limit"
+        )
+    ordered = tuple(sorted(expected_types))
+    object_input = b"".join(object_id.encode("ascii") + b"\n" for object_id in ordered)
+    if len(object_input) > GIT_INPUT_LIMIT_BYTES:
+        raise PlanError(
+            "checkout execution view exceeds the "
+            f"{GIT_INPUT_LIMIT_BYTES}-byte pack input limit"
+        )
+    maximum_pack_bytes = (
+        sum(manifest.receipt.logical_bytes for manifest in manifests)
+        + (len(ordered) * 256)
+        + MAX_CHECKOUT_PACK_INDEX_OVERHEAD_BYTES
+    )
+    object_id_bytes = len(roots[0]) // 2
+    maximum_index_bytes = (
+        MAX_CHECKOUT_PACK_INDEX_OVERHEAD_BYTES
+        + len(ordered) * (object_id_bytes + 32)
+        + (2 * object_id_bytes)
+    )
+    pack_base = private_pack / "checkout"
+    result = read_git_bounded(
+        [
+            *source_object_repo_args(source_git_dir),
+            "-c",
+            "pack.indexVersion=2",
+            "-c",
+            "pack.writeReverseIndex=false",
+            "pack-objects",
+            "--non-empty",
+            "--no-reuse-delta",
+            "--no-reuse-object",
+            "--no-use-bitmap-index",
+            "--window=0",
+            "--depth=1",
+            "--threads=1",
+            "--compression=0",
+            str(pack_base),
+        ],
+        input_bytes=object_input,
+        stdout_limit=256,
+        directory_identity_leases=source_directory_leases,
+        file_content_leases=source_file_leases,
+        file_size_limit_bytes=maximum_pack_bytes,
+    )
+    pack_id = os.fsdecode(result.stdout).strip()
+    if not re.fullmatch(rf"[0-9a-f]{{{len(roots[0])}}}", pack_id):
+        raise PlanError("checkout object pack returned an invalid pack id")
+    pack_path = private_pack / f"checkout-{pack_id}.pack"
+    index_path = private_pack / f"checkout-{pack_id}.idx"
+    expected_names = {pack_path.name, index_path.name}
+    observed_names = set(os.listdir(private_pack))
+    if observed_names != expected_names:
+        raise PlanError("checkout object pack produced an unexpected private inventory")
+    for path, maximum_bytes in (
+        (pack_path, maximum_pack_bytes),
+        (index_path, maximum_index_bytes),
+    ):
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+            path_stat = os.fstat(descriptor)
+            if (
+                stat.S_IFMT(path_stat.st_mode) != stat.S_IFREG
+                or path_stat.st_uid != os.geteuid()
+                or path_stat.st_size <= 0
+                or path_stat.st_size > maximum_bytes
+            ):
+                raise PlanError(
+                    f"checkout object pack output violates its bound: {path}"
+                )
+            os.fchmod(descriptor, 0o400)
+            os.fsync(descriptor)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    pack_directory_descriptor = open_directory_descriptor(
+        private_pack,
+        f"isolated checkout pack directory for {submodule_path}",
+    )
+    try:
+        os.fsync(pack_directory_descriptor)
+    finally:
+        os.close(pack_directory_descriptor)
+    revalidate_source_completeness_receipt(
+        source_git_dir,
+        source_completeness,
+    )
+    return (
+        manifests,
+        pack_path,
+        index_path,
+        maximum_pack_bytes,
+        maximum_index_bytes,
+    )
+
+
 def capture_checkout_execution_view(
     source_git_dir: Path,
     source_completeness: SourceCompletenessReceipt,
     attributes_receipt: CheckoutAttributesReceipt,
     submodule_path: str,
+    object_roots: tuple[str, ...],
 ) -> CheckoutExecutionView:
-    # The actual checkout reads config and common info/attributes only from
-    # this owner-private snapshot. Source leases remain in the child pre-exec
-    # gate so launch-window drift fails before Git starts; post-exec source
-    # drift cannot change the bytes consumed by Git.
+    # The actual checkout reads config, common info/attributes, and every
+    # required object only from this owner-private snapshot. The exact private
+    # pack is content-bound again in the child pre-exec gate; live source
+    # object bytes can no longer influence checkout after materialization.
+    roots = normalize_checkout_object_roots(object_roots)
     resolved_source_git_dir = source_git_dir.resolve(strict=True)
     if (
         source_completeness.gitdir_binding.path.resolve(strict=True)
@@ -14556,7 +15114,9 @@ def capture_checkout_execution_view(
 
     with ExitStack() as cleanup:
         directory_leases: list[DirectoryEntryLease] = []
+        exact_inventory_leases: list[DirectoryExactInventoryLease] = []
         file_leases: list[DescriptorBoundFileLease] = []
+        digest_file_leases: list[DescriptorBoundDigestFileLease] = []
         absent_entry_leases: list[DirectoryAbsentEntryLease] = []
 
         def capture_directory(binding: AccessBinding) -> DirectoryEntryLease:
@@ -14615,6 +15175,39 @@ def capture_checkout_execution_view(
             file_leases.append(lease)
             return lease, content
 
+        def capture_digest_file(
+            directory_lease: DirectoryEntryLease,
+            path: Path,
+            maximum_bytes: int,
+            purpose: str,
+        ) -> DescriptorBoundDigestFileLease:
+            if path.parent.resolve(strict=True) != directory_lease.path:
+                raise PlanError(
+                    f"{purpose} does not belong to its checkout-view directory"
+                )
+            entry_name = os.fsdecode(validate_descriptor_entry_name(path.name))
+            descriptor, binding, content = open_bound_regular_file_at(
+                directory_lease.descriptor,
+                entry_name,
+                path,
+                maximum_bytes=maximum_bytes,
+                mode=os.R_OK,
+                purpose=purpose,
+                retain_content=False,
+            )
+            cleanup.callback(os.close, descriptor)
+            if content is not None:
+                raise PlanError(f"{purpose} retained unexpected in-memory content")
+            lease = DescriptorBoundDigestFileLease(
+                directory_binding=directory_lease.binding,
+                directory_descriptor=directory_lease.descriptor,
+                entry_name=entry_name,
+                descriptor=descriptor,
+                binding=binding,
+            )
+            digest_file_leases.append(lease)
+            return lease
+
         source_root_lease = capture_directory(
             source_completeness.gitdir_binding,
         )
@@ -14644,14 +15237,28 @@ def capture_checkout_execution_view(
         private_root = Path(guard.name).resolve(strict=True)
         private_info = private_root / "info"
         private_objects = private_root / "objects"
+        private_object_info = private_objects / "info"
+        private_pack = private_objects / "pack"
         private_refs = private_root / "refs"
-        for directory in (private_info, private_objects, private_refs):
+        for directory in (
+            private_info,
+            private_objects,
+            private_object_info,
+            private_pack,
+            private_refs,
+        ):
             os.mkdir(directory, mode=0o700)
         private_config = private_root / "config"
         write_owner_private_file(
             private_config,
             source_config_content,
             f"isolated checkout config for {submodule_path}",
+        )
+        private_head = private_root / "HEAD"
+        write_owner_private_file(
+            private_head,
+            b"ref: refs/heads/checkout-isolated\n",
+            f"isolated checkout HEAD for {submodule_path}",
         )
         private_attributes = private_info / "attributes"
         if source_attributes_content is not None:
@@ -14661,6 +15268,21 @@ def capture_checkout_execution_view(
                 f"isolated checkout attributes for {submodule_path}",
             )
 
+        (
+            expected_manifests,
+            private_pack_path,
+            private_index_path,
+            maximum_pack_bytes,
+            maximum_index_bytes,
+        ) = materialize_checkout_object_pack(
+            source_git_dir,
+            source_completeness,
+            roots,
+            private_pack,
+            tuple(directory_leases),
+            tuple(file_leases),
+            submodule_path,
+        )
         private_root_binding = capture_owner_private_directory(
             private_root,
             f"isolated checkout common gitdir for {submodule_path}",
@@ -14671,7 +15293,15 @@ def capture_checkout_execution_view(
         )
         private_objects_binding = capture_owner_private_directory(
             private_objects,
-            f"isolated checkout object placeholder for {submodule_path}",
+            f"isolated checkout object directory for {submodule_path}",
+        )
+        private_object_info_binding = capture_owner_private_directory(
+            private_object_info,
+            f"isolated checkout object-info directory for {submodule_path}",
+        )
+        private_pack_binding = capture_owner_private_directory(
+            private_pack,
+            f"isolated checkout pack directory for {submodule_path}",
         )
         private_refs_binding = capture_owner_private_directory(
             private_refs,
@@ -14679,8 +15309,10 @@ def capture_checkout_execution_view(
         )
         private_root_lease = capture_directory(private_root_binding)
         private_info_lease = capture_directory(private_info_binding)
-        capture_directory(private_objects_binding)
-        capture_directory(private_refs_binding)
+        private_objects_lease = capture_directory(private_objects_binding)
+        private_object_info_lease = capture_directory(private_object_info_binding)
+        private_pack_lease = capture_directory(private_pack_binding)
+        private_refs_lease = capture_directory(private_refs_binding)
         private_config_binding = read_bound_regular_file(
             private_config,
             maximum_bytes=MAX_SOURCE_CONFIG_BYTES,
@@ -14689,6 +15321,14 @@ def capture_checkout_execution_view(
             retain_content=False,
         )[0]
         capture_file(private_root_lease, private_config_binding)
+        private_head_binding = read_bound_regular_file(
+            private_head,
+            maximum_bytes=MAX_GITDIR_FILE_BYTES,
+            mode=os.R_OK,
+            purpose=f"isolated checkout HEAD for {submodule_path}",
+            retain_content=False,
+        )[0]
+        capture_file(private_root_lease, private_head_binding)
         if source_attributes_content is None:
             absent_entry_leases.append(
                 capture_directory_absent_entry_lease(
@@ -14706,29 +15346,119 @@ def capture_checkout_execution_view(
                 retain_content=False,
             )[0]
             capture_file(private_info_lease, private_attributes_binding)
-        # Repository-local excludes are deliberately absent from the execution
-        # view. The preflight already rejects ignored overwrite conflicts; a
-        # narrower checkout ignore set can only make Git refuse additional
-        # untracked overwrites rather than silently bless a mutable source
-        # info/exclude file.
-        absent_entry_leases.append(
-            capture_directory_absent_entry_lease(
-                private_info_lease,
-                ("exclude",),
-                f"isolated checkout excludes for {submodule_path}",
+        private_index_binding = read_bound_regular_file(
+            private_index_path,
+            maximum_bytes=maximum_index_bytes,
+            mode=os.R_OK,
+            purpose=f"isolated checkout pack index for {submodule_path}",
+            retain_content=False,
+        )[0]
+        _private_index_lease, private_index_content = capture_file(
+            private_pack_lease,
+            private_index_binding,
+        )
+        _private_pack_digest_lease = capture_digest_file(
+            private_pack_lease,
+            private_pack_path,
+            maximum_pack_bytes,
+            f"isolated checkout object pack for {submodule_path}",
+        )
+        exact_inventory_leases.extend(
+            (
+                capture_directory_exact_inventory_lease(
+                    private_root_lease,
+                    ("HEAD", "config", "info", "objects", "refs"),
+                    f"isolated checkout exact common-gitdir inventory for "
+                    f"{submodule_path}",
+                ),
+                capture_directory_exact_inventory_lease(
+                    private_info_lease,
+                    (() if source_attributes_content is None else ("attributes",)),
+                    f"isolated checkout exact info inventory for {submodule_path}",
+                ),
+                capture_directory_exact_inventory_lease(
+                    private_objects_lease,
+                    ("info", "pack"),
+                    f"isolated checkout exact object inventory for {submodule_path}",
+                ),
+                capture_directory_exact_inventory_lease(
+                    private_object_info_lease,
+                    (),
+                    f"isolated checkout exact object-info inventory for "
+                    f"{submodule_path}",
+                ),
+                capture_directory_exact_inventory_lease(
+                    private_refs_lease,
+                    (),
+                    f"isolated checkout exact refs inventory for {submodule_path}",
+                ),
+                capture_directory_exact_inventory_lease(
+                    private_pack_lease,
+                    (private_pack_path.name, private_index_path.name),
+                    f"isolated checkout exact pack inventory for {submodule_path}",
+                ),
             )
         )
+        object_id_bytes = len(roots[0]) // 2
+        indexed_object_ids = parse_checkout_pack_index(
+            private_index_content,
+            object_id_bytes,
+        )
+        expected_object_ids = tuple(
+            sorted(
+                {
+                    object_id
+                    for manifest in expected_manifests
+                    for object_id, _object_type in manifest.objects
+                }
+            )
+        )
+        if indexed_object_ids != expected_object_ids:
+            raise PlanError(
+                f"isolated checkout pack inventory changed for {submodule_path}"
+            )
+        # Exact inventories leave no repository-local excludes, loose objects,
+        # refs, alternates, promisor markers, or acceleration side channels in
+        # the private view. A narrower ignore set can only make Git refuse an
+        # additional overwrite; it cannot silently bless mutable source input.
 
         view = CheckoutExecutionView(
             common_git_dir=private_root,
-            source_object_directory=(
-                source_completeness.objects_binding.path.resolve(strict=True)
-            ),
+            object_directory=private_objects,
             directory_leases=tuple(directory_leases),
+            exact_inventory_leases=tuple(exact_inventory_leases),
             file_leases=tuple(file_leases),
+            digest_file_leases=tuple(digest_file_leases),
             absent_entry_leases=tuple(absent_entry_leases),
             guard=guard,
         )
+        revalidate_checkout_execution_view(view)
+        read_git_bounded(
+            [
+                *source_object_repo_args(private_root),
+                "verify-pack",
+                "-s",
+                str(private_index_path),
+            ],
+            stdout_limit=MAX_CHECKOUT_PACK_INDEX_OVERHEAD_BYTES,
+            extra_env=checkout_execution_environment(view, roots[-1]),
+            directory_identity_leases=view.directory_leases,
+            directory_exact_inventory_leases=view.exact_inventory_leases,
+            directory_absent_entry_leases=view.absent_entry_leases,
+            file_content_leases=view.file_leases,
+            digest_file_leases=view.digest_file_leases,
+        )
+        private_completeness = capture_source_completeness_receipt(private_root)
+        for expected_manifest in expected_manifests:
+            observed_manifest = target_object_manifest(
+                private_root,
+                expected_manifest.root,
+                private_completeness,
+            )
+            if observed_manifest != expected_manifest:
+                raise PlanError(
+                    f"isolated checkout object closure changed for {submodule_path}"
+                )
         revalidate_checkout_execution_view(view)
         cleanup.pop_all()
         return view
@@ -14739,27 +15469,35 @@ def revalidate_checkout_execution_view(view: CheckoutExecutionView) -> None:
         raise PlanError("checkout execution view is inactive")
     if not view.common_git_dir.is_absolute():
         raise PlanError("checkout execution-view common gitdir is not absolute")
-    if not view.source_object_directory.is_absolute():
+    if not view.object_directory.is_absolute():
         raise PlanError("checkout execution-view object directory is not absolute")
-    if not view.directory_leases or not view.file_leases:
+    if (
+        not view.directory_leases
+        or not view.exact_inventory_leases
+        or not view.file_leases
+        or not view.digest_file_leases
+    ):
         raise PlanError("checkout execution view is incomplete")
     if (
         sum(lease.path == view.common_git_dir for lease in view.directory_leases) != 1
-        or sum(
-            lease.path == view.source_object_directory
-            for lease in view.directory_leases
-        )
+        or sum(lease.path == view.object_directory for lease in view.directory_leases)
         != 1
     ):
         raise PlanError("checkout execution view has an invalid directory shape")
     for directory_lease in view.directory_leases:
         revalidate_directory_entry_lease(directory_lease)
+    for inventory_lease in view.exact_inventory_leases:
+        revalidate_directory_exact_inventory_lease(inventory_lease)
     for absent_entry_lease in view.absent_entry_leases:
         revalidate_directory_absent_entry_lease(absent_entry_lease)
     for file_lease in view.file_leases:
         revalidate_descriptor_bound_file_lease(file_lease)
+    for file_lease in view.digest_file_leases:
+        revalidate_descriptor_bound_digest_file_lease(file_lease)
     for directory_lease in view.directory_leases:
         revalidate_directory_entry_lease(directory_lease)
+    for inventory_lease in view.exact_inventory_leases:
+        revalidate_directory_exact_inventory_lease(inventory_lease)
     for absent_entry_lease in view.absent_entry_leases:
         revalidate_directory_absent_entry_lease(absent_entry_lease)
 
@@ -14772,7 +15510,7 @@ def checkout_execution_environment(
     return {
         "GIT_ATTR_SOURCE": sha,
         "GIT_COMMON_DIR": str(view.common_git_dir),
-        "GIT_OBJECT_DIRECTORY": str(view.source_object_directory),
+        "GIT_OBJECT_DIRECTORY": str(view.object_directory),
     }
 
 
@@ -15063,8 +15801,10 @@ def probe_managed_checkout(
         check=False,
         extra_env=environment,
         directory_identity_leases=checkout_view.directory_leases,
+        directory_exact_inventory_leases=checkout_view.exact_inventory_leases,
         directory_absent_entry_leases=checkout_view.absent_entry_leases,
         file_content_leases=checkout_view.file_leases,
+        digest_file_leases=checkout_view.digest_file_leases,
     )
     if result.returncode != 0:
         detail = os.fsdecode(result.stderr).strip()
@@ -15159,6 +15899,7 @@ def capture_checkout_preflight(
             entry.source_completeness,
             attributes_receipt,
             entry.submodule.path,
+            (current_head, entry.sha),
         )
         checkout_view_outcome: Optional[BaseException] = None
         try:
@@ -15297,6 +16038,7 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
             entry.source_completeness,
             receipt.attributes_receipt,
             entry.submodule.path,
+            (current_head, entry.sha),
         )
         checkout_view_outcome: Optional[BaseException] = None
         try:
@@ -16421,6 +17163,14 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                     entry.source_completeness,
                     checkout_receipt.attributes_receipt,
                     entry.submodule.path,
+                    (
+                        (
+                            checkout_receipt.current_head,
+                            entry.sha,
+                        )
+                        if checkout_receipt.current_head is not None
+                        else (entry.sha,)
+                    ),
                 )
                 checkout_outcome: Optional[BaseException] = None
                 try:

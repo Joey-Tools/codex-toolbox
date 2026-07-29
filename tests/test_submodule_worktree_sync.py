@@ -245,6 +245,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self,
         source_git_dir: Path,
         submodule_path: str = "test-checkout",
+        object_roots: tuple[str, ...] | None = None,
     ) -> MODULE.CheckoutExecutionView:
         completeness = MODULE.capture_source_completeness_receipt(
             source_git_dir,
@@ -257,6 +258,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             completeness,
             attributes,
             submodule_path,
+            object_roots or (self.sha,),
         )
         self.addCleanup(view.close)
         return view
@@ -2770,12 +2772,20 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             checkout_view.directory_leases,
         )
         self.assertEqual(
+            bounded_git.call_args.kwargs["directory_exact_inventory_leases"],
+            checkout_view.exact_inventory_leases,
+        )
+        self.assertEqual(
             bounded_git.call_args.kwargs["directory_absent_entry_leases"],
             checkout_view.absent_entry_leases,
         )
         self.assertEqual(
             bounded_git.call_args.kwargs["file_content_leases"],
             checkout_view.file_leases,
+        )
+        self.assertEqual(
+            bounded_git.call_args.kwargs["digest_file_leases"],
+            checkout_view.digest_file_leases,
         )
 
     def test_managed_checkout_probe_uses_isolated_execution_view(self) -> None:
@@ -2815,12 +2825,20 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             checkout_view.directory_leases,
         )
         self.assertEqual(
+            bounded_git.call_args.kwargs["directory_exact_inventory_leases"],
+            checkout_view.exact_inventory_leases,
+        )
+        self.assertEqual(
             bounded_git.call_args.kwargs["directory_absent_entry_leases"],
             checkout_view.absent_entry_leases,
         )
         self.assertEqual(
             bounded_git.call_args.kwargs["file_content_leases"],
             checkout_view.file_leases,
+        )
+        self.assertEqual(
+            bounded_git.call_args.kwargs["digest_file_leases"],
+            checkout_view.digest_file_leases,
         )
 
     def test_isolated_tracked_status_uses_the_managed_worktree(self) -> None:
@@ -2846,6 +2864,107 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 checkout_view,
             )
         )
+
+    def test_isolated_status_exec_gate_rejects_private_object_injection(
+        self,
+    ) -> None:
+        for injection_kind in ("extra-pack-entry", "loose-object-fanout"):
+            with self.subTest(injection_kind=injection_kind):
+                checkout_view = self.capture_checkout_execution_view(
+                    self.named_source_git_dir,
+                    f"private-object-injection-{injection_kind}",
+                )
+                if injection_kind == "extra-pack-entry":
+                    injected_path = (
+                        checkout_view.object_directory / "pack" / "attacker-shadow.idx"
+                    )
+                else:
+                    injected_path = checkout_view.object_directory / "00"
+                original_popen = MODULE.subprocess.Popen
+                injected = False
+
+                def inject_before_child_exec(
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    nonlocal injected
+                    command = args[0] if args else kwargs.get("args")
+                    if (
+                        isinstance(command, (list, tuple))
+                        and "status" in command
+                        and not injected
+                    ):
+                        if injection_kind == "extra-pack-entry":
+                            injected_path.write_bytes(b"attacker\n")
+                        else:
+                            injected_path.mkdir()
+                        injected = True
+                        try:
+                            return original_popen(*args, **kwargs)
+                        finally:
+                            if injection_kind == "extra-pack-entry":
+                                injected_path.unlink()
+                            else:
+                                injected_path.rmdir()
+                    return original_popen(*args, **kwargs)
+
+                with mock.patch.object(
+                    MODULE.subprocess,
+                    "Popen",
+                    side_effect=inject_before_child_exec,
+                ):
+                    with self.assertRaises((MODULE.GitError, MODULE.PlanError)):
+                        MODULE.has_local_changes(
+                            self.root,
+                            self.sha,
+                            checkout_view,
+                        )
+
+                self.assertTrue(injected)
+                self.assertFalse(injected_path.exists())
+
+    def test_isolated_status_final_inventory_gate_rejects_digest_window_injection(
+        self,
+    ) -> None:
+        checkout_view = self.capture_checkout_execution_view(
+            self.named_source_git_dir,
+            "private-object-digest-window-injection",
+        )
+        pack_lease = checkout_view.digest_file_leases[0]
+        injected_path = pack_lease.binding.path.parent / "late-shadow.idx"
+        parent_pid = os.getpid()
+        original_pread = MODULE.os.pread
+
+        def inject_while_child_hashes_pack(
+            descriptor: int,
+            length: int,
+            offset: int,
+        ) -> bytes:
+            if (
+                os.getpid() != parent_pid
+                and descriptor == pack_lease.descriptor
+                and offset == 0
+                and not injected_path.exists()
+            ):
+                injected_path.write_bytes(b"attacker\n")
+            return original_pread(descriptor, length, offset)
+
+        try:
+            with mock.patch.object(
+                MODULE.os,
+                "pread",
+                side_effect=inject_while_child_hashes_pack,
+            ):
+                with self.assertRaises((MODULE.GitError, MODULE.PlanError)):
+                    MODULE.has_local_changes(
+                        self.root,
+                        self.sha,
+                        checkout_view,
+                    )
+            self.assertTrue(injected_path.is_file())
+        finally:
+            if injected_path.exists():
+                injected_path.unlink()
 
     def test_worktree_registry_enforces_a_bounded_record_count(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -3508,6 +3627,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             *,
             extra_env: dict[str, str] | None = None,
             directory_identity_leases: tuple[object, ...] = (),
+            **kwargs: object,
         ) -> subprocess.CompletedProcess[str]:
             nonlocal replaced
             commands.append(args)
@@ -3521,6 +3641,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 directory_descriptor,
                 extra_env=extra_env,
                 directory_identity_leases=directory_identity_leases,
+                **kwargs,
             )
 
         with mock.patch.object(
@@ -4140,6 +4261,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             *,
             extra_env: dict[str, str] | None = None,
             directory_identity_leases: tuple[object, ...] = (),
+            **kwargs: object,
         ) -> subprocess.CompletedProcess[str]:
             nonlocal inserted
             if not inserted and "worktree" in args and "add" in args:
@@ -4157,6 +4279,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 directory_descriptor,
                 extra_env=extra_env,
                 directory_identity_leases=directory_identity_leases,
+                **kwargs,
             )
 
         with mock.patch.object(
@@ -6003,7 +6126,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     environment["GIT_OBJECT_DIRECTORY"],
-                    str((self.named_source_git_dir / "objects").resolve()),
+                    str(Path(environment["GIT_COMMON_DIR"]) / "objects"),
                 )
                 config_path.write_bytes(injected_config)
                 mutated = True
@@ -6114,7 +6237,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             )
             self.assertEqual(
                 environment["GIT_OBJECT_DIRECTORY"],
-                str(source_objects),
+                str(private_common / "objects"),
             )
             self.assertEqual(environment["GIT_ATTR_SOURCE"], self.sha)
 
@@ -6129,6 +6252,8 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     private_common,
                     private_common / "info",
                     private_common / "objects",
+                    private_common / "objects" / "info",
+                    private_common / "objects" / "pack",
                     private_common / "refs",
                 }.issubset(identity_paths)
             )
@@ -6141,6 +6266,52 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     private_common / "config",
                 }.issubset(file_paths)
             )
+            digest_leases = kwargs["digest_file_leases"]
+            self.assertIsInstance(digest_leases, tuple)
+            self.assertEqual(len(digest_leases), 1)
+            self.assertEqual(
+                digest_leases[0].binding.path.parent,
+                private_common / "objects" / "pack",
+            )
+            self.assertEqual(
+                digest_leases[0].binding.path.suffix,
+                ".pack",
+            )
+            exact_inventory_leases = kwargs["directory_exact_inventory_leases"]
+            self.assertIsInstance(exact_inventory_leases, tuple)
+            exact_inventories = {
+                lease.directory_binding.path: tuple(
+                    name for name, _fingerprint in lease.entries
+                )
+                for lease in exact_inventory_leases
+            }
+            self.assertEqual(
+                exact_inventories[private_common],
+                ("HEAD", "config", "info", "objects", "refs"),
+            )
+            self.assertEqual(
+                exact_inventories[private_common / "info"],
+                (),
+            )
+            self.assertEqual(
+                exact_inventories[private_common / "objects"],
+                ("info", "pack"),
+            )
+            self.assertEqual(
+                exact_inventories[private_common / "objects" / "info"],
+                (),
+            )
+            self.assertEqual(
+                exact_inventories[private_common / "refs"],
+                (),
+            )
+            self.assertEqual(
+                {
+                    Path(name).suffix
+                    for name in exact_inventories[private_common / "objects" / "pack"]
+                },
+                {".idx", ".pack"},
+            )
             absent_leases = kwargs["directory_absent_entry_leases"]
             self.assertIsInstance(absent_leases, tuple)
             absent_paths = {
@@ -6151,8 +6322,6 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             self.assertTrue(
                 {
                     attributes_path.resolve(strict=False),
-                    private_common / "info" / "attributes",
-                    private_common / "info" / "exclude",
                 }.issubset(absent_paths)
             )
 
@@ -6314,6 +6483,257 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 "--porcelain",
             ),
             registry_before,
+        )
+
+    def test_new_checkout_rejects_launch_window_attributes_object_mutation(
+        self,
+    ) -> None:
+        (self.remote / ".gitattributes").write_text(
+            "# no checkout filters\n",
+            encoding="utf-8",
+        )
+        (self.remote / "payload.bin").write_text("payload\n", encoding="utf-8")
+        run_git(self.remote, "add", ".gitattributes", "payload.bin")
+        run_git(
+            self.remote,
+            "commit",
+            "-m",
+            "add safe checkout attributes",
+        )
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+
+        marker = self.root / "object-window-filter-executed"
+        filter_helper = self.root / "object-window-filter.sh"
+        filter_helper.write_text(
+            f"#!/bin/sh\ntouch {marker}\ncat\n",
+            encoding="utf-8",
+        )
+        filter_helper.chmod(0o700)
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "filter.object-window.smudge",
+            str(filter_helper),
+        )
+        attributes_blob = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "rev-parse",
+            f"{target_sha}:.gitattributes",
+        )
+        loose_attributes = self.ensure_loose_source_object(
+            self.named_source_git_dir,
+            attributes_blob,
+        )
+        original_object = loose_attributes.read_bytes()
+        original_mode = stat.S_IMODE(loose_attributes.stat().st_mode)
+        forged_attributes = b"payload.bin filter=object-window\n"
+        forged_storage = (
+            f"blob {len(forged_attributes)}\0".encode("ascii") + forged_attributes
+        )
+        forged_digest = (
+            hashlib.sha1(forged_storage).hexdigest()
+            if len(attributes_blob) == 40
+            else hashlib.sha256(forged_storage).hexdigest()
+        )
+        self.assertNotEqual(forged_digest, attributes_blob)
+
+        target_super = self.root / "new-object-window-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "custom-lib",
+                        "lib",
+                        str(self.remote),
+                    ),
+                    target_sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        self.addCleanup(plan.close)
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        original_read_git_bounded = MODULE.read_git_bounded
+        injected = False
+
+        def mutate_attributes_object_before_private_pack(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal injected
+            if "pack-objects" not in args or injected:
+                return original_read_git_bounded(args, **kwargs)
+            injected = True
+            self.assertGreater(kwargs["file_size_limit_bytes"], 0)
+            loose_attributes.chmod(original_mode | stat.S_IWUSR)
+            loose_attributes.write_bytes(zlib.compress(forged_storage))
+            try:
+                return original_read_git_bounded(args, **kwargs)
+            finally:
+                loose_attributes.write_bytes(original_object)
+                loose_attributes.chmod(original_mode)
+
+        with mock.patch.object(
+            MODULE,
+            "read_git_bounded",
+            side_effect=mutate_attributes_object_before_private_pack,
+        ):
+            with self.assertRaises((MODULE.GitError, MODULE.PlanError)):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(injected)
+        self.assertFalse(marker.exists())
+        self.assertFalse(target.exists())
+        self.assertEqual(loose_attributes.read_bytes(), original_object)
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={self.named_source_git_dir}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
+    def test_new_checkout_ignores_live_attributes_object_mutation_at_launch(
+        self,
+    ) -> None:
+        (self.remote / ".gitattributes").write_text(
+            "# no checkout filters\n",
+            encoding="utf-8",
+        )
+        (self.remote / "payload.bin").write_text("payload\n", encoding="utf-8")
+        run_git(self.remote, "add", ".gitattributes", "payload.bin")
+        run_git(
+            self.remote,
+            "commit",
+            "-m",
+            "add launch-isolated checkout attributes",
+        )
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+
+        marker = self.root / "live-object-filter-executed"
+        filter_helper = self.root / "live-object-filter.sh"
+        filter_helper.write_text(
+            f"#!/bin/sh\ntouch {marker}\ncat\n",
+            encoding="utf-8",
+        )
+        filter_helper.chmod(0o700)
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "filter.live-object.smudge",
+            str(filter_helper),
+        )
+        attributes_blob = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "rev-parse",
+            f"{target_sha}:.gitattributes",
+        )
+        loose_attributes = self.ensure_loose_source_object(
+            self.named_source_git_dir,
+            attributes_blob,
+        )
+        original_object = loose_attributes.read_bytes()
+        original_mode = stat.S_IMODE(loose_attributes.stat().st_mode)
+        forged_attributes = b"payload.bin filter=live-object\n"
+        forged_storage = (
+            f"blob {len(forged_attributes)}\0".encode("ascii") + forged_attributes
+        )
+
+        target_super = self.root / "live-object-launch-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "custom-lib",
+                        "lib",
+                        str(self.remote),
+                    ),
+                    target_sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        self.addCleanup(plan.close)
+        original_run = MODULE.run_git_at_directory_descriptor
+        injected = False
+
+        def mutate_live_object_during_checkout_launch(
+            args: list[str],
+            directory_descriptor: int,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal injected
+            if "checkout" not in args or injected:
+                return original_run(
+                    args,
+                    directory_descriptor,
+                    **kwargs,
+                )
+            injected = True
+            environment = kwargs["extra_env"]
+            self.assertIsInstance(environment, dict)
+            assert isinstance(environment, dict)
+            self.assertNotEqual(
+                environment["GIT_OBJECT_DIRECTORY"],
+                str((self.named_source_git_dir / "objects").resolve()),
+            )
+            loose_attributes.chmod(original_mode | stat.S_IWUSR)
+            loose_attributes.write_bytes(zlib.compress(forged_storage))
+            try:
+                return original_run(
+                    args,
+                    directory_descriptor,
+                    **kwargs,
+                )
+            finally:
+                loose_attributes.write_bytes(original_object)
+                loose_attributes.chmod(original_mode)
+
+        with mock.patch.object(
+            MODULE,
+            "run_git_at_directory_descriptor",
+            side_effect=mutate_live_object_during_checkout_launch,
+        ):
+            MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(injected)
+        self.assertFalse(marker.exists())
+        self.assertEqual(loose_attributes.read_bytes(), original_object)
+        self.assertEqual(run_git(target, "rev-parse", "HEAD"), target_sha)
+        self.assertEqual(
+            (target / "payload.bin").read_text(encoding="utf-8"),
+            "payload\n",
         )
 
     def test_new_worktree_revalidates_temporarily_forged_path_selection(
@@ -9463,6 +9883,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             *,
             extra_env: dict[str, str] | None = None,
             directory_identity_leases: tuple[object, ...] = (),
+            **kwargs: object,
         ) -> subprocess.CompletedProcess[str]:
             nonlocal replaced
             result = original_run(
@@ -9470,6 +9891,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 directory_descriptor,
                 extra_env=extra_env,
                 directory_identity_leases=directory_identity_leases,
+                **kwargs,
             )
             if not replaced and "worktree" in args and "add" in args:
                 entry.source_git_dir.rename(original_source)
@@ -9540,6 +9962,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             *,
             extra_env: dict[str, str] | None = None,
             directory_identity_leases: tuple[object, ...] = (),
+            **kwargs: object,
         ) -> subprocess.CompletedProcess[str]:
             if "worktree" in args and "add" in args:
                 partial_admin.mkdir(parents=True)
@@ -9559,6 +9982,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 directory_descriptor,
                 extra_env=extra_env,
                 directory_identity_leases=directory_identity_leases,
+                **kwargs,
             )
 
         with mock.patch.object(
@@ -9638,6 +10062,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             *,
             extra_env: dict[str, str] | None = None,
             directory_identity_leases: tuple[object, ...] = (),
+            **kwargs: object,
         ) -> subprocess.CompletedProcess[str]:
             nonlocal recreated_admin
             if "worktree" in args and "remove" in args:
@@ -9648,6 +10073,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     directory_descriptor,
                     extra_env=extra_env,
                     directory_identity_leases=directory_identity_leases,
+                    **kwargs,
                 )
                 assert recreated_admin is not None
                 recreated_admin.mkdir()
@@ -9657,6 +10083,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 directory_descriptor,
                 extra_env=extra_env,
                 directory_identity_leases=directory_identity_leases,
+                **kwargs,
             )
 
         with (
@@ -9786,6 +10213,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             *,
             extra_env: dict[str, str] | None = None,
             directory_identity_leases: tuple[object, ...] = (),
+            **kwargs: object,
         ) -> subprocess.CompletedProcess[str]:
             nonlocal remove_attempted
             if "worktree" in args and "remove" in args:
@@ -9795,6 +10223,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 directory_descriptor,
                 extra_env=extra_env,
                 directory_identity_leases=directory_identity_leases,
+                **kwargs,
             )
             if interrupt_after_add and "worktree" in args and "add" in args:
                 raise MODULE.GitError("injected post-add interruption")
@@ -12441,6 +12870,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         )
         checkout_view = self.capture_checkout_execution_view(
             shallow_source,
+            object_roots=(third_sha,),
         )
         try:
             MODULE.add_worktree(
@@ -13219,6 +13649,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         target = SimpleNamespace(path=self.root / "no-fetch-target")
         checkout_receipt = SimpleNamespace(
             attributes_receipt=mock.sentinel.attributes_receipt,
+            current_head=None,
         )
         checkout_view = mock.MagicMock()
         checkout_view.common_git_dir = self.root / "mock-checkout-view"
@@ -13306,6 +13737,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         events: list[str] = []
         checkout_receipt = SimpleNamespace(
             attributes_receipt=mock.sentinel.attributes_receipt,
+            current_head=None,
         )
         checkout_view = mock.MagicMock()
         checkout_view.common_git_dir = self.root / "mock-checkout-view"
