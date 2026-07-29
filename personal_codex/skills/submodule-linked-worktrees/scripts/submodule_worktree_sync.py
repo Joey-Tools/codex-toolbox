@@ -516,6 +516,8 @@ class CheckoutPreflight:
     current_head: Optional[str]
     index_digest: Optional[str]
     index_entry_count: Optional[int]
+    target_blob_paths: tuple[tuple[str, ...], ...]
+    filter_selections: tuple[FilterSelection, ...]
     path_count: int
     path_digest: str
     object_count: int
@@ -529,6 +531,32 @@ class ObjectClosureReceipt:
     object_count: int
     logical_bytes: int
     digest: str
+
+
+@dataclass(frozen=True)
+class CommitGitmodulesReceipt:
+    commit: str
+    entry_mode: Optional[str]
+    blob_id: Optional[str]
+    content_size: int
+    content_sha256: Optional[str]
+    modules: tuple[tuple[str, str, str], ...]
+
+
+@dataclass(frozen=True)
+class RecursiveSubmoduleSelection:
+    name: str
+    path: str
+    url: str
+    mode: str
+    sha: str
+
+
+@dataclass(frozen=True)
+class RecursiveMetadataReceipt:
+    root_tree_id: str
+    gitmodules: CommitGitmodulesReceipt
+    selections: tuple[RecursiveSubmoduleSelection, ...]
 
 
 @dataclass(frozen=True)
@@ -997,6 +1025,7 @@ class PlannedWorktree:
     source_completeness: SourceCompletenessReceipt
     target_bindings: tuple[AccessBinding, ...]
     checkout_preflight: Optional[CheckoutPreflight]
+    recursive_metadata: Optional[RecursiveMetadataReceipt]
     transport_receipt: Optional[TransportReceipt]
     needs_fetch: bool
 
@@ -5886,12 +5915,12 @@ def read_worktree_gitmodules(
     return modules
 
 
-def read_commit_gitmodules(
+def _capture_commit_gitmodules_with_receipt(
     source_git_dir: Path,
     work_tree: Path,
     commit: str,
     budget: Optional[GitmodulesReadBudget] = None,
-) -> list[Submodule]:
+) -> tuple[list[Submodule], CommitGitmodulesReceipt]:
     del work_tree
     budget = budget or GitmodulesReadBudget.start()
     tree_result = read_git_bounded(
@@ -5912,7 +5941,17 @@ def read_commit_gitmodules(
         maximum_records=1,
     )
     if not records:
-        return []
+        return (
+            [],
+            CommitGitmodulesReceipt(
+                commit=commit,
+                entry_mode=None,
+                blob_id=None,
+                content_size=0,
+                content_sha256=None,
+                modules=(),
+            ),
+        )
     try:
         metadata, raw_path = records[0].split(b"\t", 1)
     except ValueError as exc:
@@ -5956,7 +5995,33 @@ def read_commit_gitmodules(
     if len(content_result.stdout) != blob_size:
         raise PlanError(f"{commit}:.gitmodules changed size during bounded read")
     budget.retain(blob_size, f"{commit}:.gitmodules")
-    return decode_gitmodules(content_result.stdout, f"{commit}:.gitmodules")
+    modules = decode_gitmodules(content_result.stdout, f"{commit}:.gitmodules")
+    return (
+        modules,
+        CommitGitmodulesReceipt(
+            commit=commit,
+            entry_mode=os.fsdecode(fields[0]),
+            blob_id=object_id,
+            content_size=blob_size,
+            content_sha256=hashlib.sha256(content_result.stdout).hexdigest(),
+            modules=tuple((module.name, module.path, module.url) for module in modules),
+        ),
+    )
+
+
+def read_commit_gitmodules(
+    source_git_dir: Path,
+    work_tree: Path,
+    commit: str,
+    budget: Optional[GitmodulesReadBudget] = None,
+) -> list[Submodule]:
+    modules, _receipt = _capture_commit_gitmodules_with_receipt(
+        source_git_dir,
+        work_tree,
+        commit,
+        budget,
+    )
+    return modules
 
 
 def expected_sha(root: Path, rel_path: str) -> str:
@@ -6177,16 +6242,56 @@ def revalidate_superproject_index_receipt(
         revalidate_file_content_binding(binding)
 
 
+def _read_tree_gitlink(
+    source_git_dir: Path, work_tree: Path, treeish: str, rel_path: str
+) -> tuple[str, str]:
+    del work_tree
+    result = read_git_bounded(
+        [
+            *source_object_repo_args(source_git_dir),
+            "ls-tree",
+            "-z",
+            treeish,
+            "--",
+            rel_path,
+        ],
+        stdout_limit=MAX_CHECKOUT_PATH_BYTES + 512,
+    )
+    records = bounded_records(
+        result.stdout,
+        f"{treeish}:{rel_path} gitlink",
+        maximum_records=1,
+    )
+    if len(records) != 1:
+        raise PlanError(f"{rel_path} is not a gitlink in {treeish}")
+    try:
+        metadata, raw_path = records[0].split(b"\t", 1)
+    except ValueError as exc:
+        raise PlanError(f"{rel_path} has an invalid gitlink in {treeish}") from exc
+    fields = metadata.split()
+    if (
+        len(fields) != 3
+        or fields[0] != b"160000"
+        or fields[1] != b"commit"
+        or raw_path != os.fsencode(rel_path)
+    ):
+        raise PlanError(f"{rel_path} is not a gitlink in {treeish}")
+    object_id = os.fsdecode(fields[2])
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", object_id):
+        raise PlanError(f"{rel_path} has an invalid gitlink object id in {treeish}")
+    return os.fsdecode(fields[0]), object_id
+
+
 def expected_sha_from_tree(
     source_git_dir: Path, work_tree: Path, treeish: str, rel_path: str
 ) -> str:
-    output = git(
-        [*source_object_repo_args(source_git_dir), "ls-tree", treeish, "--", rel_path]
+    _mode, object_id = _read_tree_gitlink(
+        source_git_dir,
+        work_tree,
+        treeish,
+        rel_path,
     )
-    fields = output.split()
-    if len(fields) < 4 or fields[0] != "160000":
-        raise PlanError(f"{rel_path} is not a gitlink in {treeish}")
-    return fields[2]
+    return object_id
 
 
 def source_git_dir_for(common_git_dir: Path, submodule_name: str) -> Path:
@@ -13911,6 +14016,97 @@ def target_object_closure(
     return receipt
 
 
+def target_root_tree_id(source_git_dir: Path, target_sha: str) -> str:
+    result = read_git_bounded(
+        [
+            *source_object_repo_args(source_git_dir),
+            "rev-parse",
+            "--verify",
+            f"{target_sha}^{{tree}}",
+        ],
+        stdout_limit=256,
+    )
+    root_tree_id = os.fsdecode(result.stdout).strip()
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", root_tree_id):
+        raise PlanError("recursive metadata returned an invalid root tree id")
+    return root_tree_id
+
+
+def capture_recursive_metadata_receipt(
+    entry: PlannedWorktree,
+    budget: Optional[GitmodulesReadBudget] = None,
+) -> RecursiveMetadataReceipt:
+    checkout_receipt = entry.checkout_preflight
+    if checkout_receipt is None:
+        raise PlanError(
+            f"recursive metadata lacks checkout preflight for {entry.submodule.path}"
+        )
+    expected_object_closure = checkout_object_receipt(checkout_receipt)
+    initial_object_closure = target_object_closure(
+        entry.source_git_dir,
+        entry.sha,
+        entry.source_completeness,
+    )
+    require_object_closure_receipt(
+        initial_object_closure,
+        expected_object_closure,
+        f"recursive metadata for {entry.submodule.path}",
+    )
+    root_tree_id = target_root_tree_id(entry.source_git_dir, entry.sha)
+    modules, gitmodules_receipt = _capture_commit_gitmodules_with_receipt(
+        entry.source_git_dir,
+        entry.target.path,
+        entry.sha,
+        budget,
+    )
+    selections: list[RecursiveSubmoduleSelection] = []
+    for module in modules:
+        mode, object_id = _read_tree_gitlink(
+            entry.source_git_dir,
+            entry.target.path,
+            entry.sha,
+            module.path,
+        )
+        selections.append(
+            RecursiveSubmoduleSelection(
+                name=module.name,
+                path=module.path,
+                url=module.url,
+                mode=mode,
+                sha=object_id,
+            )
+        )
+    repeated_object_closure = target_object_closure(
+        entry.source_git_dir,
+        entry.sha,
+        entry.source_completeness,
+    )
+    require_object_closure_receipt(
+        repeated_object_closure,
+        expected_object_closure,
+        f"recursive metadata for {entry.submodule.path}",
+    )
+    return RecursiveMetadataReceipt(
+        root_tree_id=root_tree_id,
+        gitmodules=gitmodules_receipt,
+        selections=tuple(selections),
+    )
+
+
+def revalidate_recursive_metadata_receipt(
+    entry: PlannedWorktree,
+    budget: Optional[GitmodulesReadBudget] = None,
+) -> None:
+    expected = entry.recursive_metadata
+    if expected is None:
+        return
+    observed = capture_recursive_metadata_receipt(entry, budget)
+    if observed != expected:
+        raise PlanError(
+            f"recursive metadata changed after preflight: {entry.submodule.path}"
+        )
+
+
 def selected_checkout_filters(
     source_git_dir: Path,
     treeish: str,
@@ -14072,7 +14268,7 @@ def reject_checkout_filters(
     worktree_path: Path,
     tree_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...],
     index_paths: tuple[tuple[str, ...], ...] = (),
-) -> None:
+) -> tuple[FilterSelection, ...]:
     selections: list[FilterSelection] = []
     selections.extend(selected_index_filters(worktree_path, index_paths))
     for treeish, paths in tree_paths:
@@ -14085,7 +14281,7 @@ def reject_checkout_filters(
         )
     configured_commands = configured_filter_commands(source_git_dir)
     if not selections:
-        return
+        return ()
     selection = selections[0]
     command_kinds = sorted(configured_commands.get(selection.driver.casefold(), set()))
     configured_text = ", ".join(command_kinds) if command_kinds else "none"
@@ -14407,6 +14603,23 @@ def checkout_path_digest(paths: Iterable[tuple[str, ...]]) -> tuple[int, str]:
     return count, digest.hexdigest()
 
 
+def checkout_object_receipt(receipt: CheckoutPreflight) -> ObjectClosureReceipt:
+    return ObjectClosureReceipt(
+        object_count=receipt.object_count,
+        logical_bytes=receipt.object_logical_bytes,
+        digest=receipt.object_digest,
+    )
+
+
+def require_object_closure_receipt(
+    observed: ObjectClosureReceipt,
+    expected: ObjectClosureReceipt,
+    purpose: str,
+) -> None:
+    if observed != expected:
+        raise PlanError(f"{purpose} object closure changed")
+
+
 def capture_checkout_preflight(
     entry: PlannedWorktree,
 ) -> tuple[CheckoutPreflight, tuple[AccessBinding, ...]]:
@@ -14440,7 +14653,7 @@ def capture_checkout_preflight(
             entry.source_git_dir,
             current_head,
         )
-        reject_checkout_filters(
+        filter_selections = reject_checkout_filters(
             entry.source_git_dir,
             entry.target.path,
             (
@@ -14461,11 +14674,21 @@ def capture_checkout_preflight(
         validate_managed_preflight_index(entry, current_head)
         probe_managed_checkout(entry.target.path, entry.sha)
     else:
-        reject_checkout_filters(
+        filter_selections = reject_checkout_filters(
             entry.source_git_dir,
             entry.target.path,
             ((entry.sha, target_blob_paths),),
         )
+    repeated_object_closure = target_object_closure(
+        entry.source_git_dir,
+        entry.sha,
+        entry.source_completeness,
+    )
+    require_object_closure_receipt(
+        repeated_object_closure,
+        object_closure,
+        f"target checkout metadata for {entry.submodule.path}",
+    )
     digest_paths: Iterable[tuple[str, ...]]
     if changes is None:
         digest_paths = target_blob_paths
@@ -14480,6 +14703,8 @@ def capture_checkout_preflight(
             current_head=current_head,
             index_digest=index_digest,
             index_entry_count=index_entry_count,
+            target_blob_paths=target_blob_paths,
+            filter_selections=filter_selections,
             path_count=path_count,
             path_digest=path_digest,
             object_count=object_closure.object_count,
@@ -14495,60 +14720,105 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
     receipt = entry.checkout_preflight
     if receipt is None:
         raise PlanError(f"checkout preflight is incomplete for {entry.submodule.path}")
+    expected_object_closure = checkout_object_receipt(receipt)
     object_closure = target_object_closure(
         entry.source_git_dir,
         entry.sha,
         entry.source_completeness,
     )
-    if (
-        object_closure.object_count != receipt.object_count
-        or object_closure.logical_bytes != receipt.object_logical_bytes
-        or object_closure.digest != receipt.object_digest
-    ):
-        raise PlanError(
-            f"target object closure changed after preflight: {entry.submodule.path}"
-        )
-    if receipt.kind != "managed":
-        return
-    current_head = managed_head(entry.target.path)
-    if current_head != receipt.current_head:
-        raise PlanError(
-            f"managed worktree HEAD changed after preflight: {entry.target.path}"
-        )
-    current_digest, current_count, index_blob_paths = managed_index_snapshot(
-        entry.target.path
-    )
-    if (
-        current_digest != receipt.index_digest
-        or current_count != receipt.index_entry_count
-    ):
-        raise PlanError(
-            f"managed worktree index changed after preflight: {entry.target.path}"
-        )
-    current_blob_paths = target_tree_blob_paths(
-        entry.source_git_dir,
-        current_head,
+    require_object_closure_receipt(
+        object_closure,
+        expected_object_closure,
+        f"target checkout for {entry.submodule.path}",
     )
     target_blob_paths = target_tree_blob_paths(
         entry.source_git_dir,
         entry.sha,
     )
-    reject_checkout_filters(
-        entry.source_git_dir,
-        entry.target.path,
-        (
-            (current_head, current_blob_paths),
-            (entry.sha, target_blob_paths),
-        ),
-        index_blob_paths,
-    )
-    if has_local_changes(entry.target.path, current_head):
+    if target_blob_paths != receipt.target_blob_paths:
         raise PlanError(
-            f"{entry.target.path} has local changes; clean it before syncing"
+            f"target checkout path selection changed after preflight: "
+            f"{entry.submodule.path}"
         )
-    reject_managed_ignored_conflicts(entry.target.path, receipt.changes)
-    validate_managed_preflight_index(entry, current_head)
-    probe_managed_checkout(entry.target.path, entry.sha)
+    if receipt.kind == "managed":
+        current_head = managed_head(entry.target.path)
+        if current_head != receipt.current_head:
+            raise PlanError(
+                f"managed worktree HEAD changed after preflight: {entry.target.path}"
+            )
+        current_digest, current_count, index_blob_paths = managed_index_snapshot(
+            entry.target.path
+        )
+        if (
+            current_digest != receipt.index_digest
+            or current_count != receipt.index_entry_count
+        ):
+            raise PlanError(
+                f"managed worktree index changed after preflight: {entry.target.path}"
+            )
+        current_blob_paths = target_tree_blob_paths(
+            entry.source_git_dir,
+            current_head,
+        )
+        filter_selections = reject_checkout_filters(
+            entry.source_git_dir,
+            entry.target.path,
+            (
+                (current_head, current_blob_paths),
+                (entry.sha, target_blob_paths),
+            ),
+            index_blob_paths,
+        )
+        repeated_changes = parse_managed_tree_changes(
+            entry.target.path,
+            current_head,
+            entry.sha,
+        )
+        if repeated_changes != receipt.changes:
+            raise PlanError(
+                f"managed checkout write set changed after preflight: "
+                f"{entry.target.path}"
+            )
+        digest_paths: Iterable[tuple[str, ...]] = (
+            change.relative_parts for change in repeated_changes
+        )
+        if has_local_changes(entry.target.path, current_head):
+            raise PlanError(
+                f"{entry.target.path} has local changes; clean it before syncing"
+            )
+        reject_managed_ignored_conflicts(entry.target.path, receipt.changes)
+        validate_managed_preflight_index(entry, current_head)
+        probe_managed_checkout(entry.target.path, entry.sha)
+    elif receipt.kind == "new":
+        filter_selections = reject_checkout_filters(
+            entry.source_git_dir,
+            entry.target.path,
+            ((entry.sha, target_blob_paths),),
+        )
+        digest_paths = target_blob_paths
+    else:
+        raise PlanError(
+            f"checkout preflight has an invalid kind for {entry.submodule.path}"
+        )
+    if filter_selections != receipt.filter_selections:
+        raise PlanError(
+            f"checkout filter selection changed after preflight: {entry.submodule.path}"
+        )
+    path_count, path_digest = checkout_path_digest(digest_paths)
+    if path_count != receipt.path_count or path_digest != receipt.path_digest:
+        raise PlanError(
+            f"checkout path receipt changed after preflight: {entry.submodule.path}"
+        )
+    repeated_object_closure = target_object_closure(
+        entry.source_git_dir,
+        entry.sha,
+        entry.source_completeness,
+    )
+    require_object_closure_receipt(
+        repeated_object_closure,
+        expected_object_closure,
+        f"target checkout for {entry.submodule.path}",
+    )
 
 
 def missing_commit_error(
@@ -14708,6 +14978,7 @@ def build_sync_plan(
             source_completeness=source_completeness,
             target_bindings=target_bindings,
             checkout_preflight=None,
+            recursive_metadata=None,
             transport_receipt=transport_receipt,
             needs_fetch=needs_fetch,
         )
@@ -14728,23 +14999,20 @@ def build_sync_plan(
 
         if not recursive:
             return
+        entry.recursive_metadata = capture_recursive_metadata_receipt(
+            entry,
+            gitmodules_budget,
+        )
         active_ancestor_indexes.add(current_index)
         try:
-            for nested in read_commit_gitmodules(
-                source_git_dir,
-                target.path,
-                sha,
-                gitmodules_budget,
-            ):
-                nested_sha = expected_sha_from_tree(
-                    source_git_dir,
-                    target.path,
-                    sha,
-                    nested.path,
-                )
+            for selection in entry.recursive_metadata.selections:
                 add_entry(
-                    nested,
-                    nested_sha,
+                    Submodule(
+                        name=selection.name,
+                        path=selection.path,
+                        url=selection.url,
+                    ),
+                    selection.sha,
                     target.relative_parts,
                     source_git_dir,
                     current_index,
@@ -14964,9 +15232,80 @@ def revalidate_planned_entry(
     return target
 
 
+def validate_recursive_plan_structure(plan: SyncPlan) -> None:
+    children_by_parent: dict[int, list[PlannedWorktree]] = {}
+    for index, entry in enumerate(plan.entries):
+        parent_index = entry.parent_index
+        if parent_index is None:
+            if entry.parent_source_git_dir is not None:
+                raise PlanError(
+                    f"top-level plan entry has a recursive parent source: "
+                    f"{entry.submodule.path}"
+                )
+            continue
+        if parent_index < 0 or parent_index >= index:
+            raise PlanError(
+                f"recursive plan has an invalid parent index for {entry.submodule.path}"
+            )
+        children_by_parent.setdefault(parent_index, []).append(entry)
+
+    for parent_index, parent in enumerate(plan.entries):
+        children = children_by_parent.get(parent_index, [])
+        receipt = parent.recursive_metadata
+        if receipt is None:
+            if children:
+                raise PlanError(
+                    f"recursive plan parent lacks metadata: {parent.submodule.path}"
+                )
+            continue
+        if receipt.gitmodules.commit != parent.sha:
+            raise PlanError(
+                f"recursive metadata names the wrong commit for {parent.submodule.path}"
+            )
+        if len(children) != len(receipt.selections):
+            raise PlanError(
+                f"recursive child set changed after preflight: {parent.submodule.path}"
+            )
+        for child, selection in zip(children, receipt.selections):
+            if (
+                child.submodule.name != selection.name
+                or child.submodule.path != selection.path
+                or child.submodule.url != selection.url
+                or selection.mode != "160000"
+                or child.sha != selection.sha
+                or child.parent_source_git_dir != parent.source_git_dir
+            ):
+                raise PlanError(
+                    f"recursive child selection changed after preflight: "
+                    f"{parent.submodule.path} -> {child.submodule.path}"
+                )
+
+
+def revalidate_recursive_metadata_for_entry(
+    plan: SyncPlan,
+    index: int,
+) -> None:
+    validate_recursive_plan_structure(plan)
+    entry = plan.entries[index]
+    budget = GitmodulesReadBudget.start()
+    checked_indexes: set[int] = set()
+    if entry.parent_index is not None:
+        checked_indexes.add(entry.parent_index)
+        revalidate_recursive_metadata_receipt(
+            plan.entries[entry.parent_index],
+            budget,
+        )
+    if entry.recursive_metadata is not None and index not in checked_indexes:
+        revalidate_recursive_metadata_receipt(entry, budget)
+
+
 def validate_sync_plan(plan: SyncPlan) -> None:
     revalidate_plan_input_receipt(plan)
     revalidate_shared_missing_ancestors(plan)
+    validate_recursive_plan_structure(plan)
+    gitmodules_budget = GitmodulesReadBudget.start()
+    for entry in plan.entries:
+        revalidate_recursive_metadata_receipt(entry, gitmodules_budget)
     for entry in plan.entries:
         revalidate_planned_entry(plan, entry)
 
@@ -15409,10 +15748,11 @@ def finalize_recursive_parent_checkout(
 def apply_sync_plan(plan: SyncPlan) -> None:
     validate_sync_plan(plan)
     plan_state_changed = False
-    for entry in plan.entries:
+    for index, entry in enumerate(plan.entries):
         if not entry.needs_fetch:
             continue
         revalidate_plan_input_receipt(plan)
+        revalidate_recursive_metadata_for_entry(plan, index)
         revalidate_runtime_source_access(entry)
         terminal_completeness_receipts: list[SourceCompletenessReceipt] = []
         fetch_missing_commit(
@@ -15464,6 +15804,7 @@ def apply_sync_plan(plan: SyncPlan) -> None:
             first_mutation = False
         source_lease = capture_planned_source_lease(entry)
         try:
+            revalidate_recursive_metadata_for_entry(plan, index)
             lease = materialize_bound_target_directory(target)
             try:
                 # The fresh source lease is fingerprint-equal to both preflight
@@ -15473,7 +15814,6 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                 revalidate_planned_source_lease(entry, source_lease)
                 revalidate_materialized_target_lease(lease)
                 revalidate_source_object_admission(entry.source_git_dir)
-                revalidate_checkout_preflight(entry)
                 if index in recursive_parent_indexes:
 
                     def finalize_recursive_current_checkout(
@@ -15513,6 +15853,8 @@ def apply_sync_plan(plan: SyncPlan) -> None:
 
                     finalize_current_checkout = finalize_leaf_current_checkout
                 if entry.state == "managed":
+                    revalidate_recursive_metadata_for_entry(plan, index)
+                    revalidate_checkout_preflight(entry)
                     checkout_existing_worktree(
                         target.path,
                         entry.sha,
@@ -15523,6 +15865,8 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                         finalize_checkout=finalize_current_checkout,
                     )
                 else:
+                    revalidate_recursive_metadata_for_entry(plan, index)
+                    revalidate_checkout_preflight(entry)
                     add_worktree(
                         entry.source_git_dir,
                         target.path,

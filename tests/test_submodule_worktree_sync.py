@@ -372,6 +372,47 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             str(self.root / standard_name),
         )
 
+    def prepare_single_child_recursive_sources(
+        self,
+        scenario: str,
+    ) -> tuple[Path, Path, Path, str, Path, str]:
+        child_remote, child_sha = self.create_gitlink_remote(
+            f"{scenario}-child",
+        )
+        parent_remote, parent_sha = self.create_gitlink_remote(
+            f"{scenario}-parent",
+            (
+                (
+                    "child",
+                    "nested/child",
+                    child_remote,
+                    child_sha,
+                ),
+            ),
+        )
+        source_common = self.root / f"{scenario}-source" / ".git"
+        parent_source = source_common / "modules" / "parent"
+        self.clone_recursive_source(
+            parent_source,
+            parent_remote,
+            f"{scenario}-parent-standard",
+        )
+        self.clone_recursive_source(
+            parent_source / "modules" / "child",
+            child_remote,
+            f"{scenario}-child-standard",
+        )
+        target_super = self.root / f"{scenario}-target"
+        target_super.mkdir()
+        return (
+            target_super,
+            source_common,
+            parent_source,
+            parent_sha,
+            child_remote,
+            child_sha,
+        )
+
     def make_grouped_recursive_plan(
         self,
         scenario: str,
@@ -5560,6 +5601,177 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 fetch_missing=False,
             )
 
+    def test_new_worktree_revalidates_temporarily_hidden_filter_blob(
+        self,
+    ) -> None:
+        target_sha = self.filtered_target_sha("race-filter", required=False)
+        target_super = self.root / "filter-race-target"
+        target_super.mkdir()
+        marker = self.root / "filter-race-executed"
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "filter.race-filter.process",
+            f"touch {marker}",
+        )
+        attributes_id = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "rev-parse",
+            f"{target_sha}:.gitattributes",
+        )
+        loose_attributes = self.ensure_loose_source_object(
+            self.named_source_git_dir,
+            attributes_id,
+        )
+        attributes_mode = stat.S_IMODE(loose_attributes.stat().st_mode)
+        loose_attributes.chmod(attributes_mode | stat.S_IWUSR)
+        original_storage = loose_attributes.read_bytes()
+        benign_payload = b"payload.bin -filter\n"
+        forged_storage = zlib.compress(
+            f"blob {len(benign_payload)}\0".encode("ascii") + benign_payload
+        )
+        original_selector = MODULE.selected_checkout_filters
+        hid_filter = False
+
+        def temporarily_hide_filter(
+            source_git_dir: Path,
+            treeish: str,
+            paths: tuple[tuple[str, ...], ...],
+        ) -> tuple[MODULE.FilterSelection, ...]:
+            nonlocal hid_filter
+            if treeish == target_sha and not hid_filter:
+                hid_filter = True
+                loose_attributes.write_bytes(forged_storage)
+                try:
+                    return original_selector(source_git_dir, treeish, paths)
+                finally:
+                    loose_attributes.write_bytes(original_storage)
+            return original_selector(source_git_dir, treeish, paths)
+
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        with mock.patch.object(
+            MODULE,
+            "selected_checkout_filters",
+            side_effect=temporarily_hide_filter,
+        ):
+            plan = MODULE.build_sync_plan(
+                root=target_super,
+                common_git_dir=self.named_common_git_dir,
+                source_superproject=None,
+                planned_modules=[
+                    (
+                        MODULE.Submodule(
+                            "custom-lib",
+                            "lib",
+                            str(self.remote),
+                        ),
+                        target_sha,
+                    )
+                ],
+                depth=1,
+                recursive=False,
+                force_replace_empty=False,
+                fetch_missing=False,
+            )
+            self.addCleanup(plan.close)
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "untrusted content filter",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(hid_filter)
+        self.assertFalse(marker.exists())
+        self.assertFalse((target_super / "lib").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={self.named_source_git_dir}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
+    def test_new_worktree_revalidates_temporarily_forged_path_selection(
+        self,
+    ) -> None:
+        target_super = self.root / "path-selection-race-target"
+        target_super.mkdir()
+        original_reader = MODULE.target_tree_blob_paths
+        forged_paths = False
+
+        def temporarily_forge_paths(
+            source_git_dir: Path,
+            target_sha: str,
+        ) -> tuple[tuple[str, ...], ...]:
+            nonlocal forged_paths
+            paths = original_reader(source_git_dir, target_sha)
+            if target_sha == self.sha and not forged_paths:
+                forged_paths = True
+                return (*paths, ("forged-during-planning.bin",))
+            return paths
+
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        with mock.patch.object(
+            MODULE,
+            "target_tree_blob_paths",
+            side_effect=temporarily_forge_paths,
+        ):
+            plan = MODULE.build_sync_plan(
+                root=target_super,
+                common_git_dir=self.named_common_git_dir,
+                source_superproject=None,
+                planned_modules=[
+                    (
+                        MODULE.Submodule(
+                            "custom-lib",
+                            "lib",
+                            str(self.remote),
+                        ),
+                        self.sha,
+                    )
+                ],
+                depth=1,
+                recursive=False,
+                force_replace_empty=False,
+                fetch_missing=False,
+            )
+            self.addCleanup(plan.close)
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "path selection changed after preflight",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(forged_paths)
+        self.assertFalse((target_super / "lib").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={self.named_source_git_dir}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
     def test_managed_worktree_rejects_new_filtered_payload(self) -> None:
         target_sha = self.filtered_target_sha("managed-filter", required=False)
         target_super = self.root / "managed-filter-target"
@@ -6731,6 +6943,274 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertEqual(
             run_git(target / "third_party" / "libexample", "rev-parse", "HEAD"),
             target_sha,
+        )
+
+    def test_recursive_apply_revalidates_temporarily_rewritten_gitmodules_blob(
+        self,
+    ) -> None:
+        (
+            target_super,
+            source_common,
+            parent_source,
+            parent_sha,
+            _child_remote,
+            _child_sha,
+        ) = self.prepare_single_child_recursive_sources("recursive-gitmodules-race")
+        gitmodules_id = run_git(
+            self.root,
+            f"--git-dir={parent_source}",
+            "rev-parse",
+            f"{parent_sha}:.gitmodules",
+        )
+        loose_gitmodules = self.ensure_loose_source_object(
+            parent_source,
+            gitmodules_id,
+        )
+        gitmodules_mode = stat.S_IMODE(loose_gitmodules.stat().st_mode)
+        loose_gitmodules.chmod(gitmodules_mode | stat.S_IWUSR)
+        original_storage = loose_gitmodules.read_bytes()
+        original_payload = subprocess.run(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                f"--git-dir={parent_source}",
+                "cat-file",
+                "blob",
+                gitmodules_id,
+            ],
+            cwd=self.root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+        forged_payload = original_payload + b"# temporary planning view\n"
+        forged_storage = zlib.compress(
+            f"blob {len(forged_payload)}\0".encode("ascii") + forged_payload
+        )
+        original_capture = MODULE._capture_commit_gitmodules_with_receipt
+        rewrote_gitmodules = False
+
+        def temporarily_rewrite_gitmodules(
+            source_git_dir: Path,
+            work_tree: Path,
+            commit: str,
+            budget: MODULE.GitmodulesReadBudget | None = None,
+        ) -> tuple[list[MODULE.Submodule], MODULE.CommitGitmodulesReceipt]:
+            nonlocal rewrote_gitmodules
+            if commit == parent_sha and not rewrote_gitmodules:
+                rewrote_gitmodules = True
+                loose_gitmodules.write_bytes(forged_storage)
+                try:
+                    return original_capture(
+                        source_git_dir,
+                        work_tree,
+                        commit,
+                        budget,
+                    )
+                finally:
+                    loose_gitmodules.write_bytes(original_storage)
+            return original_capture(
+                source_git_dir,
+                work_tree,
+                commit,
+                budget,
+            )
+
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={parent_source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        with mock.patch.object(
+            MODULE,
+            "_capture_commit_gitmodules_with_receipt",
+            side_effect=temporarily_rewrite_gitmodules,
+        ):
+            plan = MODULE.build_sync_plan(
+                root=target_super,
+                common_git_dir=source_common,
+                source_superproject=None,
+                planned_modules=[
+                    (
+                        MODULE.Submodule(
+                            "parent",
+                            "parent",
+                            "unused",
+                        ),
+                        parent_sha,
+                    )
+                ],
+                depth=1,
+                recursive=True,
+                force_replace_empty=False,
+                fetch_missing=False,
+            )
+            self.addCleanup(plan.close)
+            self.assertNotEqual(
+                plan.entries[0].recursive_metadata.gitmodules.content_sha256,
+                hashlib.sha256(original_payload).hexdigest(),
+            )
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "recursive metadata changed after preflight",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(rewrote_gitmodules)
+        self.assertFalse((target_super / "parent").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={parent_source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
+    def test_recursive_apply_revalidates_temporarily_rewritten_gitlink_tree(
+        self,
+    ) -> None:
+        (
+            target_super,
+            source_common,
+            parent_source,
+            parent_sha,
+            child_remote,
+            child_sha,
+        ) = self.prepare_single_child_recursive_sources("recursive-gitlink-race")
+        (child_remote / "ALTERNATE.md").write_text(
+            "alternate\n",
+            encoding="utf-8",
+        )
+        run_git(child_remote, "add", "ALTERNATE.md")
+        run_git(child_remote, "commit", "-m", "alternate child")
+        alternate_sha = run_git(child_remote, "rev-parse", "HEAD")
+        child_source = parent_source / "modules" / "child"
+        self.fetch_source(child_source)
+
+        nested_tree_id = run_git(
+            self.root,
+            f"--git-dir={parent_source}",
+            "rev-parse",
+            f"{parent_sha}:nested",
+        )
+        loose_nested_tree = self.ensure_loose_source_object(
+            parent_source,
+            nested_tree_id,
+        )
+        nested_tree_mode = stat.S_IMODE(loose_nested_tree.stat().st_mode)
+        loose_nested_tree.chmod(nested_tree_mode | stat.S_IWUSR)
+        original_storage = loose_nested_tree.read_bytes()
+        original_payload = subprocess.run(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                f"--git-dir={parent_source}",
+                "cat-file",
+                "tree",
+                nested_tree_id,
+            ],
+            cwd=self.root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+        child_raw = bytes.fromhex(child_sha)
+        alternate_raw = bytes.fromhex(alternate_sha)
+        self.assertEqual(original_payload.count(child_raw), 1)
+        forged_payload = original_payload.replace(child_raw, alternate_raw, 1)
+        forged_storage = zlib.compress(
+            f"tree {len(forged_payload)}\0".encode("ascii") + forged_payload
+        )
+        original_gitlink_reader = MODULE._read_tree_gitlink
+        rewrote_gitlink = False
+
+        def temporarily_rewrite_gitlink(
+            source_git_dir: Path,
+            work_tree: Path,
+            treeish: str,
+            rel_path: str,
+        ) -> tuple[str, str]:
+            nonlocal rewrote_gitlink
+            if (
+                treeish == parent_sha
+                and rel_path == "nested/child"
+                and not rewrote_gitlink
+            ):
+                rewrote_gitlink = True
+                loose_nested_tree.write_bytes(forged_storage)
+                try:
+                    return original_gitlink_reader(
+                        source_git_dir,
+                        work_tree,
+                        treeish,
+                        rel_path,
+                    )
+                finally:
+                    loose_nested_tree.write_bytes(original_storage)
+            return original_gitlink_reader(
+                source_git_dir,
+                work_tree,
+                treeish,
+                rel_path,
+            )
+
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={parent_source}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        with mock.patch.object(
+            MODULE,
+            "_read_tree_gitlink",
+            side_effect=temporarily_rewrite_gitlink,
+        ):
+            plan = MODULE.build_sync_plan(
+                root=target_super,
+                common_git_dir=source_common,
+                source_superproject=None,
+                planned_modules=[
+                    (
+                        MODULE.Submodule(
+                            "parent",
+                            "parent",
+                            "unused",
+                        ),
+                        parent_sha,
+                    )
+                ],
+                depth=1,
+                recursive=True,
+                force_replace_empty=False,
+                fetch_missing=False,
+            )
+            self.addCleanup(plan.close)
+            self.assertEqual(plan.entries[1].sha, alternate_sha)
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "recursive metadata changed after preflight",
+            ):
+                MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(rewrote_gitlink)
+        self.assertFalse((target_super / "parent").exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={parent_source}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
         )
 
     def test_recursive_apply_parent_with_two_children_uses_parent_receipt(
@@ -12053,6 +12533,8 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             needs_fetch=False,
             checkout_preflight=mock.sentinel.checkout_receipt,
             parent_index=None,
+            parent_source_git_dir=None,
+            recursive_metadata=None,
             target=target,
             source_git_dir=self.named_source_git_dir,
             submodule=MODULE.Submodule(
@@ -12116,6 +12598,8 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     target_bindings=(),
                     state="missing",
                     parent_index=None,
+                    parent_source_git_dir=None,
+                    recursive_metadata=None,
                 )
             )
         plan = SimpleNamespace(entries=entries, depth=1)
