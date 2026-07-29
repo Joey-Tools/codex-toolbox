@@ -2737,6 +2737,10 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             stdout=b"",
             stderr=b"",
         )
+        checkout_view = self.capture_checkout_execution_view(
+            self.named_source_git_dir,
+            "tracked-status",
+        )
         with mock.patch.object(
             MODULE,
             "read_git_bounded",
@@ -2746,6 +2750,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 MODULE.has_local_changes(
                     self.root,
                     self.sha,
+                    checkout_view,
                 )
             )
 
@@ -2755,7 +2760,91 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertIn("--no-renames", args)
         self.assertEqual(
             bounded_git.call_args.kwargs["extra_env"],
-            {"GIT_ATTR_SOURCE": self.sha},
+            MODULE.checkout_execution_environment(
+                checkout_view,
+                self.sha,
+            ),
+        )
+        self.assertEqual(
+            bounded_git.call_args.kwargs["directory_identity_leases"],
+            checkout_view.directory_leases,
+        )
+        self.assertEqual(
+            bounded_git.call_args.kwargs["directory_absent_entry_leases"],
+            checkout_view.absent_entry_leases,
+        )
+        self.assertEqual(
+            bounded_git.call_args.kwargs["file_content_leases"],
+            checkout_view.file_leases,
+        )
+
+    def test_managed_checkout_probe_uses_isolated_execution_view(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["git"],
+            0,
+            stdout=b"",
+            stderr=b"",
+        )
+        checkout_view = self.capture_checkout_execution_view(
+            self.named_source_git_dir,
+            "managed-probe",
+        )
+        with mock.patch.object(
+            MODULE,
+            "read_git_bounded",
+            return_value=completed,
+        ) as bounded_git:
+            MODULE.probe_managed_checkout(
+                self.root,
+                self.sha,
+                checkout_view,
+            )
+
+        args = bounded_git.call_args.args[0]
+        self.assertIn("read-tree", args)
+        self.assertIn("--dry-run", args)
+        self.assertEqual(
+            bounded_git.call_args.kwargs["extra_env"],
+            MODULE.checkout_execution_environment(
+                checkout_view,
+                self.sha,
+            ),
+        )
+        self.assertEqual(
+            bounded_git.call_args.kwargs["directory_identity_leases"],
+            checkout_view.directory_leases,
+        )
+        self.assertEqual(
+            bounded_git.call_args.kwargs["directory_absent_entry_leases"],
+            checkout_view.absent_entry_leases,
+        )
+        self.assertEqual(
+            bounded_git.call_args.kwargs["file_content_leases"],
+            checkout_view.file_leases,
+        )
+
+    def test_isolated_tracked_status_uses_the_managed_worktree(self) -> None:
+        target = self.root / "isolated-status-target"
+        self.add_managed_worktree(
+            self.named_source_git_dir,
+            target,
+            self.sha,
+        )
+        (target / "README.md").write_text(
+            "locally modified\n",
+            encoding="utf-8",
+        )
+        checkout_view = self.capture_checkout_execution_view(
+            self.named_source_git_dir,
+            "isolated-status",
+        )
+
+        self.assertTrue(
+            MODULE.has_local_changes(
+                target,
+                self.sha,
+                checkout_view,
+            )
         )
 
     def test_worktree_registry_enforces_a_bounded_record_count(self) -> None:
@@ -5941,6 +6030,189 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertEqual((target / "README.md").read_bytes(), readme_before)
         self.assertEqual((admin_git_dir / "index").read_bytes(), index_before)
         self.assertEqual(run_git(target, "status", "--porcelain"), "")
+
+    def test_managed_dry_run_blocks_status_launch_window_filter_injection(
+        self,
+    ) -> None:
+        (self.remote / "README.md").write_text(
+            "updated dry-run target\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "README.md")
+        run_git(self.remote, "commit", "-m", "update dry-run target")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+
+        target_super = self.root / "managed-status-launch-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        self.add_managed_worktree(
+            self.named_source_git_dir,
+            target,
+            self.sha,
+        )
+        admin_git_dir = MODULE.gitdir_file_target(target)
+        self.assertIsNotNone(admin_git_dir)
+        assert admin_git_dir is not None
+        readme_path = target / "README.md"
+        readme_before = readme_path.read_bytes()
+        readme_stat = readme_path.stat()
+        os.utime(
+            readme_path,
+            ns=(
+                readme_stat.st_atime_ns,
+                readme_stat.st_mtime_ns + 1_000_000_000,
+            ),
+        )
+        index_before = (admin_git_dir / "index").read_bytes()
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+
+        marker = self.root / "status-launch-filter-executed"
+        filter_helper = self.root / "status-launch-filter.sh"
+        filter_helper.write_text(
+            f"#!/bin/sh\ntouch {marker}\ncat\n",
+            encoding="utf-8",
+        )
+        filter_helper.chmod(0o700)
+        config_path = self.named_source_git_dir / "config"
+        config_before = config_path.read_bytes()
+        injected_config = (
+            config_before
+            + b'\n[filter "status-launch"]\n\tclean = '
+            + os.fsencode(filter_helper)
+            + b"\n"
+        )
+        attributes_path = self.named_source_git_dir / "info" / "attributes"
+        self.assertFalse(attributes_path.exists())
+        original_run_bounded = MODULE.run_bounded_bytes
+        injected = False
+
+        def inject_filter_during_status_launch(
+            args: list[str],
+            *run_args: object,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal injected
+            if "status" not in args or "--porcelain=v1" not in args or injected:
+                return original_run_bounded(args, *run_args, **kwargs)
+
+            injected = True
+            environment = kwargs["extra_env"]
+            self.assertIsInstance(environment, dict)
+            assert isinstance(environment, dict)
+            private_common = Path(environment["GIT_COMMON_DIR"])
+            source_objects = (self.named_source_git_dir / "objects").resolve()
+            self.assertNotEqual(
+                private_common,
+                self.named_source_git_dir.resolve(),
+            )
+            self.assertEqual(
+                environment["GIT_OBJECT_DIRECTORY"],
+                str(source_objects),
+            )
+            self.assertEqual(environment["GIT_ATTR_SOURCE"], self.sha)
+
+            directory_leases = kwargs["directory_identity_leases"]
+            self.assertIsInstance(directory_leases, tuple)
+            identity_paths = {lease.path for lease in directory_leases}
+            self.assertTrue(
+                {
+                    self.named_source_git_dir.resolve(),
+                    (self.named_source_git_dir / "info").resolve(),
+                    source_objects,
+                    private_common,
+                    private_common / "info",
+                    private_common / "objects",
+                    private_common / "refs",
+                }.issubset(identity_paths)
+            )
+            file_leases = kwargs["file_content_leases"]
+            self.assertIsInstance(file_leases, tuple)
+            file_paths = {lease.binding.path for lease in file_leases}
+            self.assertTrue(
+                {
+                    config_path.resolve(),
+                    private_common / "config",
+                }.issubset(file_paths)
+            )
+            absent_leases = kwargs["directory_absent_entry_leases"]
+            self.assertIsInstance(absent_leases, tuple)
+            absent_paths = {
+                lease.directory_binding.path / entry_name
+                for lease in absent_leases
+                for entry_name in lease.entry_names
+            }
+            self.assertTrue(
+                {
+                    attributes_path.resolve(strict=False),
+                    private_common / "info" / "attributes",
+                    private_common / "info" / "exclude",
+                }.issubset(absent_paths)
+            )
+
+            config_path.write_bytes(injected_config)
+            attributes_path.write_text(
+                "README.md filter=status-launch\n",
+                encoding="utf-8",
+            )
+            try:
+                return original_run_bounded(args, *run_args, **kwargs)
+            finally:
+                config_path.write_bytes(config_before)
+                if attributes_path.exists():
+                    attributes_path.unlink()
+
+        with mock.patch.object(
+            MODULE,
+            "run_bounded_bytes",
+            side_effect=inject_filter_during_status_launch,
+        ):
+            with self.assertRaises((MODULE.GitError, MODULE.PlanError)):
+                MODULE.execute_sync_plan(
+                    root=target_super,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[
+                        (
+                            MODULE.Submodule(
+                                "custom-lib",
+                                "lib",
+                                str(self.remote),
+                            ),
+                            target_sha,
+                        )
+                    ],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    dry_run=True,
+                    fetch_missing=False,
+                )
+
+        self.assertTrue(injected)
+        self.assertFalse(marker.exists())
+        self.assertFalse(attributes_path.exists())
+        self.assertEqual(config_path.read_bytes(), config_before)
+        self.assertEqual(run_git(target, "rev-parse", "HEAD"), self.sha)
+        self.assertEqual((admin_git_dir / "index").read_bytes(), index_before)
+        self.assertEqual(readme_path.read_bytes(), readme_before)
+        self.assertEqual(run_git(target, "status", "--porcelain"), "")
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={self.named_source_git_dir}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
 
     def test_new_checkout_blocks_launch_window_info_attributes_creation(
         self,

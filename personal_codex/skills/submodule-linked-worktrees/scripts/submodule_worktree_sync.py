@@ -3576,6 +3576,8 @@ def read_git_bounded(
     timeout_seconds: float = GIT_ENUMERATION_TIMEOUT_SECONDS,
     preserve_split_index: bool = False,
     directory_identity_leases: tuple[DirectoryEntryLease, ...] = (),
+    directory_absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...] = (),
+    file_content_leases: tuple[DescriptorBoundFileLease, ...] = (),
 ) -> subprocess.CompletedProcess[bytes]:
     return run_bounded_bytes(
         ["git", "--no-optional-locks", *args],
@@ -3588,6 +3590,8 @@ def read_git_bounded(
         timeout_seconds=timeout_seconds,
         preserve_split_index=preserve_split_index,
         directory_identity_leases=directory_identity_leases,
+        directory_absent_entry_leases=directory_absent_entry_leases,
+        file_content_leases=file_content_leases,
     )
 
 
@@ -10885,18 +10889,27 @@ def is_empty_dir(path: Path) -> bool:
     return path.is_dir() and next(path.iterdir(), None) is None
 
 
-def has_local_changes(worktree_path: Path, current_head: str) -> bool:
+def has_local_changes(
+    worktree_path: Path,
+    current_head: str,
+    checkout_view: CheckoutExecutionView,
+) -> bool:
+    environment = checkout_execution_environment(checkout_view, current_head)
     result = read_git_bounded(
         [
             "-C",
             str(worktree_path),
+            "--work-tree=.",
             "status",
             "--porcelain=v1",
             "-z",
             "--untracked-files=no",
             "--no-renames",
         ],
-        extra_env={"GIT_ATTR_SOURCE": current_head},
+        extra_env=environment,
+        directory_identity_leases=checkout_view.directory_leases,
+        directory_absent_entry_leases=checkout_view.absent_entry_leases,
+        file_content_leases=checkout_view.file_leases,
     )
     records = bounded_records(
         result.stdout,
@@ -15029,11 +15042,17 @@ def reject_managed_ignored_conflicts(
         )
 
 
-def probe_managed_checkout(worktree_path: Path, target_sha: str) -> None:
+def probe_managed_checkout(
+    worktree_path: Path,
+    target_sha: str,
+    checkout_view: CheckoutExecutionView,
+) -> None:
+    environment = checkout_execution_environment(checkout_view, target_sha)
     result = read_git_bounded(
         [
             "-C",
             str(worktree_path),
+            "--work-tree=.",
             "read-tree",
             "--dry-run",
             "-m",
@@ -15042,6 +15061,10 @@ def probe_managed_checkout(worktree_path: Path, target_sha: str) -> None:
             target_sha,
         ],
         check=False,
+        extra_env=environment,
+        directory_identity_leases=checkout_view.directory_leases,
+        directory_absent_entry_leases=checkout_view.absent_entry_leases,
+        file_content_leases=checkout_view.file_leases,
     )
     if result.returncode != 0:
         detail = os.fsdecode(result.stderr).strip()
@@ -15128,17 +15151,46 @@ def capture_checkout_preflight(
             final_tree_paths,
             final_index_paths,
         )
-        if has_local_changes(entry.target.path, current_head):
-            raise PlanError(
-                f"{entry.target.path} has local changes; clean it before syncing"
-            )
-        write_bindings = checkout_write_access_bindings(
-            entry.target.path,
-            changes,
+        # Status and read-tree can invoke clean/process conversion even during
+        # plan-only preflight. Keep both on the captured control bytes and put
+        # every source/private lease in their child-side exec gate.
+        checkout_view = capture_checkout_execution_view(
+            entry.source_git_dir,
+            entry.source_completeness,
+            attributes_receipt,
+            entry.submodule.path,
         )
-        reject_managed_ignored_conflicts(entry.target.path, changes)
-        validate_managed_preflight_index(entry, current_head)
-        probe_managed_checkout(entry.target.path, entry.sha)
+        checkout_view_outcome: Optional[BaseException] = None
+        try:
+            if has_local_changes(
+                entry.target.path,
+                current_head,
+                checkout_view,
+            ):
+                raise PlanError(
+                    f"{entry.target.path} has local changes; clean it before syncing"
+                )
+            write_bindings = checkout_write_access_bindings(
+                entry.target.path,
+                changes,
+            )
+            reject_managed_ignored_conflicts(entry.target.path, changes)
+            validate_managed_preflight_index(entry, current_head)
+            probe_managed_checkout(
+                entry.target.path,
+                entry.sha,
+                checkout_view,
+            )
+        except BaseException as exc:
+            checkout_view_outcome = exc
+            raise
+        finally:
+            finish_explicit_cleanup(
+                checkout_view.close,
+                outcome_exception=checkout_view_outcome,
+                purpose="managed preflight checkout execution view",
+                recovery_identity=str(checkout_view.common_git_dir),
+            )
     else:
         final_tree_paths = ((entry.sha, target_blob_paths),)
         final_index_paths = ()
@@ -15240,26 +15292,50 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
             expected_attributes=receipt.attributes_receipt,
             expected_selections=receipt.filter_selections,
         )
-        repeated_changes = parse_managed_tree_changes(
-            entry.target.path,
-            current_head,
-            entry.sha,
+        checkout_view = capture_checkout_execution_view(
+            entry.source_git_dir,
+            entry.source_completeness,
+            receipt.attributes_receipt,
+            entry.submodule.path,
         )
-        if repeated_changes != receipt.changes:
-            raise PlanError(
-                f"managed checkout write set changed after preflight: "
-                f"{entry.target.path}"
+        checkout_view_outcome: Optional[BaseException] = None
+        try:
+            repeated_changes = parse_managed_tree_changes(
+                entry.target.path,
+                current_head,
+                entry.sha,
             )
-        digest_paths: Iterable[tuple[str, ...]] = (
-            change.relative_parts for change in repeated_changes
-        )
-        if has_local_changes(entry.target.path, current_head):
-            raise PlanError(
-                f"{entry.target.path} has local changes; clean it before syncing"
+            if repeated_changes != receipt.changes:
+                raise PlanError(
+                    f"managed checkout write set changed after preflight: "
+                    f"{entry.target.path}"
+                )
+            digest_paths = (change.relative_parts for change in repeated_changes)
+            if has_local_changes(
+                entry.target.path,
+                current_head,
+                checkout_view,
+            ):
+                raise PlanError(
+                    f"{entry.target.path} has local changes; clean it before syncing"
+                )
+            reject_managed_ignored_conflicts(entry.target.path, receipt.changes)
+            validate_managed_preflight_index(entry, current_head)
+            probe_managed_checkout(
+                entry.target.path,
+                entry.sha,
+                checkout_view,
             )
-        reject_managed_ignored_conflicts(entry.target.path, receipt.changes)
-        validate_managed_preflight_index(entry, current_head)
-        probe_managed_checkout(entry.target.path, entry.sha)
+        except BaseException as exc:
+            checkout_view_outcome = exc
+            raise
+        finally:
+            finish_explicit_cleanup(
+                checkout_view.close,
+                outcome_exception=checkout_view_outcome,
+                purpose="managed preflight checkout execution view",
+                recovery_identity=str(checkout_view.common_git_dir),
+            )
     elif receipt.kind == "new":
         final_tree_paths = ((entry.sha, target_blob_paths),)
         final_index_paths = ()
