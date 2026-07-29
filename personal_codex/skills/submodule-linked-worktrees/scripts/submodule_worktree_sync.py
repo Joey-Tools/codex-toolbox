@@ -153,6 +153,10 @@ SAFE_GIT_CONFIG_ARGS = (
     "-c",
     "core.splitIndex=false",
     "-c",
+    "core.sparseCheckout=false",
+    "-c",
+    "core.sparseCheckoutCone=false",
+    "-c",
     "core.untrackedCache=false",
     "-c",
     "credential.helper=",
@@ -698,6 +702,45 @@ class FetchControlLease:
             ) from first_error
 
 
+@dataclass
+class CheckoutExecutionView:
+    common_git_dir: Path
+    source_object_directory: Path
+    directory_leases: tuple[DirectoryEntryLease, ...]
+    file_leases: tuple[DescriptorBoundFileLease, ...]
+    absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...]
+    guard: object = dataclass_field(repr=False, compare=False)
+    active: bool = dataclass_field(default=True, repr=False, compare=False)
+
+    def close(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        cleanup_errors: list[str] = []
+        for file_lease in reversed(self.file_leases):
+            try:
+                os.close(file_lease.descriptor)
+            except OSError as exc:
+                cleanup_errors.append(str(exc))
+        for directory_lease in reversed(self.directory_leases):
+            try:
+                directory_lease.close()
+            except BaseException as exc:
+                cleanup_errors.append(str(exc))
+        cleanup = getattr(self.guard, "cleanup", None)
+        if cleanup is None:
+            cleanup_errors.append("owner-private checkout view has no cleanup method")
+        else:
+            try:
+                cleanup()
+            except BaseException as exc:
+                cleanup_errors.append(str(exc))
+        if cleanup_errors:
+            raise PlanError(
+                "checkout execution-view cleanup failed: " + "; ".join(cleanup_errors)
+            )
+
+
 def close_fetch_execution_leases(
     source_object_lease: DirectoryEntryLease,
     fetch_control_lease: Optional[FetchControlLease],
@@ -1177,6 +1220,7 @@ def git_environment(
             "GIT_ATTR_SOURCE",
             "GIT_COMMON_DIR",
             "GIT_LITERAL_PATHSPECS",
+            "GIT_OBJECT_DIRECTORY",
         }
         if unsupported:
             raise PlanError(
@@ -1186,6 +1230,9 @@ def git_environment(
         common_git_dir = extra_env.get("GIT_COMMON_DIR")
         if common_git_dir is not None and not Path(common_git_dir).is_absolute():
             raise PlanError("GIT_COMMON_DIR override must be an absolute path")
+        object_directory = extra_env.get("GIT_OBJECT_DIRECTORY")
+        if object_directory is not None and not Path(object_directory).is_absolute():
+            raise PlanError("GIT_OBJECT_DIRECTORY override must be an absolute path")
         environment.update(extra_env)
     return environment
 
@@ -3488,6 +3535,8 @@ def run_git_at_directory_descriptor(
     *,
     extra_env: Optional[dict[str, str]] = None,
     directory_identity_leases: tuple[DirectoryEntryLease, ...] = (),
+    directory_absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...] = (),
+    file_content_leases: tuple[DescriptorBoundFileLease, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     result = run_bounded_bytes(
         args,
@@ -3497,6 +3546,8 @@ def run_git_at_directory_descriptor(
         extra_env=extra_env,
         directory_descriptor=directory_descriptor,
         directory_identity_leases=directory_identity_leases,
+        directory_absent_entry_leases=directory_absent_entry_leases,
+        file_content_leases=file_content_leases,
     )
     decoded = subprocess.CompletedProcess(
         args=result.args,
@@ -6399,6 +6450,13 @@ def reject_incomplete_source_config(
             raise PlanError(
                 "source repository completeness depends on unsupported include or "
                 "promisor policy\n"
+                f"  path: {source}\n"
+                f"  key: {key}\n"
+                f"  value: {value}"
+            )
+        if lowered.startswith("extensions.") and lowered != "extensions.objectformat":
+            raise PlanError(
+                "source repository uses an unsupported repository-format extension\n"
                 f"  path: {source}\n"
                 f"  key: {key}\n"
                 f"  value: {value}"
@@ -11333,6 +11391,7 @@ def checkout_existing_worktree(
     target_descriptor: Optional[int] = None,
     source_git_dir: Optional[Path] = None,
     source_lease: Optional[DirectoryEntryLease] = None,
+    checkout_view: Optional[CheckoutExecutionView] = None,
     finalize_checkout: Optional[
         Callable[[ManagedControlReceipt, DirectoryEntryLease], None]
     ] = None,
@@ -11356,6 +11415,8 @@ def checkout_existing_worktree(
         raise PlanError("managed checkout requires an explicit common gitdir")
     if source_lease is None or source_lease.path != source_git_dir.resolve(strict=True):
         raise PlanError("managed checkout requires a matching source gitdir lease")
+    if checkout_view is None:
+        raise PlanError("managed checkout requires an isolated execution view")
     control = capture_managed_control_receipt(
         worktree_path,
         source_git_dir,
@@ -11364,6 +11425,7 @@ def checkout_existing_worktree(
     try:
         revalidate_managed_control_receipt(control, target_descriptor)
         revalidate_directory_entry_lease(source_lease)
+        environment = checkout_execution_environment(checkout_view, sha)
         run_git_at_directory_descriptor(
             [
                 "git",
@@ -11376,14 +11438,14 @@ def checkout_existing_worktree(
                 sha,
             ],
             target_descriptor,
-            extra_env={
-                "GIT_ATTR_SOURCE": sha,
-                "GIT_COMMON_DIR": str(source_git_dir),
-            },
+            extra_env=environment,
             directory_identity_leases=(
                 source_lease,
                 control.admin_lease,
+                *checkout_view.directory_leases,
             ),
+            directory_absent_entry_leases=checkout_view.absent_entry_leases,
+            file_content_leases=checkout_view.file_leases,
         )
         signal_checkpoint("checkout-git-complete")
         revalidate_managed_control_receipt(control, target_descriptor)
@@ -11942,6 +12004,7 @@ def add_worktree(
     *,
     lease: Optional[MaterializedTargetLease] = None,
     source_lease: Optional[DirectoryEntryLease] = None,
+    checkout_view: Optional[CheckoutExecutionView] = None,
     finalize_checkout: Optional[
         Callable[[ManagedControlReceipt, DirectoryEntryLease], None]
     ] = None,
@@ -11965,6 +12028,8 @@ def add_worktree(
         raise PlanError("new worktree creation requires a matching target lease")
     if source_lease is None or source_lease.path != source_git_dir.resolve(strict=True):
         raise PlanError("new worktree creation requires a matching source gitdir lease")
+    if checkout_view is None:
+        raise PlanError("new worktree creation requires an isolated execution view")
     control: Optional[ManagedControlReceipt] = None
     admin_inventory_before: Optional[WorktreeAdminInventory] = None
     admin_inventory_after: Optional[WorktreeAdminInventory] = None
@@ -12026,6 +12091,7 @@ def add_worktree(
         revalidate_managed_control_receipt(control, lease.target_descriptor)
         revalidate_directory_entry_lease(source_lease)
         revalidate_materialized_target_lease(lease)
+        environment = checkout_execution_environment(checkout_view, sha)
         run_git_at_directory_descriptor(
             [
                 "git",
@@ -12038,14 +12104,14 @@ def add_worktree(
                 sha,
             ],
             lease.target_descriptor,
-            extra_env={
-                "GIT_ATTR_SOURCE": sha,
-                "GIT_COMMON_DIR": str(source_git_dir),
-            },
+            extra_env=environment,
             directory_identity_leases=(
                 source_lease,
                 control.admin_lease,
+                *checkout_view.directory_leases,
             ),
+            directory_absent_entry_leases=checkout_view.absent_entry_leases,
+            file_content_leases=checkout_view.file_leases,
         )
         signal_checkpoint("add-checkout-git-complete")
         revalidate_managed_control_receipt(control, lease.target_descriptor)
@@ -14441,6 +14507,262 @@ def bind_checkout_filter_selection(
     return attributes, selections
 
 
+def capture_checkout_execution_view(
+    source_git_dir: Path,
+    source_completeness: SourceCompletenessReceipt,
+    attributes_receipt: CheckoutAttributesReceipt,
+    submodule_path: str,
+) -> CheckoutExecutionView:
+    # The actual checkout reads config and common info/attributes only from
+    # this owner-private snapshot. Source leases remain in the child pre-exec
+    # gate so launch-window drift fails before Git starts; post-exec source
+    # drift cannot change the bytes consumed by Git.
+    resolved_source_git_dir = source_git_dir.resolve(strict=True)
+    if (
+        source_completeness.gitdir_binding.path.resolve(strict=True)
+        != resolved_source_git_dir
+    ):
+        raise PlanError(
+            f"checkout execution view names the wrong source for {submodule_path}"
+        )
+    if (
+        source_completeness.config_binding.path.resolve(strict=True)
+        != resolved_source_git_dir / "config"
+    ):
+        raise PlanError(
+            f"checkout execution view has the wrong config for {submodule_path}"
+        )
+    if (
+        attributes_receipt.info_binding.path.resolve(strict=True)
+        != resolved_source_git_dir / "info"
+    ):
+        raise PlanError(
+            f"checkout execution view has the wrong attributes directory for "
+            f"{submodule_path}"
+        )
+
+    with ExitStack() as cleanup:
+        directory_leases: list[DirectoryEntryLease] = []
+        file_leases: list[DescriptorBoundFileLease] = []
+        absent_entry_leases: list[DirectoryAbsentEntryLease] = []
+
+        def capture_directory(binding: AccessBinding) -> DirectoryEntryLease:
+            lease = capture_directory_entry_lease(
+                binding.path,
+                binding.mode,
+                binding.purpose,
+            )
+            cleanup.callback(lease.close)
+            if (
+                lease.binding.path != binding.path.resolve(strict=True)
+                or lease.binding.fingerprint != binding.fingerprint
+                or lease.binding.mode != binding.mode
+                or lease.binding.purpose != binding.purpose
+            ):
+                raise PlanError(
+                    f"{binding.purpose} changed during checkout-view binding"
+                )
+            directory_leases.append(lease)
+            return lease
+
+        def capture_file(
+            directory_lease: DirectoryEntryLease,
+            binding: FileContentBinding,
+        ) -> tuple[DescriptorBoundFileLease, bytes]:
+            if binding.path.parent.resolve(strict=True) != directory_lease.path:
+                raise PlanError(
+                    f"{binding.purpose} does not belong to its checkout-view directory"
+                )
+            entry_name = os.fsdecode(validate_descriptor_entry_name(binding.path.name))
+            descriptor, observed, content = open_bound_regular_file_at(
+                directory_lease.descriptor,
+                entry_name,
+                binding.path,
+                maximum_bytes=binding.maximum_bytes,
+                mode=binding.mode,
+                purpose=binding.purpose,
+                retain_content=True,
+            )
+            cleanup.callback(os.close, descriptor)
+            require_matching_file_binding(
+                binding,
+                observed,
+                binding.purpose,
+            )
+            if content is None:
+                raise PlanError(f"{binding.purpose} returned no checkout-view content")
+            lease = DescriptorBoundFileLease(
+                directory_binding=directory_lease.binding,
+                directory_descriptor=directory_lease.descriptor,
+                entry_name=entry_name,
+                descriptor=descriptor,
+                binding=binding,
+                content=content,
+            )
+            file_leases.append(lease)
+            return lease, content
+
+        source_root_lease = capture_directory(
+            source_completeness.gitdir_binding,
+        )
+        _source_config_lease, source_config_content = capture_file(
+            source_root_lease,
+            source_completeness.config_binding,
+        )
+        source_info_lease = capture_directory(attributes_receipt.info_binding)
+        source_attributes_content: Optional[bytes] = None
+        if attributes_receipt.attributes_binding is None:
+            absent_entry_leases.append(
+                capture_directory_absent_entry_lease(
+                    source_info_lease,
+                    ("attributes",),
+                    f"source checkout attributes for {submodule_path}",
+                )
+            )
+        else:
+            _source_attributes_lease, source_attributes_content = capture_file(
+                source_info_lease,
+                attributes_receipt.attributes_binding,
+            )
+        capture_directory(source_completeness.objects_binding)
+
+        guard = OwnerPrivateTemporaryDirectory(prefix="submodule-worktree-checkout.")
+        cleanup.callback(guard.cleanup)
+        private_root = Path(guard.name).resolve(strict=True)
+        private_info = private_root / "info"
+        private_objects = private_root / "objects"
+        private_refs = private_root / "refs"
+        for directory in (private_info, private_objects, private_refs):
+            os.mkdir(directory, mode=0o700)
+        private_config = private_root / "config"
+        write_owner_private_file(
+            private_config,
+            source_config_content,
+            f"isolated checkout config for {submodule_path}",
+        )
+        private_attributes = private_info / "attributes"
+        if source_attributes_content is not None:
+            write_owner_private_file(
+                private_attributes,
+                source_attributes_content,
+                f"isolated checkout attributes for {submodule_path}",
+            )
+
+        private_root_binding = capture_owner_private_directory(
+            private_root,
+            f"isolated checkout common gitdir for {submodule_path}",
+        )
+        private_info_binding = capture_owner_private_directory(
+            private_info,
+            f"isolated checkout info directory for {submodule_path}",
+        )
+        private_objects_binding = capture_owner_private_directory(
+            private_objects,
+            f"isolated checkout object placeholder for {submodule_path}",
+        )
+        private_refs_binding = capture_owner_private_directory(
+            private_refs,
+            f"isolated checkout refs directory for {submodule_path}",
+        )
+        private_root_lease = capture_directory(private_root_binding)
+        private_info_lease = capture_directory(private_info_binding)
+        capture_directory(private_objects_binding)
+        capture_directory(private_refs_binding)
+        private_config_binding = read_bound_regular_file(
+            private_config,
+            maximum_bytes=MAX_SOURCE_CONFIG_BYTES,
+            mode=os.R_OK,
+            purpose=f"isolated checkout config for {submodule_path}",
+            retain_content=False,
+        )[0]
+        capture_file(private_root_lease, private_config_binding)
+        if source_attributes_content is None:
+            absent_entry_leases.append(
+                capture_directory_absent_entry_lease(
+                    private_info_lease,
+                    ("attributes",),
+                    f"isolated checkout attributes for {submodule_path}",
+                )
+            )
+        else:
+            private_attributes_binding = read_bound_regular_file(
+                private_attributes,
+                maximum_bytes=MAX_CHECKOUT_ATTRIBUTES_BYTES,
+                mode=os.R_OK,
+                purpose=f"isolated checkout attributes for {submodule_path}",
+                retain_content=False,
+            )[0]
+            capture_file(private_info_lease, private_attributes_binding)
+        # Repository-local excludes are deliberately absent from the execution
+        # view. The preflight already rejects ignored overwrite conflicts; a
+        # narrower checkout ignore set can only make Git refuse additional
+        # untracked overwrites rather than silently bless a mutable source
+        # info/exclude file.
+        absent_entry_leases.append(
+            capture_directory_absent_entry_lease(
+                private_info_lease,
+                ("exclude",),
+                f"isolated checkout excludes for {submodule_path}",
+            )
+        )
+
+        view = CheckoutExecutionView(
+            common_git_dir=private_root,
+            source_object_directory=(
+                source_completeness.objects_binding.path.resolve(strict=True)
+            ),
+            directory_leases=tuple(directory_leases),
+            file_leases=tuple(file_leases),
+            absent_entry_leases=tuple(absent_entry_leases),
+            guard=guard,
+        )
+        revalidate_checkout_execution_view(view)
+        cleanup.pop_all()
+        return view
+
+
+def revalidate_checkout_execution_view(view: CheckoutExecutionView) -> None:
+    if not view.active:
+        raise PlanError("checkout execution view is inactive")
+    if not view.common_git_dir.is_absolute():
+        raise PlanError("checkout execution-view common gitdir is not absolute")
+    if not view.source_object_directory.is_absolute():
+        raise PlanError("checkout execution-view object directory is not absolute")
+    if not view.directory_leases or not view.file_leases:
+        raise PlanError("checkout execution view is incomplete")
+    if (
+        sum(lease.path == view.common_git_dir for lease in view.directory_leases) != 1
+        or sum(
+            lease.path == view.source_object_directory
+            for lease in view.directory_leases
+        )
+        != 1
+    ):
+        raise PlanError("checkout execution view has an invalid directory shape")
+    for directory_lease in view.directory_leases:
+        revalidate_directory_entry_lease(directory_lease)
+    for absent_entry_lease in view.absent_entry_leases:
+        revalidate_directory_absent_entry_lease(absent_entry_lease)
+    for file_lease in view.file_leases:
+        revalidate_descriptor_bound_file_lease(file_lease)
+    for directory_lease in view.directory_leases:
+        revalidate_directory_entry_lease(directory_lease)
+    for absent_entry_lease in view.absent_entry_leases:
+        revalidate_directory_absent_entry_lease(absent_entry_lease)
+
+
+def checkout_execution_environment(
+    view: CheckoutExecutionView,
+    sha: str,
+) -> dict[str, str]:
+    revalidate_checkout_execution_view(view)
+    return {
+        "GIT_ATTR_SOURCE": sha,
+        "GIT_COMMON_DIR": str(view.common_git_dir),
+        "GIT_OBJECT_DIRECTORY": str(view.source_object_directory),
+    }
+
+
 def checkout_write_access_bindings(
     worktree_path: Path,
     changes: tuple[TreeChange, ...],
@@ -16011,33 +16333,62 @@ def apply_sync_plan(plan: SyncPlan) -> None:
                         )
 
                     finalize_current_checkout = finalize_leaf_current_checkout
-                if entry.state == "managed":
-                    revalidate_recursive_metadata_for_entry(plan, index)
-                    revalidate_checkout_preflight(entry)
-                    checkout_existing_worktree(
-                        target.path,
-                        entry.sha,
-                        dry_run=False,
-                        target_descriptor=lease.target_descriptor,
-                        source_git_dir=entry.source_git_dir,
-                        source_lease=source_lease,
-                        finalize_checkout=finalize_current_checkout,
+                revalidate_recursive_metadata_for_entry(plan, index)
+                revalidate_checkout_preflight(entry)
+                checkout_receipt = entry.checkout_preflight
+                if checkout_receipt is None:
+                    raise PlanError(
+                        f"checkout preflight is incomplete for {entry.submodule.path}"
                     )
-                else:
-                    revalidate_recursive_metadata_for_entry(plan, index)
-                    revalidate_checkout_preflight(entry)
-                    add_worktree(
-                        entry.source_git_dir,
-                        target.path,
-                        entry.sha,
-                        dry_run=False,
-                        lease=lease,
-                        source_lease=source_lease,
-                        finalize_checkout=finalize_current_checkout,
-                        pre_checkout=lambda current_entry=entry: (
+                checkout_view = capture_checkout_execution_view(
+                    entry.source_git_dir,
+                    entry.source_completeness,
+                    checkout_receipt.attributes_receipt,
+                    entry.submodule.path,
+                )
+                checkout_outcome: Optional[BaseException] = None
+                try:
+                    if entry.state == "managed":
+                        checkout_existing_worktree(
+                            target.path,
+                            entry.sha,
+                            dry_run=False,
+                            target_descriptor=lease.target_descriptor,
+                            source_git_dir=entry.source_git_dir,
+                            source_lease=source_lease,
+                            checkout_view=checkout_view,
+                            finalize_checkout=finalize_current_checkout,
+                        )
+                    else:
+
+                        def revalidate_new_checkout(
+                            current_entry: PlannedWorktree = entry,
+                            current_view: CheckoutExecutionView = checkout_view,
+                        ) -> None:
                             revalidate_checkout_preflight(current_entry)
-                        ),
-                        adopt_materialization=adopt_current_materialization,
+                            revalidate_checkout_execution_view(current_view)
+
+                        add_worktree(
+                            entry.source_git_dir,
+                            target.path,
+                            entry.sha,
+                            dry_run=False,
+                            lease=lease,
+                            source_lease=source_lease,
+                            checkout_view=checkout_view,
+                            finalize_checkout=finalize_current_checkout,
+                            pre_checkout=revalidate_new_checkout,
+                            adopt_materialization=adopt_current_materialization,
+                        )
+                except BaseException as exc:
+                    checkout_outcome = exc
+                    raise
+                finally:
+                    finish_explicit_cleanup(
+                        checkout_view.close,
+                        outcome_exception=checkout_outcome,
+                        purpose="checkout execution view",
+                        recovery_identity=str(checkout_view.common_git_dir),
                     )
             except BaseException as exc:
                 cleanup_error: Optional[BaseException] = None

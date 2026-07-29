@@ -241,6 +241,26 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         )
         return source_git_dir
 
+    def capture_checkout_execution_view(
+        self,
+        source_git_dir: Path,
+        submodule_path: str = "test-checkout",
+    ) -> MODULE.CheckoutExecutionView:
+        completeness = MODULE.capture_source_completeness_receipt(
+            source_git_dir,
+        )
+        attributes = MODULE.capture_checkout_attributes_receipt(
+            source_git_dir,
+        )
+        view = MODULE.capture_checkout_execution_view(
+            source_git_dir,
+            completeness,
+            attributes,
+            submodule_path,
+        )
+        self.addCleanup(view.close)
+        return view
+
     def ensure_loose_source_object(
         self,
         source_git_dir: Path,
@@ -3477,9 +3497,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         def redirect_gitfile(
             args: list[str],
             directory_descriptor: int,
-            *,
-            extra_env: dict[str, str] | None = None,
-            directory_identity_leases: tuple[object, ...] = (),
+            **kwargs: object,
         ) -> subprocess.CompletedProcess[str]:
             nonlocal redirected
             if not redirected and "checkout" in args:
@@ -3491,8 +3509,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             return original_run(
                 args,
                 directory_descriptor,
-                extra_env=extra_env,
-                directory_identity_leases=directory_identity_leases,
+                **kwargs,
             )
 
         with mock.patch.object(
@@ -3573,9 +3590,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         def replace_admin(
             args: list[str],
             directory_descriptor: int,
-            *,
-            extra_env: dict[str, str] | None = None,
-            directory_identity_leases: tuple[object, ...] = (),
+            **kwargs: object,
         ) -> subprocess.CompletedProcess[str]:
             nonlocal replaced
             if not replaced and "checkout" in args:
@@ -3588,8 +3603,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             return original_run(
                 args,
                 directory_descriptor,
-                extra_env=extra_env,
-                directory_identity_leases=directory_identity_leases,
+                **kwargs,
             )
 
         with mock.patch.object(
@@ -3699,6 +3713,27 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             "config",
             "--unset",
             "extensions.worktreeConfig",
+        )
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "extensions.refStorage",
+            "reftable",
+        )
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "unsupported repository-format extension",
+        ):
+            MODULE.capture_source_completeness_receipt(
+                self.named_source_git_dir,
+            )
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "--unset",
+            "extensions.refStorage",
         )
         run_git(
             self.root,
@@ -4466,6 +4501,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             os.R_OK | os.W_OK | os.X_OK,
             "selected source common gitdir",
         )
+        checkout_view = self.capture_checkout_execution_view(
+            self.source_git_dir,
+        )
         try:
             with mock.patch.object(
                 MODULE,
@@ -4479,6 +4517,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     target_descriptor=target_descriptor,
                     source_git_dir=self.source_git_dir,
                     source_lease=source_lease,
+                    checkout_view=checkout_view,
                 )
         finally:
             try:
@@ -4509,6 +4548,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             os.R_OK | os.W_OK | os.X_OK,
             "selected source common gitdir",
         )
+        checkout_view = self.capture_checkout_execution_view(
+            self.source_git_dir,
+        )
         original_run = MODULE.run_git_at_directory_descriptor
 
         def checkout_then_interrupt(
@@ -4537,6 +4579,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         target_descriptor=target_descriptor,
                         source_git_dir=self.source_git_dir,
                         source_lease=source_lease,
+                        checkout_view=checkout_view,
                     )
             self.assertTrue(
                 any(
@@ -4574,6 +4617,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     os.R_OK | os.W_OK | os.X_OK,
                     "selected source common gitdir",
                 )
+                checkout_view = self.capture_checkout_execution_view(
+                    self.source_git_dir,
+                )
                 published = False
                 original_checkpoint = MODULE.signal_checkpoint
 
@@ -4605,6 +4651,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                                 target_descriptor=target_descriptor,
                                 source_git_dir=self.source_git_dir,
                                 source_lease=source_lease,
+                                checkout_view=checkout_view,
                                 finalize_checkout=finalize_checkout,
                             )
                     recovery_status = (
@@ -4642,6 +4689,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             os.R_OK | os.W_OK | os.X_OK,
             "selected source common gitdir",
         )
+        checkout_view = self.capture_checkout_execution_view(
+            self.source_git_dir,
+        )
         original_run = MODULE.run_git_at_directory_descriptor
         interrupted = False
 
@@ -4675,6 +4725,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         dry_run=False,
                         lease=lease,
                         source_lease=source_lease,
+                        checkout_view=checkout_view,
                     )
             self.assertTrue(interrupted)
             self.assertFalse(target.path.exists())
@@ -4711,6 +4762,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             os.R_OK | os.W_OK | os.X_OK,
             "selected source common gitdir",
         )
+        checkout_view = self.capture_checkout_execution_view(
+            self.source_git_dir,
+        )
         original_checkpoint = MODULE.signal_checkpoint
         latched = False
 
@@ -4743,6 +4797,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         dry_run=False,
                         lease=lease,
                         source_lease=source_lease,
+                        checkout_view=checkout_view,
                         finalize_checkout=fail_finalize,
                     )
             self.assertTrue(latched)
@@ -4780,6 +4835,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             os.R_OK | os.W_OK | os.X_OK,
             "selected source common gitdir",
         )
+        checkout_view = self.capture_checkout_execution_view(
+            self.source_git_dir,
+        )
         original_checkpoint = MODULE.signal_checkpoint
         published = False
 
@@ -4811,6 +4869,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         dry_run=False,
                         lease=lease,
                         source_lease=source_lease,
+                        checkout_view=checkout_view,
                         finalize_checkout=publish_receipt,
                     )
             self.assertTrue(published)
@@ -5772,6 +5831,204 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 "common checkout attributes presence changed after preflight",
             ):
                 MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(injected)
+        self.assertFalse(marker.exists())
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={self.named_source_git_dir}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
+    def test_managed_checkout_blocks_launch_window_config_mutation(self) -> None:
+        (self.remote / "README.md").write_text(
+            "updated target\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "README.md")
+        run_git(self.remote, "commit", "-m", "update managed target")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+
+        target_super = self.root / "managed-launch-config-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        self.add_managed_worktree(
+            self.named_source_git_dir,
+            target,
+            self.sha,
+        )
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "custom-lib",
+                        "lib",
+                        str(self.remote),
+                    ),
+                    target_sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        self.addCleanup(plan.close)
+        admin_git_dir = MODULE.gitdir_file_target(target)
+        self.assertIsNotNone(admin_git_dir)
+        assert admin_git_dir is not None
+        index_before = (admin_git_dir / "index").read_bytes()
+        readme_before = (target / "README.md").read_bytes()
+        config_path = self.named_source_git_dir / "config"
+        config_before = config_path.read_bytes()
+        marker = self.root / "managed-launch-filter-executed"
+        injected_config = (
+            config_before
+            + (f'\n[filter "launch-window"]\n\tsmudge = touch {marker}\n').encode()
+        )
+        original_run = MODULE.run_git_at_directory_descriptor
+        mutated = False
+
+        def mutate_config_before_checkout_exec(
+            args: list[str],
+            directory_descriptor: int,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal mutated
+            if "checkout" in args and not mutated:
+                environment = kwargs["extra_env"]
+                self.assertIsInstance(environment, dict)
+                self.assertNotEqual(
+                    environment["GIT_COMMON_DIR"],
+                    str(self.named_source_git_dir),
+                )
+                self.assertEqual(
+                    environment["GIT_OBJECT_DIRECTORY"],
+                    str((self.named_source_git_dir / "objects").resolve()),
+                )
+                config_path.write_bytes(injected_config)
+                mutated = True
+            return original_run(
+                args,
+                directory_descriptor,
+                **kwargs,
+            )
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "run_git_at_directory_descriptor",
+                side_effect=mutate_config_before_checkout_exec,
+            ):
+                with self.assertRaises((MODULE.GitError, MODULE.PlanError)):
+                    MODULE.apply_sync_plan(plan)
+        finally:
+            config_path.write_bytes(config_before)
+
+        self.assertTrue(mutated)
+        self.assertFalse(marker.exists())
+        self.assertEqual(run_git(target, "rev-parse", "HEAD"), self.sha)
+        self.assertEqual((target / "README.md").read_bytes(), readme_before)
+        self.assertEqual((admin_git_dir / "index").read_bytes(), index_before)
+        self.assertEqual(run_git(target, "status", "--porcelain"), "")
+
+    def test_new_checkout_blocks_launch_window_info_attributes_creation(
+        self,
+    ) -> None:
+        (self.remote / "payload.bin").write_text("payload\n", encoding="utf-8")
+        run_git(self.remote, "add", "payload.bin")
+        run_git(self.remote, "commit", "-m", "add launch-window payload")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+
+        marker = self.root / "new-launch-filter-executed"
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "filter.launch-window.smudge",
+            f"touch {marker}",
+        )
+        attributes_path = self.named_source_git_dir / "info" / "attributes"
+        self.assertFalse(attributes_path.exists())
+        target_super = self.root / "new-launch-attributes-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "custom-lib",
+                        "lib",
+                        str(self.remote),
+                    ),
+                    target_sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        self.addCleanup(plan.close)
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        original_run = MODULE.run_git_at_directory_descriptor
+        injected = False
+
+        def inject_attributes_before_checkout_exec(
+            args: list[str],
+            directory_descriptor: int,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal injected
+            if "checkout" in args and not injected:
+                environment = kwargs["extra_env"]
+                self.assertIsInstance(environment, dict)
+                self.assertNotEqual(
+                    environment["GIT_COMMON_DIR"],
+                    str(self.named_source_git_dir),
+                )
+                attributes_path.write_text(
+                    "payload.bin filter=launch-window\n",
+                    encoding="utf-8",
+                )
+                injected = True
+            return original_run(
+                args,
+                directory_descriptor,
+                **kwargs,
+            )
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "run_git_at_directory_descriptor",
+                side_effect=inject_attributes_before_checkout_exec,
+            ):
+                with self.assertRaises((MODULE.GitError, MODULE.PlanError)):
+                    MODULE.apply_sync_plan(plan)
+        finally:
+            if attributes_path.exists():
+                attributes_path.unlink()
 
         self.assertTrue(injected)
         self.assertFalse(marker.exists())
@@ -11910,6 +12167,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             os.R_OK | os.W_OK | os.X_OK,
             "selected source common gitdir",
         )
+        checkout_view = self.capture_checkout_execution_view(
+            shallow_source,
+        )
         try:
             MODULE.add_worktree(
                 shallow_source,
@@ -11918,6 +12178,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 dry_run=False,
                 lease=lease,
                 source_lease=source_lease,
+                checkout_view=checkout_view,
             )
         finally:
             try:
@@ -12684,9 +12945,15 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
     def test_no_fetch_apply_skips_redundant_full_plan_validation(self) -> None:
         target = SimpleNamespace(path=self.root / "no-fetch-target")
+        checkout_receipt = SimpleNamespace(
+            attributes_receipt=mock.sentinel.attributes_receipt,
+        )
+        checkout_view = mock.MagicMock()
+        checkout_view.common_git_dir = self.root / "mock-checkout-view"
         entry = SimpleNamespace(
             needs_fetch=False,
-            checkout_preflight=mock.sentinel.checkout_receipt,
+            checkout_preflight=checkout_receipt,
+            source_completeness=mock.sentinel.source_completeness,
             parent_index=None,
             parent_source_git_dir=None,
             recursive_metadata=None,
@@ -12725,6 +12992,12 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             mock.patch.object(MODULE, "revalidate_materialized_target_lease"),
             mock.patch.object(MODULE, "revalidate_source_object_admission"),
             mock.patch.object(MODULE, "revalidate_checkout_preflight"),
+            mock.patch.object(
+                MODULE,
+                "capture_checkout_execution_view",
+                return_value=checkout_view,
+            ),
+            mock.patch.object(MODULE, "revalidate_checkout_execution_view"),
             mock.patch.object(MODULE, "add_worktree"),
             mock.patch.object(MODULE, "postvalidate_applied_entry"),
         ):
@@ -12759,6 +13032,11 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             )
         plan = SimpleNamespace(entries=entries, depth=1)
         events: list[str] = []
+        checkout_receipt = SimpleNamespace(
+            attributes_receipt=mock.sentinel.attributes_receipt,
+        )
+        checkout_view = mock.MagicMock()
+        checkout_view.common_git_dir = self.root / "mock-checkout-view"
 
         def validate(_plan: object) -> None:
             events.append("full")
@@ -12777,7 +13055,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         def capture(entry: object) -> tuple[object, tuple[object, ...]]:
             events.append(f"capture:{entry.submodule.name}")
-            return mock.sentinel.checkout_receipt, ()
+            return checkout_receipt, ()
 
         def revalidate(
             _plan: object,
@@ -12797,6 +13075,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             *,
             lease: object | None = None,
             source_lease: object | None = None,
+            checkout_view: object | None = None,
             finalize_checkout: object | None = None,
             pre_checkout: object | None = None,
             adopt_materialization: object | None = None,
@@ -12804,6 +13083,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             self.assertFalse(dry_run)
             self.assertIsNotNone(lease)
             self.assertIsNotNone(source_lease)
+            self.assertIsNotNone(checkout_view)
             if callable(adopt_materialization):
                 adopt_materialization()
             if callable(pre_checkout):
@@ -12869,20 +13149,29 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                                                 ):
                                                     with mock.patch.object(
                                                         MODULE,
-                                                        "postvalidate_applied_entry",
+                                                        "capture_checkout_execution_view",
+                                                        return_value=checkout_view,
                                                     ):
                                                         with mock.patch.object(
                                                             MODULE,
-                                                            "revalidate_managed_final_state_receipt",
+                                                            "revalidate_checkout_execution_view",
                                                         ):
                                                             with mock.patch.object(
                                                                 MODULE,
-                                                                "add_worktree",
-                                                                side_effect=add,
+                                                                "postvalidate_applied_entry",
                                                             ):
-                                                                MODULE.apply_sync_plan(
-                                                                    plan
-                                                                )
+                                                                with mock.patch.object(
+                                                                    MODULE,
+                                                                    "revalidate_managed_final_state_receipt",
+                                                                ):
+                                                                    with mock.patch.object(
+                                                                        MODULE,
+                                                                        "add_worktree",
+                                                                        side_effect=add,
+                                                                    ):
+                                                                        MODULE.apply_sync_plan(
+                                                                            plan
+                                                                        )
 
         self.assertEqual(events.count("full"), 2)
         second_full = len(events) - 1 - events[::-1].index("full")
