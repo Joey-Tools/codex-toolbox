@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import functools
+import http.server
 import importlib.util
 import io
 import errno
 import hashlib
 import os
 from pathlib import Path
+import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -221,6 +226,44 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         )
         return source_git_dir
 
+    def create_relocated_fake_git(
+        self,
+        name: str,
+        *,
+        version: str = "2.53.0",
+    ) -> tuple[Path, str]:
+        prefix = self.root / name
+        bin_directory = prefix / "bin"
+        helper_directory = prefix / "libexec" / "git-core"
+        bin_directory.mkdir(parents=True)
+        helper_directory.mkdir(parents=True)
+        system_exec_path = Path(
+            subprocess.run(
+                ["git", "--exec-path"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).stdout.strip()
+        )
+        for helper_name in MODULE.GIT_TRANSPORT_HELPER_NAMES:
+            helper_source = (system_exec_path / helper_name).resolve(strict=True)
+            helper_target = helper_directory / helper_name
+            shutil.copy2(helper_source, helper_target)
+            helper_target.chmod(0o700)
+        content = (
+            "#!/bin/sh\n"
+            'if [ "$1" = "--exec-path" ]; then\n'
+            f"  printf '%s\\n' {shlex.quote(str(helper_directory))}\n"
+            "else\n"
+            f"  printf 'git version {version}\\n'\n"
+            "fi\n"
+        )
+        fake_git = bin_directory / "git"
+        fake_git.write_text(content, encoding="utf-8")
+        fake_git.chmod(0o700)
+        return fake_git, content
+
     def create_gitlink_remote(
         self,
         name: str,
@@ -291,7 +334,6 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         for child_name, child_path in zip(
             ("left", "right"),
             child_paths,
-            strict=True,
         ):
             remote, sha = self.create_gitlink_remote(
                 f"{scenario}-{child_name}",
@@ -1522,10 +1564,113 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             str((self.named_source_git_dir / "objects").resolve()),
         )
         self.assertEqual(
+            dict(receipt.git_environment)["GIT_EXEC_PATH"],
+            str(receipt.git_runtime_receipt.exec_path),
+        )
+        self.assertEqual(
             receipt.source_shallow_path,
             self.named_source_git_dir / "shallow",
         )
         self.assertNotIn("GIT_SHALLOW_FILE", dict(receipt.git_environment))
+
+    def test_authorized_file_fetch_uses_snapshotted_git_helper_closure(
+        self,
+    ) -> None:
+        (self.remote / "FILE-TRANSPORT.md").write_text(
+            "file transport\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "FILE-TRANSPORT.md")
+        run_git(self.remote, "commit", "-m", "file transport")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        approved_url = self.remote.resolve(strict=True).as_uri()
+        run_git(
+            self.named_source_git_dir,
+            "config",
+            "remote.origin.url",
+            approved_url,
+        )
+        submodule = MODULE.Submodule(
+            "custom-lib",
+            "third_party/libexample",
+            approved_url,
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        self.addCleanup(receipt.fetch_guard.cleanup)
+
+        with redirect_stdout(io.StringIO()):
+            fetched = MODULE.fetch_missing_commit(
+                self.named_source_git_dir,
+                self.root / "file-transport-target",
+                submodule,
+                missing_sha,
+                1,
+                dry_run=False,
+                transport_receipt=receipt,
+                fetch_missing=True,
+            )
+
+        self.assertTrue(fetched)
+        self.assertTrue(
+            MODULE.commit_exists(
+                self.named_source_git_dir,
+                self.root / "file-transport-target",
+                missing_sha,
+            )
+        )
+
+    def test_http_transport_uses_snapshotted_git_helper_closure(
+        self,
+    ) -> None:
+        (self.remote / "HTTP-TRANSPORT.md").write_text(
+            "http transport\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "HTTP-TRANSPORT.md")
+        run_git(self.remote, "commit", "-m", "http transport")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        bare_remote = self.root / "http-remote.git"
+        run_git(
+            self.root,
+            "clone",
+            "--bare",
+            str(self.remote),
+            str(bare_remote),
+        )
+        run_git(bare_remote, "update-server-info")
+
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, _format: str, *args: object) -> None:
+                del args
+
+        handler = functools.partial(
+            QuietHandler,
+            directory=str(self.root),
+        )
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        server_thread.start()
+        approved_url = f"http://127.0.0.1:{server.server_port}/{bare_remote.name}"
+        try:
+            runtime = MODULE.git_runtime()
+            result = MODULE.run_bounded_bytes(
+                ["git", "ls-remote", approved_url],
+                timeout_seconds=10,
+                stdout_limit=4096,
+                stderr_limit=4096,
+                git_runtime_receipt=runtime,
+            )
+            self.assertIn(missing_sha.encode("ascii"), result.stdout)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=3)
 
     def test_fetch_child_never_rereads_source_config_after_final_revalidation(
         self,
@@ -1641,6 +1786,10 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             bounded_fetch.call_args.kwargs["fixed_env"],
             dict(receipt.git_environment),
         )
+        self.assertIs(
+            bounded_fetch.call_args.kwargs["git_runtime_receipt"],
+            receipt.git_runtime_receipt,
+        )
         self.assertNotEqual(
             bounded_fetch.call_args.kwargs["fixed_env"].get("HOME"),
             str(self.root / "attacker-home"),
@@ -1689,12 +1838,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
     def test_git_snapshot_rejects_same_inode_source_content_replacement(
         self,
     ) -> None:
-        fake_git = self.root / "fake-git"
-        original_content = "#!/bin/sh\nprintf 'git version 2.53.0\\n'\n"
-        replacement_content = "#!/bin/sh\nprintf 'git version 9.99.9\\n'\n"
+        fake_git, original_content = self.create_relocated_fake_git("fake-git-prefix")
+        replacement_content = original_content.replace("2.53.0", "9.99.9", 1)
         self.assertEqual(len(original_content), len(replacement_content))
-        fake_git.write_text(original_content, encoding="utf-8")
-        fake_git.chmod(0o700)
         original_inode = fake_git.stat().st_ino
 
         with mock.patch.object(MODULE.shutil, "which", return_value=str(fake_git)):
@@ -1727,17 +1873,14 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
     def test_git_exec_gate_rejects_snapshot_path_replacement_before_exec(
         self,
     ) -> None:
-        fake_git = self.root / "exec-gate-path-git"
-        fake_git.write_text(
-            "#!/bin/sh\nprintf 'git version 2.53.0\\n'\n",
-            encoding="utf-8",
+        fake_git, original_content = self.create_relocated_fake_git(
+            "exec-gate-path-prefix"
         )
-        fake_git.chmod(0o700)
         with mock.patch.object(MODULE.shutil, "which", return_value=str(fake_git)):
             runtime = MODULE.discover_git_runtime()
         snapshot = runtime.executable
         held_snapshot = snapshot.with_name("git.held")
-        replacement = "#!/bin/sh\nprintf 'git version 9.99.9\\n'\n"
+        replacement = original_content.replace("2.53.0", "9.99.9", 1)
         original_popen = MODULE.subprocess.Popen
         replacement_performed = False
 
@@ -1780,12 +1923,9 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
     def test_git_exec_gate_rejects_same_inode_snapshot_rewrite_before_exec(
         self,
     ) -> None:
-        fake_git = self.root / "exec-gate-content-git"
-        fake_git.write_text(
-            "#!/bin/sh\nprintf 'git version 2.53.0\\n'\n",
-            encoding="utf-8",
+        fake_git, _original_source = self.create_relocated_fake_git(
+            "exec-gate-content-prefix"
         )
-        fake_git.chmod(0o700)
         with mock.patch.object(MODULE.shutil, "which", return_value=str(fake_git)):
             runtime = MODULE.discover_git_runtime()
         snapshot = runtime.executable
@@ -1833,6 +1973,120 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             snapshot.chmod(0o500)
             runtime.snapshot_guard.cleanup()
 
+    def test_git_runtime_snapshots_a_relocated_transport_helper_closure(
+        self,
+    ) -> None:
+        fake_git, _content = self.create_relocated_fake_git("relocated-git-prefix")
+        source_exec_path = (fake_git.parent.parent / "libexec" / "git-core").resolve(
+            strict=True
+        )
+        with mock.patch.object(MODULE.shutil, "which", return_value=str(fake_git)):
+            runtime = MODULE.discover_git_runtime()
+        try:
+            self.assertEqual(
+                runtime.source_exec_path_binding.path,
+                source_exec_path,
+            )
+            self.assertNotEqual(runtime.exec_path, source_exec_path)
+            self.assertEqual(runtime.exec_path_binding.path, runtime.exec_path)
+            self.assertEqual(
+                tuple(receipt.executable.name for receipt in runtime.helper_snapshots),
+                MODULE.GIT_TRANSPORT_HELPER_NAMES,
+            )
+            self.assertTrue(
+                all(
+                    receipt.executable.parent == runtime.exec_path
+                    for receipt in runtime.helper_snapshots
+                )
+            )
+            self.assertEqual(
+                MODULE.git_environment(runtime=runtime)["GIT_EXEC_PATH"],
+                str(runtime.exec_path),
+            )
+        finally:
+            runtime.snapshot_guard.cleanup()
+
+    def test_git_runtime_rejects_same_inode_helper_snapshot_rewrite(
+        self,
+    ) -> None:
+        fake_git, _content = self.create_relocated_fake_git("helper-rewrite-prefix")
+        with mock.patch.object(MODULE.shutil, "which", return_value=str(fake_git)):
+            runtime = MODULE.discover_git_runtime()
+        helper_receipt = runtime.helper_snapshots[0]
+        helper_snapshot = helper_receipt.executable
+        original_content = helper_snapshot.read_bytes()
+        rewritten_content = bytearray(original_content)
+        rewritten_content[0] ^= 0x01
+        original_inode = helper_snapshot.stat().st_ino
+        try:
+            helper_snapshot.chmod(0o700)
+            helper_snapshot.write_bytes(bytes(rewritten_content))
+            helper_snapshot.chmod(0o500)
+            self.assertEqual(helper_snapshot.stat().st_ino, original_inode)
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "transport helper.*content changed",
+            ):
+                MODULE.revalidate_git_runtime(runtime)
+        finally:
+            helper_snapshot.chmod(0o700)
+            helper_snapshot.write_bytes(original_content)
+            helper_snapshot.chmod(0o500)
+            runtime.snapshot_guard.cleanup()
+
+    def test_git_child_revalidates_helper_closure_after_process_exit(
+        self,
+    ) -> None:
+        fake_git, _content = self.create_relocated_fake_git(
+            "helper-runtime-drift-prefix"
+        )
+        with mock.patch.object(MODULE.shutil, "which", return_value=str(fake_git)):
+            runtime = MODULE.discover_git_runtime()
+        helper_snapshot = runtime.helper_snapshots[0].executable
+        original_content = helper_snapshot.read_bytes()
+        rewritten_content = bytearray(original_content)
+        rewritten_content[-1] ^= 0x01
+        original_popen = MODULE.subprocess.Popen
+        drifted = False
+
+        def drift_after_spawn(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal drifted
+            process = original_popen(*args, **kwargs)
+            if not drifted:
+                drifted = True
+                helper_snapshot.chmod(0o700)
+                helper_snapshot.write_bytes(bytes(rewritten_content))
+                helper_snapshot.chmod(0o500)
+            return process
+
+        try:
+            with mock.patch.object(MODULE, "_GIT_RUNTIME", runtime):
+                with mock.patch.object(
+                    MODULE.subprocess,
+                    "Popen",
+                    side_effect=drift_after_spawn,
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.PlanError,
+                        "helper closure changed while Git was running",
+                    ):
+                        MODULE.run_bounded_bytes(
+                            ["git", "--version"],
+                            timeout_seconds=5,
+                            stdout_limit=256,
+                            stderr_limit=256,
+                            git_runtime_receipt=runtime,
+                        )
+            self.assertTrue(drifted)
+        finally:
+            helper_snapshot.chmod(0o700)
+            helper_snapshot.write_bytes(original_content)
+            helper_snapshot.chmod(0o500)
+            runtime.snapshot_guard.cleanup()
+
     def test_bounded_command_stops_at_retained_stdout_limit(self) -> None:
         with self.assertRaisesRegex(
             MODULE.PlanError,
@@ -1876,6 +2130,167 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             )
         self.assertLess(time.monotonic() - started, 2)
 
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "requires POSIX process groups and signal masks",
+    )
+    def test_bounded_command_forwards_signal_cleans_group_and_redelivers(
+        self,
+    ) -> None:
+        child_pid_path = self.root / "signal-child.pid"
+        child_code = (
+            "import os,signal,sys,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "signal.signal(signal.SIGHUP,signal.SIG_IGN);"
+            "open(sys.argv[1],'w').write(str(os.getpid()));"
+            "time.sleep(30)"
+        )
+        driver_code = (
+            "import importlib.util,sys;"
+            f"p={str(SCRIPT_PATH)!r};"
+            "s=importlib.util.spec_from_file_location('signal_sync',p);"
+            "m=importlib.util.module_from_spec(s);"
+            "sys.modules[s.name]=m;"
+            "s.loader.exec_module(m);"
+            "\ntry:\n"
+            " m.run_bounded_bytes("
+            "[sys.executable,'-c',sys.argv[2],sys.argv[1]],"
+            "prepare_git_command=False,timeout_seconds=30)\n"
+            "except m.ForwardedProcessSignal as exc:\n"
+            " m.redeliver_forwarded_signal(exc)\n"
+        )
+        supervisor = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                driver_code,
+                str(child_pid_path),
+                child_code,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while (
+                not child_pid_path.exists()
+                and supervisor.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            self.assertTrue(child_pid_path.exists())
+            child_pid = int(child_pid_path.read_text(encoding="ascii"))
+            os.kill(supervisor.pid, signal.SIGTERM)
+            stdout, stderr = supervisor.communicate(timeout=8)
+            self.assertEqual(
+                supervisor.returncode,
+                -signal.SIGTERM,
+                (stdout, stderr),
+            )
+            child_deadline = time.monotonic() + 3
+            while time.monotonic() < child_deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail(f"forwarded-signal child remained alive: {child_pid}")
+        finally:
+            if supervisor.poll() is None:
+                supervisor.kill()
+                supervisor.wait(timeout=3)
+
+    def test_owner_private_temporary_cleanup_removes_nested_entries(self) -> None:
+        guard = MODULE.OwnerPrivateTemporaryDirectory(prefix="owner-private-cleanup.")
+        root = Path(guard.name)
+        nested = root / "nested"
+        nested.mkdir(mode=0o700)
+        (nested / "payload").write_bytes(b"payload")
+        (root / "link").symlink_to(nested / "payload")
+
+        guard.cleanup()
+
+        self.assertFalse(root.exists())
+
+    def test_owner_private_temporary_cleanup_retains_path_replacement(
+        self,
+    ) -> None:
+        guard = MODULE.OwnerPrivateTemporaryDirectory(
+            prefix="owner-private-replacement."
+        )
+        original = Path(guard.name)
+        held = self.root / "held-owner-private-directory"
+        original.rename(held)
+        original.mkdir(mode=0o700)
+        sentinel = original / "sentinel"
+        sentinel.write_text("replacement\n", encoding="utf-8")
+        try:
+            with self.assertRaisesRegex(
+                MODULE.TemporaryDirectoryCleanupError,
+                "recovery_schema: owner-private-temporary-cleanup-v1",
+            ) as raised:
+                guard.cleanup()
+            self.assertEqual(
+                raised.exception.status,
+                "identity-unverified-retained",
+            )
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "replacement\n")
+            self.assertTrue(held.is_dir())
+        finally:
+            shutil.rmtree(original, ignore_errors=True)
+            shutil.rmtree(held, ignore_errors=True)
+
+    def test_owner_private_temporary_cleanup_restores_check_to_rename_race(
+        self,
+    ) -> None:
+        guard = MODULE.OwnerPrivateTemporaryDirectory(prefix="owner-private-race.")
+        original = Path(guard.name)
+        held = self.root / "held-owner-private-race"
+        real_rename = MODULE.descriptor_atomic_rename_noreplace
+        raced = False
+
+        def race_then_rename(
+            directory_descriptor: int,
+            source_name: str,
+            target_name: str,
+        ) -> None:
+            nonlocal raced
+            if not raced and source_name == original.name:
+                raced = True
+                original.rename(held)
+                original.mkdir(mode=0o700)
+                (original / "sentinel").write_text(
+                    "replacement\n",
+                    encoding="utf-8",
+                )
+            real_rename(
+                directory_descriptor,
+                source_name,
+                target_name,
+            )
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "descriptor_atomic_rename_noreplace",
+                side_effect=race_then_rename,
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.TemporaryDirectoryCleanupError,
+                    "unexpected-replacement-retained",
+                ):
+                    guard.cleanup()
+            self.assertTrue(raced)
+            self.assertEqual(
+                (original / "sentinel").read_text(encoding="utf-8"),
+                "replacement\n",
+            )
+            self.assertTrue(held.is_dir())
+        finally:
+            shutil.rmtree(original, ignore_errors=True)
+            shutil.rmtree(held, ignore_errors=True)
+
     def test_process_cleanup_reports_an_unreapable_direct_child(self) -> None:
         class UnreapableProcess:
             pid = 424242
@@ -1910,6 +2325,72 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.assertEqual(len(process.wait_timeouts), 1)
         self.assertTrue(all(timeout is not None for timeout in process.wait_timeouts))
+
+    def test_process_cleanup_forwards_original_signal_before_term_and_kill(
+        self,
+    ) -> None:
+        class ReapableProcess:
+            pid = 424243
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                return -signal.SIGKILL
+
+            def terminate(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                return None
+
+        forwarded: list[int] = []
+
+        def record_signal(_pid: int, signum: int) -> None:
+            forwarded.append(signum)
+
+        with mock.patch.object(MODULE.os, "killpg", side_effect=record_signal):
+            MODULE.terminate_process_group(
+                ReapableProcess(),
+                initial_signal=signal.SIGHUP,
+                cleanup_timeout_seconds=0.1,
+                term_grace_seconds=0.02,
+            )
+
+        self.assertEqual(
+            forwarded,
+            [signal.SIGHUP, signal.SIGTERM, signal.SIGKILL],
+        )
+
+    def test_process_cleanup_never_signals_an_already_reaped_process_group(
+        self,
+    ) -> None:
+        class ReapedProcess:
+            pid = 424244
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                raise AssertionError("an already reaped child must not be waited again")
+
+            def terminate(self) -> None:
+                raise AssertionError("an already reaped child must not be terminated")
+
+            def kill(self) -> None:
+                raise AssertionError("an already reaped child must not be killed")
+
+        with mock.patch.object(MODULE.os, "killpg") as kill_process_group:
+            MODULE.terminate_process_group(
+                ReapedProcess(),
+                initial_signal=signal.SIGHUP,
+                cleanup_timeout_seconds=0.1,
+                term_grace_seconds=0.02,
+            )
+
+        kill_process_group.assert_not_called()
 
     def test_bounded_command_rejects_oversized_input_before_spawn(self) -> None:
         with mock.patch.object(MODULE, "GIT_INPUT_LIMIT_BYTES", 4):
@@ -3470,6 +3951,133 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertIn("--work-tree=.", command)
         self.assertIn("--no-overwrite-ignore", command)
         self.assertIn("--no-recurse-submodules", command)
+
+    def test_checkout_signal_publishes_retained_worktree_recovery(
+        self,
+    ) -> None:
+        self.add_managed_worktree(
+            self.source_git_dir,
+            self.linked,
+            self.sha,
+        )
+        target_descriptor = os.open(
+            self.linked,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+        source_lease = MODULE.capture_directory_entry_lease(
+            self.source_git_dir,
+            os.R_OK | os.W_OK | os.X_OK,
+            "selected source common gitdir",
+        )
+        original_run = MODULE.run_git_at_directory_descriptor
+
+        def checkout_then_interrupt(
+            args: list[str],
+            directory_descriptor: int,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            result = original_run(
+                args,
+                directory_descriptor,
+                **kwargs,
+            )
+            raise MODULE.ForwardedProcessSignal(signal.SIGHUP)
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "run_git_at_directory_descriptor",
+                side_effect=checkout_then_interrupt,
+            ):
+                with self.assertRaises(MODULE.ForwardedProcessSignal) as raised:
+                    MODULE.checkout_existing_worktree(
+                        self.linked,
+                        self.sha,
+                        dry_run=False,
+                        target_descriptor=target_descriptor,
+                        source_git_dir=self.source_git_dir,
+                        source_lease=source_lease,
+                    )
+            self.assertTrue(
+                any(
+                    '"recovery_status":"interrupted-checkout-retained"' in detail
+                    for detail in raised.exception.recovery_details
+                )
+            )
+        finally:
+            try:
+                source_lease.close()
+            finally:
+                os.close(target_descriptor)
+
+    def test_add_signal_rolls_back_before_publishing_recovery(
+        self,
+    ) -> None:
+        target = MODULE.bind_target_path(
+            self.root,
+            ("signal-add-worktree",),
+            "signal add target",
+        )
+        lease = MODULE.materialize_bound_target_directory(target)
+        source_lease = MODULE.capture_directory_entry_lease(
+            self.source_git_dir,
+            os.R_OK | os.W_OK | os.X_OK,
+            "selected source common gitdir",
+        )
+        original_run = MODULE.run_git_at_directory_descriptor
+        interrupted = False
+
+        def add_then_interrupt(
+            args: list[str],
+            directory_descriptor: int,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal interrupted
+            result = original_run(
+                args,
+                directory_descriptor,
+                **kwargs,
+            )
+            if "add" in args and not interrupted:
+                interrupted = True
+                raise MODULE.ForwardedProcessSignal(signal.SIGTERM)
+            return result
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "run_git_at_directory_descriptor",
+                side_effect=add_then_interrupt,
+            ):
+                with self.assertRaises(MODULE.ForwardedProcessSignal) as raised:
+                    MODULE.add_worktree(
+                        self.source_git_dir,
+                        target.path,
+                        self.sha,
+                        dry_run=False,
+                        lease=lease,
+                        source_lease=source_lease,
+                    )
+            self.assertTrue(interrupted)
+            self.assertFalse(target.path.exists())
+            self.assertIsNone(
+                MODULE.registered_target_path(
+                    self.source_git_dir,
+                    target.path,
+                    source_lease=source_lease,
+                )
+            )
+            self.assertTrue(
+                any(
+                    '"rollback_status":"complete"' in detail
+                    for detail in raised.exception.recovery_details
+                )
+            )
+        finally:
+            try:
+                source_lease.close()
+            finally:
+                lease.close()
 
     def test_missing_target_collision_uses_case_sensitive_volume_semantics(
         self,
@@ -5516,7 +6124,6 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         for child_path, (_remote, child_sha) in zip(
             ("group/left", "group/right"),
             child_results,
-            strict=True,
         ):
             with self.subTest(child_path=child_path):
                 self.assertEqual(
@@ -5567,7 +6174,6 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         for child_path, (_remote, child_sha) in zip(
             ("group/deep/left", "group/deep/right"),
             child_results,
-            strict=True,
         ):
             self.assertEqual(
                 run_git(target_super / "parent" / child_path, "rev-parse", "HEAD"),
@@ -8813,6 +9419,64 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 self.root / "unused-target",
                 self.sha,
             )
+
+    def test_fetch_signal_retains_fence_before_propagating_signal(
+        self,
+    ) -> None:
+        (self.remote / "FETCH-SIGNAL.md").write_text(
+            "fetch signal\n",
+            encoding="utf-8",
+        )
+        run_git(self.remote, "add", "FETCH-SIGNAL.md")
+        run_git(self.remote, "commit", "-m", "fetch signal")
+        missing_sha = run_git(self.remote, "rev-parse", "HEAD")
+        submodule = MODULE.Submodule(
+            name="custom-lib",
+            path="third_party/libexample",
+            url=str(self.remote),
+        )
+        receipt = MODULE.capture_transport_receipt(
+            self.named_source_git_dir,
+            submodule,
+        )
+        self.addCleanup(receipt.fetch_guard.cleanup)
+        original_run_bounded = MODULE.run_bounded_bytes
+
+        def interrupt_fetch(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            if "fetch" in args:
+                raise MODULE.ForwardedProcessSignal(signal.SIGTERM)
+            return original_run_bounded(args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "run_bounded_bytes",
+            side_effect=interrupt_fetch,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(MODULE.ForwardedProcessSignal) as raised:
+                    MODULE.fetch_missing_commit(
+                        self.named_source_git_dir,
+                        self.root / "unused-target",
+                        submodule,
+                        missing_sha,
+                        1,
+                        dry_run=False,
+                        transport_receipt=receipt,
+                        fetch_missing=True,
+                    )
+
+        self.assertTrue(
+            (self.named_source_git_dir / MODULE.SOURCE_FETCH_TRANSACTION_NAME).is_file()
+        )
+        self.assertTrue(
+            any(
+                "source-fetch-transaction-v1" in detail
+                for detail in raised.exception.recovery_details
+            )
+        )
 
     def test_fetch_transport_rejects_loose_object_fanout_symlink(self) -> None:
         source_objects = self.named_source_git_dir / "objects"

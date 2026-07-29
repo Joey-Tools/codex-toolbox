@@ -23,7 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Callable, Iterable, Optional
+from typing import BinaryIO, Callable, Iterable, NoReturn, Optional
 import unicodedata
 
 
@@ -34,6 +34,11 @@ GIT_INPUT_LIMIT_BYTES = 64 * 1024 * 1024
 GIT_VERSION_TIMEOUT_SECONDS = 5.0
 GIT_MINIMUM_VERSION = (2, 45, 0)
 MAX_GIT_EXECUTABLE_BYTES = 128 * 1024 * 1024
+GIT_TRANSPORT_HELPER_NAMES = (
+    "git-remote-http",
+    "git-remote-https",
+    "git-upload-pack",
+)
 PROCESS_CLEANUP_TIMEOUT_SECONDS = 1.0
 PROCESS_TERM_GRACE_SECONDS = 0.5
 UMASK_CAPTURE_TIMEOUT_SECONDS = 5.0
@@ -174,6 +179,49 @@ class PlanError(RuntimeError):
     pass
 
 
+class ForwardedProcessSignal(Exception):
+    """Carry one parent-owned termination signal through recovery publication."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+        self.recovery_details: list[str] = []
+        self.cleanup_errors: list[str] = []
+
+    def add_recovery_detail(self, detail: str) -> None:
+        if detail:
+            self.recovery_details.append(detail)
+
+    def add_cleanup_error(self, detail: str) -> None:
+        if detail:
+            self.cleanup_errors.append(detail)
+
+
+class TemporaryDirectoryCleanupError(PlanError):
+    def __init__(
+        self,
+        *,
+        status: str,
+        location: Path,
+        expected: FsFingerprint,
+        detail: str,
+    ) -> None:
+        self.status = status
+        self.location = location
+        self.expected = expected
+        super().__init__(
+            "owner-private temporary directory cleanup is incomplete\n"
+            "  recovery_schema: owner-private-temporary-cleanup-v1\n"
+            f"  recovery_status: {status}\n"
+            f"  recovery_location: {location}\n"
+            "  expected_identity: "
+            f"dev={expected.device},ino={expected.inode},kind={expected.kind},"
+            f"uid={expected.owner},gid={expected.group},"
+            f"mode={expected.permissions:04o}\n"
+            f"  recovery_detail: {detail}"
+        )
+
+
 class AtomicRenameError(PlanError):
     def __init__(self, operation: str, error_number: int) -> None:
         self.operation = operation
@@ -273,6 +321,10 @@ class GitRuntime:
     executable: Path
     executable_state: ExecutableState
     content_sha256: str
+    source_exec_path_binding: AccessBinding
+    exec_path: Path
+    exec_path_binding: AccessBinding
+    helper_snapshots: tuple[ExecutableSnapshotReceipt, ...]
     version: tuple[int, int, int]
     version_text: str
     snapshot_guard: object = dataclass_field(repr=False, compare=False)
@@ -712,6 +764,7 @@ class TransportReceipt:
     fetch_git_dir: Path
     fetch_access_bindings: tuple[AccessBinding, ...]
     fetch_file_bindings: tuple[FileContentBinding, ...]
+    git_runtime_receipt: GitRuntime = dataclass_field(repr=False, compare=False)
     git_environment: tuple[tuple[str, str], ...]
     fetch_guard: object = dataclass_field(repr=False, compare=False)
 
@@ -847,10 +900,13 @@ class TargetCollisionIndex:
         )
         node = self.root
         visited = [node]
+        if len(candidate.target.relative_parts) != len(
+            candidate.target.collision_tokens
+        ):
+            raise PlanError("planned target collision receipt has invalid depth")
         for component, token in zip(
             candidate.target.relative_parts,
             candidate.target.collision_tokens,
-            strict=True,
         ):
             if (
                 node.terminal_index is not None
@@ -902,11 +958,17 @@ _GIT_RUNTIME: Optional[GitRuntime] = None
 
 def git_environment(
     extra_env: Optional[dict[str, str]] = None,
+    *,
+    runtime: Optional[GitRuntime] = None,
+    include_git_exec_path: bool = True,
 ) -> dict[str, str]:
     environment = {
         key: os.environ[key] for key in GIT_ENV_PASSTHROUGH if key in os.environ
     }
     environment.update(SAFE_GIT_ENV)
+    selected_runtime = runtime if runtime is not None else _GIT_RUNTIME
+    if selected_runtime is not None and include_git_exec_path:
+        environment["GIT_EXEC_PATH"] = str(selected_runtime.exec_path)
     if extra_env:
         unsupported = set(extra_env) - {
             "GIT_ATTR_SOURCE",
@@ -1214,23 +1276,15 @@ def revalidate_executable_execution_lease_in_child(
         )
 
 
-def copy_executable_snapshot(
+def copy_executable_snapshot_to_directory(
     source: Path,
     expected_fingerprint: FsFingerprint,
     *,
-    prefix: str,
+    snapshot_root: Path,
     filename: str,
     maximum_bytes: int,
     description: str,
-) -> tuple[
-    object,
-    Path,
-    ExecutableState,
-    ExecutableState,
-    str,
-]:
-    snapshot_guard = tempfile.TemporaryDirectory(prefix=prefix)
-    snapshot_root = Path(snapshot_guard.name)
+) -> tuple[Path, ExecutableState, ExecutableState, str]:
     snapshot = snapshot_root / filename
     source_descriptor = -1
     snapshot_descriptor = -1
@@ -1330,25 +1384,63 @@ def copy_executable_snapshot(
             )
         snapshot = snapshot.resolve(strict=True)
         return (
-            snapshot_guard,
             snapshot,
             source_before,
             snapshot_state,
             snapshot_digest,
         )
     except OSError as exc:
-        snapshot_guard.cleanup()
         raise PlanError(
             f"cannot create a verified {description} snapshot: {exc}"
         ) from exc
-    except BaseException:
-        snapshot_guard.cleanup()
-        raise
     finally:
         if snapshot_descriptor >= 0:
             os.close(snapshot_descriptor)
         if source_descriptor >= 0:
             os.close(source_descriptor)
+
+
+def copy_executable_snapshot(
+    source: Path,
+    expected_fingerprint: FsFingerprint,
+    *,
+    prefix: str,
+    filename: str,
+    maximum_bytes: int,
+    description: str,
+) -> tuple[
+    object,
+    Path,
+    ExecutableState,
+    ExecutableState,
+    str,
+]:
+    snapshot_guard = OwnerPrivateTemporaryDirectory(prefix=prefix)
+    snapshot_root = Path(snapshot_guard.name)
+    try:
+        (
+            snapshot,
+            source_state,
+            snapshot_state,
+            snapshot_digest,
+        ) = copy_executable_snapshot_to_directory(
+            source,
+            expected_fingerprint,
+            snapshot_root=snapshot_root,
+            filename=filename,
+            maximum_bytes=maximum_bytes,
+            description=description,
+        )
+        return (
+            snapshot_guard,
+            snapshot,
+            source_state,
+            snapshot_state,
+            snapshot_digest,
+        )
+    except BaseException:
+        snapshot_guard.cleanup()
+        raise
 
 
 def copy_git_executable_snapshot(
@@ -1418,6 +1510,204 @@ def revalidate_executable_content(
             os.close(descriptor)
 
 
+def capture_git_transport_helper_closure(
+    git_snapshot: Path,
+    git_receipt: ExecutableSnapshotReceipt,
+) -> tuple[
+    object,
+    Path,
+    AccessBinding,
+    AccessBinding,
+    tuple[ExecutableSnapshotReceipt, ...],
+]:
+    # Protected property: Git's later helper lookup is restricted to exact
+    # receipt-bound bytes under one owner-private GIT_EXEC_PATH. Identity and
+    # owner/group/mode changes matter; timestamp-only churn does not.
+    result = run_bounded_bytes(
+        [str(git_snapshot), "--exec-path"],
+        timeout_seconds=GIT_VERSION_TIMEOUT_SECONDS,
+        stdout_limit=MAX_CHECKOUT_PATH_BYTES,
+        stderr_limit=256,
+        prepare_git_command=False,
+        executable_snapshot_receipt=git_receipt,
+    )
+    raw_exec_path = os.fsdecode(result.stdout).strip()
+    if (
+        not raw_exec_path
+        or "\x00" in raw_exec_path
+        or "\n" in raw_exec_path
+        or "\r" in raw_exec_path
+    ):
+        raise PlanError(f"fixed Git returned an invalid exec path: {raw_exec_path!r}")
+    source_exec_path = Path(raw_exec_path)
+    if not source_exec_path.is_absolute():
+        raise PlanError(
+            f"fixed Git returned a non-absolute exec path: {source_exec_path}"
+        )
+    try:
+        source_exec_path = source_exec_path.resolve(strict=True)
+    except OSError as exc:
+        raise PlanError(
+            f"cannot resolve the fixed Git transport-helper directory: {exc}"
+        ) from exc
+    source_exec_binding = capture_typed_access(
+        source_exec_path,
+        os.R_OK | os.X_OK,
+        "fixed Git transport-helper source directory",
+        stat.S_IFDIR,
+    )
+
+    helper_guard = OwnerPrivateTemporaryDirectory(prefix="submodule-worktree-git-exec.")
+    helper_exec_path = Path(helper_guard.name).resolve(strict=True)
+    helper_receipts: list[ExecutableSnapshotReceipt] = []
+    try:
+        for helper_name in GIT_TRANSPORT_HELPER_NAMES:
+            helper_source_entry = source_exec_path / helper_name
+            try:
+                helper_source = helper_source_entry.resolve(strict=True)
+            except OSError as exc:
+                raise PlanError(
+                    "fixed Git transport-helper closure is incomplete\n"
+                    f"  helper: {helper_name}\n"
+                    f"  source: {helper_source_entry}\n"
+                    f"  error: {exc}"
+                ) from exc
+            helper_fingerprint = filesystem_fingerprint(helper_source)
+            if helper_fingerprint.kind != stat.S_IFREG or not probe_access(
+                helper_source,
+                os.R_OK | os.X_OK,
+            ):
+                raise PlanError(
+                    "fixed Git transport helper is not an executable regular file\n"
+                    f"  helper: {helper_name}\n"
+                    f"  source: {helper_source}"
+                )
+            (
+                helper_snapshot,
+                helper_source_state,
+                helper_snapshot_state,
+                helper_digest,
+            ) = copy_executable_snapshot_to_directory(
+                helper_source,
+                helper_fingerprint,
+                snapshot_root=helper_exec_path,
+                filename=helper_name,
+                maximum_bytes=MAX_TRANSPORT_EXECUTABLE_BYTES,
+                description=f"Git transport helper {helper_name}",
+            )
+            helper_receipts.append(
+                ExecutableSnapshotReceipt(
+                    source_executable=helper_source,
+                    source_state=helper_source_state,
+                    executable=helper_snapshot,
+                    executable_state=helper_snapshot_state,
+                    content_sha256=helper_digest,
+                )
+            )
+        revalidate_access(source_exec_binding)
+        helper_exec_binding = capture_owner_private_directory(
+            helper_exec_path,
+            "owner-private Git transport-helper closure",
+        )
+        return (
+            helper_guard,
+            helper_exec_path,
+            source_exec_binding,
+            helper_exec_binding,
+            tuple(helper_receipts),
+        )
+    except BaseException:
+        helper_guard.cleanup()
+        raise
+
+
+def revalidate_git_helper_directory_binding(binding: AccessBinding) -> None:
+    try:
+        current = filesystem_fingerprint(binding.path)
+    except PlanError as exc:
+        raise PlanError(
+            f"Git transport-helper directory became unavailable: {binding.path}"
+        ) from exc
+    if current != binding.fingerprint:
+        raise PlanError(
+            "Git transport-helper directory object or access policy changed\n"
+            f"  path: {binding.path}"
+        )
+    if not probe_access(binding.path, binding.mode):
+        raise PlanError(
+            "Git transport-helper directory no longer provides required access\n"
+            f"  path: {binding.path}\n"
+            f"  required: {access_mode_text(binding.mode)}"
+        )
+
+
+def revalidate_git_runtime(
+    runtime: GitRuntime,
+    *,
+    require_transport_helpers: bool = True,
+) -> GitRuntime:
+    source_state = revalidate_executable_content(
+        runtime.source_executable,
+        runtime.source_state,
+        runtime.content_sha256,
+        "fixed source Git executable",
+    )
+    executable_state = revalidate_executable_content(
+        runtime.executable,
+        runtime.executable_state,
+        runtime.content_sha256,
+        "owner-private Git executable snapshot",
+    )
+    if not require_transport_helpers:
+        return replace(
+            runtime,
+            source_state=source_state,
+            executable_state=executable_state,
+        )
+    revalidate_git_helper_directory_binding(runtime.exec_path_binding)
+    revalidate_git_helper_directory_binding(runtime.source_exec_path_binding)
+    if runtime.exec_path_binding.path != runtime.exec_path:
+        raise PlanError("Git transport-helper closure has an inconsistent exec path")
+    if tuple(receipt.executable.name for receipt in runtime.helper_snapshots) != (
+        GIT_TRANSPORT_HELPER_NAMES
+    ):
+        raise PlanError("Git transport-helper closure has an invalid helper inventory")
+    helper_snapshots: list[ExecutableSnapshotReceipt] = []
+    for helper_name, receipt in zip(
+        GIT_TRANSPORT_HELPER_NAMES,
+        runtime.helper_snapshots,
+    ):
+        if receipt.executable.parent != runtime.exec_path:
+            raise PlanError(
+                f"Git transport helper escaped the owner-private exec path: {helper_name}"
+            )
+        helper_source_state = revalidate_executable_content(
+            receipt.source_executable,
+            receipt.source_state,
+            receipt.content_sha256,
+            f"source Git transport helper {helper_name}",
+        )
+        helper_snapshot_state = revalidate_executable_content(
+            receipt.executable,
+            receipt.executable_state,
+            receipt.content_sha256,
+            f"owner-private Git transport helper {helper_name}",
+        )
+        helper_snapshots.append(
+            replace(
+                receipt,
+                source_state=helper_source_state,
+                executable_state=helper_snapshot_state,
+            )
+        )
+    return replace(
+        runtime,
+        source_state=source_state,
+        executable_state=executable_state,
+        helper_snapshots=tuple(helper_snapshots),
+    )
+
+
 def discover_git_runtime() -> GitRuntime:
     if os.name != "posix":
         raise PlanError(
@@ -1440,6 +1730,13 @@ def discover_git_runtime() -> GitRuntime:
         snapshot_state,
         content_sha256,
     ) = copy_git_executable_snapshot(executable, fingerprint)
+    main_receipt = ExecutableSnapshotReceipt(
+        source_executable=executable,
+        source_state=source_state,
+        executable=snapshot,
+        executable_state=snapshot_state,
+        content_sha256=content_sha256,
+    )
     try:
         result = run_bounded_bytes(
             [str(snapshot), "--version"],
@@ -1447,13 +1744,7 @@ def discover_git_runtime() -> GitRuntime:
             stdout_limit=256,
             stderr_limit=256,
             prepare_git_command=False,
-            executable_snapshot_receipt=ExecutableSnapshotReceipt(
-                source_executable=executable,
-                source_state=source_state,
-                executable=snapshot,
-                executable_state=snapshot_state,
-                content_sha256=content_sha256,
-            ),
+            executable_snapshot_receipt=main_receipt,
         )
         version_text = os.fsdecode(result.stdout).strip()
         match = re.fullmatch(
@@ -1473,46 +1764,45 @@ def discover_git_runtime() -> GitRuntime:
                 f"  actual: {version_text}\n"
                 "  older Git versions cannot prove the no-lazy-fetch checkout contract"
             )
-        return GitRuntime(
-            source_executable=executable,
-            source_state=source_state,
-            executable=snapshot,
-            executable_state=snapshot_state,
-            content_sha256=content_sha256,
-            version=version,
-            version_text=version_text,
-            snapshot_guard=snapshot_guard,
-        )
+        (
+            helper_guard,
+            helper_exec_path,
+            source_exec_path_binding,
+            helper_exec_binding,
+            helper_snapshots,
+        ) = capture_git_transport_helper_closure(snapshot, main_receipt)
+        combined_guard = CleanupGuardGroup(snapshot_guard, helper_guard)
+        try:
+            return GitRuntime(
+                source_executable=executable,
+                source_state=source_state,
+                executable=snapshot,
+                executable_state=snapshot_state,
+                content_sha256=content_sha256,
+                source_exec_path_binding=source_exec_path_binding,
+                exec_path=helper_exec_path,
+                exec_path_binding=helper_exec_binding,
+                helper_snapshots=helper_snapshots,
+                version=version,
+                version_text=version_text,
+                snapshot_guard=combined_guard,
+            )
+        except BaseException:
+            combined_guard.cleanup()
+            raise
     except BaseException:
         snapshot_guard.cleanup()
         raise
 
 
-def git_runtime() -> GitRuntime:
+def git_runtime(*, require_transport_helpers: bool = False) -> GitRuntime:
     global _GIT_RUNTIME
     if _GIT_RUNTIME is None:
         _GIT_RUNTIME = discover_git_runtime()
-    source_state = revalidate_executable_content(
-        _GIT_RUNTIME.source_executable,
-        _GIT_RUNTIME.source_state,
-        _GIT_RUNTIME.content_sha256,
-        "fixed source Git executable",
+    _GIT_RUNTIME = revalidate_git_runtime(
+        _GIT_RUNTIME,
+        require_transport_helpers=require_transport_helpers,
     )
-    executable_state = revalidate_executable_content(
-        _GIT_RUNTIME.executable,
-        _GIT_RUNTIME.executable_state,
-        _GIT_RUNTIME.content_sha256,
-        "owner-private Git executable snapshot",
-    )
-    if (
-        source_state != _GIT_RUNTIME.source_state
-        or executable_state != _GIT_RUNTIME.executable_state
-    ):
-        _GIT_RUNTIME = replace(
-            _GIT_RUNTIME,
-            source_state=source_state,
-            executable_state=executable_state,
-        )
     return _GIT_RUNTIME
 
 
@@ -1553,8 +1843,18 @@ def prepare_command_execution(
     *,
     preserve_split_index: bool = False,
     executable_snapshot_receipt: Optional[ExecutableSnapshotReceipt] = None,
-) -> tuple[list[str], Optional[ExecutableExecutionLease]]:
+    git_runtime_receipt: Optional[GitRuntime] = None,
+) -> tuple[
+    list[str],
+    Optional[ExecutableExecutionLease],
+    tuple[ExecutableExecutionLease, ...],
+    Optional[GitRuntime],
+]:
     if executable_snapshot_receipt is not None:
+        if git_runtime_receipt is not None:
+            raise PlanError(
+                "explicit executable and Git runtime receipts are mutually exclusive"
+            )
         if preserve_split_index:
             raise PlanError(
                 "an explicit executable snapshot cannot preserve split-index config"
@@ -1569,10 +1869,20 @@ def prepare_command_execution(
             executable_snapshot_receipt.content_sha256,
             "owner-private executable snapshot",
         )
-        return list(args), lease
+        return list(args), lease, (), None
     if not args or args[0] != "git":
-        return args, None
-    runtime = git_runtime()
+        if git_runtime_receipt is not None:
+            raise PlanError("a Git runtime receipt requires a Git command")
+        return args, None, (), None
+    require_transport_helpers = git_runtime_receipt is not None
+    runtime = (
+        revalidate_git_runtime(
+            git_runtime_receipt,
+            require_transport_helpers=True,
+        )
+        if git_runtime_receipt is not None
+        else git_runtime()
+    )
     command = safe_git_command_for_runtime(
         runtime,
         args,
@@ -1584,7 +1894,72 @@ def prepare_command_execution(
         runtime.content_sha256,
         "owner-private Git executable snapshot",
     )
-    return command, lease
+    helper_leases: list[ExecutableExecutionLease] = []
+    try:
+        if require_transport_helpers:
+            for helper_name, receipt in zip(
+                GIT_TRANSPORT_HELPER_NAMES,
+                runtime.helper_snapshots,
+            ):
+                helper_leases.append(
+                    capture_executable_execution_lease(
+                        receipt.executable,
+                        receipt.executable_state,
+                        receipt.content_sha256,
+                        f"owner-private Git transport helper {helper_name}",
+                    )
+                )
+    except BaseException:
+        cleanup_errors: list[str] = []
+        for helper_lease in reversed(helper_leases):
+            try:
+                helper_lease.close()
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(str(cleanup_exc))
+        try:
+            lease.close()
+        except BaseException as cleanup_exc:
+            cleanup_errors.append(str(cleanup_exc))
+        if cleanup_errors:
+            raise PlanError(
+                "Git helper execution-lease capture failed and cleanup was "
+                "incomplete: " + "; ".join(cleanup_errors)
+            )
+        raise
+    return command, lease, tuple(helper_leases), runtime
+
+
+def close_executable_execution_leases(
+    main_lease: Optional[ExecutableExecutionLease],
+    helper_leases: tuple[ExecutableExecutionLease, ...],
+) -> None:
+    cleanup_errors: list[str] = []
+    for helper_lease in reversed(helper_leases):
+        try:
+            helper_lease.close()
+        except BaseException as exc:
+            cleanup_errors.append(str(exc))
+    if main_lease is not None:
+        try:
+            main_lease.close()
+        except BaseException as exc:
+            cleanup_errors.append(str(exc))
+    if cleanup_errors:
+        raise PlanError(
+            "executable execution-lease cleanup failed: " + "; ".join(cleanup_errors)
+        )
+
+
+def revalidate_helper_execution_leases(
+    helper_leases: tuple[ExecutableExecutionLease, ...],
+) -> None:
+    try:
+        for helper_lease in helper_leases:
+            revalidate_executable_execution_lease_in_child(helper_lease)
+    except OSError as exc:
+        raise PlanError(
+            f"Git transport-helper closure changed while Git was running: {exc}"
+        ) from exc
 
 
 def run(
@@ -1595,25 +1970,36 @@ def run(
     capture: bool = True,
     extra_env: Optional[dict[str, str]] = None,
 ) -> subprocess.CompletedProcess[str]:
-    command, executable_lease = prepare_command_execution(args)
+    (
+        command,
+        executable_lease,
+        helper_leases,
+        selected_runtime,
+    ) = prepare_command_execution(args)
 
     def executable_gate() -> None:
+        for helper_lease in helper_leases:
+            revalidate_executable_execution_lease_in_child(helper_lease)
         if executable_lease is not None:
             revalidate_executable_execution_lease_in_child(executable_lease)
 
-    inherited_descriptors = (
-        ()
-        if executable_lease is None
-        else (
-            executable_lease.parent_descriptor,
-            executable_lease.descriptor,
-        )
-    )
+    inherited_descriptor_set: set[int] = set()
+    for helper_lease in helper_leases:
+        inherited_descriptor_set.add(helper_lease.parent_descriptor)
+        inherited_descriptor_set.add(helper_lease.descriptor)
+    if executable_lease is not None:
+        inherited_descriptor_set.add(executable_lease.parent_descriptor)
+        inherited_descriptor_set.add(executable_lease.descriptor)
+    inherited_descriptors = tuple(sorted(inherited_descriptor_set))
     try:
         result = subprocess.run(
             command,
             cwd=str(cwd) if cwd else None,
-            env=git_environment(extra_env),
+            env=git_environment(
+                extra_env,
+                runtime=selected_runtime,
+                include_git_exec_path=bool(helper_leases),
+            ),
             stdin=subprocess.DEVNULL,
             text=True,
             stdout=subprocess.PIPE if capture else None,
@@ -1624,13 +2010,17 @@ def run(
                 else executable_subprocess_path(executable_lease)
             ),
             pass_fds=inherited_descriptors,
-            preexec_fn=executable_gate if executable_lease is not None else None,
+            preexec_fn=(
+                executable_gate
+                if executable_lease is not None or helper_leases
+                else None
+            ),
         )
+        revalidate_helper_execution_leases(helper_leases)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise GitError(f"failed to start {shell_join(command)}: {exc}") from exc
     finally:
-        if executable_lease is not None:
-            executable_lease.close()
+        close_executable_execution_leases(executable_lease, helper_leases)
     if check and result.returncode != 0:
         stderr = (result.stderr or "").strip()
         raise GitError(
@@ -1652,38 +2042,220 @@ def wait_for_process_reap(
         return False
 
 
+MANAGED_CHILD_SIGNALS = tuple(
+    getattr(signal, name)
+    for name in ("SIGINT", "SIGTERM", "SIGHUP")
+    if hasattr(signal, name)
+)
+
+
+class ChildSignalGate:
+    """Latch the first managed signal and raise only at parent-owned checkpoints."""
+
+    def __init__(self) -> None:
+        self._armed = False
+        self._raised = False
+        self._pending: Optional[int] = None
+
+    def handle(self, signum: int, _frame: object) -> None:
+        if self._pending is None:
+            self._pending = signum
+
+    def arm(self) -> None:
+        self._armed = True
+
+    def raise_if_pending(self) -> None:
+        if self._armed and not self._raised and self._pending is not None:
+            self._raised = True
+            raise ForwardedProcessSignal(self._pending)
+
+
+def start_child_signal_supervision() -> tuple[
+    ChildSignalGate,
+    dict[int, signal.Handlers],
+    set[signal.Signals],
+    set[signal.Signals],
+]:
+    """Block managed signals before spawn so no mutating child is orphaned."""
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if os.name != "posix" or not callable(pthread_sigmask):
+        raise PlanError("bounded child signal forwarding requires POSIX signal masks")
+    gate = ChildSignalGate()
+    inherited_mask = pthread_sigmask(signal.SIG_BLOCK, MANAGED_CHILD_SIGNALS)
+    supervisor_mask = set(inherited_mask).difference(MANAGED_CHILD_SIGNALS)
+    previous_handlers: dict[int, signal.Handlers] = {}
+    try:
+        for signum in MANAGED_CHILD_SIGNALS:
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, gate.handle)
+    except BaseException:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
+        raise
+    return gate, previous_handlers, set(inherited_mask), supervisor_mask
+
+
+def restore_child_signal_supervision(
+    previous_handlers: dict[int, signal.Handlers],
+    inherited_mask: set[signal.Signals],
+) -> None:
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if not callable(pthread_sigmask):
+        return
+    pthread_sigmask(signal.SIG_BLOCK, MANAGED_CHILD_SIGNALS)
+    first_error: Optional[BaseException] = None
+    for signum, handler in previous_handlers.items():
+        try:
+            signal.signal(signum, handler)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    try:
+        pthread_sigmask(signal.SIG_SETMASK, inherited_mask)
+    except BaseException as exc:
+        if first_error is None:
+            first_error = exc
+    if first_error is not None:
+        raise PlanError(
+            f"bounded child signal supervision cleanup failed: {first_error}"
+        ) from first_error
+
+
+def finish_child_signal_supervision(
+    gate: ChildSignalGate,
+    previous_handlers: dict[int, signal.Handlers],
+    inherited_mask: set[signal.Signals],
+    outcome_exception: Optional[BaseException],
+) -> None:
+    late_signal: Optional[ForwardedProcessSignal] = None
+    cleanup_error: Optional[PlanError] = None
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, MANAGED_CHILD_SIGNALS)
+        try:
+            gate.raise_if_pending()
+        except ForwardedProcessSignal as signal_exc:
+            late_signal = signal_exc
+        restore_child_signal_supervision(
+            previous_handlers,
+            inherited_mask,
+        )
+    except PlanError as exc:
+        cleanup_error = exc
+
+    active_signal = (
+        outcome_exception
+        if isinstance(outcome_exception, ForwardedProcessSignal)
+        else late_signal
+    )
+    if cleanup_error is not None:
+        if active_signal is not None:
+            active_signal.add_cleanup_error(str(cleanup_error))
+        elif outcome_exception is not None:
+            raise PlanError(
+                f"{outcome_exception}\n{cleanup_error}"
+            ) from outcome_exception
+        else:
+            raise cleanup_error
+    if late_signal is not None and not isinstance(
+        outcome_exception,
+        ForwardedProcessSignal,
+    ):
+        raise late_signal from outcome_exception
+
+
+def drain_process_pipes_until(
+    selector: Optional[selectors.BaseSelector],
+    deadline: float,
+) -> None:
+    if selector is None:
+        while time.monotonic() < deadline:
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        return
+    while selector.get_map() and time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        events = selector.select(min(0.02, max(0.0, remaining)))
+        for key, _ in events:
+            try:
+                chunk = os.read(key.fd, 64 * 1024)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                try:
+                    selector.unregister(key.fileobj)
+                except (KeyError, ValueError):
+                    pass
+                try:
+                    key.fileobj.close()
+                except OSError:
+                    pass
+
+
 def terminate_process_group(
     process: subprocess.Popen[bytes],
     *,
+    initial_signal: int = signal.SIGTERM,
+    selector: Optional[selectors.BaseSelector] = None,
     cleanup_timeout_seconds: float = PROCESS_CLEANUP_TIMEOUT_SECONDS,
     term_grace_seconds: float = PROCESS_TERM_GRACE_SECONDS,
 ) -> None:
+    """Forward the original signal, then bound group cleanup and direct reap."""
     cleanup_deadline = time.monotonic() + max(0.0, cleanup_timeout_seconds)
+    # poll() also reaps an exited direct child. Once that leader is reaped,
+    # its numeric PID/PGID may be reused, so a later killpg() would no longer
+    # be identity-safe. Bounded commands drain their pipes before the normal
+    # wait path; an already-complete child therefore needs no signal cleanup.
+    if process.poll() is not None:
+        return
     group_cleanup_error: Optional[str] = None
-    term_sent = False
+    initial_sent = False
     try:
         if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process.pid, initial_signal)
         else:
-            process.terminate()
-        term_sent = True
+            process.send_signal(initial_signal)
+        initial_sent = True
     except ProcessLookupError:
         pass
     except OSError as exc:
-        group_cleanup_error = f"cannot signal the process group with TERM: {exc}"
+        group_cleanup_error = (
+            f"cannot forward signal {initial_signal} to the process group: {exc}"
+        )
         try:
             process.terminate()
-            term_sent = True
+            initial_sent = True
         except (OSError, ProcessLookupError):
             pass
 
-    if term_sent:
+    if initial_sent:
         remaining = cleanup_deadline - time.monotonic()
         grace = min(max(0.0, term_grace_seconds), max(0.0, remaining))
         if grace:
             # Do not reap the group leader before KILL. Retaining the zombie
             # prevents PID/PGID reuse during the TERM grace window.
-            time.sleep(grace)
+            first_grace = grace if initial_signal == signal.SIGTERM else grace / 2
+            drain_process_pipes_until(
+                selector,
+                time.monotonic() + first_grace,
+            )
+            if initial_signal != signal.SIGTERM:
+                try:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGTERM)
+                    else:
+                        process.terminate()
+                except ProcessLookupError:
+                    pass
+                except OSError as exc:
+                    if group_cleanup_error is None:
+                        group_cleanup_error = (
+                            "cannot signal the process group with TERM after "
+                            f"forwarding signal {initial_signal}: {exc}"
+                        )
+                drain_process_pipes_until(
+                    selector,
+                    min(cleanup_deadline, time.monotonic() + (grace - first_grace)),
+                )
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGKILL)
@@ -1699,6 +2271,7 @@ def terminate_process_group(
         except (OSError, ProcessLookupError):
             pass
 
+    drain_process_pipes_until(selector, cleanup_deadline)
     remaining = cleanup_deadline - time.monotonic()
     reaped = wait_for_process_reap(process, max(0.0, remaining))
     if not reaped:
@@ -1732,6 +2305,7 @@ def run_bounded_bytes(
     directory_absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...] = (),
     file_content_leases: tuple[DescriptorBoundFileLease, ...] = (),
     executable_snapshot_receipt: Optional[ExecutableSnapshotReceipt] = None,
+    git_runtime_receipt: Optional[GitRuntime] = None,
 ) -> subprocess.CompletedProcess[bytes]:
     if input_bytes is not None and len(input_bytes) > GIT_INPUT_LIMIT_BYTES:
         raise PlanError(
@@ -1747,9 +2321,8 @@ def run_bounded_bytes(
         raise PlanError(
             "prepared Git commands cannot use an explicit executable snapshot receipt"
         )
-    environment = (
-        dict(fixed_env) if fixed_env is not None else git_environment(extra_env)
-    )
+    if not prepare_git_command and git_runtime_receipt is not None:
+        raise PlanError("a Git runtime receipt requires a prepared Git command")
     if (
         directory_descriptor is not None
         or directory_identity_leases
@@ -1783,19 +2356,49 @@ def run_bounded_bytes(
             input_file.write(input_bytes)
             input_file.seek(0)
         if prepare_git_command:
-            command, executable_lease = prepare_command_execution(
+            (
+                command,
+                executable_lease,
+                helper_leases,
+                selected_runtime,
+            ) = prepare_command_execution(
                 args,
                 preserve_split_index=preserve_split_index,
+                git_runtime_receipt=git_runtime_receipt,
             )
         elif executable_snapshot_receipt is not None:
-            command, executable_lease = prepare_command_execution(
+            (
+                command,
+                executable_lease,
+                helper_leases,
+                selected_runtime,
+            ) = prepare_command_execution(
                 args,
                 executable_snapshot_receipt=executable_snapshot_receipt,
             )
         else:
             command = args
             executable_lease = None
+            helper_leases = ()
+            selected_runtime = None
+        environment = (
+            dict(fixed_env)
+            if fixed_env is not None
+            else git_environment(
+                extra_env,
+                runtime=selected_runtime,
+                include_git_exec_path=bool(helper_leases),
+            )
+        )
+        if helper_leases and environment.get("GIT_EXEC_PATH") != str(
+            selected_runtime.exec_path
+        ):
+            raise PlanError(
+                "prepared Git environment does not bind the trusted helper path"
+            )
     except BaseException:
+        if "executable_lease" in locals():
+            close_executable_execution_leases(executable_lease, helper_leases)
         input_file.close()
         raise
 
@@ -2124,9 +2727,14 @@ def run_bounded_bytes(
                 )
         if directory_descriptor is not None:
             os.fchdir(directory_descriptor)
+        for helper_lease in helper_leases:
+            revalidate_executable_execution_lease_in_child(helper_lease)
         if executable_lease is not None:
-            # Keep this as the final child-side action before Popen performs exec.
+            # Keep executable validation after every other filesystem gate.
             revalidate_executable_execution_lease_in_child(executable_lease)
+        for signum in MANAGED_CHILD_SIGNALS:
+            signal.signal(signum, signal.SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_SETMASK, supervisor_signal_mask)
 
     inherited_descriptors: set[int] = set()
     if directory_descriptor is not None:
@@ -2141,142 +2749,216 @@ def run_bounded_bytes(
     for lease in file_content_leases:
         inherited_descriptors.add(lease.directory_descriptor)
         inherited_descriptors.add(lease.descriptor)
+    for helper_lease in helper_leases:
+        inherited_descriptors.add(helper_lease.parent_descriptor)
+        inherited_descriptors.add(helper_lease.descriptor)
     if executable_lease is not None:
         inherited_descriptors.add(executable_lease.parent_descriptor)
         inherited_descriptors.add(executable_lease.descriptor)
 
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=str(cwd) if cwd else None,
-            env=environment,
-            stdin=input_file,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=os.name == "posix",
-            pass_fds=tuple(sorted(inherited_descriptors)),
-            executable=(
-                None
-                if executable_lease is None
-                else executable_subprocess_path(executable_lease)
-            ),
-            preexec_fn=(
-                enter_bound_directory
-                if (
-                    directory_descriptor is not None
-                    or directory_identity_leases
-                    or directory_child_inventory_leases
-                    or directory_absent_entry_leases
-                    or file_content_leases
-                    or executable_lease is not None
-                )
-                else None
-            ),
-        )
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        lease_cleanup_error: Optional[BaseException] = None
-        if executable_lease is not None:
-            try:
-                executable_lease.close()
-            except BaseException as cleanup_exc:
-                lease_cleanup_error = cleanup_exc
+        (
+            signal_gate,
+            previous_signal_handlers,
+            inherited_signal_mask,
+            supervisor_signal_mask,
+        ) = start_child_signal_supervision()
+    except BaseException:
+        close_executable_execution_leases(executable_lease, helper_leases)
         input_file.close()
-        if lease_cleanup_error is not None:
-            raise GitError(
-                f"failed to start {shell_join(command)}: {exc}; "
-                f"executable lease cleanup failed: {lease_cleanup_error}"
-            ) from exc
-        raise GitError(f"failed to start {shell_join(command)}: {exc}") from exc
-    if executable_lease is not None:
-        try:
-            executable_lease.close()
-        except BaseException as exc:
-            try:
-                terminate_process_group(process)
-            finally:
-                if process.stdout is not None:
-                    process.stdout.close()
-                if process.stderr is not None:
-                    process.stderr.close()
-                input_file.close()
-            raise PlanError(
-                f"executable execution-lease cleanup failed after spawn: {exc}"
-            ) from exc
-
-    stdout_pipe = process.stdout
-    stderr_pipe = process.stderr
+        raise
+    process: Optional[subprocess.Popen[bytes]] = None
+    stdout_pipe: Optional[BinaryIO] = None
+    stderr_pipe: Optional[BinaryIO] = None
     selector: Optional[selectors.BaseSelector] = None
+    main_lease_open = executable_lease is not None
+    helper_leases_open = bool(helper_leases)
+    outcome_exception: Optional[BaseException] = None
     stdout = bytearray()
     stderr = bytearray()
-    deadline = time.monotonic() + timeout_seconds
-    failure: Optional[str] = None
     try:
-        if stdout_pipe is None or stderr_pipe is None:
-            raise GitError(f"{shell_join(command)} did not provide capture pipes")
-        selector = selectors.DefaultSelector()
-        selector.register(stdout_pipe, selectors.EVENT_READ, "stdout")
-        selector.register(stderr_pipe, selectors.EVENT_READ, "stderr")
-        while selector.get_map():
+        try:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(cwd) if cwd else None,
+                    env=environment,
+                    stdin=input_file,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                    pass_fds=tuple(sorted(inherited_descriptors)),
+                    executable=(
+                        None
+                        if executable_lease is None
+                        else executable_subprocess_path(executable_lease)
+                    ),
+                    preexec_fn=enter_bound_directory,
+                )
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                raise GitError(f"failed to start {shell_join(command)}: {exc}") from exc
+
+            signal_gate.arm()
+            signal.pthread_sigmask(
+                signal.SIG_SETMASK,
+                supervisor_signal_mask,
+            )
+            signal_gate.raise_if_pending()
+            close_executable_execution_leases(
+                executable_lease,
+                (),
+            )
+            main_lease_open = False
+            signal_gate.raise_if_pending()
+
+            stdout_pipe = process.stdout
+            stderr_pipe = process.stderr
+            if stdout_pipe is None or stderr_pipe is None:
+                raise GitError(f"{shell_join(command)} did not provide capture pipes")
+            selector = selectors.DefaultSelector()
+            selector.register(stdout_pipe, selectors.EVENT_READ, "stdout")
+            selector.register(stderr_pipe, selectors.EVENT_READ, "stderr")
+            deadline = time.monotonic() + timeout_seconds
+            failure: Optional[str] = None
+            while selector.get_map():
+                signal_gate.raise_if_pending()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failure = f"exceeded the {timeout_seconds:g}-second deadline"
+                    break
+                events = selector.select(min(remaining, 0.25))
+                signal_gate.raise_if_pending()
+                for key, _ in events:
+                    chunk = os.read(key.fd, 64 * 1024)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    retained = stdout if key.data == "stdout" else stderr
+                    limit = stdout_limit if key.data == "stdout" else stderr_limit
+                    if len(retained) + len(chunk) > limit:
+                        failure = (
+                            f"{key.data} exceeds the {limit}-byte retained-output limit"
+                        )
+                        break
+                    retained.extend(chunk)
+                if failure is not None:
+                    break
+            if failure is not None:
+                raise PlanError(f"{shell_join(command)} {failure}")
+            signal_gate.raise_if_pending()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 failure = f"exceeded the {timeout_seconds:g}-second deadline"
-                break
-            events = selector.select(min(remaining, 0.25))
-            for key, _ in events:
-                chunk = os.read(key.fd, 64 * 1024)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    key.fileobj.close()
-                    continue
-                retained = stdout if key.data == "stdout" else stderr
-                limit = stdout_limit if key.data == "stdout" else stderr_limit
-                if len(retained) + len(chunk) > limit:
-                    failure = (
-                        f"{key.data} exceeds the {limit}-byte retained-output limit"
-                    )
-                    break
-                retained.extend(chunk)
+            else:
+                try:
+                    returncode = process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    failure = f"exceeded the {timeout_seconds:g}-second deadline"
+            signal_gate.raise_if_pending()
             if failure is not None:
-                break
-        if failure is not None:
-            raise PlanError(f"{shell_join(command)} {failure}")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            failure = f"exceeded the {timeout_seconds:g}-second deadline"
-        else:
+                raise PlanError(f"{shell_join(command)} {failure}")
+            revalidate_helper_execution_leases(helper_leases)
             try:
-                returncode = process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                failure = f"exceeded the {timeout_seconds:g}-second deadline"
-        if failure is not None:
-            raise PlanError(f"{shell_join(command)} {failure}")
+                close_executable_execution_leases(None, helper_leases)
+            finally:
+                helper_leases_open = False
+        except BaseException as exc:
+            effective_exception = exc
+            try:
+                signal_gate.raise_if_pending()
+            except ForwardedProcessSignal as signal_exc:
+                effective_exception = signal_exc
+
+            cleanup_errors: list[str] = []
+            if main_lease_open:
+                try:
+                    close_executable_execution_leases(
+                        executable_lease,
+                        (),
+                    )
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(str(cleanup_exc))
+                main_lease_open = False
+            if process is not None:
+                try:
+                    terminate_process_group(
+                        process,
+                        initial_signal=(
+                            effective_exception.signum
+                            if isinstance(
+                                effective_exception,
+                                ForwardedProcessSignal,
+                            )
+                            else signal.SIGTERM
+                        ),
+                        selector=selector,
+                    )
+                except PlanError as cleanup_exc:
+                    cleanup_errors.append(str(cleanup_exc))
+            if helper_leases_open:
+                try:
+                    revalidate_helper_execution_leases(helper_leases)
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(str(cleanup_exc))
+                try:
+                    close_executable_execution_leases(
+                        None,
+                        helper_leases,
+                    )
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(str(cleanup_exc))
+                helper_leases_open = False
+            try:
+                signal_gate.raise_if_pending()
+            except ForwardedProcessSignal as signal_exc:
+                effective_exception = signal_exc
+
+            if isinstance(effective_exception, ForwardedProcessSignal):
+                for cleanup_error in cleanup_errors:
+                    effective_exception.add_cleanup_error(cleanup_error)
+                raise effective_exception from (
+                    None if effective_exception is exc else exc
+                )
+            if cleanup_errors:
+                raise PlanError(
+                    f"{effective_exception}\n" + "\n".join(cleanup_errors)
+                ) from effective_exception
+            if effective_exception is exc:
+                raise
+            raise effective_exception from exc
+        finally:
+            if selector is not None:
+                selector.close()
+            if stdout_pipe is not None:
+                stdout_pipe.close()
+            if stderr_pipe is not None:
+                stderr_pipe.close()
+            input_file.close()
+
+        result = subprocess.CompletedProcess(
+            args=command,
+            returncode=returncode,
+            stdout=bytes(stdout),
+            stderr=bytes(stderr),
+        )
+        if check and returncode != 0:
+            error = os.fsdecode(result.stderr).strip()
+            raise GitError(
+                f"{shell_join(command)} failed with exit code {returncode}: {error}"
+            )
+        signal_gate.raise_if_pending()
+        return result
     except BaseException as exc:
-        try:
-            terminate_process_group(process)
-        except PlanError as cleanup_error:
-            raise PlanError(f"{exc}\n{cleanup_error}") from exc
+        outcome_exception = exc
         raise
     finally:
-        if selector is not None:
-            selector.close()
-        if stdout_pipe is not None:
-            stdout_pipe.close()
-        if stderr_pipe is not None:
-            stderr_pipe.close()
-        input_file.close()
-
-    result = subprocess.CompletedProcess(
-        args=command,
-        returncode=returncode,
-        stdout=bytes(stdout),
-        stderr=bytes(stderr),
-    )
-    if check and returncode != 0:
-        error = os.fsdecode(result.stderr).strip()
-        raise GitError(
-            f"{shell_join(command)} failed with exit code {returncode}: {error}"
+        finish_child_signal_supervision(
+            signal_gate,
+            previous_signal_handlers,
+            inherited_signal_mask,
+            outcome_exception,
         )
-    return result
 
 
 def run_git_at_directory_descriptor(
@@ -7355,25 +8037,361 @@ class CleanupGuardGroup:
 
 
 class OwnerPrivateTemporaryDirectory:
+    """Descriptor-bind and conditionally remove one owner-private temp root.
+
+    The protected property is the root/child object identity plus owner, group,
+    mode, and required access. Entry churn inside the exact root is expected
+    during cleanup; timestamps are deliberately excluded from the comparison.
+    """
+
     def __init__(self, prefix: str) -> None:
-        self.name = tempfile.mkdtemp(prefix=prefix)
-        self._path = Path(self.name)
-        self._fingerprint = filesystem_fingerprint(self._path)
+        created_path = Path(tempfile.mkdtemp(prefix=prefix)).resolve(strict=True)
+        self.name = str(created_path)
+        self._path = created_path
+        self._parent_path = created_path.parent
+        self._entry_name = created_path.name
+        self._fingerprint = filesystem_fingerprint(created_path)
+        self._parent_binding = capture_typed_access(
+            self._parent_path,
+            os.R_OK | os.W_OK | os.X_OK,
+            "owner-private temporary directory parent",
+            stat.S_IFDIR,
+        )
+        self._binding = capture_owner_private_directory(
+            created_path,
+            "owner-private temporary directory",
+        )
+        self._parent_descriptor = -1
+        self._descriptor = -1
         self._active = True
+        try:
+            if self._binding.fingerprint != self._fingerprint:
+                raise PlanError(
+                    "owner-private temporary directory changed during binding"
+                )
+            self._parent_descriptor = open_directory_descriptor(
+                self._parent_path,
+                "owner-private temporary directory parent",
+            )
+            self._descriptor = open_directory_descriptor(
+                created_path,
+                "owner-private temporary directory",
+            )
+            revalidate_directory_descriptor(
+                self._parent_binding,
+                self._parent_descriptor,
+            )
+            revalidate_directory_descriptor(
+                self._binding,
+                self._descriptor,
+            )
+        except BaseException as exc:
+            self._active = False
+            self._close_descriptors()
+            raise TemporaryDirectoryCleanupError(
+                status="initial-binding-unavailable",
+                location=created_path,
+                expected=self._fingerprint,
+                detail=str(exc),
+            ) from exc
+
+    def _close_descriptors(self) -> None:
+        if self._descriptor >= 0:
+            os.close(self._descriptor)
+            self._descriptor = -1
+        if self._parent_descriptor >= 0:
+            os.close(self._parent_descriptor)
+            self._parent_descriptor = -1
+
+    @staticmethod
+    def _entry_fingerprint(
+        directory_descriptor: int,
+        entry_name: str,
+    ) -> FsFingerprint:
+        return fingerprint_from_stat(
+            os.stat(
+                entry_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        )
+
+    @classmethod
+    def _remove_contents_at(
+        cls,
+        directory_descriptor: int,
+        directory_fingerprint: FsFingerprint,
+        display_path: Path,
+    ) -> None:
+        if fingerprint_from_stat(os.fstat(directory_descriptor)) != (
+            directory_fingerprint
+        ):
+            raise PlanError(
+                f"temporary cleanup directory changed before traversal: {display_path}"
+            )
+        try:
+            entry_names = sorted(os.listdir(directory_descriptor))
+        except OSError as exc:
+            raise PlanError(
+                f"cannot enumerate temporary cleanup directory: {display_path}\n"
+                f"  error: {exc}"
+            ) from exc
+        for entry_name in entry_names:
+            validate_descriptor_entry_name(entry_name)
+            entry_path = display_path / entry_name
+            try:
+                entry_fingerprint = cls._entry_fingerprint(
+                    directory_descriptor,
+                    entry_name,
+                )
+            except OSError as exc:
+                raise PlanError(
+                    f"temporary cleanup entry became unavailable: {entry_path}\n"
+                    f"  error: {exc}"
+                ) from exc
+            if entry_fingerprint.kind == stat.S_IFDIR:
+                child_descriptor = -1
+                try:
+                    child_descriptor = os.open(
+                        entry_name,
+                        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                        dir_fd=directory_descriptor,
+                    )
+                    if (
+                        fingerprint_from_stat(os.fstat(child_descriptor))
+                        != entry_fingerprint
+                        or cls._entry_fingerprint(
+                            directory_descriptor,
+                            entry_name,
+                        )
+                        != entry_fingerprint
+                    ):
+                        raise PlanError(
+                            "temporary cleanup child directory identity or "
+                            f"access policy changed: {entry_path}"
+                        )
+                    cls._remove_contents_at(
+                        child_descriptor,
+                        entry_fingerprint,
+                        entry_path,
+                    )
+                    if (
+                        fingerprint_from_stat(os.fstat(child_descriptor))
+                        != entry_fingerprint
+                        or cls._entry_fingerprint(
+                            directory_descriptor,
+                            entry_name,
+                        )
+                        != entry_fingerprint
+                    ):
+                        raise PlanError(
+                            "temporary cleanup child directory changed after "
+                            f"traversal: {entry_path}"
+                        )
+                    os.rmdir(entry_name, dir_fd=directory_descriptor)
+                except OSError as exc:
+                    raise PlanError(
+                        f"cannot remove temporary cleanup directory: {entry_path}\n"
+                        f"  error: {exc}"
+                    ) from exc
+                finally:
+                    if child_descriptor >= 0:
+                        os.close(child_descriptor)
+            else:
+                try:
+                    if (
+                        cls._entry_fingerprint(
+                            directory_descriptor,
+                            entry_name,
+                        )
+                        != entry_fingerprint
+                    ):
+                        raise PlanError(
+                            "temporary cleanup entry object or access policy "
+                            f"changed: {entry_path}"
+                        )
+                    os.unlink(entry_name, dir_fd=directory_descriptor)
+                except OSError as exc:
+                    raise PlanError(
+                        f"cannot remove temporary cleanup entry: {entry_path}\n"
+                        f"  error: {exc}"
+                    ) from exc
+            if fingerprint_from_stat(os.fstat(directory_descriptor)) != (
+                directory_fingerprint
+            ):
+                raise PlanError(
+                    "temporary cleanup parent object or access policy changed: "
+                    f"{display_path}"
+                )
+
+    def _restore_unexpected_quarantine(
+        self,
+        quarantine_name: str,
+    ) -> tuple[Path, str]:
+        quarantine_path = self._parent_path / quarantine_name
+        try:
+            os.stat(
+                self._entry_name,
+                dir_fd=self._parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            try:
+                descriptor_atomic_rename_noreplace(
+                    self._parent_descriptor,
+                    quarantine_name,
+                    self._entry_name,
+                )
+                os.fsync(self._parent_descriptor)
+                return (
+                    self._parent_path / self._entry_name,
+                    "the unexpected replacement was restored to its original pathname",
+                )
+            except BaseException as exc:
+                return (
+                    quarantine_path,
+                    "the unexpected replacement remains quarantined because "
+                    f"pathname restoration failed: {exc}",
+                )
+        except OSError as exc:
+            return (
+                quarantine_path,
+                "the original pathname could not be inspected while retaining "
+                f"the unexpected replacement: {exc}",
+            )
+        return (
+            quarantine_path,
+            "the original pathname is occupied; the unexpected replacement "
+            "remains quarantined",
+        )
 
     def cleanup(self) -> None:
         if not self._active:
             return
-        self._active = False
+        quarantine_name: Optional[str] = None
+        recovery_location = self._path
+        status = "identity-unverified-retained"
         try:
-            current = filesystem_fingerprint(self._path)
-        except PlanError:
-            return
-        if current != self._fingerprint:
-            # Fail safe on replacement: never recursively remove an object that
-            # is no longer the owner-private directory created by this guard.
-            return
-        shutil.rmtree(self._path)
+            revalidate_directory_descriptor(
+                self._parent_binding,
+                self._parent_descriptor,
+            )
+            if (
+                self._entry_fingerprint(
+                    self._parent_descriptor,
+                    self._entry_name,
+                )
+                != self._fingerprint
+                or fingerprint_from_stat(os.fstat(self._descriptor))
+                != self._fingerprint
+            ):
+                raise PlanError(
+                    "temporary directory pathname, descriptor, or access policy "
+                    "changed before cleanup"
+                )
+
+            # Atomic quarantine closes the pathname-check-to-recursive-open
+            # interval. A replacement captured by the rename is restored or
+            # retained; it is never passed to recursive removal.
+            for _attempt in range(8):
+                candidate = f".codex-cleanup-{secrets.token_hex(16)}"
+                try:
+                    descriptor_atomic_rename_noreplace(
+                        self._parent_descriptor,
+                        self._entry_name,
+                        candidate,
+                    )
+                    quarantine_name = candidate
+                    break
+                except AtomicRenameError as exc:
+                    if exc.error_number != errno.EEXIST:
+                        raise
+            if quarantine_name is None:
+                raise PlanError(
+                    "cannot reserve an owner-private cleanup quarantine name"
+                )
+            recovery_location = self._parent_path / quarantine_name
+            try:
+                quarantined_fingerprint = self._entry_fingerprint(
+                    self._parent_descriptor,
+                    quarantine_name,
+                )
+            except OSError as exc:
+                raise PlanError(
+                    f"cannot inspect quarantined temporary directory: {exc}"
+                ) from exc
+            if (
+                quarantined_fingerprint != self._fingerprint
+                or fingerprint_from_stat(os.fstat(self._descriptor))
+                != self._fingerprint
+            ):
+                recovery_location, restore_detail = self._restore_unexpected_quarantine(
+                    quarantine_name
+                )
+                quarantine_name = None
+                status = "unexpected-replacement-retained"
+                raise PlanError(
+                    "the cleanup quarantine captured an unexpected replacement; "
+                    f"{restore_detail}"
+                )
+            self._entry_name = quarantine_name
+            self._path = recovery_location
+            quarantine_name = None
+            status = "partial-cleanup-recovery-retained"
+            os.fsync(self._parent_descriptor)
+            revalidate_directory_descriptor(
+                self._parent_binding,
+                self._parent_descriptor,
+            )
+            self._remove_contents_at(
+                self._descriptor,
+                self._fingerprint,
+                self._path,
+            )
+            if (
+                self._entry_fingerprint(
+                    self._parent_descriptor,
+                    self._entry_name,
+                )
+                != self._fingerprint
+                or fingerprint_from_stat(os.fstat(self._descriptor))
+                != self._fingerprint
+            ):
+                raise PlanError(
+                    "quarantined temporary directory changed before final removal"
+                )
+            os.rmdir(
+                self._entry_name,
+                dir_fd=self._parent_descriptor,
+            )
+            os.fsync(self._parent_descriptor)
+            try:
+                os.stat(
+                    self._entry_name,
+                    dir_fd=self._parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise PlanError(
+                    "temporary cleanup quarantine still exists after removal"
+                )
+            revalidate_directory_descriptor(
+                self._parent_binding,
+                self._parent_descriptor,
+            )
+        except BaseException as exc:
+            self._active = False
+            self._close_descriptors()
+            raise TemporaryDirectoryCleanupError(
+                status=status,
+                location=recovery_location,
+                expected=self._fingerprint,
+                detail=str(exc),
+            ) from exc
+        self._active = False
+        self._close_descriptors()
 
     def __del__(self) -> None:
         try:
@@ -7673,7 +8691,8 @@ def capture_transport_receipt(
                 content_sha256=ssh_digest,
             )
             ssh_command = ssh_command_for_executable(ssh_snapshot)
-        environment = git_environment()
+        runtime_receipt = git_runtime(require_transport_helpers=True)
+        environment = git_environment(runtime=runtime_receipt)
         environment["GIT_OBJECT_DIRECTORY"] = str(source_object_directory)
         revalidate_file_content_binding(config_binding)
         return TransportReceipt(
@@ -7695,6 +8714,7 @@ def capture_transport_receipt(
                 *private_access_bindings,
             ),
             fetch_file_bindings=fetch_file_bindings,
+            git_runtime_receipt=runtime_receipt,
             git_environment=tuple(sorted(environment.items())),
             fetch_guard=combined_guard,
         )
@@ -7708,6 +8728,7 @@ def capture_transport_receipt(
 def validate_frozen_git_environment(
     environment_items: tuple[tuple[str, str], ...],
     expected_object_directory: Path,
+    expected_git_exec_path: Path,
 ) -> None:
     environment = dict(environment_items)
     if len(environment) != len(environment_items):
@@ -7716,6 +8737,7 @@ def validate_frozen_git_environment(
         set(GIT_ENV_PASSTHROUGH)
         | set(SAFE_GIT_ENV)
         | {
+            "GIT_EXEC_PATH",
             "GIT_OBJECT_DIRECTORY",
         }
     )
@@ -7734,14 +8756,20 @@ def validate_frozen_git_environment(
         raise PlanError(
             "fetch transport environment changed the bound source object directory"
         )
-    if not expected_object_directory.is_absolute():
-        raise PlanError("fetch transport object directory is not absolute")
+    if environment.get("GIT_EXEC_PATH") != str(expected_git_exec_path):
+        raise PlanError("fetch transport environment changed the trusted helper path")
+    if (
+        not expected_object_directory.is_absolute()
+        or not expected_git_exec_path.is_absolute()
+    ):
+        raise PlanError("fetch transport object/helper paths are not absolute")
 
 
 def revalidate_transport_receipt(
     receipt: TransportReceipt,
     submodule: Submodule,
 ) -> None:
+    revalidate_git_runtime(receipt.git_runtime_receipt)
     if (
         receipt.approved_url != submodule.url
         or receipt.origin_url != receipt.approved_url
@@ -7814,6 +8842,7 @@ def revalidate_transport_receipt(
     validate_frozen_git_environment(
         receipt.git_environment,
         receipt.source_object_directory,
+        receipt.git_runtime_receipt.exec_path,
     )
 
 
@@ -7975,19 +9004,27 @@ def fetch_missing_commit(
             directory_child_inventory_leases=(source_object_child_lease,),
             directory_absent_entry_leases=fetch_control_lease.absent_entry_leases,
             file_content_leases=fetch_control_lease.file_leases,
+            git_runtime_receipt=receipt.git_runtime_receipt,
         )
     except BaseException as exc:
+        failure_detail = str(exc)
         try:
             close_fetch_execution_leases(
                 source_object_lease,
                 fetch_control_lease,
             )
         except BaseException as cleanup_exc:
-            exc = PlanError(f"{exc}; fetch exec-lease cleanup failed: {cleanup_exc}")
-        raise retain_source_fetch_transaction(
+            failure_detail += f"; fetch exec-lease cleanup failed: {cleanup_exc}"
+            if isinstance(exc, ForwardedProcessSignal):
+                exc.add_cleanup_error(str(cleanup_exc))
+        recovery_error = retain_source_fetch_transaction(
             transaction,
-            f"fetch process failed before boundary installation: {exc}",
-        ) from exc
+            f"fetch process failed before boundary installation: {failure_detail}",
+        )
+        if isinstance(exc, ForwardedProcessSignal):
+            exc.add_recovery_detail(str(recovery_error))
+            raise
+        raise recovery_error from exc
     try:
         close_fetch_execution_leases(
             source_object_lease,
@@ -9399,7 +10436,35 @@ def checkout_existing_worktree(
         revalidate_directory_entry_lease(source_lease)
         if finalize_checkout is not None:
             finalize_checkout(control, source_lease)
-    finally:
+    except BaseException as exc:
+        try:
+            control.close()
+        except BaseException as cleanup_exc:
+            if isinstance(exc, ForwardedProcessSignal):
+                exc.add_cleanup_error(
+                    f"managed control receipt cleanup failed: {cleanup_exc}"
+                )
+            else:
+                raise PlanError(
+                    f"{exc}\nmanaged control receipt cleanup failed: {cleanup_exc}"
+                ) from exc
+        if isinstance(exc, ForwardedProcessSignal):
+            exc.add_recovery_detail(
+                json.dumps(
+                    {
+                        "operation": "managed-worktree-checkout",
+                        "profile": "worktree-signal-recovery-v1",
+                        "recovery_status": "interrupted-checkout-retained",
+                        "source_git_dir": str(source_git_dir),
+                        "target": str(worktree_path),
+                        "target_commit": sha,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        raise
+    else:
         control.close()
 
 
@@ -10218,6 +11283,29 @@ def add_worktree(
             cleanup_details.append(
                 f"worktree/materialization rollback failed: {rollback_error}"
             )
+        if isinstance(exc, ForwardedProcessSignal):
+            exc.add_recovery_detail(
+                json.dumps(
+                    {
+                        "operation": "worktree-add",
+                        "profile": "worktree-signal-recovery-v1",
+                        "registration_attempted": registration_attempted,
+                        "registry_known_clean": registry_known_clean,
+                        "rollback_status": (
+                            "complete"
+                            if not cleanup_details
+                            else "incomplete-preserved"
+                        ),
+                        "source_git_dir": str(source_git_dir),
+                        "target": str(worktree_path),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            for cleanup_detail in cleanup_details:
+                exc.add_cleanup_error(cleanup_detail)
+            raise
         if cleanup_details:
             raise PlanError(f"{exc}\n" + "\n".join(cleanup_details)) from exc
         raise
@@ -11345,7 +12433,12 @@ def verify_target_object_payloads(
     try:
         input_file.write(object_input)
         input_file.seek(0)
-        command, executable_lease = prepare_command_execution(
+        (
+            command,
+            executable_lease,
+            helper_leases,
+            selected_runtime,
+        ) = prepare_command_execution(
             [
                 "git",
                 "--no-optional-locks",
@@ -11359,41 +12452,78 @@ def verify_target_object_payloads(
         raise
 
     def executable_gate() -> None:
+        for helper_lease in helper_leases:
+            revalidate_executable_execution_lease_in_child(helper_lease)
         if executable_lease is not None:
             revalidate_executable_execution_lease_in_child(executable_lease)
 
-    inherited_descriptors = (
-        ()
-        if executable_lease is None
-        else (
-            executable_lease.parent_descriptor,
-            executable_lease.descriptor,
+    inherited_descriptor_set: set[int] = set()
+    for helper_lease in helper_leases:
+        inherited_descriptor_set.add(helper_lease.parent_descriptor)
+        inherited_descriptor_set.add(helper_lease.descriptor)
+    if executable_lease is not None:
+        inherited_descriptor_set.add(executable_lease.parent_descriptor)
+        inherited_descriptor_set.add(executable_lease.descriptor)
+    inherited_descriptors = tuple(sorted(inherited_descriptor_set))
+    try:
+        (
+            signal_gate,
+            previous_signal_handlers,
+            inherited_signal_mask,
+            supervisor_signal_mask,
+        ) = start_child_signal_supervision()
+    except BaseException:
+        close_executable_execution_leases(
+            executable_lease,
+            helper_leases,
         )
-    )
+        input_file.close()
+        raise
+
+    def supervised_executable_gate() -> None:
+        executable_gate()
+        for signum in MANAGED_CHILD_SIGNALS:
+            signal.signal(signum, signal.SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_SETMASK, supervisor_signal_mask)
+
     try:
         process = subprocess.Popen(
             command,
-            env=git_environment(),
+            env=git_environment(
+                runtime=selected_runtime,
+                include_git_exec_path=bool(helper_leases),
+            ),
             stdin=input_file,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=os.name == "posix",
+            start_new_session=True,
             pass_fds=inherited_descriptors,
             executable=(
                 None
                 if executable_lease is None
                 else executable_subprocess_path(executable_lease)
             ),
-            preexec_fn=executable_gate if executable_lease is not None else None,
+            preexec_fn=supervised_executable_gate,
         )
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        start_error = GitError(
+            f"failed to start target object payload verification: {exc}"
+        )
         lease_cleanup_error: Optional[BaseException] = None
-        if executable_lease is not None:
-            try:
-                executable_lease.close()
-            except BaseException as cleanup_exc:
-                lease_cleanup_error = cleanup_exc
+        try:
+            close_executable_execution_leases(
+                executable_lease,
+                helper_leases,
+            )
+        except BaseException as cleanup_exc:
+            lease_cleanup_error = cleanup_exc
         input_file.close()
+        finish_child_signal_supervision(
+            signal_gate,
+            previous_signal_handlers,
+            inherited_signal_mask,
+            start_error,
+        )
         if lease_cleanup_error is not None:
             raise GitError(
                 "failed to start target object payload verification: "
@@ -11402,22 +12532,6 @@ def verify_target_object_payloads(
         raise GitError(
             f"failed to start target object payload verification: {exc}"
         ) from exc
-    if executable_lease is not None:
-        try:
-            executable_lease.close()
-        except BaseException as exc:
-            try:
-                terminate_process_group(process)
-            finally:
-                if process.stdout is not None:
-                    process.stdout.close()
-                if process.stderr is not None:
-                    process.stderr.close()
-                input_file.close()
-            raise PlanError(
-                "target object payload verifier executable lease cleanup "
-                f"failed after spawn: {exc}"
-            ) from exc
 
     stdout_pipe = process.stdout
     stderr_pipe = process.stderr
@@ -11437,6 +12551,9 @@ def verify_target_object_payloads(
     current_object_digest = None
     failure: Optional[str] = None
     returncode: Optional[int] = None
+    main_lease_open = executable_lease is not None
+    helper_leases_open = bool(helper_leases)
+    outcome_exception: Optional[BaseException] = None
 
     def consume_stdout_buffer() -> None:
         nonlocal current_id
@@ -11551,12 +12668,25 @@ def verify_target_object_payloads(
             current_object_digest = None
 
     try:
+        signal_gate.arm()
+        signal.pthread_sigmask(
+            signal.SIG_SETMASK,
+            supervisor_signal_mask,
+        )
+        signal_gate.raise_if_pending()
+        close_executable_execution_leases(
+            executable_lease,
+            (),
+        )
+        main_lease_open = False
+        signal_gate.raise_if_pending()
         if stdout_pipe is None or stderr_pipe is None:
             raise GitError("target object payload verification lacks capture pipes")
         selector = selectors.DefaultSelector()
         selector.register(stdout_pipe, selectors.EVENT_READ, "stdout")
         selector.register(stderr_pipe, selectors.EVENT_READ, "stderr")
         while selector.get_map() and failure is None:
+            signal_gate.raise_if_pending()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 failure = (
@@ -11564,7 +12694,9 @@ def verify_target_object_payloads(
                     f"{GIT_ENUMERATION_TIMEOUT_SECONDS:g}-second deadline"
                 )
                 break
-            for key, _ in selector.select(min(remaining, 0.25)):
+            events = selector.select(min(remaining, 0.25))
+            signal_gate.raise_if_pending()
+            for key, _ in events:
                 chunk = os.read(key.fd, 64 * 1024)
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -11592,6 +12724,7 @@ def verify_target_object_payloads(
                 if failure is not None:
                     break
         if failure is None:
+            signal_gate.raise_if_pending()
             consume_stdout_buffer()
         if failure is None and (
             object_index != len(ordered)
@@ -11617,14 +12750,74 @@ def verify_target_object_payloads(
                         "target checkout object payload verification exceeded the "
                         f"{GIT_ENUMERATION_TIMEOUT_SECONDS:g}-second deadline"
                     )
+        signal_gate.raise_if_pending()
         if failure is not None:
             raise PlanError(failure)
-    except BaseException as exc:
+        revalidate_helper_execution_leases(helper_leases)
         try:
-            terminate_process_group(process)
-        except PlanError as cleanup_error:
-            raise PlanError(f"{exc}\n{cleanup_error}") from exc
-        raise
+            close_executable_execution_leases(None, helper_leases)
+        finally:
+            helper_leases_open = False
+    except BaseException as exc:
+        effective_exception = exc
+        try:
+            signal_gate.raise_if_pending()
+        except ForwardedProcessSignal as signal_exc:
+            effective_exception = signal_exc
+        cleanup_errors: list[str] = []
+        if main_lease_open:
+            try:
+                close_executable_execution_leases(
+                    executable_lease,
+                    (),
+                )
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(str(cleanup_exc))
+            main_lease_open = False
+        try:
+            terminate_process_group(
+                process,
+                initial_signal=(
+                    effective_exception.signum
+                    if isinstance(effective_exception, ForwardedProcessSignal)
+                    else signal.SIGTERM
+                ),
+                selector=selector,
+            )
+        except PlanError as cleanup_exc:
+            cleanup_errors.append(str(cleanup_exc))
+        if helper_leases_open:
+            try:
+                revalidate_helper_execution_leases(helper_leases)
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(str(cleanup_exc))
+            try:
+                close_executable_execution_leases(
+                    None,
+                    helper_leases,
+                )
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(str(cleanup_exc))
+            helper_leases_open = False
+        try:
+            signal_gate.raise_if_pending()
+        except ForwardedProcessSignal as signal_exc:
+            effective_exception = signal_exc
+        if isinstance(effective_exception, ForwardedProcessSignal):
+            for cleanup_error in cleanup_errors:
+                effective_exception.add_cleanup_error(cleanup_error)
+            outcome_exception = effective_exception
+            raise effective_exception from (None if effective_exception is exc else exc)
+        if cleanup_errors:
+            combined_error = PlanError(
+                f"{effective_exception}\n" + "\n".join(cleanup_errors)
+            )
+            outcome_exception = combined_error
+            raise combined_error from effective_exception
+        outcome_exception = effective_exception
+        if effective_exception is exc:
+            raise
+        raise effective_exception from exc
     finally:
         if selector is not None:
             selector.close()
@@ -11633,6 +12826,12 @@ def verify_target_object_payloads(
         if stderr_pipe is not None:
             stderr_pipe.close()
         input_file.close()
+        finish_child_signal_supervision(
+            signal_gate,
+            previous_signal_handlers,
+            inherited_signal_mask,
+            outcome_exception,
+        )
 
     if returncode != 0:
         detail = os.fsdecode(retained_stderr).strip()
@@ -13583,9 +14782,29 @@ def main() -> int:
     return 0
 
 
+def redeliver_forwarded_signal(forwarded: ForwardedProcessSignal) -> NoReturn:
+    signal_name = signal.Signals(forwarded.signum).name
+    print(
+        f"interrupted by {signal_name} after child cleanup and recovery publication",
+        file=sys.stderr,
+    )
+    for detail in forwarded.recovery_details:
+        print(f"recovery: {detail}", file=sys.stderr)
+    for detail in forwarded.cleanup_errors:
+        print(f"cleanup-incomplete: {detail}", file=sys.stderr)
+    signal.signal(forwarded.signum, signal.SIG_DFL)
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if callable(pthread_sigmask):
+        pthread_sigmask(signal.SIG_UNBLOCK, {forwarded.signum})
+    os.kill(os.getpid(), forwarded.signum)
+    os._exit(128 + forwarded.signum)
+
+
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except ForwardedProcessSignal as exc:
+        redeliver_forwarded_signal(exc)
     except (GitError, PlanError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1)

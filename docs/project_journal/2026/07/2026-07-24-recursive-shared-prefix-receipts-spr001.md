@@ -3,7 +3,7 @@ id: 20260724-spr001
 title: Recursive Shared Prefix Receipts
 status: completed
 created: 2026-07-24
-updated: 2026-07-27
+updated: 2026-07-29
 branch: codex/toolbox-skill-sync-refactor
 pr:
 supersedes: []
@@ -48,6 +48,9 @@ superseded_by:
 - Private fetch `config`, `HEAD`, and `shallow` bindings retain independent 4 MiB, 64 KiB, and 64 MiB limits, allowing valid shallow boundaries larger than the config ceiling while rejecting content beyond the shallow cap.
 - Existing source shallow replacement locks must preserve the receipt-bound owner, group, and mode before exchange. A shared-repository process that cannot reproduce that policy fails closed without changing the original boundary.
 - A same-source, same-HEAD redirect to another worktree admin cannot satisfy finalization. New-target rollback atomically preserves each unexpected marker/backlink entry while temporarily restoring the retained original bytes for Git unregister, then verifies target, registry, materialized-parent, and plan-receipt restoration.
+- Receipt-bound file, HTTP, and HTTPS transports now use an owner-private `GIT_EXEC_PATH` containing exact-byte snapshots of `git-upload-pack`, `git-remote-http`, and `git-remote-https`. The runtime binds the source helper directory and every source/snapshot helper object, retains no-follow execution leases through the child lifetime, and revalidates the closure before release; local-only Git commands do not expose the unused helper path.
+- Bounded Git children now run in fresh process groups under a first-signal latch for `SIGINT`, `SIGTERM`, and `SIGHUP`. The original signal is forwarded before bounded TERM/KILL, pipes are drained, the direct child is reaped, mutation-specific recovery is published, and the CLI then exits under the original signal. Already reaped group leaders are never signalled because their numeric PID/PGID may have been reused.
+- Owner-private executable and fetch-control temporary roots now use descriptor-anchored cleanup. The exact root is atomically quarantined before no-follow recursive removal; pre-cleanup replacement, check-to-rename replacement, access drift, unreadable state, or partial cleanup retains a structured `owner-private-temporary-cleanup-v1` recovery location instead of invoking pathname-recursive deletion.
 
 ## Next Steps
 
@@ -99,3 +102,6 @@ superseded_by:
 - GitHub round-four launch/absence/cap follow-up: nine focused executable-path, same-inode executable rewrite, private shallow regular/symlink injection, independent-limit, control-file race, and successful-fetch regressions passed in 5.013 seconds.
 - The complete helper suite passed 209 tests in 243.690 seconds, and the complete repository module matrix passed 930 tests in 338.345 seconds.
 - Python compilation, repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, helper `--help`, skill validation, project-journal validation, sync-manifest validation, and `git diff --check` passed for the launch/absence/cap follow-up.
+- GitHub round-five transport/signal/cleanup follow-up: 14 focused regressions passed under Xcode Python 3.9.6 in 9.293 seconds, covering relocated helper prefixes, exact-byte helper drift, real file and HTTP transports, process-group signal forwarding, already-reaped PGID safety, descriptor-anchored quarantine cleanup, and fetch/add/checkout recovery publication.
+- The final complete helper suite passed 223 tests in 286.400 seconds, and the final complete repository module matrix passed 944 tests in 366.568 seconds.
+- Repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, current-Python and Python 3.9 compilation, helper `--help`, skill validation, project-journal validation, sync-manifest validation, and `git diff --check` passed for the transport/signal/cleanup follow-up.
