@@ -3090,6 +3090,178 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             dirty_content,
         )
 
+    def test_cached_filter_query_uses_retained_private_index_during_live_aba(
+        self,
+    ) -> None:
+        (self.remote / ".gitattributes").write_text(
+            "payload.bin filter=marker\n",
+            encoding="utf-8",
+        )
+        (self.remote / "payload.bin").write_text("payload\n", encoding="utf-8")
+        run_git(self.remote, "add", ".gitattributes", "payload.bin")
+        run_git(self.remote, "commit", "-m", "add index filter")
+        filtered_sha = run_git(self.remote, "rev-parse", "HEAD")
+        source = self.clone_named_source("cached-filter-private-index")
+        target = self.root / "cached-filter-private-index-target"
+        peer = self.root / "cached-filter-private-index-peer"
+        self.add_managed_worktree(source, target, filtered_sha)
+        self.add_managed_worktree(source, peer, self.sha)
+        managed_preflight, checkout_view = self.capture_managed_preflight_resources(
+            source,
+            target,
+            "cached-filter-private-index",
+            (filtered_sha,),
+        )
+        self.assertIsNotNone(checkout_view.private_index_path)
+        private_index_path = checkout_view.private_index_path
+        assert private_index_path is not None
+        index_path = managed_preflight.control.admin_git_dir / "index"
+        peer_admin = MODULE.gitdir_file_target(peer)
+        self.assertIsNotNone(peer_admin)
+        assert peer_admin is not None
+        original_index = index_path.read_bytes()
+        benign_index = (peer_admin / "index").read_bytes()
+        self.assertEqual(private_index_path.read_bytes(), original_index)
+
+        original_read_git_bounded = MODULE.read_git_bounded
+        raced_index = False
+
+        def query_during_live_index_aba(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal raced_index
+            if "check-attr" in args and "--cached" in args and not raced_index:
+                environment = kwargs.get("extra_env")
+                self.assertIsInstance(environment, dict)
+                assert isinstance(environment, dict)
+                self.assertEqual(
+                    environment.get("GIT_INDEX_FILE"),
+                    str(private_index_path),
+                )
+                index_path.write_bytes(benign_index)
+                raced_index = True
+                ungated_kwargs = dict(kwargs)
+                # Model an ABA after the production child pre-exec gate: the
+                # inner Git call must remain correct from its already selected
+                # private paths while the live admin index is attacker-owned.
+                for lease_key in (
+                    "directory_identity_leases",
+                    "directory_exact_inventory_leases",
+                    "directory_absent_entry_leases",
+                    "file_content_leases",
+                    "digest_file_leases",
+                ):
+                    ungated_kwargs[lease_key] = ()
+                try:
+                    return original_read_git_bounded(args, **ungated_kwargs)
+                finally:
+                    index_path.write_bytes(original_index)
+            return original_read_git_bounded(args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "read_git_bounded",
+            side_effect=query_during_live_index_aba,
+        ):
+            selections = MODULE.selected_index_filters(
+                checkout_view,
+                (("payload.bin",),),
+            )
+
+        self.assertTrue(raced_index)
+        self.assertEqual(
+            selections,
+            (
+                MODULE.FilterSelection(
+                    treeish="index",
+                    raw_path=b"payload.bin",
+                    driver="marker",
+                ),
+            ),
+        )
+        self.assertEqual(index_path.read_bytes(), original_index)
+        MODULE.revalidate_managed_preflight_receipt(managed_preflight)
+
+    def test_tree_filter_query_uses_private_info_attributes_during_live_aba(
+        self,
+    ) -> None:
+        source = self.clone_named_source("private-info-attributes")
+        attributes_path = source / "info" / "attributes"
+        attributes_content = b"README.md filter=marker\n"
+        attributes_path.write_bytes(attributes_content)
+        checkout_view = self.capture_checkout_execution_view(
+            source,
+            "private-info-attributes",
+        )
+        private_attributes_path = checkout_view.common_git_dir / "info" / "attributes"
+        self.assertEqual(private_attributes_path.read_bytes(), attributes_content)
+
+        original_read_git_bounded = MODULE.read_git_bounded
+        raced_attributes = False
+
+        def query_during_live_attributes_aba(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal raced_attributes
+            if "check-attr" in args and not raced_attributes:
+                environment = kwargs.get("extra_env")
+                self.assertIsInstance(environment, dict)
+                assert isinstance(environment, dict)
+                self.assertEqual(
+                    environment.get("GIT_COMMON_DIR"),
+                    str(checkout_view.common_git_dir),
+                )
+                self.assertIn(
+                    f"--git-dir={checkout_view.common_git_dir}",
+                    args,
+                )
+                attributes_path.write_bytes(b"README.md -filter\n")
+                raced_attributes = True
+                ungated_kwargs = dict(kwargs)
+                # Model an ABA after the production child pre-exec gate: the
+                # inner Git call must still consume the captured private
+                # attributes while the live common path is attacker-owned.
+                for lease_key in (
+                    "directory_identity_leases",
+                    "directory_exact_inventory_leases",
+                    "directory_absent_entry_leases",
+                    "file_content_leases",
+                    "digest_file_leases",
+                ):
+                    ungated_kwargs[lease_key] = ()
+                try:
+                    return original_read_git_bounded(args, **ungated_kwargs)
+                finally:
+                    attributes_path.write_bytes(attributes_content)
+            return original_read_git_bounded(args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "read_git_bounded",
+            side_effect=query_during_live_attributes_aba,
+        ):
+            selections = MODULE.selected_checkout_filters(
+                checkout_view,
+                self.sha,
+                (("README.md",),),
+            )
+
+        self.assertTrue(raced_attributes)
+        self.assertEqual(
+            selections,
+            (
+                MODULE.FilterSelection(
+                    treeish=self.sha,
+                    raw_path=b"README.md",
+                    driver="marker",
+                ),
+            ),
+        )
+        self.assertEqual(attributes_path.read_bytes(), attributes_content)
+        MODULE.revalidate_checkout_execution_view(checkout_view)
+
     def test_isolated_status_exec_gate_rejects_private_object_injection(
         self,
     ) -> None:
@@ -6413,7 +6585,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         hid_filter = False
 
         def temporarily_hide_filter(
-            source_git_dir: Path,
+            checkout_view: MODULE.CheckoutExecutionView,
             treeish: str,
             paths: tuple[tuple[str, ...], ...],
         ) -> tuple[MODULE.FilterSelection, ...]:
@@ -6422,10 +6594,10 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                 hid_filter = True
                 loose_attributes.write_bytes(forged_storage)
                 try:
-                    return original_selector(source_git_dir, treeish, paths)
+                    return original_selector(checkout_view, treeish, paths)
                 finally:
                     loose_attributes.write_bytes(original_storage)
-            return original_selector(source_git_dir, treeish, paths)
+            return original_selector(checkout_view, treeish, paths)
 
         registry_before = run_git(
             self.root,
@@ -6439,31 +6611,29 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             "selected_checkout_filters",
             side_effect=temporarily_hide_filter,
         ):
-            plan = MODULE.build_sync_plan(
-                root=target_super,
-                common_git_dir=self.named_common_git_dir,
-                source_superproject=None,
-                planned_modules=[
-                    (
-                        MODULE.Submodule(
-                            "custom-lib",
-                            "lib",
-                            str(self.remote),
-                        ),
-                        target_sha,
-                    )
-                ],
-                depth=1,
-                recursive=False,
-                force_replace_empty=False,
-                fetch_missing=False,
-            )
-            self.addCleanup(plan.close)
             with self.assertRaisesRegex(
                 MODULE.PlanError,
                 "untrusted content filter",
             ):
-                MODULE.apply_sync_plan(plan)
+                MODULE.build_sync_plan(
+                    root=target_super,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[
+                        (
+                            MODULE.Submodule(
+                                "custom-lib",
+                                "lib",
+                                str(self.remote),
+                            ),
+                            target_sha,
+                        )
+                    ],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    fetch_missing=False,
+                )
 
         self.assertTrue(hid_filter)
         self.assertFalse(marker.exists())
@@ -6546,7 +6716,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 MODULE.PlanError,
-                "common checkout attributes presence changed after preflight",
+                "source checkout attributes for lib entry must be absent before exec",
             ):
                 MODULE.apply_sync_plan(plan)
 
@@ -8496,7 +8666,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             target_sha,
         )
 
-    def test_recursive_apply_revalidates_temporarily_rewritten_gitmodules_blob(
+    def test_recursive_planning_rejects_temporarily_rewritten_gitmodules_blob(
         self,
     ) -> None:
         (
@@ -8535,7 +8705,13 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         ).stdout
-        forged_payload = original_payload + b"# temporary planning view\n"
+        forged_payload = original_payload.replace(
+            b"nested/child",
+            b"nested/other",
+            1,
+        )
+        self.assertEqual(len(forged_payload), len(original_payload))
+        self.assertNotEqual(forged_payload, original_payload)
         forged_storage = zlib.compress(
             f"blob {len(forged_payload)}\0".encode("ascii") + forged_payload
         )
@@ -8580,35 +8756,29 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             "_capture_commit_gitmodules_with_receipt",
             side_effect=temporarily_rewrite_gitmodules,
         ):
-            plan = MODULE.build_sync_plan(
-                root=target_super,
-                common_git_dir=source_common,
-                source_superproject=None,
-                planned_modules=[
-                    (
-                        MODULE.Submodule(
-                            "parent",
-                            "parent",
-                            "unused",
-                        ),
-                        parent_sha,
-                    )
-                ],
-                depth=1,
-                recursive=True,
-                force_replace_empty=False,
-                fetch_missing=False,
-            )
-            self.addCleanup(plan.close)
-            self.assertNotEqual(
-                plan.entries[0].recursive_metadata.gitmodules.content_sha256,
-                hashlib.sha256(original_payload).hexdigest(),
-            )
             with self.assertRaisesRegex(
                 MODULE.PlanError,
-                "recursive metadata changed after preflight",
+                "blob content does not match its object id",
             ):
-                MODULE.apply_sync_plan(plan)
+                MODULE.build_sync_plan(
+                    root=target_super,
+                    common_git_dir=source_common,
+                    source_superproject=None,
+                    planned_modules=[
+                        (
+                            MODULE.Submodule(
+                                "parent",
+                                "parent",
+                                "unused",
+                            ),
+                            parent_sha,
+                        )
+                    ],
+                    depth=1,
+                    recursive=True,
+                    force_replace_empty=False,
+                    fetch_missing=False,
+                )
 
         self.assertTrue(rewrote_gitmodules)
         self.assertFalse((target_super / "parent").exists())

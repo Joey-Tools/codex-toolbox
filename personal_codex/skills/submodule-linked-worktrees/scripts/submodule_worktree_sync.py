@@ -6267,7 +6267,7 @@ def _capture_commit_gitmodules_with_receipt(
     ):
         raise PlanError(f"{commit}:.gitmodules is not a regular Git blob")
     object_id = os.fsdecode(fields[2])
-    if not re.fullmatch(r"[0-9a-f]+", object_id):
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", object_id):
         raise PlanError(f"{commit}:.gitmodules returned an invalid object id")
     size_result = read_git_bounded(
         [
@@ -6296,6 +6296,13 @@ def _capture_commit_gitmodules_with_receipt(
     )
     if len(content_result.stdout) != blob_size:
         raise PlanError(f"{commit}:.gitmodules changed size during bounded read")
+    blob_digest = hashlib.sha1() if len(object_id) == 40 else hashlib.sha256()
+    blob_digest.update(f"blob {blob_size}\0".encode("ascii"))
+    blob_digest.update(content_result.stdout)
+    if blob_digest.hexdigest() != object_id:
+        raise PlanError(
+            f"{commit}:.gitmodules blob content does not match its object id"
+        )
     budget.retain(blob_size, f"{commit}:.gitmodules")
     modules = decode_gitmodules(content_result.stdout, f"{commit}:.gitmodules")
     return (
@@ -15259,7 +15266,7 @@ def require_checkout_attributes_receipt(
 
 
 def selected_checkout_filters(
-    source_git_dir: Path,
+    checkout_view: CheckoutExecutionView,
     treeish: str,
     paths: tuple[tuple[str, ...], ...],
 ) -> tuple[FilterSelection, ...]:
@@ -15277,9 +15284,10 @@ def selected_checkout_filters(
         encoded_paths.extend(raw_path)
         encoded_paths.append(0)
         expected_paths.append(raw_path)
-    result = read_git_bounded(
+    result = read_checkout_execution_view_git(
+        checkout_view,
         [
-            *source_object_repo_args(source_git_dir),
+            *source_object_repo_args(checkout_view.common_git_dir),
             "check-attr",
             f"--source={treeish}",
             "-z",
@@ -15317,11 +15325,13 @@ def selected_checkout_filters(
 
 
 def selected_index_filters(
-    worktree_path: Path,
+    checkout_view: CheckoutExecutionView,
     paths: tuple[tuple[str, ...], ...],
 ) -> tuple[FilterSelection, ...]:
     if not paths:
         return ()
+    if checkout_view.private_index_path is None:
+        raise PlanError("index filter query lacks an isolated index snapshot")
     encoded_paths = bytearray()
     expected_paths: list[bytes] = []
     for parts in paths:
@@ -15334,10 +15344,10 @@ def selected_index_filters(
         encoded_paths.extend(raw_path)
         encoded_paths.append(0)
         expected_paths.append(raw_path)
-    result = read_git_bounded(
+    result = read_checkout_execution_view_git(
+        checkout_view,
         [
-            "-C",
-            str(worktree_path),
+            *source_object_repo_args(checkout_view.common_git_dir),
             "check-attr",
             "--cached",
             "-z",
@@ -15373,11 +15383,12 @@ def selected_index_filters(
 
 
 def configured_filter_commands(
-    source_git_dir: Path,
+    checkout_view: CheckoutExecutionView,
 ) -> dict[str, set[str]]:
-    result = read_git_bounded(
+    result = read_checkout_execution_view_git(
+        checkout_view,
         [
-            *source_object_repo_args(source_git_dir),
+            *source_object_repo_args(checkout_view.common_git_dir),
             "config",
             "--local",
             "--no-includes",
@@ -15394,7 +15405,7 @@ def configured_filter_commands(
         detail = os.fsdecode(result.stderr).strip()
         raise PlanError(
             "cannot inspect local clean/process filter configuration\n"
-            f"  source gitdir: {source_git_dir}\n"
+            f"  source gitdir: {checkout_view.common_git_dir}\n"
             f"  error: {detail or 'git config failed'}"
         )
     commands: dict[str, set[str]] = {}
@@ -15415,22 +15426,27 @@ def configured_filter_commands(
 
 
 def reject_checkout_filters(
-    source_git_dir: Path,
     worktree_path: Path,
+    checkout_view: CheckoutExecutionView,
     tree_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...],
     index_paths: tuple[tuple[str, ...], ...] = (),
 ) -> tuple[FilterSelection, ...]:
     selections: list[FilterSelection] = []
-    selections.extend(selected_index_filters(worktree_path, index_paths))
+    selections.extend(
+        selected_index_filters(
+            checkout_view,
+            index_paths,
+        )
+    )
     for treeish, paths in tree_paths:
         selections.extend(
             selected_checkout_filters(
-                source_git_dir,
+                checkout_view,
                 treeish,
                 paths,
             )
         )
-    configured_commands = configured_filter_commands(source_git_dir)
+    configured_commands = configured_filter_commands(checkout_view)
     if not selections:
         return ()
     selection = selections[0]
@@ -15451,33 +15467,36 @@ def reject_checkout_filters(
 
 def bind_checkout_filter_selection(
     entry: PlannedWorktree,
+    checkout_view: CheckoutExecutionView,
     tree_paths: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...],
     index_paths: tuple[tuple[str, ...], ...] = (),
     *,
-    expected_attributes: Optional[CheckoutAttributesReceipt] = None,
+    expected_attributes: CheckoutAttributesReceipt,
     expected_selections: Optional[tuple[FilterSelection, ...]] = None,
 ) -> tuple[CheckoutAttributesReceipt, tuple[FilterSelection, ...]]:
-    # Protected properties: the source-local config bytes, common
-    # info/attributes object/content, and the resulting filter selection stay
-    # exact across the authoritative check-attr query. Any selected filter is
-    # rejected regardless of whether its driver currently has a command.
+    # Protected properties: the retained managed-index bytes, captured common
+    # info/attributes bytes, private object closure, and resulting filter
+    # selection stay exact across the authoritative check-attr query. Every
+    # pathname read by Git is owner-private and descriptor-bound through the
+    # child pre-exec gate. Any selected filter is rejected regardless of
+    # whether its driver currently has a command.
     revalidate_file_content_binding(entry.source_completeness.config_binding)
+    revalidate_checkout_execution_view(checkout_view)
     attributes = capture_checkout_attributes_receipt(entry.source_git_dir)
-    if expected_attributes is not None:
-        require_checkout_attributes_receipt(expected_attributes, attributes)
+    require_checkout_attributes_receipt(expected_attributes, attributes)
     selections = reject_checkout_filters(
-        entry.source_git_dir,
         entry.target.path,
+        checkout_view,
         tree_paths,
         index_paths,
     )
+    revalidate_checkout_execution_view(checkout_view)
     repeated_attributes = capture_checkout_attributes_receipt(entry.source_git_dir)
     require_checkout_attributes_receipt(attributes, repeated_attributes)
-    if expected_attributes is not None:
-        require_checkout_attributes_receipt(
-            expected_attributes,
-            repeated_attributes,
-        )
+    require_checkout_attributes_receipt(
+        expected_attributes,
+        repeated_attributes,
+    )
     revalidate_file_content_binding(entry.source_completeness.config_binding)
     if expected_selections is not None and selections != expected_selections:
         raise PlanError(
@@ -16345,17 +16364,40 @@ def revalidate_checkout_execution_view(view: CheckoutExecutionView) -> None:
 
 def checkout_execution_environment(
     view: CheckoutExecutionView,
-    sha: str,
+    sha: Optional[str],
 ) -> dict[str, str]:
     revalidate_checkout_execution_view(view)
     environment = {
-        "GIT_ATTR_SOURCE": sha,
         "GIT_COMMON_DIR": str(view.common_git_dir),
         "GIT_OBJECT_DIRECTORY": str(view.object_directory),
     }
+    if sha is not None:
+        environment["GIT_ATTR_SOURCE"] = sha
     if view.private_index_path is not None:
         environment["GIT_INDEX_FILE"] = str(view.private_index_path)
     return environment
+
+
+def read_checkout_execution_view_git(
+    view: CheckoutExecutionView,
+    args: list[str],
+    *,
+    check: bool = True,
+    input_bytes: Optional[bytes] = None,
+) -> subprocess.CompletedProcess[bytes]:
+    result = read_git_bounded(
+        args,
+        check=check,
+        input_bytes=input_bytes,
+        extra_env=checkout_execution_environment(view, None),
+        directory_identity_leases=view.directory_leases,
+        directory_exact_inventory_leases=view.exact_inventory_leases,
+        directory_absent_entry_leases=view.absent_entry_leases,
+        file_content_leases=view.file_leases,
+        digest_file_leases=view.digest_file_leases,
+    )
+    revalidate_checkout_execution_view(view)
+    return result
 
 
 def checkout_write_access_bindings(
@@ -16728,10 +16770,8 @@ def capture_checkout_preflight(
                 (entry.sha, target_blob_paths),
             )
             final_index_paths = managed_preflight.index_blob_paths
-            attributes_receipt, filter_selections = bind_checkout_filter_selection(
-                entry,
-                final_tree_paths,
-                final_index_paths,
+            attributes_receipt = capture_checkout_attributes_receipt(
+                entry.source_git_dir
             )
             # Status and read-tree can invoke clean/process conversion even
             # during plan-only preflight. The explicit admin binding selects
@@ -16747,6 +16787,15 @@ def capture_checkout_preflight(
             )
             checkout_view_outcome: Optional[BaseException] = None
             try:
+                _observed_attributes, filter_selections = (
+                    bind_checkout_filter_selection(
+                        entry,
+                        checkout_view,
+                        final_tree_paths,
+                        final_index_paths,
+                        expected_attributes=attributes_receipt,
+                    )
+                )
                 if has_local_changes(
                     entry.target.path,
                     current_head,
@@ -16793,10 +16842,32 @@ def capture_checkout_preflight(
     else:
         final_tree_paths = ((entry.sha, target_blob_paths),)
         final_index_paths = ()
-        attributes_receipt, filter_selections = bind_checkout_filter_selection(
-            entry,
-            final_tree_paths,
+        attributes_receipt = capture_checkout_attributes_receipt(entry.source_git_dir)
+        checkout_view = capture_checkout_execution_view(
+            entry.source_git_dir,
+            entry.source_completeness,
+            attributes_receipt,
+            entry.submodule.path,
+            (entry.sha,),
         )
+        checkout_view_outcome = None
+        try:
+            _observed_attributes, filter_selections = bind_checkout_filter_selection(
+                entry,
+                checkout_view,
+                final_tree_paths,
+                expected_attributes=attributes_receipt,
+            )
+        except BaseException as exc:
+            checkout_view_outcome = exc
+            raise
+        finally:
+            finish_explicit_cleanup(
+                checkout_view.close,
+                outcome_exception=checkout_view_outcome,
+                purpose="new preflight checkout filter view",
+                recovery_identity=str(checkout_view.common_git_dir),
+            )
     repeated_object_closure = target_object_closure(
         entry.source_git_dir,
         entry.sha,
@@ -16889,13 +16960,6 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
                 (entry.sha, target_blob_paths),
             )
             final_index_paths = managed_preflight.index_blob_paths
-            bind_checkout_filter_selection(
-                entry,
-                final_tree_paths,
-                final_index_paths,
-                expected_attributes=receipt.attributes_receipt,
-                expected_selections=receipt.filter_selections,
-            )
             checkout_view = capture_checkout_execution_view(
                 entry.source_git_dir,
                 entry.source_completeness,
@@ -16906,6 +16970,14 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
             )
             checkout_view_outcome: Optional[BaseException] = None
             try:
+                bind_checkout_filter_selection(
+                    entry,
+                    checkout_view,
+                    final_tree_paths,
+                    final_index_paths,
+                    expected_attributes=receipt.attributes_receipt,
+                    expected_selections=receipt.filter_selections,
+                )
                 repeated_changes = parse_managed_tree_changes(
                     entry.target.path,
                     current_head,
@@ -16938,6 +17010,14 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
                     managed_preflight,
                 )
                 revalidate_managed_preflight_receipt(managed_preflight)
+                bind_checkout_filter_selection(
+                    entry,
+                    checkout_view,
+                    final_tree_paths,
+                    final_index_paths,
+                    expected_attributes=receipt.attributes_receipt,
+                    expected_selections=receipt.filter_selections,
+                )
             except BaseException as exc:
                 checkout_view_outcome = exc
                 raise
@@ -16983,13 +17063,34 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
         expected_object_closure,
         f"target checkout for {entry.submodule.path}",
     )
-    bind_checkout_filter_selection(
-        entry,
-        final_tree_paths,
-        final_index_paths,
-        expected_attributes=receipt.attributes_receipt,
-        expected_selections=receipt.filter_selections,
-    )
+    if receipt.kind == "new":
+        checkout_view = capture_checkout_execution_view(
+            entry.source_git_dir,
+            entry.source_completeness,
+            receipt.attributes_receipt,
+            entry.submodule.path,
+            (entry.sha,),
+        )
+        checkout_view_outcome = None
+        try:
+            bind_checkout_filter_selection(
+                entry,
+                checkout_view,
+                final_tree_paths,
+                final_index_paths,
+                expected_attributes=receipt.attributes_receipt,
+                expected_selections=receipt.filter_selections,
+            )
+        except BaseException as exc:
+            checkout_view_outcome = exc
+            raise
+        finally:
+            finish_explicit_cleanup(
+                checkout_view.close,
+                outcome_exception=checkout_view_outcome,
+                purpose="new preflight filter revalidation view",
+                recovery_identity=str(checkout_view.common_git_dir),
+            )
 
 
 def missing_commit_error(

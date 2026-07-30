@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-24
 updated: 2026-07-30
 branch: codex/toolbox-skill-sync-refactor
-pr:
+pr: https://github.com/Joey-Tools/codex-toolbox/pull/18
 supersedes: []
 superseded_by:
 ---
@@ -16,6 +16,11 @@ superseded_by:
 
 - Bound shared directory prefixes created by recursive parent checkout before planned child worktrees are materialized.
 - Added transactional rollback so a failed prefix binding does not retain a registered parent worktree or plan receipts.
+- Closed the GitHub review gaps in filter admission by running index, tree,
+  `info/attributes`, and local filter-config queries only against the
+  descriptor-bound private checkout execution view.
+- Bound recursive `.gitmodules` parsing to the exact `ls-tree` blob object by
+  recomputing its SHA-1 or SHA-256 Git object ID before accepting content.
 
 ## Current State
 
@@ -59,6 +64,17 @@ superseded_by:
 - The private pack and index are owner-private regular files under retained directory-entry leases. Index bytes are retained and checksum/inventory bound; potentially large pack bytes stay on a held no-follow descriptor and are rehashed at the child exec gate without a second retained-memory copy. Exact inventories cover the complete private common-gitdir, `info`, `objects`, `objects/info`, `objects/pack`, and `refs` directories, leaving no alternate/promisor/lazy-fetch, loose-object, shallow/ref, commit-graph, multi-pack-index, bitmap, reverse-index, or extra-pack input. Pack creation inherits the existing time, object-count, logical-byte, input, and derived file-size bounds without relaxing a stricter inherited file-size limit.
 - Managed plan-only and `--dry-run` preflight now give tracked `git status` and `read-tree --dry-run` their own short-lived copy of that complete private view. Both conversion-capable probes explicitly name the managed worktree and carry every source/private directory, exact-inventory, control-file, index, pack-digest, and source-absence lease into the child pre-exec gate; the exact inventories are repeated after the potentially long pack digest. Launch-window source config/attributes injection still fails before Git starts; a temporary forged `.gitattributes` loose object during private pack capture likewise cannot execute its dormant filter or publish target/registry state. A separate real-checkout regression rewrites and restores that live loose object only across the actual checkout launch: checkout succeeds from the frozen private pack, and the dormant filter never runs.
 - Managed preflight now captures and parses the raw live admin index before its first tracked-status command, retains the target/control/index descriptors through both probes, and gives Git only a mode-`0400` private index through absolute `GIT_INDEX_FILE`, explicit bound `--git-dir`, and the held target `cwd`. The semantic receipt excludes benign stat-cache metadata, while terminal raw-index revalidation still rejects object replacement, persistent content change, unreadable state, or access-policy drift. A same-inode exact-byte live-index ABA that temporarily enables `assume-valid` is harmless because neither probe reads the live bytes; the deterministic regression toggles and restores that flag around two status launches while both continue to report the dirty tracked file.
+- Filter selection now runs after that private view exists. `check-attr
+  --cached` consumes only the retained private index, while tree
+  `check-attr` and `git config` consume only the copied common gitdir,
+  `info/attributes`, config, and exact private object pack. Every relevant
+  descriptor and inventory lease reaches the child pre-exec gate and is
+  revalidated after the query.
+- Recursive planning accepts only canonical 40- or 64-hex `.gitmodules` blob
+  IDs and hashes `blob <size>\0` plus the bounded payload with the matching
+  algorithm before decoding metadata. Same-size source-object substitution
+  therefore cannot authorize nested targets from bytes that do not match the
+  selected tree entry.
 - Private pack admission now retains every verified object size and computes an overflow-safe output limit from the exact Git pack header/trailer, each exact variable-length object header, and zlib's per-object `compressBound`; the canonical v2 index has an independent exact limit. `pack-objects` receives the larger of those two file limits, terminal inspection applies the file-specific bound, and a one-byte overflow fails closed. Boundary regressions cover zlib's 4 KiB, 16 KiB, 64 KiB, and 32 MiB shifts plus a pure-integer 13 GiB object calculation without payload allocation.
 
 ## Next Steps
@@ -136,3 +152,18 @@ superseded_by:
 - Source-only selected-gitlink parser follow-up: nine focused SHA-1/SHA-256, v2/v3/v4, split delete/replace/add overlay, stage, identity, and deterministic post-digest same-inode/same-size valid-index ABA regressions passed in 4.965 seconds. Xcode 26.6.0 Python 3.9.6 passed the same nine regressions in 4.183 seconds and compiled the changed runtime/tests with bytecode redirected to the task-scoped cache.
 - The complete helper suite passed 265 tests in 350.733 seconds. The complete README module matrix passed 986 tests in 479.824 seconds, and its omitted public-release workflow module passed 38 tests in 0.460 seconds.
 - Current-Python compilation, repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, helper `--help`, skill validation, project-journal validation, sync-manifest validation from `6443af48ca61079d731399b59681952e21d7bab3`, and `git diff --check` passed for the source-only parser follow-up.
+- Private attribute/object-binding follow-up base:
+  `dd82b481f285ed64639685fce4a29be9d0e1ebc5`.
+- Three focused captured-index ABA, `info/attributes` ABA, and same-size
+  `.gitmodules` substitution regressions passed; an independent read-only
+  patch audit reported no findings.
+- After the follow-up implementation and before the final formatting pass,
+  the complete README module matrix passed `988` tests in `584.715s`.
+- After final Ruff formatting, the complete submodule helper suite passed
+  `267` tests in `442.559s`.
+- System Python `3.9.6` passed the three new captured-index ABA,
+  `info/attributes` ABA, and `.gitmodules` object-binding regressions in
+  `3.958s`.
+- Ruff check/format, helper `--help`, isolated PyYAML skill validation,
+  project-journal validation, sync-manifest validation against current
+  `origin/master`, and `git diff --check` passed for this follow-up.
