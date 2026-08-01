@@ -3,7 +3,7 @@ id: 20260724-spr001
 title: Recursive Shared Prefix Receipts
 status: completed
 created: 2026-07-24
-updated: 2026-07-30
+updated: 2026-08-01
 branch: codex/toolbox-skill-sync-refactor
 pr: https://github.com/Joey-Tools/codex-toolbox/pull/18
 supersedes: []
@@ -21,6 +21,9 @@ superseded_by:
   descriptor-bound private checkout execution view.
 - Bound recursive `.gitmodules` parsing to the exact `ls-tree` blob object by
   recomputing its SHA-1 or SHA-256 Git object ID before accepting content.
+- Closed the remaining checkout-control findings by deriving filter path sets
+  from verified private tree bytes, binding the new admin index as absent
+  through the child exec gate, and requiring a writable registry-parent policy.
 
 ## Current State
 
@@ -75,6 +78,14 @@ superseded_by:
   algorithm before decoding metadata. Same-size source-object substitution
   therefore cannot authorize nested targets from bytes that do not match the
   selected tree entry.
+- Filter admission derives its complete target path set with `ls-tree` inside
+  the already verified private checkout view. A forged live source tree cannot
+  omit a filtered path while the later private checkout still contains it.
+- New registrations bind the receipt-owned admin `index` name as absent from
+  post-`--no-checkout` validation through the checkout child's final exec gate.
+  The source `worktrees/` parent and managed-control parent binding both require
+  owner write/search bits and effective read/write/search access, so rollback
+  does not silently depend on DAC override.
 - Private pack admission now retains every verified object size and computes an overflow-safe output limit from the exact Git pack header/trailer, each exact variable-length object header, and zlib's per-object `compressBound`; the canonical v2 index has an independent exact limit. `pack-objects` receives the larger of those two file limits, terminal inspection applies the file-specific bound, and a one-byte overflow fails closed. Boundary regressions cover zlib's 4 KiB, 16 KiB, 64 KiB, and 32 MiB shifts plus a pure-integer 13 GiB object calculation without payload allocation.
 
 ## Next Steps
@@ -167,3 +178,15 @@ superseded_by:
 - Ruff check/format, helper `--help`, isolated PyYAML skill validation,
   project-journal validation, sync-manifest validation against current
   `origin/master`, and `git diff --check` passed for this follow-up.
+- Final checkout-control follow-up: the complete helper suite passed `273`
+  tests in `782.100s`; the complete README module matrix passed `994` tests
+  in `666.086s`, and its omitted public-release workflow module passed `38`
+  tests in `0.444s`.
+- Xcode Python `3.9.6` compiled the changed runtime/tests and passed all six
+  SHA-1/SHA-256 `.gitmodules`, private-tree path-selection, admin-index
+  absence, and registry-parent policy regressions in `5.267s`.
+- Current-Python compilation, repository-wide Ruff fatal-error lint
+  (`E9,F63,F7,F82`), changed-file Ruff format, helper `--help`, skill
+  validation, project-journal validation, sync-manifest validation from
+  `6443af48ca61079d731399b59681952e21d7bab3`, and `git diff --check` passed
+  for the checkout-control follow-up.

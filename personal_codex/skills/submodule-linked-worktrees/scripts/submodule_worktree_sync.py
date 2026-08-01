@@ -3222,6 +3222,17 @@ def run_bounded_bytes(
                     f"{lease.binding.purpose} changed before exec",
                 )
             if not os.access(
+                ".",
+                lease.parent_binding.mode,
+                dir_fd=lease.parent_descriptor,
+                effective_ids=True,
+                follow_symlinks=False,
+            ):
+                raise OSError(
+                    errno.EACCES,
+                    f"{lease.binding.purpose} parent access changed before exec",
+                )
+            if not os.access(
                 lease.entry_name,
                 lease.binding.mode,
                 dir_fd=lease.parent_descriptor,
@@ -11010,12 +11021,14 @@ def capture_directory_entry_lease(
     path: Path,
     mode: int,
     purpose: str,
+    *,
+    parent_mode: int = os.R_OK | os.X_OK,
 ) -> DirectoryEntryLease:
     resolved = path.resolve(strict=True)
     parent = resolved.parent
     parent_binding = capture_typed_access(
         parent,
-        os.R_OK | os.X_OK,
+        parent_mode,
         f"{purpose} parent",
         stat.S_IFDIR,
     )
@@ -11477,6 +11490,7 @@ def capture_managed_control_receipt(
         purpose="descriptor-bound managed worktree control file",
         retain_content=True,
     )
+    admin_lease: Optional[DirectoryEntryLease] = None
     try:
         if content is None:
             raise PlanError("managed worktree control-file binding returned no content")
@@ -11489,10 +11503,22 @@ def capture_managed_control_receipt(
             admin_git_dir,
             os.R_OK | os.W_OK | os.X_OK,
             "managed worktree administration",
+            parent_mode=os.R_OK | os.W_OK | os.X_OK,
         )
+        if not owner_mode_permits_write_search(admin_lease.parent_binding.fingerprint):
+            raise PlanError(
+                "managed worktree administration parent owner policy denies "
+                "write/search\n"
+                f"  path: {admin_lease.parent_binding.path}"
+            )
     except BaseException:
-        os.close(descriptor)
+        try:
+            if admin_lease is not None:
+                admin_lease.close()
+        finally:
+            os.close(descriptor)
         raise
+    assert admin_lease is not None
     backlink_descriptor = -1
     try:
         backlink_descriptor = os.open(
@@ -11878,10 +11904,23 @@ def revalidate_worktree_admin_root_descriptor(
             "source worktree administration directory entry changed\n"
             f"  path: {source_git_dir / 'worktrees'}"
         )
-    if not probe_access_at(root_descriptor, ".", os.R_OK | os.X_OK):
+    # Protected property: the receipt-bound owner can both publish and remove
+    # administration entries without relying on DAC override. Directory entry
+    # churn is expected during worktree add/remove; identity and the recorded
+    # POSIX access policy remain exact.
+    if not owner_mode_permits_write_search(expected):
         raise PlanError(
-            "source worktree administration access policy now denies inventory "
-            "reads\n"
+            "source worktree administration owner policy denies write/search\n"
+            f"  path: {source_git_dir / 'worktrees'}"
+        )
+    if not probe_access_at(
+        root_descriptor,
+        ".",
+        os.R_OK | os.W_OK | os.X_OK,
+    ):
+        raise PlanError(
+            "source worktree administration access policy now denies "
+            "read/write/search\n"
             f"  path: {source_git_dir / 'worktrees'}"
         )
     revalidate_source_registry_lease(source_git_dir, source_lease)
@@ -13003,6 +13042,16 @@ def add_worktree(
         )
         admin_ownership_proven = True
         signal_checkpoint("add-admin-ownership-complete")
+        # `worktree add --no-checkout` must leave the administration index
+        # absent. Bind that one-way precondition before the potentially long
+        # caller preflight and carry it into the child's final exec gate. Git
+        # is expected to create the index after exec; an earlier appearance is
+        # a real control-input replacement, not benign directory-entry churn.
+        admin_index_absence = capture_directory_absent_entry_lease(
+            control.admin_lease,
+            ("index",),
+            "new worktree pre-checkout admin index",
+        )
         if pre_checkout is not None:
             pre_checkout()
         revalidate_managed_control_receipt(control, lease.target_descriptor)
@@ -13028,7 +13077,10 @@ def add_worktree(
                 *checkout_view.directory_leases,
             ),
             directory_exact_inventory_leases=checkout_view.exact_inventory_leases,
-            directory_absent_entry_leases=checkout_view.absent_entry_leases,
+            directory_absent_entry_leases=(
+                *checkout_view.absent_entry_leases,
+                admin_index_absence,
+            ),
             file_content_leases=checkout_view.file_leases,
             digest_file_leases=checkout_view.digest_file_leases,
         )
@@ -14455,18 +14507,24 @@ def parse_managed_tree_changes(
 
 
 def target_tree_blob_paths(
-    source_git_dir: Path,
+    checkout_view: CheckoutExecutionView,
     target_sha: str,
 ) -> tuple[tuple[str, ...], ...]:
-    result = read_git_bounded(
+    # Protected property: the queried path set belongs to the exact verified
+    # tree bytes in the owner-private checkout object pack. Live-source
+    # ls-tree output is not authoritative because an object-path ABA could
+    # otherwise omit a filtered blob while preserving the repeated closure
+    # receipt.
+    result = read_checkout_execution_view_git(
+        checkout_view,
         [
-            *source_object_repo_args(source_git_dir),
+            *source_object_repo_args(checkout_view.common_git_dir),
             "ls-tree",
             "-r",
             "-z",
             "--full-tree",
             target_sha,
-        ]
+        ],
     )
     paths: list[tuple[str, ...]] = []
     for record in bounded_records(result.stdout, "target checkout tree"):
@@ -16742,10 +16800,7 @@ def capture_checkout_preflight(
         entry.sha,
         entry.source_completeness,
     )
-    target_blob_paths = target_tree_blob_paths(
-        entry.source_git_dir,
-        entry.sha,
-    )
+    target_blob_paths: Optional[tuple[tuple[str, ...], ...]] = None
     if entry.state == "managed":
         managed_preflight = capture_managed_preflight_receipt(
             entry.target.path,
@@ -16760,14 +16815,6 @@ def capture_checkout_preflight(
                 entry.target.path,
                 current_head,
                 entry.sha,
-            )
-            current_blob_paths = target_tree_blob_paths(
-                entry.source_git_dir,
-                current_head,
-            )
-            final_tree_paths = (
-                (current_head, current_blob_paths),
-                (entry.sha, target_blob_paths),
             )
             final_index_paths = managed_preflight.index_blob_paths
             attributes_receipt = capture_checkout_attributes_receipt(
@@ -16787,6 +16834,18 @@ def capture_checkout_preflight(
             )
             checkout_view_outcome: Optional[BaseException] = None
             try:
+                current_blob_paths = target_tree_blob_paths(
+                    checkout_view,
+                    current_head,
+                )
+                target_blob_paths = target_tree_blob_paths(
+                    checkout_view,
+                    entry.sha,
+                )
+                final_tree_paths = (
+                    (current_head, current_blob_paths),
+                    (entry.sha, target_blob_paths),
+                )
                 _observed_attributes, filter_selections = (
                     bind_checkout_filter_selection(
                         entry,
@@ -16840,7 +16899,6 @@ def capture_checkout_preflight(
                 ),
             )
     else:
-        final_tree_paths = ((entry.sha, target_blob_paths),)
         final_index_paths = ()
         attributes_receipt = capture_checkout_attributes_receipt(entry.source_git_dir)
         checkout_view = capture_checkout_execution_view(
@@ -16852,6 +16910,11 @@ def capture_checkout_preflight(
         )
         checkout_view_outcome = None
         try:
+            target_blob_paths = target_tree_blob_paths(
+                checkout_view,
+                entry.sha,
+            )
+            final_tree_paths = ((entry.sha, target_blob_paths),)
             _observed_attributes, filter_selections = bind_checkout_filter_selection(
                 entry,
                 checkout_view,
@@ -16868,6 +16931,10 @@ def capture_checkout_preflight(
                 purpose="new preflight checkout filter view",
                 recovery_identity=str(checkout_view.common_git_dir),
             )
+    if target_blob_paths is None:
+        raise PlanError(
+            f"checkout path selection is incomplete for {entry.submodule.path}"
+        )
     repeated_object_closure = target_object_closure(
         entry.source_git_dir,
         entry.sha,
@@ -16921,15 +16988,6 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
         expected_object_closure,
         f"target checkout for {entry.submodule.path}",
     )
-    target_blob_paths = target_tree_blob_paths(
-        entry.source_git_dir,
-        entry.sha,
-    )
-    if target_blob_paths != receipt.target_blob_paths:
-        raise PlanError(
-            f"target checkout path selection changed after preflight: "
-            f"{entry.submodule.path}"
-        )
     if receipt.kind == "managed":
         managed_preflight = capture_managed_preflight_receipt(
             entry.target.path,
@@ -16951,14 +17009,6 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
                     f"managed worktree index changed after preflight: "
                     f"{entry.target.path}"
                 )
-            current_blob_paths = target_tree_blob_paths(
-                entry.source_git_dir,
-                current_head,
-            )
-            final_tree_paths = (
-                (current_head, current_blob_paths),
-                (entry.sha, target_blob_paths),
-            )
             final_index_paths = managed_preflight.index_blob_paths
             checkout_view = capture_checkout_execution_view(
                 entry.source_git_dir,
@@ -16970,6 +17020,23 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
             )
             checkout_view_outcome: Optional[BaseException] = None
             try:
+                current_blob_paths = target_tree_blob_paths(
+                    checkout_view,
+                    current_head,
+                )
+                target_blob_paths = target_tree_blob_paths(
+                    checkout_view,
+                    entry.sha,
+                )
+                if target_blob_paths != receipt.target_blob_paths:
+                    raise PlanError(
+                        f"target checkout path selection changed after preflight: "
+                        f"{entry.submodule.path}"
+                    )
+                final_tree_paths = (
+                    (current_head, current_blob_paths),
+                    (entry.sha, target_blob_paths),
+                )
                 bind_checkout_filter_selection(
                     entry,
                     checkout_view,
@@ -17041,9 +17108,45 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
                 ),
             )
     elif receipt.kind == "new":
-        final_tree_paths = ((entry.sha, target_blob_paths),)
-        final_index_paths = ()
-        digest_paths = target_blob_paths
+        checkout_view = capture_checkout_execution_view(
+            entry.source_git_dir,
+            entry.source_completeness,
+            receipt.attributes_receipt,
+            entry.submodule.path,
+            (entry.sha,),
+        )
+        checkout_view_outcome: Optional[BaseException] = None
+        try:
+            target_blob_paths = target_tree_blob_paths(
+                checkout_view,
+                entry.sha,
+            )
+            if target_blob_paths != receipt.target_blob_paths:
+                raise PlanError(
+                    f"target checkout path selection changed after preflight: "
+                    f"{entry.submodule.path}"
+                )
+            final_tree_paths = ((entry.sha, target_blob_paths),)
+            final_index_paths = ()
+            digest_paths = target_blob_paths
+            bind_checkout_filter_selection(
+                entry,
+                checkout_view,
+                final_tree_paths,
+                final_index_paths,
+                expected_attributes=receipt.attributes_receipt,
+                expected_selections=receipt.filter_selections,
+            )
+        except BaseException as exc:
+            checkout_view_outcome = exc
+            raise
+        finally:
+            finish_explicit_cleanup(
+                checkout_view.close,
+                outcome_exception=checkout_view_outcome,
+                purpose="new preflight filter revalidation view",
+                recovery_identity=str(checkout_view.common_git_dir),
+            )
     else:
         raise PlanError(
             f"checkout preflight has an invalid kind for {entry.submodule.path}"
@@ -17063,34 +17166,6 @@ def revalidate_checkout_preflight(entry: PlannedWorktree) -> None:
         expected_object_closure,
         f"target checkout for {entry.submodule.path}",
     )
-    if receipt.kind == "new":
-        checkout_view = capture_checkout_execution_view(
-            entry.source_git_dir,
-            entry.source_completeness,
-            receipt.attributes_receipt,
-            entry.submodule.path,
-            (entry.sha,),
-        )
-        checkout_view_outcome = None
-        try:
-            bind_checkout_filter_selection(
-                entry,
-                checkout_view,
-                final_tree_paths,
-                final_index_paths,
-                expected_attributes=receipt.attributes_receipt,
-                expected_selections=receipt.filter_selections,
-            )
-        except BaseException as exc:
-            checkout_view_outcome = exc
-            raise
-        finally:
-            finish_explicit_cleanup(
-                checkout_view.close,
-                outcome_exception=checkout_view_outcome,
-                purpose="new preflight filter revalidation view",
-                recovery_identity=str(checkout_view.common_git_dir),
-            )
 
 
 def missing_commit_error(

@@ -3469,6 +3469,57 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
 
         self.assertEqual(bounded_git.call_count, 2)
 
+    def test_commit_gitmodules_binds_sha1_and_sha256_blob_payloads(self) -> None:
+        canonical = (
+            b'[submodule "child"]\n'
+            b"    path = nested/child\n"
+            b"    url = https://example.invalid/child.git\n"
+        )
+        forged = canonical.replace(b"nested/child", b"nested/other")
+        self.assertEqual(len(canonical), len(forged))
+
+        for algorithm in (hashlib.sha1, hashlib.sha256):
+            with self.subTest(algorithm=algorithm().name):
+                canonical_object = (
+                    f"blob {len(canonical)}\0".encode("ascii") + canonical
+                )
+                object_id = algorithm(canonical_object).hexdigest().encode("ascii")
+                tree_result = subprocess.CompletedProcess(
+                    ["git"],
+                    0,
+                    stdout=(b"100644 blob " + object_id + b"\t.gitmodules\0"),
+                    stderr=b"",
+                )
+                size_result = subprocess.CompletedProcess(
+                    ["git"],
+                    0,
+                    stdout=f"{len(forged)}\n".encode("ascii"),
+                    stderr=b"",
+                )
+                content_result = subprocess.CompletedProcess(
+                    ["git"],
+                    0,
+                    stdout=forged,
+                    stderr=b"",
+                )
+
+                with mock.patch.object(
+                    MODULE,
+                    "read_git_bounded",
+                    side_effect=[tree_result, size_result, content_result],
+                ) as bounded_git:
+                    with self.assertRaisesRegex(
+                        MODULE.PlanError,
+                        "blob content does not match its object id",
+                    ):
+                        MODULE.read_commit_gitmodules(
+                            self.source_git_dir,
+                            self.standard,
+                            self.sha,
+                        )
+
+                self.assertEqual(bounded_git.call_count, 3)
+
     def test_commit_gitmodules_honors_expired_shared_deadline(self) -> None:
         budget = MODULE.GitmodulesReadBudget(
             deadline=time.monotonic() - 1,
@@ -7487,6 +7538,188 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             registry_before,
         )
 
+    def test_filter_path_query_uses_verified_private_tree_bytes(self) -> None:
+        target_sha = self.filtered_target_sha(
+            "private-tree-paths",
+            required=False,
+        )
+        attributes_id = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "rev-parse",
+            f"{target_sha}:.gitattributes",
+        )
+        forged_live_tree = f"100644 blob {attributes_id}\t.gitattributes\0".encode(
+            "ascii"
+        )
+        target_super = self.root / "private-tree-path-target"
+        target_super.mkdir()
+        original_read = MODULE.read_git_bounded
+        live_path_queries = 0
+        private_path_queries = 0
+
+        def forge_every_live_path_query(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            nonlocal live_path_queries
+            nonlocal private_path_queries
+            if "ls-tree" in args and "-r" in args and "--full-tree" in args:
+                git_dir = next(
+                    (value for value in args if value.startswith("--git-dir=")),
+                    "",
+                )
+                if git_dir == f"--git-dir={self.named_source_git_dir}":
+                    live_path_queries += 1
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        stdout=forged_live_tree,
+                        stderr=b"",
+                    )
+                private_path_queries += 1
+            return original_read(args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "read_git_bounded",
+            side_effect=forge_every_live_path_query,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "filter: private-tree-paths",
+            ):
+                MODULE.build_sync_plan(
+                    root=target_super,
+                    common_git_dir=self.named_common_git_dir,
+                    source_superproject=None,
+                    planned_modules=[
+                        (
+                            MODULE.Submodule(
+                                "custom-lib",
+                                "lib",
+                                str(self.remote),
+                            ),
+                            target_sha,
+                        )
+                    ],
+                    depth=1,
+                    recursive=False,
+                    force_replace_empty=False,
+                    fetch_missing=False,
+                )
+
+        self.assertEqual(live_path_queries, 0)
+        self.assertGreater(private_path_queries, 0)
+        self.assertFalse((target_super / "lib").exists())
+
+    def test_new_checkout_binds_absent_admin_index_at_exec_gate(self) -> None:
+        (self.remote / "SECOND.md").write_text("second\n", encoding="utf-8")
+        run_git(self.remote, "add", "SECOND.md")
+        run_git(self.remote, "commit", "-m", "add second checkout payload")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+        peer = self.root / "pre-checkout-index-peer"
+        self.add_managed_worktree(
+            self.named_source_git_dir,
+            peer,
+            target_sha,
+        )
+        peer_admin = MODULE.gitdir_file_target(peer)
+        self.assertIsNotNone(peer_admin)
+        assert peer_admin is not None
+        forged_index = (peer_admin / "index").read_bytes()
+
+        target_super = self.root / "pre-checkout-index-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "custom-lib",
+                        "lib",
+                        str(self.remote),
+                    ),
+                    target_sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        self.addCleanup(plan.close)
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        original_run = MODULE.run_git_at_directory_descriptor
+        injected = False
+        absence_lease_rejected = False
+
+        def create_admin_index_before_checkout_exec(
+            args: list[str],
+            directory_descriptor: int,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal injected
+            nonlocal absence_lease_rejected
+            if "checkout" in args and not injected:
+                admin_arg = next(
+                    value for value in args if value.startswith("--git-dir=")
+                )
+                admin_index = Path(admin_arg.removeprefix("--git-dir=")) / "index"
+                self.assertFalse(admin_index.exists())
+                admin_index.write_bytes(forged_index)
+                injected = True
+                matching_leases = [
+                    lease
+                    for lease in kwargs["directory_absent_entry_leases"]
+                    if lease.purpose == "new worktree pre-checkout admin index"
+                ]
+                self.assertEqual(len(matching_leases), 1)
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "entry must be absent before exec",
+                ):
+                    MODULE.revalidate_directory_absent_entry_lease(matching_leases[0])
+                absence_lease_rejected = True
+            return original_run(
+                args,
+                directory_descriptor,
+                **kwargs,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "run_git_at_directory_descriptor",
+            side_effect=create_admin_index_before_checkout_exec,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises((MODULE.GitError, MODULE.PlanError)):
+                    MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(injected)
+        self.assertTrue(absence_lease_rejected)
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={self.named_source_git_dir}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
     def test_managed_worktree_rejects_new_filtered_payload(self) -> None:
         target_sha = self.filtered_target_sha("managed-filter", required=False)
         target_super = self.root / "managed-filter-target"
@@ -9107,7 +9340,10 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             MODULE.filesystem_fingerprint(shared),
         )
         try:
-            with mock.patch.object(MODULE, "probe_access", return_value=True):
+            with (
+                mock.patch.object(MODULE, "probe_access", return_value=True),
+                mock.patch.object(MODULE, "probe_access_at", return_value=True),
+            ):
                 with self.assertRaisesRegex(
                     MODULE.PlanError,
                     "no longer permits materialization",
@@ -11026,6 +11262,92 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             if target_descriptor >= 0:
                 os.close(target_descriptor)
             source_lease.close()
+
+    def test_worktrees_parent_requires_owner_write_under_dac_override(self) -> None:
+        source = self.clone_named_source("admin-owner-write")
+        peer = self.root / "admin-owner-write-peer"
+        self.add_managed_worktree(source, peer, self.sha)
+        worktrees_root = source / "worktrees"
+        original_mode = stat.S_IMODE(worktrees_root.stat().st_mode)
+        source_lease = MODULE.capture_directory_entry_lease(
+            source,
+            os.R_OK | os.W_OK | os.X_OK,
+            "selected source common gitdir",
+        )
+        try:
+            worktrees_root.chmod(0o555)
+            with mock.patch.object(MODULE, "probe_access_at", return_value=True):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "owner policy denies write/search",
+                ):
+                    MODULE.capture_worktree_admin_inventory(
+                        source,
+                        source_lease,
+                    )
+        finally:
+            worktrees_root.chmod(original_mode)
+            source_lease.close()
+
+    def test_managed_control_binds_writable_worktrees_parent(self) -> None:
+        source = self.clone_named_source("admin-parent-policy")
+        target = self.root / "admin-parent-policy-target"
+        self.add_managed_worktree(source, target, self.sha)
+        target_descriptor = MODULE.open_directory_descriptor(
+            target,
+            "managed worktree target",
+        )
+        control = None
+        try:
+            control = MODULE.capture_managed_control_receipt(
+                target,
+                source,
+                target_descriptor,
+            )
+            self.assertEqual(
+                control.admin_lease.parent_binding.mode,
+                os.R_OK | os.W_OK | os.X_OK,
+            )
+            self.assertTrue(
+                MODULE.owner_mode_permits_write_search(
+                    control.admin_lease.parent_binding.fingerprint,
+                )
+            )
+        finally:
+            if control is not None:
+                control.close()
+            os.close(target_descriptor)
+
+    def test_managed_control_rejects_readonly_parent_under_dac_override(
+        self,
+    ) -> None:
+        source = self.clone_named_source("admin-parent-readonly")
+        target = self.root / "admin-parent-readonly-target"
+        self.add_managed_worktree(source, target, self.sha)
+        worktrees_root = source / "worktrees"
+        original_mode = stat.S_IMODE(worktrees_root.stat().st_mode)
+        target_descriptor = MODULE.open_directory_descriptor(
+            target,
+            "managed worktree target",
+        )
+        try:
+            worktrees_root.chmod(0o555)
+            with (
+                mock.patch.object(MODULE, "probe_access", return_value=True),
+                mock.patch.object(MODULE, "probe_access_at", return_value=True),
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "administration parent owner policy denies write/search",
+                ):
+                    MODULE.capture_managed_control_receipt(
+                        target,
+                        source,
+                        target_descriptor,
+                    )
+        finally:
+            worktrees_root.chmod(original_mode)
+            os.close(target_descriptor)
 
     def test_final_rollback_registry_query_drift_preserves_target_parent(
         self,
