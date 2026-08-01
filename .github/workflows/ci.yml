@@ -20,28 +20,11 @@ jobs:
         with:
           python-version: "3.x"
       - name: Compile
-        run: |
-          python3 -m py_compile \
-            scripts/codex_personal_sync.py \
-            scripts/build_personal_codex_package.py \
-            scripts/validate_sync_manifest_changes.py \
-            tests/test_codex_personal_sync.py \
-            tests/test_package_builder_safety.py \
-            tests/test_personal_sync_reconciliation_safety.py \
-            tests/test_release_manifest_baseline.py \
-            tests/test_sync_manifest_changes.py \
-            tests/test_submodule_worktree_sync.py
+        run: python3 -m compileall -q scripts tests
       - name: Run tests
-        run: |
-          python3 -m unittest \
-            tests.test_codex_personal_sync \
-            tests.test_codex_clean_tmp \
-            tests.test_codex_git_helpers \
-            tests.test_package_builder_safety \
-            tests.test_personal_sync_reconciliation_safety \
-            tests.test_release_manifest_baseline \
-            tests.test_sync_manifest_changes \
-            tests.test_submodule_worktree_sync
+        # Discovery keeps generated retention and scheduler/doctor suites in
+        # the consumer gate without a second hand-maintained module list.
+        run: python3 -m unittest discover -s tests
       - name: Validate sync manifest changes
         env:
           BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -83,5 +66,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - name: Run platform reconciliation safety tests
-        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
+      - name: Run platform personal sync safety tests
+        shell: bash
+        run: |
+          modules=(tests.test_personal_sync_reconciliation_safety)
+          if [[ -f tests/test_release_retention.py ]]; then
+            modules+=(tests.test_release_retention)
+          fi
+          if [[ -f tests/test_scheduler_doctor.py ]]; then
+            modules+=(tests.test_scheduler_doctor)
+          fi
+          python3 -m unittest "${modules[@]}"
