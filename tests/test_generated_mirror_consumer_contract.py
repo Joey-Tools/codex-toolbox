@@ -8,7 +8,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_REPOSITORY = "Joey-Tools/codex-personal-sync"
 COMPILE_COMMAND = "python3 -m compileall -q scripts tests"
 DISCOVERY_COMMAND = "python3 -m unittest discover -s tests"
-PRIVATE_TMP_RUNNER = "scripts/run_ci_tests_with_private_tmp.sh"
 
 
 class GeneratedMirrorConsumerContractTests(unittest.TestCase):
@@ -20,8 +19,6 @@ class GeneratedMirrorConsumerContractTests(unittest.TestCase):
         self.assertIn(CANONICAL_REPOSITORY, guidance)
         self.assertIn("generated-sync-source-lock.json", guidance)
         self.assertIn("read-only", guidance)
-        self.assertIn(PRIVATE_TMP_RUNNER, guidance)
-        self.assertIn("toolbox-owned CI environment adapters", guidance)
 
     def test_readme_documents_receipt_bound_generation(self) -> None:
         readme = self.read("README.md")
@@ -34,20 +31,6 @@ class GeneratedMirrorConsumerContractTests(unittest.TestCase):
         workflow = self.read(".github/workflows/ci.yml")
         self.assertIn(COMPILE_COMMAND, workflow)
         self.assertIn(DISCOVERY_COMMAND, workflow)
-        self.assertIn(
-            f"bash {PRIVATE_TMP_RUNNER} --\n"
-            f"          {DISCOVERY_COMMAND}",
-            workflow,
-        )
-        self.assertIn(
-            f"bash {PRIVATE_TMP_RUNNER} -- \\\n"
-            '              python3 -m unittest "${modules[@]}"',
-            workflow,
-        )
-        self.assertIn(
-            'else\n            python3 -m unittest "${modules[@]}"',
-            workflow,
-        )
         self.assertIn("tests/test_release_retention.py", workflow)
         self.assertIn("tests/test_scheduler_doctor.py", workflow)
 
@@ -55,11 +38,6 @@ class GeneratedMirrorConsumerContractTests(unittest.TestCase):
         workflow = self.read(".github/workflows/release.yml")
         self.assertIn(COMPILE_COMMAND, workflow)
         self.assertIn(DISCOVERY_COMMAND, workflow)
-        self.assertIn(
-            f"bash {PRIVATE_TMP_RUNNER} --\n"
-            f"          {DISCOVERY_COMMAND}",
-            workflow,
-        )
         self.assertEqual(workflow.count('- "generated-sync-source-lock.json"'), 2)
         self.assertEqual(workflow.count('- "schema/**"'), 2)
 

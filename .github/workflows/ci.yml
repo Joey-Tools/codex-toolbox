@@ -24,9 +24,7 @@ jobs:
       - name: Run tests
         # Discovery keeps generated retention and scheduler/doctor suites in
         # the consumer gate without a second hand-maintained module list.
-        run: >-
-          bash scripts/run_ci_tests_with_private_tmp.sh --
-          python3 -m unittest discover -s tests
+        run: python3 -m unittest discover -s tests
       - name: Validate sync manifest changes
         env:
           BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -78,9 +76,4 @@ jobs:
           if [[ -f tests/test_scheduler_doctor.py ]]; then
             modules+=(tests.test_scheduler_doctor)
           fi
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            bash scripts/run_ci_tests_with_private_tmp.sh -- \
-              python3 -m unittest "${modules[@]}"
-          else
-            python3 -m unittest "${modules[@]}"
-          fi
+          python3 -m unittest "${modules[@]}"
