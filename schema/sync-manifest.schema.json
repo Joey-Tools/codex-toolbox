@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Joey-Tools/codex-personal-sync/blob/master/schema/sync-manifest.schema.json",
+  "title": "Codex Personal Sync Manifest",
+  "description": "Static shape for personal_codex/sync-manifest.json. The runtime remains authoritative for filesystem, portability, byte-length, cross-field, and ownership checks.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "links"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "owner": {
+      "$ref": "#/$defs/owner"
+    },
+    "links": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 9999,
+      "items": {
+        "$ref": "#/$defs/link"
+      }
+    },
+    "reference_only": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/relativePath"
+      }
+    },
+    "removed_links": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/removedLink"
+      }
+    },
+    "base_release": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "repo": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/repository"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*\\\\).+$"
+    },
+    "owner": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?/[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?$"
+    },
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "target",
+        "kind"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "target": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "file",
+            "directory",
+            "skill"
+          ]
+        },
+        "owner": {
+          "$ref": "#/$defs/owner"
+        },
+        "override": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "removedLink": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source",
+        "target",
+        "kind"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        },
+        "source": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "target": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "file",
+            "directory",
+            "skill"
+          ]
+        },
+        "replacement_target": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*\\\\).+$"
+        },
+        "retires_replacements": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*:[A-Za-z0-9][A-Za-z0-9_.-]*$"
+          }
+        },
+        "legacy": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    }
+  }
+}

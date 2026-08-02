@@ -14,13 +14,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "codex_personal_sync.py"
-PACKAGE_SCRIPT_PATH = REPO_ROOT / "scripts" / "build_personal_codex_package.py"
 SPEC = importlib.util.spec_from_file_location("codex_personal_sync", SCRIPT_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC is not None
@@ -59,29 +59,43 @@ def github_release_asset(
 
 
 class FakeDownloadProcess:
-    def __init__(self, payload: bytes, *, returncode: int = 0) -> None:
-        self.stdout = io.BytesIO(payload)
-        self.final_returncode = returncode
-        self.returncode: int | None = None
-        self.terminated = False
-        self.killed = False
+    def __new__(
+        cls,
+        payload: bytes,
+        *,
+        returncode: int = 0,
+    ) -> MODULE._GuardedProcess:
+        del cls
+        return MODULE._spawn_guarded_process(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys;"
+                    "os.write(1,bytes.fromhex(sys.argv[1]));"
+                    "raise SystemExit(int(sys.argv[2]))"
+                ),
+                payload.hex(),
+                str(returncode),
+            ],
+            deadline=time.monotonic() + 5.0,
+            process_label="fake download",
+            unavailable_code="test-unavailable",
+            unavailable_message="test executable unavailable",
+        )
 
-    def poll(self) -> int | None:
-        return self.returncode
 
-    def wait(self, timeout: float | None = None) -> int:
-        del timeout
-        if self.returncode is None:
-            self.returncode = self.final_returncode
-        return self.returncode
+class CloseFailingSelector:
+    def __init__(self, inner, error: BaseException) -> None:
+        self.inner = inner
+        self.error = error
 
-    def terminate(self) -> None:
-        self.terminated = True
-        self.returncode = -15
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
 
-    def kill(self) -> None:
-        self.killed = True
-        self.returncode = -9
+    def close(self) -> None:
+        self.inner.close()
+        raise self.error
 
 
 def snapshot_tree(root: Path) -> tuple[tuple[str, str, int, bytes | str | None], ...]:
@@ -165,7 +179,9 @@ def write_minimal_release(
     )
 
 
-def write_agent_only_release(release_root: Path, *, agent_text: str = "agent\n") -> None:
+def write_agent_only_release(
+    release_root: Path, *, agent_text: str = "agent\n"
+) -> None:
     personal_root = release_root / "personal_codex"
     personal_root.mkdir(parents=True)
     (personal_root / "AGENTS.md").write_text(agent_text, encoding="utf-8")
@@ -368,27 +384,6 @@ def write_scheduler_runner(home: Path) -> Path:
     return runner
 
 
-class PersonalGuidelinesContentTests(unittest.TestCase):
-    def test_agents_guidance_requires_bounded_command_output(self) -> None:
-        agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
-
-        self.assertIn("large or unbounded output", agents)
-        self.assertIn("narrow its inputs or results", agents)
-        self.assertIn("capture complete output in a task-scoped file", agents)
-        self.assertIn("counts, candidate filenames, decisive key lines, or a short tail", agents)
-        self.assertIn("backstops, not execution-time bounds", agents)
-        self.assertNotIn("$bounded-command-output", agents)
-
-    def test_agents_guidance_documents_wait_agent_timeout_contract(self) -> None:
-        agents = (REPO_ROOT / "personal_codex" / "AGENTS.md").read_text(encoding="utf-8")
-
-        self.assertIn("polling with `wait_agent`", agents)
-        self.assertIn("omit `timeout_ms` to use the `30000` millisecond default", agents)
-        self.assertIn("supported `10000`–`3600000` millisecond range", agents)
-        self.assertIn("`30000`–`60000` for ordinary or reviewer polling", agents)
-        self.assertIn("longer single waits are valid", agents)
-
-
 class CodexPersonalSyncTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory(prefix="codex-personal-sync.")
@@ -396,7 +391,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.archive_workspace_context = MODULE.bind_archive_workspace(self.root)
         self.archive_workspace = self.archive_workspace_context.__enter__()
         self.user_home = self.root / "home"
-        self.path_home_patch = mock.patch.object(MODULE.Path, "home", return_value=self.user_home)
+        self.path_home_patch = mock.patch.object(
+            MODULE.Path, "home", return_value=self.user_home
+        )
         self.path_home_patch.start()
 
     def tearDown(self) -> None:
@@ -475,9 +472,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         def capture(home: Path, action, backup: Path) -> None:
             real_verify(home, action, backup)
             relative_target = action.target.relative_to(home)
-            relative_backup = backup.relative_to(
-                home / "personal-sync" / "quarantine"
-            )
+            relative_backup = backup.relative_to(home / "personal-sync" / "quarantine")
             self.assertGreaterEqual(len(relative_backup.parts), 3)
             self.assertIsNotNone(
                 MODULE.PENDING_LINK_BATCH_RE.fullmatch(relative_backup.parts[0])
@@ -570,8 +565,11 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 parser.parse_args(["install"])
             with self.assertRaises(SystemExit):
                 parser.parse_args(["install-private"])
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["install-scheduler"])
+        scheduler_args = parser.parse_args(["install-scheduler"])
+        self.assertIsNone(scheduler_args.repo)
+        self.assertIsNone(scheduler_args.mode)
+        self.assertIsNone(scheduler_args.base_repo)
+        self.assertIsNone(scheduler_args.owner)
 
     def test_default_release_repo_can_be_overridden_by_environment(self) -> None:
         with mock.patch.dict(
@@ -587,7 +585,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertEqual(install_args.repo, "ExampleOrg/example-codex")
         self.assertEqual(install_private_args.repo, "ExampleOrg/example-codex")
         self.assertEqual(install_private_args.base_repo, "Joey-Tools/codex-toolbox")
-        self.assertEqual(scheduler_args.repo, "ExampleOrg/example-codex")
+        self.assertIsNone(scheduler_args.repo)
 
     def test_empty_release_repo_environment_is_ignored(self) -> None:
         with mock.patch.dict(
@@ -604,8 +602,8 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 parser.parse_args(["install"])
             with self.assertRaises(SystemExit):
                 parser.parse_args(["install-private"])
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["install-scheduler"])
+        scheduler_defaults = parser.parse_args(["install-scheduler"])
+        self.assertIsNone(scheduler_defaults.repo)
 
         install_private_args = parser.parse_args(
             ["install-private", "--repo", "ExampleOrg/private-codex"]
@@ -621,7 +619,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         )
 
         self.assertEqual(install_private_args.base_repo, "Joey-Tools/codex-toolbox")
-        self.assertEqual(scheduler_args.base_repo, "Joey-Tools/codex-toolbox")
+        self.assertIsNone(scheduler_args.base_repo)
 
     def test_base_release_repo_can_be_overridden_by_environment(self) -> None:
         with mock.patch.dict(
@@ -637,318 +635,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         scheduler_args = parser.parse_args(["install-scheduler", "--mode", "private"])
 
         self.assertEqual(install_private_args.base_repo, "ExampleOrg/public-codex")
-        self.assertEqual(scheduler_args.base_repo, "ExampleOrg/public-codex")
-
-    def test_public_package_uses_public_manifest_allowlist(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir_raw:
-            temp_dir = Path(temp_dir_raw)
-            dist_dir = temp_dir / "dist"
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(PACKAGE_SCRIPT_PATH),
-                    "--repo-root",
-                    str(REPO_ROOT),
-                    "--sha",
-                    SHA1,
-                    "--output-dir",
-                    str(dist_dir),
-                ],
-                check=True,
-                text=True,
-                capture_output=True,
-            )
-
-            archive_path = dist_dir / f"personal-codex-{SHA1}.tar.gz"
-            checksum_path = dist_dir / f"personal-codex-{SHA1}.sha256"
-            with MODULE.bind_archive_workspace(temp_dir) as workspace:
-                release_root, _release_expectation = (
-                    MODULE.verify_and_extract_archive(
-                        archive_path,
-                        checksum_path,
-                        temp_dir / "extract",
-                        workspace=workspace,
-                    )
-                )
-            with tarfile.open(archive_path, "r:gz") as archive:
-                member_names = archive.getnames()
-
-            joined_names = "\n".join(member_names)
-            self.assertIn(
-                f"personal-codex-{SHA1}/personal_codex/sync-manifest.json",
-                member_names,
-            )
-            self.assertIn(
-                f"personal-codex-{SHA1}/scripts/codex_personal_sync.py",
-                member_names,
-            )
-            self.assertIn(
-                f"personal-codex-{SHA1}/personal_codex/AGENTS.md",
-                member_names,
-            )
-            self.assertIn(
-                f"personal-codex-{SHA1}/personal_codex/skills/submodule-linked-worktrees/SKILL.md",
-                member_names,
-            )
-            self.assertNotIn("cisco-trackers-lookup", joined_names)
-            self.assertNotIn("remote-host-context", joined_names)
-            self.assertNotIn("automations/", joined_names)
-
-            entries = MODULE.validate_release_tree(release_root)
-            self.assertEqual(len(entries), 5)
-
-    def test_package_builder_rejects_nested_directory_symlinks(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir_raw:
-            temp_dir = Path(temp_dir_raw)
-            repo_root = temp_dir / "repo"
-            source_root = repo_root / "personal_codex" / "skills" / "example"
-            source_root.mkdir(parents=True)
-            (source_root / "SKILL.md").write_text("---\nname: example\n---\n", encoding="utf-8")
-            (source_root / "leak").symlink_to(Path.home())
-            manifest_path = repo_root / "personal_codex" / "test-manifest.json"
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "links": [
-                            {
-                                "source": "personal_codex/skills/example",
-                                "target": "skills/example",
-                                "kind": "skill",
-                            }
-                        ],
-                        "reference_only": [],
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(PACKAGE_SCRIPT_PATH),
-                    "--repo-root",
-                    str(repo_root),
-                    "--manifest",
-                    "personal_codex/test-manifest.json",
-                    "--sha",
-                    SHA1,
-                    "--output-dir",
-                    str(temp_dir / "dist"),
-                ],
-                check=False,
-                text=True,
-                capture_output=True,
-            )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("nested symlink", result.stderr)
-
-    def test_package_builder_rejects_current_directory_source(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir_raw:
-            temp_dir = Path(temp_dir_raw)
-            repo_root = temp_dir / "repo"
-            manifest_path = repo_root / "personal_codex" / "test-manifest.json"
-            manifest_path.parent.mkdir(parents=True)
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "links": [
-                            {
-                                "source": ".",
-                                "target": "skills/example",
-                                "kind": "directory",
-                            }
-                        ],
-                        "reference_only": [],
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(PACKAGE_SCRIPT_PATH),
-                    "--repo-root",
-                    str(repo_root),
-                    "--manifest",
-                    "personal_codex/test-manifest.json",
-                    "--sha",
-                    SHA1,
-                    "--output-dir",
-                    str(temp_dir / "dist"),
-                ],
-                check=False,
-                text=True,
-                capture_output=True,
-            )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unsafe manifest source", result.stderr)
-
-    def test_package_builder_rejects_generated_file_symlinks(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir_raw:
-            temp_dir = Path(temp_dir_raw)
-            repo_root = temp_dir / "repo"
-            source_root = repo_root / "personal_codex" / "skills" / "example"
-            source_root.mkdir(parents=True)
-            (source_root / "SKILL.md").write_text("---\nname: example\n---\n", encoding="utf-8")
-            (source_root / "generated.pyc").symlink_to(Path.home())
-            manifest_path = repo_root / "personal_codex" / "test-manifest.json"
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "links": [
-                            {
-                                "source": "personal_codex/skills/example",
-                                "target": "skills/example",
-                                "kind": "skill",
-                            }
-                        ],
-                        "reference_only": [],
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(PACKAGE_SCRIPT_PATH),
-                    "--repo-root",
-                    str(repo_root),
-                    "--manifest",
-                    "personal_codex/test-manifest.json",
-                    "--sha",
-                    SHA1,
-                    "--output-dir",
-                    str(temp_dir / "dist"),
-                ],
-                check=False,
-                text=True,
-                capture_output=True,
-            )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("nested symlink", result.stderr)
-
-    def test_package_builder_rejects_top_level_generated_file_sources(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir_raw:
-            temp_dir = Path(temp_dir_raw)
-            repo_root = temp_dir / "repo"
-            source_root = repo_root / "personal_codex" / "skills" / "example"
-            source_root.mkdir(parents=True)
-            (source_root / "generated.pyc").write_bytes(b"generated")
-            manifest_path = repo_root / "personal_codex" / "test-manifest.json"
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "links": [
-                            {
-                                "source": "personal_codex/skills/example/generated.pyc",
-                                "target": "skills/example/generated.pyc",
-                                "kind": "skill",
-                            }
-                        ],
-                        "reference_only": [],
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(PACKAGE_SCRIPT_PATH),
-                    "--repo-root",
-                    str(repo_root),
-                    "--manifest",
-                    "personal_codex/test-manifest.json",
-                    "--sha",
-                    SHA1,
-                    "--output-dir",
-                    str(temp_dir / "dist"),
-                ],
-                check=False,
-                text=True,
-                capture_output=True,
-            )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("generated manifest source", result.stderr)
-
-    def test_package_builder_filters_generated_files_without_dropping_real_dirs(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir_raw:
-            temp_dir = Path(temp_dir_raw)
-            repo_root = temp_dir / "repo"
-            source_root = repo_root / "personal_codex" / "skills" / "example"
-            cache_root = source_root / "__pycache__"
-            real_pyc_dir = source_root / "assets" / "fixture.pyc"
-            cache_root.mkdir(parents=True)
-            real_pyc_dir.mkdir(parents=True)
-            (source_root / "SKILL.md").write_text("---\nname: example\n---\n", encoding="utf-8")
-            (source_root / ".DS_Store").write_text("generated\n", encoding="utf-8")
-            (source_root / "generated.pyc").write_bytes(b"generated")
-            (source_root / "assets" / "generated.pyo").write_bytes(b"generated")
-            (cache_root / "session_retrospective.cpython-314.pyc").write_bytes(b"generated")
-            (real_pyc_dir / "fixture.txt").write_text("keep\n", encoding="utf-8")
-            manifest_path = repo_root / "personal_codex" / "test-manifest.json"
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "links": [
-                            {
-                                "source": "personal_codex/skills/example",
-                                "target": "skills/example",
-                                "kind": "skill",
-                            }
-                        ],
-                        "reference_only": [],
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            dist_dir = temp_dir / "dist"
-
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(PACKAGE_SCRIPT_PATH),
-                    "--repo-root",
-                    str(repo_root),
-                    "--manifest",
-                    "personal_codex/test-manifest.json",
-                    "--sha",
-                    SHA1,
-                    "--output-dir",
-                    str(dist_dir),
-                ],
-                check=True,
-                text=True,
-                capture_output=True,
-            )
-            archive_path = dist_dir / f"personal-codex-{SHA1}.tar.gz"
-            with tarfile.open(archive_path, "r:gz") as archive:
-                member_names = archive.getnames()
-
-        joined_names = "\n".join(member_names)
-        self.assertIn(f"personal-codex-{SHA1}/personal_codex/skills/example/SKILL.md", member_names)
-        self.assertIn(f"personal-codex-{SHA1}/personal_codex/skills/example/assets/fixture.pyc/fixture.txt", member_names)
-        self.assertNotIn("__pycache__", joined_names)
-        self.assertNotIn(".DS_Store", joined_names)
-        self.assertNotIn("/generated.pyc", joined_names)
-        self.assertNotIn("/generated.pyo", joined_names)
-        self.assertNotIn(".cpython-314.pyc", joined_names)
+        self.assertIsNone(scheduler_args.base_repo)
 
     def test_install_private_downloads_public_base_and_overlay(self) -> None:
         public_release = self.root / "public-release"
@@ -1197,7 +884,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             )
         )
         moving_record = next(
-            entry for entry in state["links"] if entry["target"] == "skills/moving-skill"
+            entry
+            for entry in state["links"]
+            if entry["target"] == "skills/moving-skill"
         )
         self.assertEqual(moving_record["owner"], "public")
 
@@ -1250,13 +939,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertEqual(
-            (
-                home
-                / "personal-sync"
-                / "overlays"
-                / "private"
-                / "current"
-            ).readlink().as_posix(),
+            (home / "personal-sync" / "overlays" / "private" / "current")
+            .readlink()
+            .as_posix(),
             f"releases/{SHA2}",
         )
         self.assertEqual(
@@ -1318,9 +1003,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     "source": "personal_codex/skills/moving-skill",
                     "target": "skills/moving-skill",
                     "kind": "skill",
-                    "retires_replacements": [
-                        "private:move-moving-skill-to-public"
-                    ],
+                    "retires_replacements": ["private:move-moving-skill-to-public"],
                 }
             ],
         )
@@ -1370,9 +1053,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     "source": "personal_codex/skills/moving-skill",
                     "target": "skills/moving-skill",
                     "kind": "skill",
-                    "retires_replacements": [
-                        "private:move-moving-skill-to-public"
-                    ],
+                    "retires_replacements": ["private:move-moving-skill-to-public"],
                 }
             ],
         )
@@ -1448,9 +1129,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     "source": "personal_codex/skills/moving-skill",
                     "target": "skills/moving-skill",
                     "kind": "skill",
-                    "retires_replacements": [
-                        "private:move-moving-skill-to-public"
-                    ],
+                    "retires_replacements": ["private:move-moving-skill-to-public"],
                 }
             ],
         )
@@ -1517,9 +1196,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             legacy_metadata.st_ino,
             legacy_link.readlink().as_posix(),
             current_target(home),
-            (
-                home / "personal-sync" / "overlays" / "private" / "current"
-            ).readlink().as_posix(),
+            (home / "personal-sync" / "overlays" / "private" / "current")
+            .readlink()
+            .as_posix(),
             state_path.read_bytes(),
         )
 
@@ -1543,13 +1222,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 legacy_metadata.st_ino,
                 legacy_link.readlink().as_posix(),
                 current_target(home),
-                (
-                    home
-                    / "personal-sync"
-                    / "overlays"
-                    / "private"
-                    / "current"
-                ).readlink().as_posix(),
+                (home / "personal-sync" / "overlays" / "private" / "current")
+                .readlink()
+                .as_posix(),
                 state_path.read_bytes(),
             ),
             before,
@@ -1615,11 +1290,15 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 private_sha=SHA4,
             )
 
-        self.assertEqual((local_directory / "local.txt").read_text(encoding="utf-8"), "local\n")
+        self.assertEqual(
+            (local_directory / "local.txt").read_text(encoding="utf-8"), "local\n"
+        )
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertEqual(snapshot_tree(quarantine_root), quarantine_before)
 
-    def test_install_private_does_not_commit_state_after_overlay_verification_failure(self) -> None:
+    def test_install_private_does_not_commit_state_after_overlay_verification_failure(
+        self,
+    ) -> None:
         home = self.root / "home" / ".codex"
         old_public = self.root / "old-public"
         old_private = self.root / "old-private"
@@ -1647,8 +1326,12 @@ class CodexPersonalSyncTests(unittest.TestCase):
             skills=("private-keeper",),
         )
 
-        with mock.patch.object(MODULE, "_collect_overlay_issues", return_value=["forced"]):
-            with self.assertRaisesRegex(MODULE.SyncError, "overlay verification failed"):
+        with mock.patch.object(
+            MODULE, "_collect_overlay_issues", return_value=["forced"]
+        ):
+            with self.assertRaisesRegex(
+                MODULE.SyncError, "overlay verification failed"
+            ):
                 self.install_private_pair(
                     home,
                     new_public,
@@ -1672,7 +1355,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             {"private": SHA4, "public": SHA3},
         )
 
-    def test_install_private_rejects_cross_layer_ancestor_target_collision(self) -> None:
+    def test_install_private_rejects_cross_layer_ancestor_target_collision(
+        self,
+    ) -> None:
         home = self.root / "home" / ".codex"
         public_release = self.root / "public"
         private_release = self.root / "private"
@@ -1873,12 +1558,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertFalse((home / "personal-sync" / "releases" / SHA3).exists())
         self.assertFalse(
             (
-                home
-                / "personal-sync"
-                / "overlays"
-                / "private"
-                / "releases"
-                / SHA4
+                home / "personal-sync" / "overlays" / "private" / "releases" / SHA4
             ).exists()
         )
 
@@ -1898,9 +1578,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         manifest_path = private_release / "personal_codex" / "sync-manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         next(
-            entry
-            for entry in manifest["links"]
-            if entry["target"] == "skills/shared"
+            entry for entry in manifest["links"] if entry["target"] == "skills/shared"
         )["override"] = True
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         self.install_private_pair(
@@ -1952,9 +1630,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         self.run_quietly(MODULE.uninstall_overlay, home, "private", dry_run=False)
 
-        private_current = (
-            home / "personal-sync" / "overlays" / "private" / "current"
-        )
+        private_current = home / "personal-sync" / "overlays" / "private" / "current"
         self.assertFalse(os.path.lexists(private_current))
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertEqual(foreign_leaf_snapshot(agents), foreign_before)
@@ -2007,18 +1683,16 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertEqual(MODULE._state_path(home).read_bytes(), state_before)
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertEqual(
-            (
-                home
-                / "personal-sync"
-                / "overlays"
-                / "private"
-                / "current"
-            ).readlink().as_posix(),
+            (home / "personal-sync" / "overlays" / "private" / "current")
+            .readlink()
+            .as_posix(),
             f"releases/{SHA2}",
         )
         self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(home)))
 
-    def test_uninstall_overlay_rolls_back_then_retries_after_write_failure(self) -> None:
+    def test_uninstall_overlay_rolls_back_then_retries_after_write_failure(
+        self,
+    ) -> None:
         home = self.root / "home" / ".codex"
         public_release = self.root / "public"
         private_release = self.root / "private"
@@ -2083,9 +1757,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             public_sha=SHA1,
             private_sha=SHA2,
         )
-        private_current = (
-            home / "personal-sync" / "overlays" / "private" / "current"
-        )
+        private_current = home / "personal-sync" / "overlays" / "private" / "current"
         private_current.unlink()
 
         self.run_quietly(MODULE.uninstall_overlay, home, "private", dry_run=False)
@@ -2103,7 +1775,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             {"public"},
         )
 
-    def test_uninstall_overlay_with_missing_current_rolls_back_and_retries(self) -> None:
+    def test_uninstall_overlay_with_missing_current_rolls_back_and_retries(
+        self,
+    ) -> None:
         home = self.root / "home" / ".codex"
         public_release = self.root / "public"
         private_release = self.root / "private"
@@ -2120,9 +1794,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             public_sha=SHA1,
             private_sha=SHA2,
         )
-        private_current = (
-            home / "personal-sync" / "overlays" / "private" / "current"
-        )
+        private_current = home / "personal-sync" / "overlays" / "private" / "current"
         private_current.unlink()
         state_path = home / "personal-sync" / "state" / "managed-links.json"
         old_state = state_path.read_bytes()
@@ -2206,13 +1878,10 @@ class CodexPersonalSyncTests(unittest.TestCase):
         retired_payload = next(
             record
             for record in malformed["records"]
-            if record["scope"] == "current"
-            and record["action"] == "retire-absent"
+            if record["scope"] == "current" and record["action"] == "retire-absent"
         )
         retired_payload["owner"] = "ghost"
-        retired_payload["target"] = (
-            "personal-sync/overlays/ghost/current"
-        )
+        retired_payload["target"] = "personal-sync/overlays/ghost/current"
         pointer.write_text(json.dumps(malformed) + "\n", encoding="utf-8")
         with self.assertRaisesRegex(
             MODULE.SyncError,
@@ -2227,7 +1896,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertEqual(state["owners"], {"public": SHA1})
         self.assertFalse(os.path.lexists(home / "skills" / "private-only"))
 
-    def test_uninstall_overlay_retains_pending_when_outgoing_release_changes(self) -> None:
+    def test_uninstall_overlay_retains_pending_when_outgoing_release_changes(
+        self,
+    ) -> None:
         home = self.root / "home" / ".codex"
         public_release = self.root / "public"
         private_release = self.root / "private"
@@ -2244,9 +1915,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             public_sha=SHA1,
             private_sha=SHA2,
         )
-        private_current = (
-            home / "personal-sync" / "overlays" / "private" / "current"
-        )
+        private_current = home / "personal-sync" / "overlays" / "private" / "current"
         state_path = home / "personal-sync" / "state" / "managed-links.json"
         old_state = state_path.read_bytes()
         installed_skill = (
@@ -2288,7 +1957,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertEqual(state_path.read_bytes(), old_state)
         self.assertTrue(MODULE._pending_link_pointer_path(home).is_file())
 
-    def test_private_scheduler_invokes_private_install_entrypoint(self) -> None:
+    def test_private_scheduler_invokes_stable_scheduled_entrypoint(self) -> None:
         home = self.root / "home" / ".codex"
         args = MODULE._scheduler_install_args(
             Path("/runner"),
@@ -2303,7 +1972,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             args,
             [
                 "/runner",
-                "install-private",
+                "run-scheduled",
+                "--mode",
+                "private",
                 "--repo",
                 "Joey-Tools/codex-private-workflows",
                 "--base-repo",
@@ -2489,9 +2160,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
     def test_select_release_assets_rejects_missing_checksum(self) -> None:
         release = {
             "tagName": "personal-codex-20260511-120000-1111111",
-            "assets": [
-                github_release_asset(101, f"personal-codex-{SHA1}.tar.gz")
-            ],
+            "assets": [github_release_asset(101, f"personal-codex-{SHA1}.tar.gz")],
         }
 
         with self.assertRaisesRegex(MODULE.SyncError, "missing checksum"):
@@ -2569,20 +2238,548 @@ class CodexPersonalSyncTests(unittest.TestCase):
     def test_run_gh_json_wraps_missing_gh(self) -> None:
         with mock.patch.object(
             MODULE.subprocess,
-            "run",
+            "Popen",
             side_effect=FileNotFoundError("No such file or directory"),
         ):
-            with self.assertRaisesRegex(MODULE.SyncError, "GitHub CLI `gh` is not available"):
+            with self.assertRaisesRegex(
+                MODULE.SyncError, "GitHub CLI `gh` is not available"
+            ):
                 MODULE._run_gh_json(["api", "repos/owner/repo/releases"])
 
     def test_run_gh_wraps_missing_gh(self) -> None:
         with mock.patch.object(
             MODULE.subprocess,
-            "run",
+            "Popen",
             side_effect=FileNotFoundError("No such file or directory"),
         ):
-            with self.assertRaisesRegex(MODULE.SyncError, "GitHub CLI `gh` is not available"):
+            with self.assertRaisesRegex(
+                MODULE.SyncError, "GitHub CLI `gh` is not available"
+            ):
                 MODULE._run_gh(["release", "download", "tag"])
+
+    def test_process_guardian_reports_target_and_remains_live_for_fence(
+        self,
+    ) -> None:
+        process = MODULE._spawn_guarded_process(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os;os.write(1,b'guardian-stdout');"
+                    "os.write(2,b'guardian-stderr')"
+                ),
+            ],
+            deadline=time.monotonic() + 5.0,
+            process_label="test process",
+            unavailable_code="test-unavailable",
+            unavailable_message="test executable unavailable",
+        )
+        stdout = process.stdout.read()
+        stderr = process.stderr.read()
+        status_payload = process.status.read(MODULE.PROCESS_GUARDIAN_STATUS_RECORD.size)
+
+        self.assertEqual(stdout, b"guardian-stdout")
+        self.assertEqual(stderr, b"guardian-stderr")
+        self.assertEqual(
+            len(status_payload), MODULE.PROCESS_GUARDIAN_STATUS_RECORD.size
+        )
+        magic, guardian_pid, target_pid, target_returncode = (
+            MODULE.PROCESS_GUARDIAN_STATUS_RECORD.unpack(status_payload)
+        )
+        self.assertEqual(magic, MODULE.PROCESS_GUARDIAN_STATUS_MAGIC)
+        self.assertEqual(guardian_pid, process.pid)
+        self.assertEqual(target_pid, process.target_pid)
+        self.assertEqual(target_returncode, 0)
+        self.assertIsNone(process.returncode)
+        os.set_blocking(process.status.fileno(), False)
+        with self.assertRaises(BlockingIOError):
+            os.read(process.status.fileno(), 1)
+
+        receipt = MODULE._terminalize_process_group_before_reap(
+            process,
+            deadline=time.monotonic() + 5.0,
+            process_label="test process guardian",
+        )
+        close_failures = MODULE._close_process_supervision_resources(
+            process,
+            None,
+            process_label="test process guardian",
+        )
+
+        self.assertTrue(receipt.complete, receipt.errors)
+        self.assertTrue(receipt.kill_sent)
+        self.assertEqual(receipt.returncode, -9)
+        self.assertEqual(close_failures, [])
+
+    def test_guardian_terminalization_never_touches_group_after_wait(self) -> None:
+        lifecycle: list[str] = []
+        guardian = mock.Mock()
+        guardian.returncode = None
+        process = mock.Mock(pid=12345, returncode=None, guardian=guardian)
+
+        def kill_group(process_group_id, signal_number):
+            self.assertEqual(process_group_id, 12345)
+            self.assertEqual(signal_number, MODULE.signal.SIGKILL)
+            self.assertEqual(lifecycle, [])
+            lifecycle.append("killpg")
+
+        def wait(*, timeout):
+            self.assertGreaterEqual(timeout, 0.0)
+            self.assertEqual(lifecycle, ["killpg"])
+            lifecycle.append("wait")
+            return -MODULE.signal.SIGKILL
+
+        process.wait.side_effect = wait
+        with mock.patch.object(MODULE.os, "killpg", side_effect=kill_group):
+            receipt = MODULE._terminalize_process_group_before_reap(
+                process,
+                deadline=time.monotonic() + 1.0,
+                process_label="test guardian",
+            )
+
+        self.assertTrue(receipt.complete, receipt.errors)
+        self.assertEqual(lifecycle, ["killpg", "wait"])
+        process.wait.assert_called_once()
+
+    def test_guardian_terminalization_rejects_early_exit_and_signal_errors(
+        self,
+    ) -> None:
+        early = mock.Mock(pid=12345, returncode=0)
+        with mock.patch.object(MODULE.os, "killpg") as kill_group:
+            receipt = MODULE._terminalize_process_group_before_reap(
+                early,
+                deadline=time.monotonic() + 1.0,
+                process_label="early guardian",
+            )
+        self.assertFalse(receipt.complete)
+        kill_group.assert_not_called()
+        early.wait.assert_not_called()
+
+        for signal_error in (
+            ProcessLookupError("missing group"),
+            PermissionError("denied group"),
+            OSError("other group failure"),
+        ):
+            with self.subTest(error=type(signal_error).__name__):
+                process = mock.Mock(pid=12345, returncode=None)
+                process.wait.return_value = -MODULE.signal.SIGKILL
+                with mock.patch.object(
+                    MODULE.os,
+                    "killpg",
+                    side_effect=signal_error,
+                ):
+                    receipt = MODULE._terminalize_process_group_before_reap(
+                        process,
+                        deadline=time.monotonic() + 1.0,
+                        process_label="failed guardian",
+                    )
+                self.assertFalse(receipt.complete)
+                process.wait.assert_called_once()
+
+    def test_guardian_status_is_exact_and_identity_bound(self) -> None:
+        process = mock.Mock(pid=12345, target_pid=23456)
+        valid = MODULE.PROCESS_GUARDIAN_STATUS_RECORD.pack(
+            MODULE.PROCESS_GUARDIAN_STATUS_MAGIC,
+            process.pid,
+            process.target_pid,
+            0,
+        )
+        self.assertEqual(
+            MODULE._parse_guardian_status(
+                process,
+                valid,
+                process_label="test process",
+                error_code="test-protocol",
+            ),
+            0,
+        )
+        invalid_payloads = (
+            valid[:-1],
+            valid + b"x",
+            MODULE.PROCESS_GUARDIAN_STATUS_RECORD.pack(
+                b"BADMAGIC",
+                process.pid,
+                process.target_pid,
+                0,
+            ),
+            MODULE.PROCESS_GUARDIAN_STATUS_RECORD.pack(
+                MODULE.PROCESS_GUARDIAN_STATUS_MAGIC,
+                process.pid + 1,
+                process.target_pid,
+                0,
+            ),
+            MODULE.PROCESS_GUARDIAN_STATUS_RECORD.pack(
+                MODULE.PROCESS_GUARDIAN_STATUS_MAGIC,
+                process.pid,
+                process.target_pid + 1,
+                0,
+            ),
+            MODULE.PROCESS_GUARDIAN_STATUS_RECORD.pack(
+                MODULE.PROCESS_GUARDIAN_STATUS_MAGIC,
+                process.pid,
+                process.target_pid,
+                256,
+            ),
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(MODULE.SyncError) as raised:
+                    MODULE._parse_guardian_status(
+                        process,
+                        payload,
+                        process_label="test process",
+                        error_code="test-protocol",
+                    )
+                self.assertEqual(raised.exception.code, "test-protocol")
+
+    def test_guardian_status_writer_eof_is_early_exit(self) -> None:
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        status = os.fdopen(read_fd, "rb", buffering=0)
+        process = mock.Mock(status=status)
+        os.set_blocking(status.fileno(), False)
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "exited before process-group fencing",
+            ) as raised:
+                MODULE._require_guardian_status_writer_live(
+                    process,
+                    process_label="test process",
+                    error_code="test-protocol",
+                )
+            self.assertEqual(raised.exception.code, "test-protocol")
+        finally:
+            status.close()
+
+    def test_guardian_target_launch_failure_preserves_unavailable_taxonomy(
+        self,
+    ) -> None:
+        guardians: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def capture_guardian(args, **kwargs):
+            guardian = real_popen(args, **kwargs)
+            guardians.append(guardian)
+            return guardian
+
+        with (
+            mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=capture_guardian,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "test executable unavailable",
+            ) as raised,
+        ):
+            MODULE._spawn_guarded_process(
+                ["/definitely/missing/codex-personal-sync-target"],
+                deadline=time.monotonic() + 5.0,
+                process_label="missing target",
+                unavailable_code="test-unavailable",
+                unavailable_message="test executable unavailable",
+            )
+
+        self.assertEqual(raised.exception.code, "test-unavailable")
+        self.assertEqual(len(guardians), 1)
+        self.assertEqual(guardians[0].returncode, -MODULE.signal.SIGKILL)
+        self.assertTrue(guardians[0].stdout.closed)
+        self.assertTrue(guardians[0].stderr.closed)
+
+    def test_guardian_control_descriptors_do_not_reach_target(self) -> None:
+        process = MODULE._spawn_guarded_process(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os;leaks=[];"
+                    'exec("for fd in range(3, 64):\\n'
+                    " try:\\n  os.fstat(fd)\\n  leaks.append(fd)\\n"
+                    ' except OSError:\\n  pass");'
+                    "os.write(1,(','.join(map(str,leaks))).encode())"
+                ),
+            ],
+            deadline=time.monotonic() + 5.0,
+            process_label="descriptor test",
+            unavailable_code="test-unavailable",
+            unavailable_message="test executable unavailable",
+        )
+        self.assertEqual(process.stdout.read(), b"")
+        self.assertEqual(process.stderr.read(), b"")
+        status = process.status.read(MODULE.PROCESS_GUARDIAN_STATUS_RECORD.size)
+        self.assertEqual(len(status), MODULE.PROCESS_GUARDIAN_STATUS_RECORD.size)
+        receipt = MODULE._terminalize_process_group_before_reap(
+            process,
+            deadline=time.monotonic() + 5.0,
+            process_label="descriptor test guardian",
+        )
+        MODULE._close_process_supervision_resources(
+            process,
+            None,
+            process_label="descriptor test guardian",
+        )
+        self.assertTrue(receipt.complete, receipt.errors)
+
+    def test_truncated_guardian_ready_receipt_is_fenced_before_reap(self) -> None:
+        guardians: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+        truncated_guardian = """
+import os
+import signal
+import sys
+ready_fd = int(sys.argv[1])
+status_fd = int(sys.argv[2])
+os.write(ready_fd, b'x')
+os.close(ready_fd)
+os.close(status_fd)
+os.close(1)
+os.close(2)
+while True:
+    signal.pause()
+"""
+
+        def capture_guardian(args, **kwargs):
+            guardian = real_popen(args, **kwargs)
+            guardians.append(guardian)
+            return guardian
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "PROCESS_GUARDIAN_SOURCE",
+                truncated_guardian,
+            ),
+            mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=capture_guardian,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "ready receipt is incomplete",
+            ) as raised,
+        ):
+            MODULE._spawn_guarded_process(
+                [sys.executable, "-c", "pass"],
+                deadline=time.monotonic() + 5.0,
+                process_label="truncated guardian",
+                unavailable_code="test-unavailable",
+                unavailable_message="test executable unavailable",
+            )
+
+        self.assertEqual(raised.exception.code, "process-guardian-protocol")
+        self.assertEqual(len(guardians), 1)
+        self.assertEqual(guardians[0].returncode, -MODULE.signal.SIGKILL)
+
+    def test_second_guardian_pipe_failure_closes_first_pipe_pair(self) -> None:
+        real_pipe = os.pipe
+        first_pair: tuple[int, int] | None = None
+        calls = 0
+
+        def fail_second_pipe():
+            nonlocal calls, first_pair
+            calls += 1
+            if calls == 1:
+                first_pair = real_pipe()
+                return first_pair
+            raise OSError("injected second pipe failure")
+
+        with (
+            mock.patch.object(MODULE.os, "pipe", side_effect=fail_second_pipe),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "guardian control pipes",
+            ) as raised,
+        ):
+            MODULE._spawn_guarded_process(
+                [sys.executable, "-c", "pass"],
+                deadline=time.monotonic() + 5.0,
+                process_label="pipe failure",
+                unavailable_code="test-unavailable",
+                unavailable_message="test executable unavailable",
+            )
+
+        self.assertEqual(raised.exception.code, "process-guardian-protocol")
+        self.assertIsNotNone(first_pair)
+        assert first_pair is not None
+        for file_descriptor in first_pair:
+            with self.assertRaises(OSError):
+                os.fstat(file_descriptor)
+
+    def test_ready_reader_owns_fd_across_exception_and_number_reuse(self) -> None:
+        real_reader = MODULE._read_guardian_ready_record
+        reused_fd: int | None = None
+
+        def read_then_reuse(file_descriptor, **kwargs):
+            nonlocal reused_fd
+            real_reader(file_descriptor, **kwargs)
+            reused_fd = os.open("/dev/null", os.O_RDONLY)
+            self.assertEqual(reused_fd, file_descriptor)
+            raise MODULE.SyncError(
+                "injected post-ready failure",
+                code="process-guardian-protocol",
+            )
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_read_guardian_ready_record",
+                    side_effect=read_then_reuse,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "injected post-ready failure",
+                ),
+            ):
+                MODULE._spawn_guarded_process(
+                    [sys.executable, "-c", "pass"],
+                    deadline=time.monotonic() + 5.0,
+                    process_label="ready ownership",
+                    unavailable_code="test-unavailable",
+                    unavailable_message="test executable unavailable",
+                )
+            self.assertIsNotNone(reused_fd)
+            assert reused_fd is not None
+            os.fstat(reused_fd)
+        finally:
+            if reused_fd is not None:
+                os.close(reused_fd)
+
+    def test_ready_reader_close_failure_preserves_protocol_primary(self) -> None:
+        read_fd, write_fd = os.pipe()
+        real_selector = MODULE.selectors.DefaultSelector
+        try:
+            with (
+                mock.patch.object(
+                    MODULE.selectors,
+                    "DefaultSelector",
+                    return_value=CloseFailingSelector(
+                        real_selector(),
+                        RuntimeError("injected ready selector close failure"),
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "ready receipt timed out.*ready selector close failure",
+                ) as raised,
+            ):
+                MODULE._read_guardian_ready_record(
+                    read_fd,
+                    deadline=time.monotonic() - 1.0,
+                    process_label="ready close test",
+                )
+            read_fd = -1
+            self.assertEqual(raised.exception.code, "process-guardian-protocol")
+            self.assertIsInstance(raised.exception.__cause__, MODULE.SyncError)
+            self.assertIn(
+                "ready receipt timed out",
+                str(raised.exception.__cause__),
+            )
+        finally:
+            if read_fd >= 0:
+                os.close(read_fd)
+            os.close(write_fd)
+
+    def test_bounded_gh_selector_close_failure_preserves_primary(self) -> None:
+        process = FakeDownloadProcess(b"123456789")
+        real_selector = MODULE.selectors.DefaultSelector
+        selector_calls = 0
+
+        def selector_factory():
+            nonlocal selector_calls
+            selector_calls += 1
+            if selector_calls == 1:
+                return CloseFailingSelector(
+                    real_selector(),
+                    RuntimeError("injected selector close failure"),
+                )
+            return real_selector()
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_spawn_guarded_process",
+                return_value=process,
+            ),
+            mock.patch.object(
+                MODULE.selectors,
+                "DefaultSelector",
+                side_effect=selector_factory,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "stdout exceeds.*selector close failure",
+            ) as raised,
+        ):
+            MODULE._run_bounded_gh_process(
+                ["api", "repos/owner/repo/releases"],
+                deadline=time.monotonic() + 5.0,
+                stdout_limit=8,
+                stderr_limit=8,
+                label="gh metadata command",
+            )
+
+        self.assertEqual(raised.exception.code, "gh-cleanup-inconclusive")
+        self.assertIsInstance(raised.exception.__cause__, MODULE.SyncError)
+        self.assertEqual(raised.exception.__cause__.code, "gh-stdout-limit")
+        self.assertEqual(process.returncode, -MODULE.signal.SIGKILL)
+
+    def test_gh_maps_guardian_spawn_cleanup_failure_to_lane_taxonomy(self) -> None:
+        primary = MODULE.SyncError(
+            "injected guardian cleanup failure",
+            code="process-guardian-cleanup-inconclusive",
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_spawn_guarded_process",
+                side_effect=primary,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "guardian cleanup was inconclusive",
+            ) as raised,
+        ):
+            MODULE._run_bounded_gh_process(
+                ["api", "repos/owner/repo/releases"],
+                deadline=time.monotonic() + 5.0,
+                stdout_limit=8,
+                stderr_limit=8,
+                label="gh metadata command",
+            )
+
+        self.assertEqual(raised.exception.code, "gh-cleanup-inconclusive")
+        self.assertIs(raised.exception.__cause__, primary)
+
+    def test_gh_maps_guardian_operation_deadline_to_lane_taxonomy(self) -> None:
+        primary = MODULE.SyncError(
+            "gh metadata command exceeded its monotonic deadline",
+            code="process-guardian-operation-timeout",
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_spawn_guarded_process",
+                side_effect=primary,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "gh metadata command exceeded its monotonic deadline",
+            ) as raised,
+        ):
+            MODULE._run_bounded_gh_process(
+                ["api", "repos/owner/repo/releases"],
+                deadline=time.monotonic() + 1.0,
+                stdout_limit=8,
+                stderr_limit=8,
+                label="gh metadata command",
+            )
+
+        self.assertEqual(raised.exception.code, "gh-timeout")
+        self.assertIs(raised.exception.__cause__, primary)
 
     def test_run_gh_json_stream_accepts_concatenated_pages(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -2596,6 +2793,135 @@ class CodexPersonalSyncTests(unittest.TestCase):
             pages = MODULE._run_gh_json_stream(["api", "repos/owner/repo/releases"])
 
         self.assertEqual(pages, [[{"tag_name": "one"}], [{"tag_name": "two"}]])
+
+    def test_run_gh_metadata_enforces_output_cap_and_reaps_group(self) -> None:
+        real_spawn = MODULE._spawn_guarded_process
+        processes: list[MODULE._GuardedProcess] = []
+
+        def overflowing_spawn(_args, **kwargs):
+            process = real_spawn(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os,time;os.write(1,b'123456789');time.sleep(30)",
+                ],
+                deadline=kwargs["deadline"],
+                process_label=kwargs["process_label"],
+                unavailable_code="test-unavailable",
+                unavailable_message="test executable unavailable",
+            )
+            processes.append(process)
+            return process
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_spawn_guarded_process",
+                side_effect=overflowing_spawn,
+            ),
+            mock.patch.object(MODULE, "MAX_GH_METADATA_STDOUT_BYTES", 8),
+            mock.patch.object(MODULE, "GH_OPERATION_TIMEOUT_SECONDS", 1.0),
+            mock.patch.object(MODULE, "GH_CLEANUP_TIMEOUT_SECONDS", 1.0),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "stdout exceeds the 8-byte limit",
+            ) as raised,
+        ):
+            MODULE._run_gh_process(["api", "repos/owner/repo/releases"])
+
+        self.assertEqual(raised.exception.code, "gh-stdout-limit")
+        self.assertEqual(len(processes), 1)
+        self.assertEqual(processes[0].returncode, -9)
+
+    def test_download_release_asset_times_out_and_reaps_stalled_group(self) -> None:
+        real_spawn = MODULE._spawn_guarded_process
+        processes: list[MODULE._GuardedProcess] = []
+
+        def stalled_spawn(_args, **kwargs):
+            process = real_spawn(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                deadline=kwargs["deadline"],
+                process_label=kwargs["process_label"],
+                unavailable_code="test-unavailable",
+                unavailable_message="test executable unavailable",
+            )
+            processes.append(process)
+            return process
+
+        payload = b"x"
+        assets = MODULE.ReleaseAssets(
+            tag_name="personal-codex-20260511-120000-1111111",
+            sha=SHA1,
+            archive_name=f"personal-codex-{SHA1}.tar.gz",
+            checksum_name=f"personal-codex-{SHA1}.sha256",
+            archive_id=101,
+            archive_size=len(payload),
+            checksum_id=102,
+            checksum_size=len(payload),
+            archive_digest=github_sha256(payload),
+            checksum_digest=github_sha256(payload),
+        )
+        destination = self.root / "stalled-download"
+        with (
+            mock.patch.object(
+                MODULE,
+                "_spawn_guarded_process",
+                side_effect=stalled_spawn,
+            ),
+            mock.patch.object(MODULE, "GH_OPERATION_TIMEOUT_SECONDS", 1.0),
+            mock.patch.object(MODULE, "GH_CLEANUP_TIMEOUT_SECONDS", 1.0),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "exceeded its monotonic deadline",
+            ) as raised,
+        ):
+            self.download_release_assets("owner/repo", assets, destination)
+
+        self.assertEqual(raised.exception.code, "gh-timeout")
+        self.assertEqual(len(processes), 1)
+        self.assertEqual(processes[0].returncode, -9)
+        self.assertFalse((destination / assets.archive_name).exists())
+        self.assertEqual(list(destination.glob(".*.partial.*")), [])
+
+    def test_gh_cleanup_inconclusive_preserves_primary_classification(self) -> None:
+        process = FakeDownloadProcess(b"123456789")
+        incomplete = MODULE._GhCleanupReceipt(
+            kill_sent=True,
+            child_reaped=False,
+            stdout_drained=False,
+            stderr_drained=True,
+            status_drained=False,
+            process_group_fenced=False,
+            errors=("injected cleanup failure",),
+        )
+        with (
+            mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process),
+            mock.patch.object(
+                MODULE,
+                "_cleanup_gh_process_group",
+                return_value=incomplete,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "cleanup was inconclusive.*stdout-not-drained",
+            ) as raised,
+        ):
+            MODULE._run_bounded_gh_process(
+                ["api", "repos/owner/repo/releases"],
+                deadline=time.monotonic() + 1,
+                stdout_limit=8,
+                stderr_limit=8,
+                label="gh metadata command",
+            )
+
+        self.assertEqual(raised.exception.code, "gh-cleanup-inconclusive")
+        self.assertIn("stdout exceeds", str(raised.exception.__cause__))
+        terminalization = MODULE._terminalize_process_group_before_reap(
+            process,
+            deadline=time.monotonic() + 5.0,
+            process_label="test cleanup guardian",
+        )
+        self.assertTrue(terminalization.complete, terminalization.errors)
 
     def test_download_release_assets_streams_api_assets_by_id(self) -> None:
         archive_payload = b"archive-payload"
@@ -2623,7 +2949,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             return processes.pop(0)
 
         destination = self.root / "downloads"
-        with mock.patch.object(MODULE.subprocess, "Popen", side_effect=fake_popen):
+        with mock.patch.object(
+            MODULE, "_spawn_guarded_process", side_effect=fake_popen
+        ):
             self.download_release_assets("owner/repo", assets, destination)
 
         self.assertEqual(len(calls), 2)
@@ -2636,8 +2964,12 @@ class CodexPersonalSyncTests(unittest.TestCase):
             ["gh", "api", "repos/owner/repo/releases/assets/102"],
         )
         self.assertIn("Accept: application/octet-stream", calls[0])
-        self.assertEqual((destination / assets.archive_name).read_bytes(), archive_payload)
-        self.assertEqual((destination / assets.checksum_name).read_bytes(), checksum_payload)
+        self.assertEqual(
+            (destination / assets.archive_name).read_bytes(), archive_payload
+        )
+        self.assertEqual(
+            (destination / assets.checksum_name).read_bytes(), checksum_payload
+        )
         self.assertEqual(list(destination.glob(".*.partial.*")), [])
 
     def test_download_release_assets_rejects_replaced_partial_during_publish(
@@ -2680,8 +3012,10 @@ class CodexPersonalSyncTests(unittest.TestCase):
             return real_link(source, target, **kwargs)
 
         with (
-            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
-            mock.patch.object(MODULE.os, "link", side_effect=replace_partial_before_link),
+            mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process),
+            mock.patch.object(
+                MODULE.os, "link", side_effect=replace_partial_before_link
+            ),
             self.assertRaisesRegex(
                 MODULE.SyncError,
                 "changed during publication",
@@ -2699,7 +3033,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 for entry in retained
             )
         )
-        self.assertEqual({entry.read_bytes() for entry in retained}, {b"forged-payload"})
+        self.assertEqual(
+            {entry.read_bytes() for entry in retained}, {b"forged-payload"}
+        )
 
     def test_download_release_assets_rejects_replaced_target_during_publish(
         self,
@@ -2742,7 +3078,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             return result
 
         with (
-            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
+            mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process),
             mock.patch.object(MODULE.os, "link", side_effect=replace_target_after_link),
             self.assertRaisesRegex(
                 MODULE.SyncError,
@@ -2761,7 +3097,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 for entry in retained
             )
         )
-        self.assertEqual({entry.read_bytes() for entry in retained}, {b"forged-payload"})
+        self.assertEqual(
+            {entry.read_bytes() for entry in retained}, {b"forged-payload"}
+        )
 
     def test_download_release_assets_preserves_partial_replaced_during_cleanup(
         self,
@@ -2812,7 +3150,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             )
 
         with (
-            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
+            mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process),
             mock.patch.object(
                 MODULE,
                 "_rename_noreplace_at",
@@ -2835,7 +3173,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 for entry in retained
             )
         )
-        self.assertEqual({entry.read_bytes() for entry in retained}, {b"forged-payload"})
+        self.assertEqual(
+            {entry.read_bytes() for entry in retained}, {b"forged-payload"}
+        )
 
     def test_download_release_assets_cleanup_error_does_not_mask_primary_error(
         self,
@@ -2862,7 +3202,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             return real_fsync(file_descriptor)
 
         with (
-            mock.patch.object(MODULE.subprocess, "Popen", return_value=process),
+            mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process),
             mock.patch.object(MODULE.os, "fsync", side_effect=fail_directory_fsync),
             mock.patch.object(
                 MODULE,
@@ -2903,11 +3243,11 @@ class CodexPersonalSyncTests(unittest.TestCase):
         )
         destination = self.root / "oversized-download"
 
-        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process):
+        with mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process):
             with self.assertRaisesRegex(MODULE.SyncError, "exceeds its advertised"):
                 self.download_release_assets("owner/repo", assets, destination)
 
-        self.assertTrue(process.terminated)
+        self.assertEqual(process.returncode, -9)
         self.assertFalse((destination / assets.archive_name).exists())
         self.assertEqual(list(destination.glob(".*.partial.*")), [])
 
@@ -2929,14 +3269,16 @@ class CodexPersonalSyncTests(unittest.TestCase):
         )
         destination = self.root / "short-download"
 
-        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process):
+        with mock.patch.object(MODULE, "_spawn_guarded_process", return_value=process):
             with self.assertRaisesRegex(MODULE.SyncError, "size mismatch"):
                 self.download_release_assets("owner/repo", assets, destination)
 
         self.assertFalse((destination / assets.archive_name).exists())
         self.assertEqual(list(destination.glob(".*.partial.*")), [])
 
-    def test_download_release_assets_validates_all_metadata_before_starting(self) -> None:
+    def test_download_release_assets_validates_all_metadata_before_starting(
+        self,
+    ) -> None:
         assets = MODULE.ReleaseAssets(
             tag_name="personal-codex-20260511-120000-1111111",
             sha=SHA1,
@@ -2951,7 +3293,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         )
         destination = self.root / "invalid-metadata-download"
 
-        with mock.patch.object(MODULE.subprocess, "Popen") as popen:
+        with mock.patch.object(MODULE, "_spawn_guarded_process") as popen:
             with self.assertRaisesRegex(MODULE.SyncError, "exceeds"):
                 self.download_release_assets("owner/repo", assets, destination)
 
@@ -3402,6 +3744,415 @@ class CodexPersonalSyncTests(unittest.TestCase):
             self.assertNotEqual(workspace.path.parent, real_parent)
             self.assertTrue(workspace.path.is_dir())
 
+    def test_temporary_archive_workspace_normalizes_macos_system_temp_alias(
+        self,
+    ) -> None:
+        canonical_parent = self.root / "private-tmp"
+        alias_parent = self.root / "tmp"
+        canonical_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+
+        workspace_path: Path | None = None
+        with (
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            mock.patch.object(
+                MODULE.tempfile,
+                "gettempdir",
+                return_value=str(alias_parent),
+            ),
+        ):
+            with MODULE.temporary_archive_workspace(
+                prefix="macos-system-temp."
+            ) as workspace:
+                workspace_path = workspace.path
+                self.assertEqual(workspace.path.parent, canonical_parent)
+                self.assertEqual(stat.S_IMODE(workspace.path.stat().st_mode), 0o700)
+
+        assert workspace_path is not None
+        self.assertFalse(workspace_path.exists())
+        self.assertTrue(alias_parent.is_symlink())
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and Path("/tmp").is_symlink(),
+        "requires the macOS system /tmp alias",
+    )
+    def test_actual_macos_system_temp_alias_binds_private_tmp(self) -> None:
+        workspace_path: Path | None = None
+
+        with MODULE.temporary_archive_workspace(
+            prefix="codex-system-tmp-regression.",
+            parent=Path("/tmp"),
+        ) as workspace:
+            workspace_path = workspace.path
+            self.assertEqual(workspace.path.parent, Path("/private/tmp"))
+            self.assertEqual(stat.S_IMODE(workspace.path.stat().st_mode), 0o700)
+
+        assert workspace_path is not None
+        self.assertFalse(workspace_path.exists())
+
+    def test_macos_system_temp_alias_replacement_during_binding_fails_closed(
+        self,
+    ) -> None:
+        canonical_parent = self.root / "replacement-private-tmp"
+        alias_parent = self.root / "replacement-tmp"
+        canonical_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+        real_open = MODULE.os.open
+        replaced = False
+
+        def replace_alias_before_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal replaced
+            if not replaced and Path(path) == canonical_parent and dir_fd is None:
+                replaced = True
+                alias_parent.unlink()
+                alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            mock.patch.object(
+                MODULE.os,
+                "open",
+                side_effect=replace_alias_before_open,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "system temporary archive alias changed while binding",
+            ),
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.fail("a replaced system temporary alias must not be yielded")
+
+        self.assertTrue(replaced)
+        self.assertTrue(alias_parent.is_symlink())
+        self.assertTrue(canonical_parent.is_dir())
+
+    def test_macos_system_temp_alias_descriptor_closes_before_yield(self) -> None:
+        canonical_parent = self.root / "descriptor-private-tmp"
+        alias_parent = self.root / "descriptor-tmp"
+        canonical_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+        real_open = MODULE.os.open
+        alias_fd = -1
+
+        def capture_alias_fd(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal alias_fd
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path) == alias_parent and dir_fd is None:
+                alias_fd = descriptor
+            return descriptor
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            mock.patch.object(MODULE.os, "open", side_effect=capture_alias_fd),
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.assertGreaterEqual(alias_fd, 0)
+                with self.assertRaises(OSError):
+                    os.fstat(alias_fd)
+
+    def test_macos_system_temp_alias_close_failure_is_reported(self) -> None:
+        canonical_parent = self.root / "descriptor-close-private-tmp"
+        alias_parent = self.root / "descriptor-close-tmp"
+        canonical_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+        real_open = MODULE.os.open
+        real_close = MODULE.os.close
+        alias_fd = -1
+        close_failed = False
+
+        def capture_alias_fd(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal alias_fd
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path) == alias_parent and dir_fd is None:
+                alias_fd = descriptor
+            return descriptor
+
+        def fail_alias_close(file_descriptor: int) -> None:
+            nonlocal close_failed
+            if file_descriptor == alias_fd and not close_failed:
+                close_failed = True
+                real_close(file_descriptor)
+                raise OSError("simulated alias descriptor close failure")
+            real_close(file_descriptor)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            mock.patch.object(MODULE.os, "open", side_effect=capture_alias_fd),
+            mock.patch.object(MODULE.os, "close", side_effect=fail_alias_close),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "failed to close system temporary archive alias",
+            ),
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.fail("an alias close failure must prevent workspace use")
+
+        self.assertTrue(close_failed)
+
+    def test_macos_system_temp_alias_close_failure_preserves_primary(self) -> None:
+        canonical_parent = self.root / "descriptor-primary-private-tmp"
+        unexpected_parent = self.root / "descriptor-primary-unexpected-tmp"
+        alias_parent = self.root / "descriptor-primary-tmp"
+        canonical_parent.mkdir(mode=0o700)
+        unexpected_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        unexpected_parent = unexpected_parent.resolve()
+        alias_parent.symlink_to(unexpected_parent, target_is_directory=True)
+        real_open = MODULE.os.open
+        real_close = MODULE.os.close
+        alias_fd = -1
+        close_failed = False
+        stderr = io.StringIO()
+
+        def capture_alias_fd(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal alias_fd
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path) == alias_parent and dir_fd is None:
+                alias_fd = descriptor
+            return descriptor
+
+        def fail_alias_close(file_descriptor: int) -> None:
+            nonlocal close_failed
+            if file_descriptor == alias_fd and not close_failed:
+                close_failed = True
+                real_close(file_descriptor)
+                raise OSError("simulated alias descriptor close failure")
+            real_close(file_descriptor)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            mock.patch.object(MODULE.os, "open", side_effect=capture_alias_fd),
+            mock.patch.object(MODULE.os, "close", side_effect=fail_alias_close),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "refusing non-standard macOS system temporary alias",
+            ),
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.fail("the unexpected alias target must not be yielded")
+
+        self.assertTrue(close_failed)
+        self.assertIn(
+            "warning: failed to close system temporary archive alias",
+            stderr.getvalue(),
+        )
+
+    def test_macos_system_temp_alias_cleanup_attempts_both_owned_fds(self) -> None:
+        canonical_parent = self.root / "descriptor-dual-close-private-tmp"
+        alias_parent = self.root / "descriptor-dual-close-tmp"
+        canonical_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+        real_open = MODULE.os.open
+        real_close = MODULE.os.close
+        alias_fd = -1
+        workspace_fd = -1
+        closed_fds: list[int] = []
+        stderr = io.StringIO()
+
+        def capture_owned_fds(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal alias_fd, workspace_fd
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path) == alias_parent and dir_fd is None:
+                alias_fd = descriptor
+            elif Path(path) == canonical_parent and dir_fd is None:
+                workspace_fd = descriptor
+            return descriptor
+
+        def fail_owned_close(file_descriptor: int) -> None:
+            if file_descriptor in {alias_fd, workspace_fd}:
+                closed_fds.append(file_descriptor)
+                real_close(file_descriptor)
+                raise OSError(f"simulated close failure for fd {file_descriptor}")
+            real_close(file_descriptor)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            mock.patch.object(MODULE.os, "open", side_effect=capture_owned_fds),
+            mock.patch.object(MODULE.os, "close", side_effect=fail_owned_close),
+            mock.patch.object(
+                MODULE,
+                "_revalidate_archive_workspace_alias",
+                side_effect=MODULE.SyncError("simulated alias revalidation failure"),
+            ),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "simulated alias revalidation failure",
+            ),
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.fail("failed alias revalidation must not yield the workspace")
+
+        self.assertEqual(set(closed_fds), {alias_fd, workspace_fd})
+        for file_descriptor in (alias_fd, workspace_fd):
+            with self.assertRaises(OSError):
+                os.fstat(file_descriptor)
+        cleanup_output = stderr.getvalue()
+        self.assertIn("warning: failed to close archive workspace", cleanup_output)
+        self.assertIn(
+            "warning: failed to close system temporary archive alias",
+            cleanup_output,
+        )
+
+    def test_macos_system_temp_alias_rejects_unexpected_target(self) -> None:
+        canonical_parent = self.root / "expected-private-tmp"
+        unexpected_parent = self.root / "unexpected-private-tmp"
+        alias_parent = self.root / "unexpected-tmp"
+        canonical_parent.mkdir(mode=0o700)
+        unexpected_parent.mkdir(mode=0o700)
+        canonical_parent = canonical_parent.resolve()
+        unexpected_parent = unexpected_parent.resolve()
+        alias_parent.symlink_to(unexpected_parent, target_is_directory=True)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_uses_macos_system_temp_alias",
+                return_value=True,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_ALIAS",
+                alias_parent,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MACOS_SYSTEM_TEMP_DIRECTORY",
+                canonical_parent,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "refusing non-standard macOS system temporary alias",
+            ),
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.fail("an unexpected system temporary target must not be yielded")
+
+    def test_archive_workspace_revalidates_access_policy_not_child_churn(
+        self,
+    ) -> None:
+        parent = self.root / "archive-access-policy"
+        parent.mkdir(mode=0o700)
+
+        with MODULE.bind_archive_workspace(parent) as workspace:
+            child = parent / "benign-child"
+            child.write_text(
+                "content churn is not parent replacement\n", encoding="utf-8"
+            )
+            check_fd = MODULE._duplicate_bound_archive_workspace(workspace)
+            os.close(check_fd)
+
+            parent.chmod(0o755)
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "archive workspace binding changed",
+            ):
+                MODULE._duplicate_bound_archive_workspace(workspace)
+
+    def test_arbitrary_archive_workspace_leaf_symlink_remains_rejected(self) -> None:
+        canonical_parent = self.root / "arbitrary-real-temp"
+        alias_parent = self.root / "arbitrary-temp-alias"
+        canonical_parent.mkdir(mode=0o700)
+        alias_parent.symlink_to(canonical_parent, target_is_directory=True)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "failed to bind archive workspace",
+        ):
+            with MODULE.bind_archive_workspace(alias_parent):
+                self.fail("an arbitrary leaf symlink must remain rejected")
+
     def test_temporary_archive_workspace_rejects_leaf_replacement_before_open(
         self,
     ) -> None:
@@ -3729,9 +4480,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
         retained_replacements = list(parent.glob(".codex-archive-cleanup-*"))
         self.assertEqual(len(retained_replacements), 1)
         self.assertEqual(
-            (retained_replacements[0] / "sentinel.txt").read_text(
-                encoding="utf-8"
-            ),
+            (retained_replacements[0] / "sentinel.txt").read_text(encoding="utf-8"),
             "keep\n",
         )
 
@@ -3862,7 +4611,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     workspace=workspace,
                 )
 
-        self.assertEqual(replacement_marker.read_text(encoding="utf-8"), "replacement\n")
+        self.assertEqual(
+            replacement_marker.read_text(encoding="utf-8"), "replacement\n"
+        )
         self.assertEqual(list(retained_workspace.iterdir()), [])
 
     def test_safe_extract_rejects_closed_or_mismatched_workspace_fd(self) -> None:
@@ -3893,6 +4644,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 path=first_workspace.path,
                 fd=second_workspace.fd,
                 identity=first_workspace.identity,
+                access_policy=first_workspace.access_policy,
             )
             with self.assertRaisesRegex(
                 MODULE.SyncError,
@@ -4003,9 +4755,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
     def test_release_tree_snapshot_enforces_component_byte_limit(self) -> None:
         release_root = self.root / "component-limit-release-tree"
         release_root.mkdir()
-        component_limit = len(
-            MODULE.CANONICAL_PACKAGE_ROOT_COMPONENT.encode("utf-8")
-        )
+        component_limit = len(MODULE.CANONICAL_PACKAGE_ROOT_COMPONENT.encode("utf-8"))
         (release_root / ("w" * (component_limit + 1))).write_bytes(b"x")
 
         with (
@@ -4059,7 +4809,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 "_hash_exact_regular_file",
                 side_effect=AssertionError("oversized file hashed"),
             ) as hash_file,
-            self.assertRaisesRegex(MODULE.SyncError, "file exceeds expanded byte limit"),
+            self.assertRaisesRegex(
+                MODULE.SyncError, "file exceeds expanded byte limit"
+            ),
         ):
             self.snapshot_release_tree(release_root)
 
@@ -4167,9 +4919,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             archive.add(source_root, arcname=f"personal-codex-{SHA1}")
         archive_payload = archive_path.read_bytes()
         expanded_size = len(MODULE.gzip.decompress(archive_payload))
-        archive_path.write_bytes(
-            archive_payload + MODULE.gzip.compress(b"x" * 4096)
-        )
+        archive_path.write_bytes(archive_payload + MODULE.gzip.compress(b"x" * 4096))
         destination = self.root / "trailing-payload-extract"
 
         with mock.patch.object(
@@ -4229,7 +4979,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             "_release_tree_identity_from_directory_fd",
             side_effect=rewrite_after_identity,
         ):
-            with self.assertRaisesRegex(MODULE.SyncError, "file changed during validation"):
+            with self.assertRaisesRegex(
+                MODULE.SyncError, "file changed during validation"
+            ):
                 self.safe_extract_archive(archive_path, destination)
 
         self.assertEqual(identity_calls, 1)
@@ -4569,7 +5321,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             ).is_file()
         )
 
-    def test_safe_extract_parent_swap_does_not_create_in_redirected_parent(self) -> None:
+    def test_safe_extract_parent_swap_does_not_create_in_redirected_parent(
+        self,
+    ) -> None:
         source_root = self.root / "parent-swap-source"
         write_minimal_release(source_root)
         archive_path = self.root / "parent-swap.tar.gz"
@@ -4661,7 +5415,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
                     "_rename_noreplace_at",
                     insert_expected_leaf,
                 ):
-                    with self.assertRaisesRegex(MODULE.SyncError, "entry already exists"):
+                    with self.assertRaisesRegex(
+                        MODULE.SyncError, "entry already exists"
+                    ):
                         self.safe_extract_archive(archive_path, destination)
 
                 existing = (
@@ -4811,7 +5567,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             "extractall",
             side_effect=AssertionError("extractall must not be used"),
         ) as extractall:
-            release_root = self.safe_extract_archive(archive_path, self.root / "extract")
+            release_root = self.safe_extract_archive(
+                archive_path, self.root / "extract"
+            )
 
         extractall.assert_not_called()
         mode = (release_root / "personal_codex" / "bin" / "example-tool").stat().st_mode
@@ -4822,7 +5580,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
     def test_load_manifest_requires_skill_markdown(self) -> None:
         release_root = self.root / "release"
         write_minimal_release(release_root)
-        (release_root / "personal_codex" / "skills" / "example-skill" / "SKILL.md").unlink()
+        (
+            release_root / "personal_codex" / "skills" / "example-skill" / "SKILL.md"
+        ).unlink()
 
         with self.assertRaisesRegex(MODULE.SyncError, "missing SKILL.md"):
             MODULE.load_manifest(release_root)
@@ -4971,6 +5731,60 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 MODULE._validate_target_path(target, "target")
             portable_key.assert_not_called()
 
+    def test_manifest_rejects_release_retention_control_targets(self) -> None:
+        def payload(route: str, target: str) -> dict[str, object]:
+            active_link: dict[str, object] = {
+                "source": "personal_codex/AGENTS.md",
+                "target": "AGENTS.md",
+                "kind": "file",
+            }
+            data: dict[str, object] = {
+                "version": 1,
+                "links": [active_link],
+            }
+            if route == "active":
+                active_link["target"] = target
+                return data
+            removed_link: dict[str, object] = {
+                "id": "retired",
+                "source": "personal_codex/retired",
+                "target": "skills/retired",
+                "kind": "file",
+            }
+            if route == "removed":
+                removed_link["target"] = target
+            else:
+                removed_link["replacement_target"] = target
+            data["removed_links"] = [removed_link]
+            return data
+
+        for reserved_target in MODULE.RELEASE_RETENTION_CONTROL_TARGETS:
+            exact = reserved_target.as_posix()
+            portable_alias = exact.upper()
+            variants = (
+                ("exact", exact),
+                ("portable-alias", portable_alias),
+                ("descendant", f"{exact}/child"),
+                ("portable-alias-descendant", f"{portable_alias}/child"),
+            )
+            for route in ("active", "removed", "replacement"):
+                for variant, target in variants:
+                    with (
+                        self.subTest(
+                            reserved=exact,
+                            route=route,
+                            variant=variant,
+                        ),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "release retention transaction/control path",
+                        ),
+                    ):
+                        MODULE._parse_manifest_data(
+                            payload(route, target),
+                            lambda _path: "file",
+                        )
+
     def test_base_release_repo_requires_owner_repository_form(self) -> None:
         data = {
             "version": 1,
@@ -5008,6 +5822,17 @@ class CodexPersonalSyncTests(unittest.TestCase):
             with self.subTest(fallback=fallback):
                 with self.assertRaisesRegex(MODULE.SyncError, "owner/repo string"):
                     MODULE._load_base_release_spec(manifest, fallback)
+
+    def test_manifest_relative_paths_reject_backslashes(self) -> None:
+        for field_name, raw_path in (
+            ("source", "personal_codex\\AGENTS.md"),
+            ("target", "skills\\example"),
+        ):
+            with (
+                self.subTest(field=field_name),
+                self.assertRaisesRegex(MODULE.SyncError, "safe POSIX"),
+            ):
+                MODULE._validate_relative_path(raw_path, field_name)
 
     def test_manifest_payload_digest_translates_serialization_errors(self) -> None:
         data = {
@@ -5261,9 +6086,13 @@ class CodexPersonalSyncTests(unittest.TestCase):
         (home / "personal-sync" / "current").mkdir(parents=True)
 
         with self.assertRaisesRegex(MODULE.SyncError, "non-symlink current pointer"):
-            self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+            self.run_quietly(
+                MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+            )
 
-    def test_install_release_tree_recovers_when_release_dir_already_exists(self) -> None:
+    def test_install_release_tree_recovers_when_release_dir_already_exists(
+        self,
+    ) -> None:
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
         write_minimal_release(release_root)
@@ -5287,14 +6116,136 @@ class CodexPersonalSyncTests(unittest.TestCase):
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
         write_minimal_release(release_root)
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
 
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
 
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertEqual((home / "AGENTS.md").read_text(encoding="utf-8"), "agent\n")
 
-    def test_install_release_tree_removes_stale_links_after_manifest_shrink(self) -> None:
+    def test_doctor_classifies_unexpected_release_cache_as_immutable_drift(
+        self,
+    ) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(release_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        installed = home / "personal-sync" / "releases" / SHA1
+        cache = installed / "review_runtime" / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "guard.cpython-313.pyc").write_bytes(b"pyc-313")
+        (cache / "guard.cpython-314.pyc").write_bytes(b"pyc-314")
+        release_identity = installed.stat().st_dev, installed.stat().st_ino
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "immutable release drift: unexpected cache artifacts",
+        ) as raised:
+            self.run_quietly(
+                MODULE.install_release_tree,
+                release_root,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        self.assertEqual(raised.exception.code, "immutable-release-drift")
+        self.assertEqual(
+            (installed.stat().st_dev, installed.stat().st_ino),
+            release_identity,
+        )
+        self.assertEqual((cache / "guard.cpython-313.pyc").read_bytes(), b"pyc-313")
+        self.assertEqual((cache / "guard.cpython-314.pyc").read_bytes(), b"pyc-314")
+        with contextlib.redirect_stdout(io.StringIO()):
+            _report, issues = MODULE.doctor(
+                home,
+                "linux",
+                json_output=True,
+            )
+        drift = [issue for issue in issues if issue.code == "immutable-release-drift"]
+        self.assertTrue(drift)
+        self.assertTrue(
+            any("unexpected cache artifacts" in issue.detail for issue in drift)
+        )
+
+    def test_install_rejects_source_release_cache_artifacts(self) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(release_root)
+        cache = release_root / "review_runtime" / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "guard.cpython-314.pyc").write_bytes(b"generated")
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "release package contains unexpected cache artifacts",
+        ):
+            self.run_quietly(
+                MODULE.install_release_tree,
+                release_root,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        self.assertFalse((home / "personal-sync").exists())
+
+    def test_scheduler_release_baseline_detects_bytes_not_mtime(self) -> None:
+        release_root = self.root / "release"
+        home = self.root / "home" / ".codex"
+        write_minimal_release(release_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        baseline = MODULE._capture_scheduler_release_trees(
+            home,
+            mode="public",
+            owner=MODULE.PUBLIC_OWNER,
+        )
+        installed_agent = (
+            home / "personal-sync" / "releases" / SHA1 / "personal_codex" / "AGENTS.md"
+        )
+        metadata = installed_agent.stat()
+        os.utime(
+            installed_agent,
+            ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000),
+        )
+        self.assertEqual(
+            MODULE._scheduler_release_integrity_issues(
+                home,
+                ((MODULE.PUBLIC_OWNER, SHA1),),
+                baseline,
+            ),
+            (),
+        )
+
+        installed_agent.write_text("other\n", encoding="utf-8")
+        issues = MODULE._scheduler_release_integrity_issues(
+            home,
+            ((MODULE.PUBLIC_OWNER, SHA1),),
+            baseline,
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0][0], "immutable-release-drift")
+        self.assertIn("differs from the last verified", issues[0][3])
+
+    def test_install_release_tree_removes_stale_links_after_manifest_shrink(
+        self,
+    ) -> None:
         release_one = self.root / "release-one"
         release_two = self.root / "release-two"
         home = self.root / "home" / ".codex"
@@ -5302,9 +6253,13 @@ class CodexPersonalSyncTests(unittest.TestCase):
         write_agent_only_release(release_two, agent_text="two\n")
         (home / "skills" / ".system").mkdir(parents=True)
         (home / "skills" / "host-local").mkdir()
-        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_one, home, SHA1, dry_run=False
+        )
 
-        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_two, home, SHA2, dry_run=False
+        )
 
         self.assertEqual(current_target(home), f"releases/{SHA2}")
         self.assertEqual((home / "AGENTS.md").read_text(encoding="utf-8"), "two\n")
@@ -5326,7 +6281,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
         home = self.root / "home" / ".codex"
         write_minimal_release(release_one, agent_text="one\n")
         write_agent_only_release(release_two, agent_text="two\n")
-        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_one, home, SHA1, dry_run=False
+        )
         release_two_dir = home / "personal-sync" / "releases" / SHA2
         shutil.copytree(release_two, release_two_dir)
         self.run_quietly(MODULE._switch_current, home, SHA2, dry_run=False)
@@ -5353,9 +6310,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             )
         )
         self.assertEqual(state["owners"], {"public": SHA1})
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(home)))
 
     def test_install_release_tree_preserves_existing_local_agents_file(self) -> None:
         release_root = self.root / "release"
@@ -5364,7 +6319,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
         home.mkdir(parents=True)
         (home / "AGENTS.md").write_text("local\n", encoding="utf-8")
 
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
 
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertFalse((home / "AGENTS.md").is_symlink())
@@ -5382,7 +6339,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
         local_agents.write_text("local\n", encoding="utf-8")
         (home / "AGENTS.md").symlink_to(local_agents)
 
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
 
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertEqual((home / "AGENTS.md").readlink(), local_agents)
@@ -5436,9 +6395,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
                 self.assertEqual(current_target(home), f"releases/{SHA2}")
                 self.assertEqual(foreign_leaf_snapshot(agents), foreign_before)
-                state = json.loads(
-                    MODULE._state_path(home).read_text(encoding="utf-8")
-                )
+                state = json.loads(MODULE._state_path(home).read_text(encoding="utf-8"))
                 self.assertEqual(state["owners"], {"public": SHA2})
                 self.assertNotIn(
                     "AGENTS.md",
@@ -5634,7 +6591,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
         write_minimal_release(release_root)
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
         state_path = home / "personal-sync" / "state" / "managed-links.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
         state["links"][0]["link_target"] = "../local-file"
@@ -5649,14 +6608,20 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 dry_run=False,
             )
 
-    def test_install_release_tree_bootstraps_historical_manifest_ownership(self) -> None:
+    def test_install_release_tree_bootstraps_historical_manifest_ownership(
+        self,
+    ) -> None:
         release_one = self.root / "release-one"
         release_two = self.root / "release-two"
         home = self.root / "home" / ".codex"
         write_minimal_release(release_one)
         write_agent_only_release(release_two)
-        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
-        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_one, home, SHA1, dry_run=False
+        )
+        self.run_quietly(
+            MODULE.install_release_tree, release_two, home, SHA2, dry_run=False
+        )
         state_path = home / "personal-sync" / "state" / "managed-links.json"
         state_path.unlink()
         historical_link = home / "skills" / "example-skill"
@@ -5665,7 +6630,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             target_is_directory=True,
         )
 
-        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_two, home, SHA2, dry_run=False
+        )
 
         self.assertFalse(os.path.lexists(historical_link))
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -5713,11 +6680,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             "../personal-sync/current/personal_codex/skills/new-source",
         )
         self.assertEqual(
-            list(
-                (home / "personal-sync" / "quarantine").glob(
-                    "*/links/skills/stable"
-                )
-            ),
+            list((home / "personal-sync" / "quarantine").glob("*/links/skills/stable")),
             [],
         )
         self.assertIn(
@@ -5728,6 +6691,61 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 "public:rename-old-source",
             ),
             backup_events,
+        )
+
+    def test_removed_links_retire_legacy_workflow_skills_from_active_install(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        old_release = self.root / "old-public-workflows"
+        new_release = self.root / "new-public-workflows"
+        retired_skills = (
+            "agile-delivery-workflow",
+            "bug-triage-playbook",
+            "waited-delivery",
+        )
+        write_skill_manifest_release(
+            old_release,
+            skills=("kept-skill", *retired_skills),
+        )
+        self.run_quietly(
+            MODULE.install_release_tree,
+            old_release,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        write_skill_manifest_release(
+            new_release,
+            skills=("kept-skill",),
+            removed_links=[
+                {
+                    "id": f"retire-{skill}",
+                    "source": f"personal_codex/skills/{skill}",
+                    "target": f"skills/{skill}",
+                    "kind": "skill",
+                    "legacy": True,
+                }
+                for skill in retired_skills
+            ],
+            extra_skill_dirs=retired_skills,
+        )
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            new_release,
+            home,
+            SHA2,
+            dry_run=False,
+        )
+
+        self.assertTrue((home / "skills" / "kept-skill").is_symlink())
+        for skill in retired_skills:
+            self.assertFalse(os.path.lexists(home / "skills" / skill))
+        state = MODULE._load_managed_state(home)
+        self.assertFalse(
+            {f"skills/{skill}" for skill in retired_skills}
+            & {target.as_posix() for target in state.links}
         )
 
     def test_install_private_keeps_legacy_agent_overlay_without_override(self) -> None:
@@ -5788,7 +6806,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertEqual(
-            (home / "personal-sync" / "overlays" / "private" / "current").readlink().as_posix(),
+            (home / "personal-sync" / "overlays" / "private" / "current")
+            .readlink()
+            .as_posix(),
             f"releases/{SHA2}",
         )
         self.assertTrue((home / "AGENTS.md").is_symlink())
@@ -5800,7 +6820,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
         home = self.root / "home" / ".codex"
         write_minimal_release(release_root)
 
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=True)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=True
+        )
 
         self.assertFalse(home.exists())
 
@@ -5816,8 +6838,12 @@ class CodexPersonalSyncTests(unittest.TestCase):
         home = self.root / "home" / ".codex"
         write_minimal_release(release_one, agent_text="one\n")
         write_minimal_release(release_two, agent_text="two\n")
-        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
-        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_one, home, SHA1, dry_run=False
+        )
+        self.run_quietly(
+            MODULE.install_release_tree, release_two, home, SHA2, dry_run=False
+        )
 
         self.run_quietly(MODULE.rollback, home, SHA1[:8])
 
@@ -5881,8 +6907,12 @@ class CodexPersonalSyncTests(unittest.TestCase):
         home = self.root / "home" / ".codex"
         write_agent_only_release(release_one, agent_text="one\n")
         write_minimal_release(release_two, agent_text="two\n")
-        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
-        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_one, home, SHA1, dry_run=False
+        )
+        self.run_quietly(
+            MODULE.install_release_tree, release_two, home, SHA2, dry_run=False
+        )
 
         self.run_quietly(MODULE.rollback, home, SHA1[:8])
 
@@ -5898,8 +6928,12 @@ class CodexPersonalSyncTests(unittest.TestCase):
         home = self.root / "home" / ".codex"
         write_agent_only_release(release_one, agent_text="one\n")
         write_minimal_release(release_two, agent_text="two\n")
-        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
-        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_one, home, SHA1, dry_run=False
+        )
+        self.run_quietly(
+            MODULE.install_release_tree, release_two, home, SHA2, dry_run=False
+        )
         self.run_quietly(MODULE._switch_current, home, SHA1, dry_run=False)
         before = snapshot_tree(home)
 
@@ -5918,9 +6952,7 @@ class CodexPersonalSyncTests(unittest.TestCase):
             )
         )
         self.assertEqual(state["owners"], {"public": SHA2})
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(home)))
 
     def test_rollback_without_target_uses_most_recent_non_current_release(self) -> None:
         release_one = self.root / "release-one"
@@ -5928,8 +6960,12 @@ class CodexPersonalSyncTests(unittest.TestCase):
         home = self.root / "home" / ".codex"
         write_minimal_release(release_one, agent_text="one\n")
         write_minimal_release(release_two, agent_text="two\n")
-        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
-        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_one, home, SHA1, dry_run=False
+        )
+        self.run_quietly(
+            MODULE.install_release_tree, release_two, home, SHA2, dry_run=False
+        )
 
         self.run_quietly(MODULE.rollback, home, None)
 
@@ -5943,9 +6979,15 @@ class CodexPersonalSyncTests(unittest.TestCase):
         write_minimal_release(release_one, agent_text="one\n")
         write_minimal_release(release_two, agent_text="two\n")
         write_minimal_release(release_three, agent_text="three\n")
-        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
-        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
-        self.run_quietly(MODULE.install_release_tree, release_three, home, SHA3, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_one, home, SHA1, dry_run=False
+        )
+        self.run_quietly(
+            MODULE.install_release_tree, release_two, home, SHA2, dry_run=False
+        )
+        self.run_quietly(
+            MODULE.install_release_tree, release_three, home, SHA3, dry_run=False
+        )
         os.utime(home / "personal-sync" / "releases" / SHA1, (300, 300))
         os.utime(home / "personal-sync" / "releases" / SHA2, (200, 200))
         os.utime(home / "personal-sync" / "releases" / SHA3, (100, 100))
@@ -5954,14 +6996,20 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         self.assertEqual(current_target(home), f"releases/{SHA1}")
 
-    def test_rollback_without_target_ignores_incomplete_release_directories(self) -> None:
+    def test_rollback_without_target_ignores_incomplete_release_directories(
+        self,
+    ) -> None:
         release_one = self.root / "release-one"
         release_two = self.root / "release-two"
         home = self.root / "home" / ".codex"
         write_minimal_release(release_one, agent_text="one\n")
         write_minimal_release(release_two, agent_text="two\n")
-        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
-        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_one, home, SHA1, dry_run=False
+        )
+        self.run_quietly(
+            MODULE.install_release_tree, release_two, home, SHA2, dry_run=False
+        )
         releases_root = home / "personal-sync" / "releases"
         (releases_root / f".tmp-{SHA3}-123").mkdir()
         (releases_root / SHA3).mkdir()
@@ -5978,7 +7026,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
         write_minimal_release(release_root)
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
         (home / "personal-sync" / "releases" / SHA3).mkdir()
 
         with self.assertRaisesRegex(MODULE.SyncError, f"no release matches {SHA3[:8]}"):
@@ -5988,7 +7038,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
         write_minimal_release(release_root)
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
         (home / "AGENTS.md").unlink()
 
         self.run_quietly(MODULE.rollback, home, SHA1[:8])
@@ -6001,7 +7053,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
         write_minimal_release(release_root)
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
         current = MODULE._current_link(home)
         current.unlink()
 
@@ -6010,44 +7064,64 @@ class CodexPersonalSyncTests(unittest.TestCase):
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertEqual((home / "AGENTS.md").read_text(encoding="utf-8"), "agent\n")
 
-    def test_rollback_to_current_release_preserves_unmanaged_current_symlink(self) -> None:
+    def test_rollback_to_current_release_preserves_unmanaged_current_symlink(
+        self,
+    ) -> None:
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
         write_agent_only_release(release_root)
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
         unmanaged_link = home / "bin" / "local-tool"
         unmanaged_link.parent.mkdir(parents=True, exist_ok=True)
-        unmanaged_link.symlink_to("../personal-sync/current/personal_codex/bin/local-tool")
+        unmanaged_link.symlink_to(
+            "../personal-sync/current/personal_codex/bin/local-tool"
+        )
 
         self.run_quietly(MODULE.rollback, home, SHA1[:8])
 
         self.assertTrue(unmanaged_link.is_symlink())
 
-    def test_rollback_to_current_release_ignores_incomplete_tmp_manifest_targets(self) -> None:
+    def test_rollback_to_current_release_ignores_incomplete_tmp_manifest_targets(
+        self,
+    ) -> None:
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
         write_agent_only_release(release_root)
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
         tmp_release = home / "personal-sync" / "releases" / f".tmp-{SHA2}-123"
         write_minimal_release(tmp_release)
         unmanaged_link = home / "bin" / "example-tool"
         unmanaged_link.parent.mkdir(parents=True, exist_ok=True)
-        unmanaged_link.symlink_to("../personal-sync/current/personal_codex/bin/example-tool")
+        unmanaged_link.symlink_to(
+            "../personal-sync/current/personal_codex/bin/example-tool"
+        )
 
         self.run_quietly(MODULE.rollback, home, SHA1[:8])
 
         self.assertTrue(unmanaged_link.is_symlink())
 
-    def test_rollback_to_current_release_preserves_known_target_with_unmanaged_link(self) -> None:
+    def test_rollback_to_current_release_preserves_known_target_with_unmanaged_link(
+        self,
+    ) -> None:
         release_one = self.root / "release-one"
         release_two = self.root / "release-two"
         home = self.root / "home" / ".codex"
         write_minimal_release(release_one, agent_text="one\n")
         write_agent_only_release(release_two, agent_text="two\n")
-        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
-        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_one, home, SHA1, dry_run=False
+        )
+        self.run_quietly(
+            MODULE.install_release_tree, release_two, home, SHA2, dry_run=False
+        )
         unmanaged_link = home / "bin" / "example-tool"
-        unmanaged_link.symlink_to("../personal-sync/current/personal_codex/bin/local-tool")
+        unmanaged_link.symlink_to(
+            "../personal-sync/current/personal_codex/bin/local-tool"
+        )
 
         self.run_quietly(MODULE.rollback, home, SHA2[:8])
 
@@ -6066,11 +7140,13 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         self.assertIn("not installed", output.getvalue())
 
-    def test_status_ignores_unmanaged_current_symlink(self) -> None:
+    def test_status_reports_unmanaged_broken_skill_symlink(self) -> None:
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
         write_agent_only_release(release_root)
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
         stale_target = home / "skills" / "stale-skill"
         stale_target.parent.mkdir(parents=True, exist_ok=True)
         stale_target.symlink_to(
@@ -6085,13 +7161,16 @@ class CodexPersonalSyncTests(unittest.TestCase):
         status_output = output.getvalue()
         self.assertIn("current manifest symlinks: ok", status_output)
         self.assertNotIn("stale managed symlinks", status_output)
-        self.assertNotIn(str(stale_target), status_output)
+        self.assertIn("broken-link", status_output)
+        self.assertIn(str(stale_target), status_output)
 
     def test_status_ignores_near_miss_current_symlink_substring(self) -> None:
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
         write_agent_only_release(release_root)
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
         near_miss = home / "skills" / "near-miss"
         near_miss.parent.mkdir(parents=True, exist_ok=True)
         near_miss.symlink_to(
@@ -6119,8 +7198,12 @@ class CodexPersonalSyncTests(unittest.TestCase):
         home = self.root / "home" / ".codex"
         write_rules_release(release_one, agent_text="one\n")
         write_agent_only_release(release_two, agent_text="two\n")
-        self.run_quietly(MODULE.install_release_tree, release_one, home, SHA1, dry_run=False)
-        self.run_quietly(MODULE.install_release_tree, release_two, home, SHA2, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_one, home, SHA1, dry_run=False
+        )
+        self.run_quietly(
+            MODULE.install_release_tree, release_two, home, SHA2, dry_run=False
+        )
         stale_target = home / "rules" / "example-rule"
         stale_target.symlink_to(
             "../personal-sync/current/personal_codex/rules/example-rule"
@@ -6227,10 +7310,14 @@ class CodexPersonalSyncTests(unittest.TestCase):
         release_root = self.root / "release"
         home = self.root / "home" / ".codex"
         write_minimal_release(release_root)
-        self.run_quietly(MODULE.install_release_tree, release_root, home, SHA1, dry_run=False)
+        self.run_quietly(
+            MODULE.install_release_tree, release_root, home, SHA1, dry_run=False
+        )
         current = home / "personal-sync" / "current"
         current.unlink()
-        current.symlink_to(home / "personal-sync" / "releases" / SHA1, target_is_directory=True)
+        current.symlink_to(
+            home / "personal-sync" / "releases" / SHA1, target_is_directory=True
+        )
 
         with self.assertRaisesRegex(MODULE.SyncError, "must use releases/<sha>"):
             MODULE._current_sha(home)
@@ -6276,7 +7363,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             mock.patch.object(MODULE, "find_latest_release", return_value=release),
             mock.patch.object(MODULE, "download_release_assets", fake_download),
         ):
-            self.run_quietly(MODULE.install_from_github, "owner/repo", home, dry_run=False)
+            self.run_quietly(
+                MODULE.install_from_github, "owner/repo", home, dry_run=False
+            )
 
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertTrue((home / "AGENTS.md").is_symlink())
@@ -6371,7 +7460,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             mock.patch.object(MODULE, "download_release_assets", fake_download),
         ):
             with self.assertRaisesRegex(MODULE.SyncError, "checksum mismatch"):
-                self.run_quietly(MODULE.install_from_github, "owner/repo", home, dry_run=False)
+                self.run_quietly(
+                    MODULE.install_from_github, "owner/repo", home, dry_run=False
+                )
 
         self.assertFalse(home.exists())
 
@@ -6461,7 +7552,9 @@ class CodexPersonalSyncTests(unittest.TestCase):
             payload["ProgramArguments"],
             [
                 str(runner),
-                "install",
+                "run-scheduled",
+                "--mode",
+                "public",
                 "--repo",
                 "owner/repo",
                 "--home",
@@ -6473,6 +7566,102 @@ class CodexPersonalSyncTests(unittest.TestCase):
             MODULE.MACOS_SCHEDULER_PATH,
         )
         self.assertIn("codex-personal-sync.out.log", payload["StandardOutPath"])
+
+    def test_bare_install_scheduler_preserves_legacy_private_target(self) -> None:
+        home = self.user_home / ".codex"
+        runner = write_scheduler_runner(home)
+        paths = MODULE._scheduler_paths("macos", home)
+        assert paths.launchd_plist is not None
+        paths.launchd_plist.parent.mkdir(parents=True)
+        legacy = MODULE._launchd_plist(
+            home,
+            "Joey-Tools/codex-private-workflows",
+            73,
+            runner,
+            mode="private",
+            base_repo="Joey-Tools/codex-toolbox",
+            owner="private",
+        )
+        legacy["ProgramArguments"] = [
+            str(runner),
+            "install-private",
+            "--repo",
+            "Joey-Tools/codex-private-workflows",
+            "--base-repo",
+            "Joey-Tools/codex-toolbox",
+            "--owner",
+            "private",
+            "--home",
+            str(home),
+        ]
+        paths.launchd_plist.write_bytes(plistlib.dumps(legacy, sort_keys=True))
+        before = MODULE._load_macos_scheduler_config(paths)
+        assert before is not None
+        self.assertEqual(before.command, "install-private")
+
+        self.run_quietly(
+            MODULE.install_scheduler,
+            home,
+            None,
+            None,
+            "macos",
+            None,
+            dry_run=False,
+            enable=False,
+        )
+
+        migrated = MODULE._load_macos_scheduler_config(paths)
+        assert migrated is not None
+        self.assertEqual(migrated.command, "run-scheduled")
+        self.assertEqual(migrated.mode, "private")
+        self.assertEqual(migrated.repo, "Joey-Tools/codex-private-workflows")
+        self.assertEqual(migrated.base_repo, "Joey-Tools/codex-toolbox")
+        self.assertEqual(migrated.owner, "private")
+        self.assertEqual(migrated.interval_minutes, 73)
+
+    def test_ordinary_release_install_does_not_mutate_scheduler(self) -> None:
+        home = self.user_home / ".codex"
+        initial_release_root = self.root / "initial-release"
+        write_minimal_release(initial_release_root)
+        (initial_release_root / "scripts" / "codex_personal_sync.py").chmod(0o755)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            initial_release_root,
+            home,
+            "2" * 40,
+            dry_run=False,
+        )
+        self.run_quietly(
+            MODULE.install_scheduler,
+            home,
+            "owner/public-sync",
+            61,
+            "macos",
+            None,
+            dry_run=False,
+            enable=False,
+        )
+        paths = MODULE._scheduler_paths("macos", home)
+        assert paths.launchd_plist is not None
+        before_metadata = paths.launchd_plist.stat()
+        before = paths.launchd_plist.read_bytes()
+        release_root = self.root / "ordinary-release"
+        write_minimal_release(release_root)
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            "3" * 40,
+            dry_run=False,
+        )
+
+        after_metadata = paths.launchd_plist.stat()
+        self.assertEqual(paths.launchd_plist.read_bytes(), before)
+        self.assertEqual(
+            (after_metadata.st_dev, after_metadata.st_ino),
+            (before_metadata.st_dev, before_metadata.st_ino),
+        )
 
     def test_install_scheduler_no_enable_keeps_legacy_macos_plist(self) -> None:
         home = self.root / "home" / ".codex"
@@ -6503,9 +7692,22 @@ class CodexPersonalSyncTests(unittest.TestCase):
     def test_install_scheduler_runs_macos_enable_commands(self) -> None:
         home = self.root / "home" / ".codex"
         write_scheduler_runner(home)
-        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
 
-        with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: ["/bin/launchctl", *args[1:]],
+            ),
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_scheduler_process",
+                return_value=completed,
+            ) as run,
+        ):
             self.run_quietly(
                 MODULE.install_scheduler,
                 home,
@@ -6526,10 +7728,15 @@ class CodexPersonalSyncTests(unittest.TestCase):
             / f"{MODULE.LAUNCHD_LABEL}.plist"
         )
         domain = f"gui/{os.getuid()}"
-        self.assertIn(["launchctl", "bootout", domain, str(plist_path)], calls)
-        self.assertIn(["launchctl", "bootstrap", domain, str(plist_path)], calls)
-        self.assertIn(["launchctl", "enable", f"{domain}/{MODULE.LAUNCHD_LABEL}"], calls)
-        self.assertFalse(any(call[:2] == ["launchctl", "kickstart"] for call in calls))
+        self.assertIn(["/bin/launchctl", "bootout", domain, str(plist_path)], calls)
+        self.assertIn(["/bin/launchctl", "bootstrap", domain, str(plist_path)], calls)
+        self.assertIn(
+            ["/bin/launchctl", "enable", f"{domain}/{MODULE.LAUNCHD_LABEL}"],
+            calls,
+        )
+        self.assertFalse(
+            any(call[:2] == ["/bin/launchctl", "kickstart"] for call in calls)
+        )
 
     def test_install_scheduler_writes_linux_systemd_units(self) -> None:
         home = self.root / "home" / ".codex"
@@ -6547,11 +7754,15 @@ class CodexPersonalSyncTests(unittest.TestCase):
         )
 
         unit_root = self.root / "home" / ".config" / "systemd" / "user"
-        service = (unit_root / "codex-personal-sync.service").read_text(encoding="utf-8")
+        service = (unit_root / "codex-personal-sync.service").read_text(
+            encoding="utf-8"
+        )
         timer = (unit_root / "codex-personal-sync.timer").read_text(encoding="utf-8")
         self.assertIn("Type=oneshot", service)
         self.assertIn(f'Environment="PATH={MODULE.LINUX_SCHEDULER_PATH}"', service)
-        self.assertIn(f'ExecStart="{runner}" "install"', service)
+        self.assertIn('Environment="PYTHONDONTWRITEBYTECODE=1"', service)
+        self.assertIn(f'ExecStart="{runner}" "run-scheduled"', service)
+        self.assertIn('"--mode" "public"', service)
         self.assertIn('"--repo" "owner/repo"', service)
         self.assertIn(f'"--home" "{home}"', service)
         self.assertIn("OnBootSec=5min", timer)
@@ -6561,9 +7772,22 @@ class CodexPersonalSyncTests(unittest.TestCase):
     def test_install_scheduler_runs_linux_enable_commands(self) -> None:
         home = self.root / "home" / ".codex"
         write_scheduler_runner(home)
-        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
 
-        with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: ["/usr/bin/systemctl", *args[1:]],
+            ),
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_scheduler_process",
+                return_value=completed,
+            ) as run,
+        ):
             self.run_quietly(
                 MODULE.install_scheduler,
                 home,
@@ -6576,11 +7800,924 @@ class CodexPersonalSyncTests(unittest.TestCase):
             )
 
         calls = [call.args[0] for call in run.call_args_list]
-        self.assertIn(["systemctl", "--user", "daemon-reload"], calls)
+        self.assertIn(["/usr/bin/systemctl", "--user", "daemon-reload"], calls)
         self.assertIn(
-            ["systemctl", "--user", "enable", "--now", "codex-personal-sync.timer"],
+            [
+                "/usr/bin/systemctl",
+                "--user",
+                "start",
+                "codex-personal-sync.timer",
+            ],
             calls,
         )
+        enablement = (
+            self.root
+            / "home"
+            / ".config"
+            / "systemd"
+            / "user"
+            / "timers.target.wants"
+            / "codex-personal-sync.timer"
+        )
+        self.assertEqual(
+            os.readlink(enablement), str(enablement.parent.parent / enablement.name)
+        )
+
+    def test_install_scheduler_rejects_drop_in_when_linux_units_are_absent(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        unit_root = self.root / "home" / ".config" / "systemd" / "user"
+        drop_in = unit_root / "codex-personal-sync.service.d"
+        drop_in.mkdir(parents=True)
+        override = drop_in / "override.conf"
+        override.write_text(
+            "[Service]\nExecStartPre=/tmp/attacker\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "drop-ins are unsupported",
+        ):
+            MODULE.install_scheduler(
+                home,
+                "owner/repo",
+                60,
+                "linux",
+                None,
+                dry_run=False,
+                enable=False,
+            )
+
+        self.assertFalse((unit_root / "codex-personal-sync.service").exists())
+        self.assertFalse((unit_root / "codex-personal-sync.timer").exists())
+        self.assertEqual(
+            override.read_text(encoding="utf-8"),
+            "[Service]\nExecStartPre=/tmp/attacker\n",
+        )
+
+    def test_linux_enable_rejects_drop_in_appearing_after_daemon_reload(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        unit_root = self.root / "home" / ".config" / "systemd" / "user"
+        calls: list[list[str]] = []
+
+        def inject_after_reload(
+            args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool = False,
+        ) -> None:
+            del dry_run, allow_fail
+            calls.append(args)
+            if args == ["systemctl", "--user", "daemon-reload"]:
+                drop_in = unit_root / "codex-personal-sync.service.d"
+                drop_in.mkdir()
+                (drop_in / "override.conf").write_text(
+                    "[Service]\nExecStartPre=/tmp/attacker\n",
+                    encoding="utf-8",
+                )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=inject_after_reload,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "drop-ins are unsupported",
+            ),
+        ):
+            MODULE.install_scheduler(
+                home,
+                "owner/repo",
+                60,
+                "linux",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(
+            calls,
+            [["systemctl", "--user", "daemon-reload"]],
+        )
+
+    def test_linux_enable_rejects_main_unit_drift_during_daemon_reload(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        paths = MODULE._scheduler_paths("linux", home)
+        assert paths.systemd_service is not None
+        calls: list[list[str]] = []
+
+        def mutate_during_reload(
+            args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool = False,
+        ) -> None:
+            del dry_run, allow_fail
+            calls.append(args)
+            if args == ["systemctl", "--user", "daemon-reload"]:
+                paths.systemd_service.write_text(
+                    "[Unit]\nDescription=foreign replacement\n",
+                    encoding="utf-8",
+                )
+                paths.systemd_service.chmod(0o600)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=mutate_during_reload,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "(?:command-interval name/content stability|"
+                "Linux systemd scheduler service content changed "
+                "after native action systemctl --user daemon-reload)",
+            ),
+        ):
+            MODULE.install_scheduler(
+                home,
+                "owner/repo",
+                60,
+                "linux",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(
+            calls,
+            [["systemctl", "--user", "daemon-reload"]],
+        )
+
+    def test_linux_enable_rejects_main_unit_drift_before_start(self) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        paths = MODULE._scheduler_paths("linux", home)
+        assert paths.systemd_service is not None
+        calls: list[list[str]] = []
+
+        real_enablement = MODULE._ensure_systemd_timer_enablement
+
+        def replace_after_enablement(
+            selected_paths: MODULE.SchedulerPaths,
+            *,
+            dry_run: bool,
+        ) -> MODULE.SymlinkSnapshot | None:
+            result = real_enablement(selected_paths, dry_run=dry_run)
+            paths.systemd_service.unlink()
+            paths.systemd_service.write_text(
+                "[Unit]\nDescription=foreign replacement\n",
+                encoding="utf-8",
+            )
+            paths.systemd_service.chmod(0o600)
+            return result
+
+        def capture_native(
+            args: list[str],
+            **_kwargs,
+        ) -> None:
+            calls.append(args)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=capture_native,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_ensure_systemd_timer_enablement",
+                side_effect=replace_after_enablement,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "published systemd scheduler service/timer pair changed",
+            ),
+        ):
+            MODULE.install_scheduler(
+                home,
+                "owner/repo",
+                60,
+                "linux",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(
+            calls,
+            [["systemctl", "--user", "daemon-reload"]],
+        )
+
+    def test_linux_enable_rejects_enablement_drift_after_start(self) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        paths = MODULE._scheduler_paths("linux", home)
+        enablement = MODULE._systemd_timer_enablement_path(paths)
+        calls: list[list[str]] = []
+
+        def replace_enablement_after_start(
+            args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool = False,
+        ) -> None:
+            del dry_run, allow_fail
+            calls.append(args)
+            if args == [
+                "systemctl",
+                "--user",
+                "start",
+                f"{MODULE.SYSTEMD_UNIT}.timer",
+            ]:
+                enablement.unlink()
+                enablement.symlink_to("foreign.timer")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=replace_enablement_after_start,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "timer enablement changed after publication",
+            ),
+        ):
+            MODULE.install_scheduler(
+                home,
+                "owner/repo",
+                60,
+                "linux",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                ["systemctl", "--user", "daemon-reload"],
+                [
+                    "systemctl",
+                    "--user",
+                    "start",
+                    f"{MODULE.SYSTEMD_UNIT}.timer",
+                ],
+            ],
+        )
+        self.assertEqual(os.readlink(enablement), "foreign.timer")
+        self.assertTrue(MODULE._scheduler_activation_transaction_path(paths).exists())
+
+    def test_linux_enable_keeps_exact_published_unit_snapshot(
+        self,
+    ) -> None:
+        for drift in ("same-content-replacement", "mode"):
+            with self.subTest(drift=drift):
+                case_user_home = self.root / f"home-{drift}"
+                home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    write_scheduler_runner(home)
+                    paths = MODULE._scheduler_paths("linux", home)
+                    assert paths.systemd_service is not None
+                    marker_path = MODULE._scheduler_pair_transaction_path(paths)
+                    real_remove = MODULE._remove_scheduler_config_if_snapshot
+                    native_calls: list[list[str]] = []
+                    injected = False
+
+                    def drift_before_pair_commit(
+                        path: Path,
+                        expected: MODULE.ManagedStateFileSnapshot,
+                    ) -> None:
+                        nonlocal injected
+                        if path == marker_path and not injected:
+                            injected = True
+                            if drift == "same-content-replacement":
+                                payload = paths.systemd_service.read_bytes()
+                                paths.systemd_service.unlink()
+                                paths.systemd_service.write_bytes(payload)
+                                paths.systemd_service.chmod(0o600)
+                            else:
+                                paths.systemd_service.chmod(0o640)
+                        real_remove(path, expected)
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_remove_scheduler_config_if_snapshot",
+                            side_effect=drift_before_pair_commit,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_run_native_command",
+                            side_effect=lambda args, **_kwargs: native_calls.append(
+                                args
+                            ),
+                        ),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "published systemd scheduler service/timer pair changed",
+                        ),
+                    ):
+                        MODULE.install_scheduler(
+                            home,
+                            "owner/repo",
+                            60,
+                            "linux",
+                            None,
+                            dry_run=False,
+                            enable=True,
+                        )
+
+                    self.assertTrue(injected)
+                    self.assertEqual(native_calls, [])
+
+    def test_systemd_pair_revalidation_detects_interleaved_service_drift(
+        self,
+    ) -> None:
+        for drift in ("same-content-replacement", "mode"):
+            with self.subTest(drift=drift):
+                case_user_home = self.root / f"pair-read-{drift}"
+                home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    write_scheduler_runner(home)
+                    self.run_quietly(
+                        MODULE.install_scheduler,
+                        home,
+                        "owner/repo",
+                        60,
+                        "linux",
+                        None,
+                        dry_run=False,
+                        enable=False,
+                    )
+                    paths = MODULE._scheduler_paths("linux", home)
+                    assert paths.systemd_service is not None
+                    assert paths.systemd_timer is not None
+                    expected = (
+                        MODULE._scheduler_config_snapshot(paths.systemd_service),
+                        MODULE._scheduler_config_snapshot(paths.systemd_timer),
+                    )
+                    real_open = MODULE.os.open
+                    injected = False
+
+                    def drift_before_timer_open(
+                        path: str | bytes,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        nonlocal injected
+                        if (
+                            path == paths.systemd_timer.name
+                            and dir_fd is not None
+                            and not injected
+                        ):
+                            injected = True
+                            if drift == "same-content-replacement":
+                                payload = paths.systemd_service.read_bytes()
+                                paths.systemd_service.unlink()
+                                paths.systemd_service.write_bytes(payload)
+                                paths.systemd_service.chmod(0o600)
+                            else:
+                                paths.systemd_service.chmod(0o640)
+                        return real_open(
+                            path,
+                            flags,
+                            mode,
+                            dir_fd=dir_fd,
+                        )
+
+                    with (
+                        MODULE._retain_launchd_activation_binding(
+                            paths.systemd_service,
+                            expected[0],
+                            description="Linux systemd scheduler service",
+                            revalidate_on_exit=False,
+                        ) as service_binding,
+                        MODULE._retain_launchd_activation_binding(
+                            paths.systemd_timer,
+                            expected[1],
+                            description="Linux systemd scheduler timer",
+                            revalidate_on_exit=False,
+                        ) as timer_binding,
+                        mock.patch.object(
+                            MODULE.os,
+                            "open",
+                            side_effect=drift_before_timer_open,
+                        ),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "published systemd scheduler service/timer pair changed",
+                        ),
+                    ):
+                        MODULE._revalidate_published_systemd_pair(
+                            paths,
+                            expected,
+                            (service_binding, timer_binding),
+                        )
+
+                    self.assertTrue(injected)
+
+    def test_systemd_publication_binding_rejects_simulated_inode_reuse(
+        self,
+    ) -> None:
+        user_home = self.root / "publication-reuse"
+        unit = user_home / ".config" / "systemd" / "user" / "unit.service"
+        unit.parent.mkdir(parents=True)
+        with mock.patch.object(MODULE.Path, "home", return_value=user_home):
+            before = MODULE._scheduler_config_snapshot(unit)
+            installed, binding = MODULE._write_text_with_activation_binding(
+                unit,
+                "stable payload\n",
+                expected_snapshot=before,
+                description="Linux systemd scheduler service",
+            )
+            payload = unit.read_bytes()
+            unit.unlink()
+            unit.write_bytes(payload)
+            unit.chmod(0o600)
+            real_stat = MODULE.os.stat
+
+            def report_reused_identity(path, *args, **kwargs):
+                observed = real_stat(path, *args, **kwargs)
+                if path == unit.name and kwargs.get("dir_fd") == binding.parent_fd:
+                    fields = list(observed)
+                    fields[1] = installed.file_identity[1]
+                    fields[2] = installed.file_identity[0]
+                    return os.stat_result(fields)
+                return observed
+
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE.os,
+                        "stat",
+                        side_effect=report_reused_identity,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "object identity changed",
+                    ),
+                ):
+                    MODULE._revalidate_launchd_activation_binding(
+                        binding,
+                        boundary="before daemon reload",
+                    )
+            finally:
+                MODULE._release_retained_scheduler_activation_binding(
+                    binding,
+                    revalidate=False,
+                )
+
+    def test_systemd_publication_binding_allows_benign_metadata_churn(
+        self,
+    ) -> None:
+        user_home = self.root / "publication-benign"
+        unit = user_home / ".config" / "systemd" / "user" / "unit.service"
+        alias = unit.with_name("unit-alias.service")
+        unit.parent.mkdir(parents=True)
+        with mock.patch.object(MODULE.Path, "home", return_value=user_home):
+            before = MODULE._scheduler_config_snapshot(unit)
+            _installed, binding = MODULE._write_text_with_activation_binding(
+                unit,
+                "stable payload\n",
+                expected_snapshot=before,
+                description="Linux systemd scheduler service",
+            )
+            os.utime(unit, None)
+            os.link(unit, alias)
+            try:
+                MODULE._revalidate_launchd_activation_binding(
+                    binding,
+                    boundary="before daemon reload",
+                )
+            finally:
+                alias.unlink()
+                MODULE._release_retained_scheduler_activation_binding(
+                    binding,
+                    revalidate=True,
+                )
+
+    def test_linux_activation_rejects_temporary_replace_consume_restore(
+        self,
+    ) -> None:
+        for config_matches in (False, True):
+            with self.subTest(config_matches=config_matches):
+                case_user_home = self.root / f"activation-aba-{config_matches}"
+                home = case_user_home / ".codex"
+                with mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=case_user_home,
+                ):
+                    write_scheduler_runner(home)
+                    paths = MODULE._scheduler_paths("linux", home)
+                    assert paths.systemd_service is not None
+                    if config_matches:
+                        self.run_quietly(
+                            MODULE.install_scheduler,
+                            home,
+                            "owner/repo",
+                            60,
+                            "linux",
+                            None,
+                            dry_run=False,
+                            enable=False,
+                        )
+                    mutation_generation = 0
+                    observed_generation = 0
+                    native_calls: list[list[str]] = []
+                    consumed_payloads: list[bytes] = []
+                    watch_token = object()
+
+                    @contextlib.contextmanager
+                    def retain_guard(_paths, _bindings, _drop_ins):
+                        yield watch_token
+
+                    def reset_generation(
+                        guard,
+                        *,
+                        boundary: str,
+                    ) -> None:
+                        del boundary
+                        self.assertIs(guard, watch_token)
+
+                    def revalidate_guard(
+                        guard,
+                        *,
+                        boundary: str,
+                        compare_generation: bool,
+                    ) -> bool:
+                        nonlocal observed_generation
+                        del boundary
+                        self.assertIs(guard, watch_token)
+                        if (
+                            compare_generation
+                            and mutation_generation != observed_generation
+                        ):
+                            observed_generation = mutation_generation
+                            return False
+                        return True
+
+                    def replace_consume_restore(
+                        args: list[str],
+                        *,
+                        dry_run: bool,
+                        allow_fail: bool = False,
+                    ) -> None:
+                        nonlocal mutation_generation
+                        del dry_run, allow_fail
+                        native_calls.append(args)
+                        if args != ["systemctl", "--user", "daemon-reload"]:
+                            return
+                        if consumed_payloads:
+                            return
+                        backup = paths.systemd_service.with_name(
+                            f"{paths.systemd_service.name}.retained"
+                        )
+                        paths.systemd_service.rename(backup)
+                        paths.systemd_service.write_text(
+                            "[Unit]\nDescription=foreign replacement\n",
+                            encoding="utf-8",
+                        )
+                        paths.systemd_service.chmod(0o600)
+                        consumed_payloads.append(paths.systemd_service.read_bytes())
+                        paths.systemd_service.unlink()
+                        backup.rename(paths.systemd_service)
+                        mutation_generation += 1
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_retain_systemd_activation_stability_guard",
+                            side_effect=retain_guard,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_reset_systemd_activation_generation",
+                            side_effect=reset_generation,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_revalidate_systemd_activation_stability_guard",
+                            side_effect=revalidate_guard,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_run_native_command",
+                            side_effect=replace_consume_restore,
+                        ),
+                    ):
+                        MODULE.install_scheduler(
+                            home,
+                            "owner/repo",
+                            60,
+                            "linux",
+                            None,
+                            dry_run=False,
+                            enable=True,
+                        )
+
+                    self.assertEqual(
+                        consumed_payloads,
+                        [b"[Unit]\nDescription=foreign replacement\n"],
+                    )
+                    self.assertEqual(
+                        native_calls,
+                        [
+                            ["systemctl", "--user", "daemon-reload"],
+                            ["systemctl", "--user", "daemon-reload"],
+                            [
+                                "systemctl",
+                                "--user",
+                                "start",
+                                f"{MODULE.SYSTEMD_UNIT}.timer",
+                            ],
+                        ],
+                    )
+                    self.assertTrue(
+                        paths.systemd_service.read_text().startswith("[Unit]")
+                    )
+                    self.assertNotIn(
+                        "foreign replacement",
+                        paths.systemd_service.read_text(),
+                    )
+                    self.assertFalse(
+                        MODULE._scheduler_activation_transaction_path(paths).exists()
+                    )
+
+    def test_linux_activation_stops_after_bounded_unstable_reloads(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        paths = MODULE._scheduler_paths("linux", home)
+        guard_token = object()
+        native_calls: list[list[str]] = []
+
+        @contextlib.contextmanager
+        def retain_guard(_paths, _bindings, _drop_ins):
+            yield guard_token
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_retain_systemd_activation_stability_guard",
+                side_effect=retain_guard,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_reset_systemd_activation_generation",
+            ),
+            mock.patch.object(
+                MODULE,
+                "_revalidate_systemd_activation_stability_guard",
+                return_value=False,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=lambda args, **_kwargs: native_calls.append(args),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "could not produce a stable daemon-reload after 3 attempts",
+            ),
+        ):
+            MODULE.install_scheduler(
+                home,
+                "owner/repo",
+                60,
+                "linux",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(
+            native_calls,
+            [
+                ["systemctl", "--user", "daemon-reload"],
+                ["systemctl", "--user", "daemon-reload"],
+                ["systemctl", "--user", "daemon-reload"],
+            ],
+        )
+        self.assertTrue(MODULE._scheduler_activation_transaction_path(paths).exists())
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"),
+        "Linux file leases are required",
+    )
+    def test_linux_activation_guard_observes_replace_restore(self) -> None:
+        user_home = self.root / "activation-watch"
+        service = (
+            user_home
+            / ".config"
+            / "systemd"
+            / "user"
+            / f"{MODULE.SYSTEMD_UNIT}.service"
+        )
+        timer = service.with_name(f"{MODULE.SYSTEMD_UNIT}.timer")
+        service.parent.mkdir(parents=True)
+        bindings: list[MODULE.SchedulerActivationBinding] = []
+        with mock.patch.object(MODULE.Path, "home", return_value=user_home):
+            try:
+                for path, payload, description in (
+                    (service, "service\n", "Linux systemd scheduler service"),
+                    (timer, "timer\n", "Linux systemd scheduler timer"),
+                ):
+                    before = MODULE._scheduler_config_snapshot(path)
+                    _installed, binding = MODULE._write_text_with_activation_binding(
+                        path,
+                        payload,
+                        expected_snapshot=before,
+                        description=description,
+                    )
+                    bindings.append(binding)
+                paths = MODULE._scheduler_paths(
+                    "linux",
+                    user_home / ".codex",
+                )
+                drop_ins = MODULE._audit_systemd_drop_ins(paths)
+                with MODULE._retain_systemd_activation_stability_guard(
+                    paths,
+                    tuple(bindings),
+                    drop_ins,
+                ) as guard:
+                    assert guard is not None
+                    MODULE._reset_systemd_activation_generation(
+                        guard,
+                        boundary="before simulated daemon reload",
+                    )
+                    backup = service.with_name(f"{service.name}.retained")
+                    service.rename(backup)
+                    service.write_text("foreign\n", encoding="utf-8")
+                    service.chmod(0o600)
+                    self.assertEqual(service.read_text(), "foreign\n")
+                    service.unlink()
+                    backup.rename(service)
+                    self.assertFalse(
+                        MODULE._revalidate_systemd_activation_stability_guard(
+                            guard,
+                            boundary="after simulated daemon reload",
+                            compare_generation=True,
+                        )
+                    )
+            finally:
+                for binding in bindings:
+                    MODULE._release_retained_scheduler_activation_binding(
+                        binding,
+                        revalidate=True,
+                    )
+
+    def test_scheduler_atomic_write_closes_stream_fd_when_fdopen_fails(
+        self,
+    ) -> None:
+        user_home = self.root / "fdopen-failure"
+        user_home.mkdir()
+        with mock.patch.object(MODULE.Path, "home", return_value=user_home):
+            for retain_description in (
+                None,
+                "Linux systemd scheduler service",
+            ):
+                with self.subTest(retain=retain_description is not None):
+                    path = (
+                        user_home
+                        / ".config"
+                        / "systemd"
+                        / "user"
+                        / (
+                            "retained.service"
+                            if retain_description is not None
+                            else "ordinary.service"
+                        )
+                    )
+                    captured_fds: list[int] = []
+
+                    def fail_fdopen(file_fd, *_args, **_kwargs):
+                        captured_fds.append(file_fd)
+                        raise OSError("injected fdopen failure")
+
+                    with (
+                        mock.patch.object(
+                            MODULE.os,
+                            "fdopen",
+                            side_effect=fail_fdopen,
+                        ),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "injected fdopen failure",
+                        ),
+                    ):
+                        MODULE._atomic_write_scheduler_config(
+                            path,
+                            b"payload\n",
+                            retain_activation_description=retain_description,
+                        )
+
+                    self.assertEqual(len(captured_fds), 1)
+                    with self.assertRaises(OSError):
+                        os.fstat(captured_fds[0])
+                    self.assertFalse(path.exists())
+                    self.assertFalse(
+                        any(
+                            "personal-sync-write" in candidate.name
+                            for candidate in path.parent.iterdir()
+                        )
+                    )
+
+    def test_linux_uninstall_preserves_foreign_drop_in_and_blocks_reinstall(
+        self,
+    ) -> None:
+        home = self.root / "home" / ".codex"
+        write_scheduler_runner(home)
+        self.run_quietly(
+            MODULE.install_scheduler,
+            home,
+            "owner/repo",
+            60,
+            "linux",
+            None,
+            dry_run=False,
+            enable=False,
+        )
+        unit_root = self.root / "home" / ".config" / "systemd" / "user"
+        drop_in = unit_root / "codex-personal-sync.timer.d"
+        drop_in.mkdir()
+        override = drop_in / "override.conf"
+        override.write_text(
+            "[Timer]\nOnUnitActiveSec=1min\n",
+            encoding="utf-8",
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            MODULE.uninstall_scheduler(
+                home,
+                "linux",
+                dry_run=False,
+                disable=False,
+            )
+
+        self.assertIn(
+            "preserved foreign systemd drop-in residue",
+            output.getvalue(),
+        )
+        self.assertTrue(override.is_file())
+        self.assertFalse((unit_root / "codex-personal-sync.service").exists())
+        self.assertFalse((unit_root / "codex-personal-sync.timer").exists())
+        report = MODULE.scheduler_report(home, "linux")
+        self.assertIn("drop-ins are unsupported", report.failure_reason or "")
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "drop-ins are unsupported",
+        ):
+            MODULE.install_scheduler(
+                home,
+                "owner/repo",
+                60,
+                "linux",
+                None,
+                dry_run=False,
+                enable=False,
+            )
+
+        override.unlink()
+        drop_in.rmdir()
+        self.run_quietly(
+            MODULE.install_scheduler,
+            home,
+            "owner/repo",
+            60,
+            "linux",
+            None,
+            dry_run=False,
+            enable=False,
+        )
+        self.assertTrue((unit_root / "codex-personal-sync.service").is_file())
+        self.assertTrue((unit_root / "codex-personal-sync.timer").is_file())
 
     def test_uninstall_scheduler_removes_linux_units(self) -> None:
         home = self.root / "home" / ".codex"
@@ -6646,11 +8783,85 @@ class CodexPersonalSyncTests(unittest.TestCase):
 
         self.assertFalse(legacy_plist.exists())
 
+    def test_launchctl_quoted_not_loaded_requires_exact_label_and_uid(
+        self,
+    ) -> None:
+        uid = str(os.getuid())
+        domain = f"gui/{uid}"
+        for label in (MODULE.LAUNCHD_LABEL, *MODULE.LEGACY_LAUNCHD_LABELS):
+            args = ["launchctl", "bootout", f"{domain}/{label}"]
+            for description, evidence, accepted in (
+                (
+                    "exact",
+                    f'Could not find service "{label}" in domain for user gui: {uid}',
+                    True,
+                ),
+                (
+                    "label case drift",
+                    f'Could not find service "{label.upper()}" '
+                    f"in domain for user gui: {uid}",
+                    False,
+                ),
+                (
+                    "wrong uid",
+                    f'Could not find service "{label}" '
+                    f"in domain for user gui: {int(uid) + 1}",
+                    False,
+                ),
+            ):
+                with self.subTest(label=label, description=description):
+                    completed = subprocess.CompletedProcess(
+                        args,
+                        113,
+                        "",
+                        f"Bad request.\n{evidence}\n",
+                    )
+                    self.assertEqual(
+                        MODULE._native_scheduler_failure_is_already_absent(
+                            args,
+                            completed,
+                        ),
+                        accepted,
+                    )
+
     def test_uninstall_scheduler_runs_macos_disable_commands(self) -> None:
         home = self.root / "home" / ".codex"
-        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        (self.root / "home" / "Library" / "LaunchAgents").mkdir(parents=True)
+        query_count = 0
 
-        with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run:
+        def run_native(
+            args: list[str],
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal query_count
+            if args[1:2] == ["print"]:
+                query_count += 1
+                if query_count == 1:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                return subprocess.CompletedProcess(
+                    args,
+                    113,
+                    "",
+                    (
+                        "Bad request.\n"
+                        f'Could not find service "{MODULE.LAUNCHD_LABEL}" '
+                        f"in domain for user gui: {os.getuid()}"
+                    ),
+                )
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_scheduler_argv",
+                side_effect=lambda args: ["/bin/launchctl", *args[1:]],
+            ),
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_scheduler_process",
+                side_effect=run_native,
+            ) as run,
+        ):
             self.run_quietly(
                 MODULE.uninstall_scheduler,
                 home,
@@ -6659,17 +8870,21 @@ class CodexPersonalSyncTests(unittest.TestCase):
                 disable=True,
             )
 
-        plist_path = (
-            self.root
-            / "home"
-            / "Library"
-            / "LaunchAgents"
-            / f"{MODULE.LAUNCHD_LABEL}.plist"
-        )
         domain = f"gui/{os.getuid()}"
         calls = [call.args[0] for call in run.call_args_list]
-        self.assertIn(["launchctl", "bootout", domain, str(plist_path)], calls)
-        self.assertIn(["launchctl", "disable", f"{domain}/{MODULE.LAUNCHD_LABEL}"], calls)
+        self.assertEqual(query_count, 2)
+        self.assertIn(
+            [
+                "/bin/launchctl",
+                "bootout",
+                f"{domain}/{MODULE.LAUNCHD_LABEL}",
+            ],
+            calls,
+        )
+        self.assertIn(
+            ["/bin/launchctl", "disable", f"{domain}/{MODULE.LAUNCHD_LABEL}"],
+            calls,
+        )
 
 
 if __name__ == "__main__":
