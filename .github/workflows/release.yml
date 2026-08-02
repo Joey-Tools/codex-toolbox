@@ -50,7 +50,9 @@ jobs:
 
       - name: Run tests
         # Discovery automatically admits canonical generated test modules.
-        run: python3 -m unittest discover -s tests
+        run: >-
+          bash scripts/run_ci_tests_with_private_tmp.sh --
+          python3 -m unittest discover -s tests
 
       - name: Validate sync manifest changes
         env:
