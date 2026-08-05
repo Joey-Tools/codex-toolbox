@@ -379,11 +379,15 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
             "getuid",
             return_value=os.getuid() + 1,
         ):
+            # A shared temporary ancestor can reject the mocked UID before the
+            # final snapshot-root ownership check. Both classifications prove
+            # that the mismatched policy identity is rejected fail-closed.
             with self.assertRaisesRegex(
                 VERIFIER.VerificationError,
-                "current uid",
+                "current uid|path binding can be replaced by another uid",
             ):
                 self.verify()
+        self.assertEqual(list(self.snapshot_root.iterdir()), [])
 
     def test_rejects_symlink_snapshot_root(self) -> None:
         target = self.root / "snapshot-target"
