@@ -39,6 +39,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.9"
+      - name: Verify generated mirror source lock
+        run: python3 scripts/verify_generated_sync_source_lock.py
       - name: Compile supported runtime
         run: |
           python3 -m py_compile \
@@ -70,6 +72,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - name: Verify generated mirror source lock
+        run: python3 scripts/verify_generated_sync_source_lock.py
       - name: Run platform personal sync safety tests
         shell: bash
         run: |

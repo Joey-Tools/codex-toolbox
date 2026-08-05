@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from typing import Callable
 from unittest import mock
 
 
@@ -160,6 +161,33 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
             ),
         )
 
+    def _verify_with_mutation_after_first_managed_scan(
+        self,
+        target_path: str,
+        mutation: Callable[[], None],
+    ) -> None:
+        original_hash = VERIFIER._hash_bounded_regular
+        mutated = False
+
+        def hash_then_mutate(root_fd, relative_path, *, maximum_bytes):
+            nonlocal mutated
+            result = original_hash(
+                root_fd,
+                relative_path,
+                maximum_bytes=maximum_bytes,
+            )
+            if not mutated and str(relative_path) == target_path:
+                mutated = True
+                mutation()
+            return result
+
+        with mock.patch.object(
+            VERIFIER,
+            "_hash_bounded_regular",
+            side_effect=hash_then_mutate,
+        ):
+            self.verify()
+
     def test_production_tree_cli_passes(self) -> None:
         completed = subprocess.run(
             [sys.executable, os.fspath(SCRIPT_PATH)],
@@ -283,36 +311,100 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
         with self.assertRaisesRegex(VERIFIER.VerificationError, "missing or unsafe"):
             self.verify()
 
-    def test_rejects_change_after_first_managed_scan(self) -> None:
-        original_hash = VERIFIER._hash_bounded_regular
+    def test_accepts_mtime_only_churn_after_first_managed_scan(self) -> None:
         target_path = TEST_FILES[0][2]
-        calls = 0
+        path = self.root / target_path
+        before = os.stat(path, follow_symlinks=False)
 
-        def hash_then_change(root_fd, relative_path, *, maximum_bytes):
-            nonlocal calls
-            result = original_hash(
-                root_fd,
-                relative_path,
-                maximum_bytes=maximum_bytes,
+        def touch_mtime() -> None:
+            os.utime(
+                path,
+                ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+                follow_symlinks=False,
             )
-            if str(relative_path) == target_path:
-                calls += 1
-                if calls == 1:
-                    path = self.root / target_path
-                    path.write_bytes(path.read_bytes() + b"post-scan drift\n")
-                    path.chmod(0o755)
-            return result
 
-        with mock.patch.object(
-            VERIFIER,
-            "_hash_bounded_regular",
-            side_effect=hash_then_change,
+        self._verify_with_mutation_after_first_managed_scan(target_path, touch_mtime)
+
+        after = os.stat(path, follow_symlinks=False)
+        self.assertNotEqual(after.st_mtime_ns, before.st_mtime_ns)
+        self.assertEqual(
+            (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+            ),
+            (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mode,
+                before.st_uid,
+                before.st_gid,
+            ),
+        )
+
+    def test_accepts_hard_link_count_churn_after_first_managed_scan(self) -> None:
+        target_path = TEST_FILES[0][2]
+        path = self.root / target_path
+        link_path = self.root / "managed-hard-link"
+        before = os.stat(path, follow_symlinks=False)
+
+        self._verify_with_mutation_after_first_managed_scan(
+            target_path,
+            lambda: os.link(path, link_path),
+        )
+
+        after = os.stat(path, follow_symlinks=False)
+        self.assertEqual(after.st_nlink, before.st_nlink + 1)
+        self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
+
+    def test_rejects_object_replacement_after_first_managed_scan(self) -> None:
+        target_path = TEST_FILES[0][2]
+        path = self.root / target_path
+        before = os.stat(path, follow_symlinks=False)
+        payload = path.read_bytes()
+        replacement = path.with_name(path.name + ".replacement")
+        replacement.write_bytes(payload)
+        replacement.chmod(before.st_mode & 0o7777)
+
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError,
+            "changed before final group revalidation",
         ):
-            with self.assertRaisesRegex(
-                VERIFIER.VerificationError,
-                "changed before final group revalidation",
-            ):
-                self.verify()
+            self._verify_with_mutation_after_first_managed_scan(
+                target_path,
+                lambda: os.replace(replacement, path),
+            )
+
+        after = os.stat(path, follow_symlinks=False)
+        self.assertNotEqual(
+            (after.st_dev, after.st_ino), (before.st_dev, before.st_ino)
+        )
+        self.assertEqual(path.read_bytes(), payload)
+        self.assertEqual(
+            (after.st_size, after.st_mode, after.st_uid, after.st_gid),
+            (before.st_size, before.st_mode, before.st_uid, before.st_gid),
+        )
+
+    def test_rejects_change_after_first_managed_scan(self) -> None:
+        target_path = TEST_FILES[0][2]
+        path = self.root / target_path
+
+        def change_content() -> None:
+            path.write_bytes(path.read_bytes() + b"post-scan drift\n")
+            path.chmod(0o755)
+
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError,
+            "changed before final group revalidation",
+        ):
+            self._verify_with_mutation_after_first_managed_scan(
+                target_path,
+                change_content,
+            )
 
 
 if __name__ == "__main__":

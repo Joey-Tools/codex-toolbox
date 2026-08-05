@@ -21,9 +21,10 @@ superseded_by:
 
 - Root guidance distinguishes consumer-owned release aggregation from
   receipt-bound generated sources owned by `Joey-Tools/codex-personal-sync`.
-- CI and release gates first verify the exact generated receipt and its six
-  managed files, then discover every test module, including generated
-  retention and scheduler/doctor suites.
+- Every CI job that imports or executes generated code and both release build
+  paths first verify the exact generated receipt and its six managed files.
+  Test discovery then includes generated retention and scheduler/doctor
+  suites.
 - The six canonical files and `generated-sync-source-lock.json` bind landed
   canonical commit `14914ca17172f00a5759758a50cf7c0295e4a42f`, tree
   `e5d81cb98194cc56872b9a4cdea83aee88c0fd2a`.
@@ -38,6 +39,8 @@ superseded_by:
   outside the receipt itself, then checks the exact canonical identity,
   closed six-file mapping, recomputed digests, target modes, and target bytes
   before CI tests or either release package build can proceed.
+- Whole-group revalidation protects object identity, content, and access
+  policy while accepting benign timestamp and hard-link-count churn.
 
 ## Next Steps
 
@@ -60,3 +63,14 @@ superseded_by:
 - Superseding verifier gates on BL: production-tree verification, 20 focused
   verifier/consumer-contract tests, 1,124-test Python 3.13 discovery with two
   expected skips, and 25 Python 3.9 compatibility tests all passed.
+- The next fresh named-single review found that two parallel CI jobs were not
+  independently receipt-gated and that timestamp/link-count churn was outside
+  the verifier's protected properties. The final follow-up gates all three CI
+  consumer jobs before generated-code execution and narrows stability checks
+  to object identity, content, and mode/ownership access policy, with focused
+  benign-churn and true-replacement regressions.
+- Final follow-up gates passed 1,128-test Python 3.13 discovery with two
+  expected skips, 24 focused verifier/consumer-contract tests on Python 3.13
+  and 3.9, and 28 Python 3.9 compatibility tests. Production receipt
+  verification, actionlint, Ruff lint/format, manifest validation, project
+  journal validation, and diff checks also passed.

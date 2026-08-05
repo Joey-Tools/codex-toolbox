@@ -15,6 +15,7 @@ from typing import (
     Iterable,
     List,
     Mapping,
+    NamedTuple,
     NoReturn,
     Optional,
     Sequence,
@@ -101,6 +102,12 @@ FILE_FIELDS = frozenset({"source_name", "source_path", "target_path", "sha256", 
 
 class VerificationError(RuntimeError):
     pass
+
+
+class _ProtectedMetadata(NamedTuple):
+    object_identity: Tuple[int, int]
+    content_size: int
+    access_policy: Tuple[int, int, int]
 
 
 def _fail(message: str) -> NoReturn:
@@ -221,17 +228,21 @@ def _open_regular_at(
     return file_fd, metadata
 
 
-def _stability_identity(metadata: os.stat_result) -> Tuple[int, ...]:
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_mode,
-        metadata.st_uid,
-        metadata.st_gid,
-        metadata.st_nlink,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
+def _protected_metadata(metadata: os.stat_result) -> _ProtectedMetadata:
+    # Revalidation protects three properties: device/inode object identity,
+    # byte content (the size here plus the payload/digest at each scan), and
+    # the mode/ownership access policy. Link count is not object identity, and
+    # timestamps record metadata events rather than any protected property, so
+    # benign hard-link or touch churn must not invalidate an otherwise stable
+    # object.
+    return _ProtectedMetadata(
+        object_identity=(metadata.st_dev, metadata.st_ino),
+        content_size=metadata.st_size,
+        access_policy=(
+            stat.S_IMODE(metadata.st_mode),
+            metadata.st_uid,
+            metadata.st_gid,
+        ),
     )
 
 
@@ -256,7 +267,9 @@ def _read_bounded_regular(
             if total > maximum_bytes:
                 _fail(f"managed path exceeds byte limit: {relative_path}")
         after = os.fstat(file_fd)
-        if _stability_identity(before) != _stability_identity(after):
+        if total != before.st_size or _protected_metadata(
+            before
+        ) != _protected_metadata(after):
             _fail(f"managed path changed while being read: {relative_path}")
         return b"".join(chunks), before
     finally:
@@ -284,7 +297,9 @@ def _hash_bounded_regular(
             if total > maximum_bytes:
                 _fail(f"managed path exceeds byte limit: {relative_path}")
         after = os.fstat(file_fd)
-        if _stability_identity(before) != _stability_identity(after):
+        if total != before.st_size or _protected_metadata(
+            before
+        ) != _protected_metadata(after):
             _fail(f"managed path changed while being hashed: {relative_path}")
         return digest.hexdigest(), before
     finally:
@@ -418,9 +433,9 @@ def verify_generated_mirror(
         receipt = _parse_receipt(receipt_payload)
 
         # Preserve the first scan's object identity, content digest, and access
-        # mode. A complete second pass below binds scan-to-final-check
+        # policy. A complete second pass below binds scan-to-final-check
         # stability for the receipt and every managed file as one fixed group.
-        first_observations: Dict[str, Tuple[str, Tuple[int, ...], int]] = {}
+        first_observations: Dict[str, Tuple[str, _ProtectedMetadata]] = {}
         for item in receipt["files"]:
             target_path = PurePosixPath(item["target_path"])
             observed_sha256, metadata = _hash_bounded_regular(
@@ -442,8 +457,7 @@ def verify_generated_mirror(
                 )
             first_observations[item["target_path"]] = (
                 observed_sha256,
-                _stability_identity(metadata),
-                observed_mode,
+                _protected_metadata(metadata),
             )
 
         final_receipt_payload, final_receipt_metadata = _read_bounded_regular(
@@ -453,8 +467,8 @@ def verify_generated_mirror(
         )
         if (
             final_receipt_payload != receipt_payload
-            or _stability_identity(final_receipt_metadata)
-            != _stability_identity(receipt_metadata)
+            or _protected_metadata(final_receipt_metadata)
+            != _protected_metadata(receipt_metadata)
             or stat.S_IMODE(final_receipt_metadata.st_mode) != 0o644
         ):
             _fail("provenance receipt changed before final group revalidation")
@@ -468,8 +482,7 @@ def verify_generated_mirror(
             )
             final_observation = (
                 final_sha256,
-                _stability_identity(final_metadata),
-                stat.S_IMODE(final_metadata.st_mode),
+                _protected_metadata(final_metadata),
             )
             if final_observation != first_observations[item["target_path"]]:
                 _fail(
