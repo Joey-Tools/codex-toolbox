@@ -4,30 +4,40 @@ Public Codex release tooling and small helper binaries.
 
 The personal sync runtime and release validation tooling support Python 3.9 or newer.
 
+## Generated personal-sync mirror
+
+`Joey-Tools/codex-personal-sync` is the canonical source of the sync engine,
+manifest schema, and mirrored behavior, reconciliation, retention, and
+scheduler/doctor tests. Do not edit their toolbox copies directly.
+
+The canonical generator writes `generated-sync-source-lock.json`, which binds
+the exact canonical commit, source-to-target mapping, file set, generated tree,
+bytes, and modes. Consumer-owned packaging, release workflows, public skills,
+manifests, and helper binaries continue to be maintained in this repository.
+Run the generator and its `check` command from an exact clean canonical commit;
+never synthesize or refresh the receipt by hand.
+
 ## Test
 
 ```bash
-python3 -m py_compile \
-  scripts/codex_personal_sync.py \
-  scripts/build_personal_codex_package.py \
-  scripts/validate_sync_manifest_changes.py \
-  tests/test_codex_personal_sync.py \
-  tests/test_package_builder_safety.py \
-  tests/test_personal_sync_reconciliation_safety.py \
-  tests/test_release_manifest_baseline.py \
-  tests/test_sync_manifest_changes.py \
-  tests/test_submodule_worktree_sync.py
-
-python3 -m unittest \
-  tests.test_codex_personal_sync \
-  tests.test_codex_clean_tmp \
-  tests.test_codex_git_helpers \
-  tests.test_package_builder_safety \
-  tests.test_personal_sync_reconciliation_safety \
-  tests.test_release_manifest_baseline \
-  tests.test_sync_manifest_changes \
-  tests.test_submodule_worktree_sync
+verified_workspace="$(mktemp -d)"
+chmod 0700 "$verified_workspace"
+verified_workspace="$(cd "$verified_workspace" && pwd -P)"
+git clone --no-local --no-hardlinks --no-checkout . "$verified_workspace"
+git -C "$verified_workspace" checkout --detach "$(git rev-parse HEAD)"
+python3 "$verified_workspace/scripts/verify_generated_sync_source_lock.py" \
+  --repo-root "$verified_workspace" \
+  --snapshot-root "$verified_workspace"
+(
+  cd "$verified_workspace"
+  python3 -m compileall -q scripts tests
+  python3 -m unittest discover -s tests
+)
 ```
+
+The mode-`0700` workspace excludes other user IDs. It does not protect against
+a malicious or cooperative same-UID process changing the snapshot after the
+verifier succeeds, so do not share it with concurrent writers.
 
 ## Release
 

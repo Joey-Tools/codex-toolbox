@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
+import dataclasses
 import errno
 import functools
 import importlib.util
@@ -211,7 +212,9 @@ class InstallLockBindingSafetyTests(unittest.TestCase):
             real_flock = MODULE.fcntl.flock
             replaced = False
 
-            def replace_parent_after_flock(file_descriptor: int, operation: int) -> None:
+            def replace_parent_after_flock(
+                file_descriptor: int, operation: int
+            ) -> None:
                 nonlocal replaced
                 real_flock(file_descriptor, operation)
                 if (
@@ -405,17 +408,11 @@ class ManifestSchemaSafetyTests(unittest.TestCase):
     def test_runtime_enforces_active_managed_link_target_byte_limit(self) -> None:
         owner = "o" * MODULE.MAX_OWNER_COMPONENT_BYTES
         target = "/".join(["t"] * MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)
-        removed_target = "/".join(
-            ["r"] * MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH
-        )
+        removed_target = "/".join(["r"] * MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)
         source_at_limit = "/".join(["s" * 181, "s" * 181, "s" * 183])
         source_over_limit = "/".join(["s" * 181, "s" * 181, "s" * 184])
-        unicode_source_at_limit = "/".join(
-            ["é" * 127, "é" * 127, "é" * 18 + "s"]
-        )
-        unicode_source_over_limit = "/".join(
-            ["é" * 127, "é" * 127, "é" * 18 + "ss"]
-        )
+        unicode_source_at_limit = "/".join(["é" * 127, "é" * 127, "é" * 18 + "s"])
+        unicode_source_over_limit = "/".join(["é" * 127, "é" * 127, "é" * 18 + "ss"])
         self.assertEqual(
             len(
                 MODULE._relative_managed_link_target(
@@ -638,9 +635,12 @@ class TargetPortabilityTests(unittest.TestCase):
             ".per\N{LATIN SMALL LETTER LONG S}onal-sync-pending-transaction.json",
             f"{MODULE.PENDING_LINK_POINTER_NAME}/child",
         ):
-            with self.subTest(target=target), self.assertRaisesRegex(
-                MODULE.SyncError,
-                "pending transaction pointer path",
+            with (
+                self.subTest(target=target),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "pending transaction pointer path",
+                ),
             ):
                 MODULE._validate_target_path(target, "target")
 
@@ -820,13 +820,16 @@ class TargetPortabilityTests(unittest.TestCase):
                     [active_manifest, removed_manifest],
                     [removed_manifest, active_manifest],
                 ):
-                    with self.subTest(
-                        case=case,
-                        active_owner=active_owner,
-                        manifests=[manifest.owner for manifest in manifests],
-                    ), self.assertRaisesRegex(
-                        MODULE.SyncError,
-                        "active and removed targets must not overlap across owners",
+                    with (
+                        self.subTest(
+                            case=case,
+                            active_owner=active_owner,
+                            manifests=[manifest.owner for manifest in manifests],
+                        ),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "active and removed targets must not overlap across owners",
+                        ),
                     ):
                         MODULE._validate_manifest_target_portability(manifests)
 
@@ -891,9 +894,12 @@ class TargetPortabilityTests(unittest.TestCase):
                     self._target_manifest("private", removed=target)
                     for target in ordered_targets
                 ]
-                with self.subTest(targets=ordered_targets), self.assertRaisesRegex(
-                    MODULE.SyncError,
-                    "manifest targets must not overlap",
+                with (
+                    self.subTest(targets=ordered_targets),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "manifest targets must not overlap",
+                    ),
                 ):
                     MODULE._validate_manifest_target_portability(manifests)
 
@@ -916,12 +922,15 @@ class TargetPortabilityTests(unittest.TestCase):
                 removed=removed_target,
             )
 
-            with self.subTest(
-                active_target=active_target,
-                removed_target=removed_target,
-            ), self.assertRaisesRegex(
-                MODULE.SyncError,
-                "hierarchy changes are not supported",
+            with (
+                self.subTest(
+                    active_target=active_target,
+                    removed_target=removed_target,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "hierarchy changes are not supported",
+                ),
             ):
                 MODULE._validate_manifest_target_portability([manifest])
 
@@ -948,10 +957,7 @@ class TargetPortabilityTests(unittest.TestCase):
     def test_non_overlapping_validation_normalizes_each_target_constant_times(
         self,
     ) -> None:
-        targets = [
-            PurePosixPath(f"skills/item-{index:05d}")
-            for index in range(2_048)
-        ]
+        targets = [PurePosixPath(f"skills/item-{index:05d}") for index in range(2_048)]
         real_portable_target_key = MODULE._portable_target_key
 
         with mock.patch.object(
@@ -1040,9 +1046,7 @@ class TargetPortabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             home = root / "home"
-            (home / "personal-sync" / "overlays" / "private").mkdir(
-                parents=True
-            )
+            (home / "personal-sync" / "overlays" / "private").mkdir(parents=True)
             manifest = self._target_manifest(
                 "Private",
                 active="skills/private",
@@ -1190,9 +1194,7 @@ class GitHubJsonErrorNormalizationSafetyTests(unittest.TestCase):
     def test_run_gh_json_stream_normalizes_deep_nesting(self) -> None:
         completed = self._completed("[]")
         decoder = mock.Mock()
-        decoder.raw_decode.side_effect = RecursionError(
-            "maximum JSON depth exceeded"
-        )
+        decoder.raw_decode.side_effect = RecursionError("maximum JSON depth exceeded")
 
         with (
             mock.patch.object(MODULE, "_run_gh_process", return_value=completed),
@@ -1238,9 +1240,7 @@ class PendingTransactionCapacitySafetyTests(unittest.TestCase):
             stage_release.assert_not_called()
             self.assertEqual(MODULE._current_sha(home), SHA_A)
             self.assertTrue((home / "skills" / "example").is_symlink())
-            self.assertFalse(
-                os.path.lexists(home / MODULE.PENDING_LINK_POINTER_NAME)
-            )
+            self.assertFalse(os.path.lexists(home / MODULE.PENDING_LINK_POINTER_NAME))
 
     def test_upgrade_rejects_record_overflow_before_release_staging(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1286,9 +1286,7 @@ class PendingTransactionCapacitySafetyTests(unittest.TestCase):
             self.assertTrue((home / "skills" / "current").is_symlink())
             self.assertFalse(os.path.lexists(home / "skills" / "next"))
             self.assertFalse((MODULE._releases_root(home) / SHA_B).exists())
-            self.assertFalse(
-                os.path.lexists(home / MODULE.PENDING_LINK_POINTER_NAME)
-            )
+            self.assertFalse(os.path.lexists(home / MODULE.PENDING_LINK_POINTER_NAME))
 
     def test_first_install_rejects_claim_overflow_before_release_staging(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1321,9 +1319,7 @@ class PendingTransactionCapacitySafetyTests(unittest.TestCase):
             stage_release.assert_not_called()
             self.assertIsNone(MODULE._current_sha(home))
             self.assertFalse((MODULE._releases_root(home) / SHA_A).exists())
-            self.assertFalse(
-                os.path.lexists(home / MODULE.PENDING_LINK_POINTER_NAME)
-            )
+            self.assertFalse(os.path.lexists(home / MODULE.PENDING_LINK_POINTER_NAME))
 
     def test_first_install_rejects_state_overflow_before_release_staging(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1356,9 +1352,7 @@ class PendingTransactionCapacitySafetyTests(unittest.TestCase):
             stage_release.assert_not_called()
             self.assertIsNone(MODULE._current_sha(home))
             self.assertFalse((MODULE._releases_root(home) / SHA_A).exists())
-            self.assertFalse(
-                os.path.lexists(home / MODULE.PENDING_LINK_POINTER_NAME)
-            )
+            self.assertFalse(os.path.lexists(home / MODULE.PENDING_LINK_POINTER_NAME))
 
     def test_first_install_rejects_release_overflow_before_release_staging(
         self,
@@ -1393,9 +1387,7 @@ class PendingTransactionCapacitySafetyTests(unittest.TestCase):
             stage_release.assert_not_called()
             self.assertIsNone(MODULE._current_sha(home))
             self.assertFalse((MODULE._releases_root(home) / SHA_A).exists())
-            self.assertFalse(
-                os.path.lexists(home / MODULE.PENDING_LINK_POINTER_NAME)
-            )
+            self.assertFalse(os.path.lexists(home / MODULE.PENDING_LINK_POINTER_NAME))
 
     def test_first_install_rejects_metadata_overflow_before_release_staging(
         self,
@@ -1405,9 +1397,7 @@ class PendingTransactionCapacitySafetyTests(unittest.TestCase):
             MODULE.MAX_PENDING_LINK_BATCH_NAME_BYTES,
         )
         self.assertIsNotNone(
-            MODULE.PENDING_LINK_BATCH_RE.fullmatch(
-                MODULE._MAX_PENDING_BATCH_NAME
-            )
+            MODULE.PENDING_LINK_BATCH_RE.fullmatch(MODULE._MAX_PENDING_BATCH_NAME)
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1439,9 +1429,7 @@ class PendingTransactionCapacitySafetyTests(unittest.TestCase):
             stage_release.assert_not_called()
             self.assertIsNone(MODULE._current_sha(home))
             self.assertFalse((MODULE._releases_root(home) / SHA_A).exists())
-            self.assertFalse(
-                os.path.lexists(home / MODULE.PENDING_LINK_POINTER_NAME)
-            )
+            self.assertFalse(os.path.lexists(home / MODULE.PENDING_LINK_POINTER_NAME))
 
 
 class ReleaseShaBoundaryTests(unittest.TestCase):
@@ -1568,7 +1556,9 @@ class ReconciliationOrderingTests(unittest.TestCase):
         first = self.home / "new-parent" / "first"
         second = self.home / "new-parent" / "second"
         actions = [
-            planned_reconcile_action(self.home, "create", first, "first-source", "file"),
+            planned_reconcile_action(
+                self.home, "create", first, "first-source", "file"
+            ),
             planned_reconcile_action(
                 self.home,
                 "create",
@@ -1737,14 +1727,17 @@ class ReconciliationOrderingTests(unittest.TestCase):
                         expected_destination_parent_identity,
                     )
 
-                with mock.patch.object(
-                    MODULE,
-                    "_verify_reconcile_action_targets",
-                    side_effect=track_verification,
-                ), mock.patch.object(
-                    MODULE,
-                    "_atomic_move_beneath_home",
-                    side_effect=require_verification_before_old_retirement,
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_verify_reconcile_action_targets",
+                        side_effect=track_verification,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_atomic_move_beneath_home",
+                        side_effect=require_verification_before_old_retirement,
+                    ),
                 ):
                     MODULE._apply_reconcile_actions(
                         home,
@@ -1943,13 +1936,11 @@ class ReconciliationOrderingTests(unittest.TestCase):
                     {MODULE.PUBLIC_OWNER: manifest},
                     [replacement],
                 )
-                required_replacements = (
-                    MODULE._required_replacements_for_removals(
-                        home,
-                        [action],
-                        [removed],
-                        [replacement],
-                    )
+                required_replacements = MODULE._required_replacements_for_removals(
+                    home,
+                    [action],
+                    [removed],
+                    [replacement],
                 )
                 self.assertEqual(required_replacements, {old_target: [replacement]})
                 replacement_target.unlink()
@@ -2158,9 +2149,12 @@ class ReconciliationOrderingTests(unittest.TestCase):
         )
 
         for label, removed_links in cases:
-            with self.subTest(cycle=label), self.assertRaisesRegex(
-                MODULE.SyncError,
-                "replacement retirement cycle",
+            with (
+                self.subTest(cycle=label),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "replacement retirement cycle",
+                ),
             ):
                 MODULE._validate_active_replacements(
                     self.home,
@@ -2644,9 +2638,7 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 (target.lstat().st_dev, target.lstat().st_ino),
                 racer_identity,
             )
-            quarantined = list(
-                (home / "personal-sync" / "quarantine").glob("*/leaf/*")
-            )
+            quarantined = list((home / "personal-sync" / "quarantine").glob("*/leaf/*"))
             self.assertEqual(quarantined, [])
 
     def test_remove_restores_same_target_inode_racer(self) -> None:
@@ -2718,9 +2710,7 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 (target.lstat().st_dev, target.lstat().st_ino),
                 racer_identity,
             )
-            quarantined = list(
-                (home / "personal-sync" / "quarantine").glob("*/leaf/*")
-            )
+            quarantined = list((home / "personal-sync" / "quarantine").glob("*/leaf/*"))
             self.assertEqual(quarantined, [])
 
     def test_parent_swap_cannot_redirect_current_move_outside_home(self) -> None:
@@ -2738,12 +2728,7 @@ class AtomicMoveSafetyTests(unittest.TestCase):
                 target_is_directory=True,
             )
             backup = (
-                home
-                / "personal-sync"
-                / "quarantine"
-                / "batch"
-                / "current"
-                / "private"
+                home / "personal-sync" / "quarantine" / "batch" / "current" / "private"
             )
             backup.parent.mkdir(parents=True)
             moved_owner_root = owner_root.with_name("private-moved")
@@ -2871,9 +2856,7 @@ class ReconcileTransactionSafetyTests(unittest.TestCase):
         self.assertTrue(target.is_file())
         self.assertEqual(target.read_text(encoding="utf-8"), "unmanaged\n")
         backups = list(
-            (self.home / "personal-sync" / "quarantine").glob(
-                "*/links/skills/old"
-            )
+            (self.home / "personal-sync" / "quarantine").glob("*/links/skills/old")
         )
         self.assertEqual(backups, [])
 
@@ -2940,9 +2923,7 @@ class ReconcileTransactionSafetyTests(unittest.TestCase):
             racer_identity,
         )
         backups = list(
-            (self.home / "personal-sync" / "quarantine").glob(
-                "*/links/skills/old"
-            )
+            (self.home / "personal-sync" / "quarantine").glob("*/links/skills/old")
         )
         self.assertEqual(backups, [])
 
@@ -2991,9 +2972,7 @@ class ReconcileTransactionSafetyTests(unittest.TestCase):
 
         self.assertFalse(os.path.lexists(target))
         backups = list(
-            (self.home / "personal-sync" / "quarantine").glob(
-                "*/links/skills/old"
-            )
+            (self.home / "personal-sync" / "quarantine").glob("*/links/skills/old")
         )
         self.assertEqual(len(backups), 1)
         self.assertTrue(backups[0].is_file())
@@ -3044,11 +3023,7 @@ class ReconcileTransactionSafetyTests(unittest.TestCase):
 
         self.assertTrue(current.is_file())
         self.assertEqual(current.read_text(encoding="utf-8"), "concurrent current\n")
-        backups = list(
-            (sync_root / "quarantine").glob(
-                "*/links/personal-sync/current"
-            )
-        )
+        backups = list((sync_root / "quarantine").glob("*/links/personal-sync/current"))
         self.assertEqual(backups, [])
 
     def test_current_switch_rejects_same_target_inode_replacement(self) -> None:
@@ -3086,7 +3061,9 @@ class ReconcileTransactionSafetyTests(unittest.TestCase):
             "_atomic_move_beneath_home",
             side_effect=replace_before_move,
         ):
-            with self.assertRaisesRegex(MODULE.SyncError, "source changed after planning"):
+            with self.assertRaisesRegex(
+                MODULE.SyncError, "source changed after planning"
+            ):
                 MODULE._switch_current(self.home, SHA_B, dry_run=False)
 
         self.assertEqual(os.readlink(current), old_target)
@@ -3164,9 +3141,7 @@ class ReconcileTransactionSafetyTests(unittest.TestCase):
         self.assertEqual(os.readlink(current), "releases/concurrent")
         assert transaction is not None
         assert transaction.batch_root is not None
-        original_backup = (
-            transaction.batch_root / "links" / "personal-sync" / "current"
-        )
+        original_backup = transaction.batch_root / "links" / "personal-sync" / "current"
         self.assertEqual(os.readlink(original_backup), f"releases/{SHA_A}")
         self.assertFalse((transaction.batch_root / "rollback").exists())
 
@@ -3240,9 +3215,7 @@ class ReconcileTransactionSafetyTests(unittest.TestCase):
         self.assertTrue(second.is_file())
         self.assertEqual(second.read_text(encoding="utf-8"), "unmanaged\n")
         second_backups = list(
-            (self.home / "personal-sync" / "quarantine").glob(
-                "*/links/skills/second"
-            )
+            (self.home / "personal-sync" / "quarantine").glob("*/links/skills/second")
         )
         self.assertEqual(second_backups, [])
 
@@ -3337,9 +3310,7 @@ class ManagedStateReadSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.home = Path(self.temp_dir.name)
-        self.state_path = (
-            self.home / "personal-sync" / "state" / "managed-links.json"
-        )
+        self.state_path = self.home / "personal-sync" / "state" / "managed-links.json"
         self.state_path.parent.mkdir(parents=True)
         self.original_payload = (
             json.dumps({"version": 1, "owners": {}, "links": []}) + "\n"
@@ -3352,8 +3323,7 @@ class ManagedStateReadSafetyTests(unittest.TestCase):
     def test_rejects_regular_file_replacement_between_stat_and_open(self) -> None:
         original_path = self.state_path.with_suffix(".before")
         replacement_payload = (
-            json.dumps({"version": 1, "owners": {}, "links": [], "raced": True})
-            + "\n"
+            json.dumps({"version": 1, "owners": {}, "links": [], "raced": True}) + "\n"
         ).encode("utf-8")
         real_open = MODULE.os.open
         replaced = False
@@ -3391,8 +3361,7 @@ class ManagedStateReadSafetyTests(unittest.TestCase):
         original_parent = self.state_path.parent
         moved_parent = original_parent.with_name("state-before-swap")
         replacement_payload = (
-            json.dumps({"version": 1, "owners": {}, "links": [], "raced": True})
-            + "\n"
+            json.dumps({"version": 1, "owners": {}, "links": [], "raced": True}) + "\n"
         ).encode("utf-8")
         real_read = MODULE._read_managed_state_bytes
         replaced = False
@@ -3400,10 +3369,11 @@ class ManagedStateReadSafetyTests(unittest.TestCase):
         def read_then_replace_parent(file_fd: int, path: Path) -> bytes:
             nonlocal replaced
             payload = real_read(file_fd, path)
-            original_parent.rename(moved_parent)
-            original_parent.mkdir()
-            self.state_path.write_bytes(replacement_payload)
-            replaced = True
+            if not replaced:
+                original_parent.rename(moved_parent)
+                original_parent.mkdir()
+                self.state_path.write_bytes(replacement_payload)
+                replaced = True
             return payload
 
         with mock.patch.object(
@@ -3923,9 +3893,7 @@ class ManagedStateTransactionSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.home = Path(self.temp_dir.name)
-        self.state_path = (
-            self.home / "personal-sync" / "state" / "managed-links.json"
-        )
+        self.state_path = self.home / "personal-sync" / "state" / "managed-links.json"
         self.state_path.parent.mkdir(parents=True)
         self.state_path.write_bytes(b"before\n")
         self.state_path.chmod(0o640)
@@ -3994,10 +3962,11 @@ class ManagedStateTransactionSafetyTests(unittest.TestCase):
         def read_then_replace_parent(file_fd: int, path: Path) -> bytes:
             nonlocal replaced
             payload = real_read(file_fd, path)
-            original_parent.rename(moved_parent)
-            original_parent.mkdir()
-            self.state_path.write_bytes(b"replacement\n")
-            replaced = True
+            if not replaced:
+                original_parent.rename(moved_parent)
+                original_parent.mkdir()
+                self.state_path.write_bytes(b"replacement\n")
+                replaced = True
             return payload
 
         with mock.patch.object(
@@ -4050,6 +4019,59 @@ class ManagedStateTransactionSafetyTests(unittest.TestCase):
             )
 
         read_file.assert_not_called()
+
+    def test_match_rejects_same_inode_group_policy_change(self) -> None:
+        snapshot = MODULE._snapshot_managed_state_file(self.home)
+        assert snapshot.gid is not None
+        alternate_groups = sorted({os.getegid(), *os.getgroups()} - {snapshot.gid})
+        if not alternate_groups:
+            self.skipTest("caller has no alternate group for gid regression")
+        identity = snapshot.file_identity
+        try:
+            os.chown(self.state_path, -1, alternate_groups[0])
+        except PermissionError as error:
+            self.skipTest(f"cannot change ledger group for regression: {error}")
+
+        metadata = self.state_path.stat()
+        self.assertEqual((metadata.st_dev, metadata.st_ino), identity)
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o640)
+        self.assertFalse(
+            MODULE._managed_state_file_matches(
+                self.home,
+                self.state_path,
+                snapshot,
+            )
+        )
+
+    def test_fixed_mode_after_state_requires_effective_owner(self) -> None:
+        before = MODULE._snapshot_managed_state_file(self.home)
+        transaction = MODULE._prepare_managed_state_transaction(
+            self.home,
+            MODULE._empty_managed_state(),
+            before,
+        )
+        after = transaction.after
+        self.assertEqual(after.mode, 0o600)
+        self.assertEqual(after.uid, os.geteuid())
+        self.assertIsNone(after.gid)
+        wrong_owner = dataclasses.replace(
+            after,
+            uid=os.geteuid() + 1,
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "_read_managed_state_file_snapshot",
+            return_value=wrong_owner,
+        ):
+            self.assertFalse(
+                MODULE._managed_state_file_matches(
+                    self.home,
+                    self.state_path,
+                    after,
+                    parent_fd=123,
+                )
+            )
 
     def test_match_rejects_parent_replacement_during_read(self) -> None:
         snapshot = MODULE._snapshot_managed_state_file(self.home)
@@ -4656,12 +4678,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         releases = self.home / "personal-sync" / "releases"
         self.assertEqual(
             (
-                releases
-                / sha
-                / "personal_codex"
-                / "skills"
-                / source_name
-                / "SKILL.md"
+                releases / sha / "personal_codex" / "skills" / source_name / "SKILL.md"
             ).read_text(encoding="utf-8"),
             expected_content,
         )
@@ -4703,9 +4720,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
 
         plan.assert_not_called()
         stage.assert_not_called()
-        self.assertFalse(
-            os.path.lexists(MODULE._current_link(self.home, "private"))
-        )
+        self.assertFalse(os.path.lexists(MODULE._current_link(self.home, "private")))
 
     def test_overlay_base_sha_validation_checks_all_overlays_and_missing_public(
         self,
@@ -4789,9 +4804,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             ),
             before,
         )
-        self.assertFalse(
-            (self.home / "personal-sync" / "releases" / SHA_B).exists()
-        )
+        self.assertFalse((self.home / "personal-sync" / "releases" / SHA_B).exists())
 
     def test_public_rollback_rejects_retained_overlay_base_sha_mismatch_before_planning(
         self,
@@ -4920,12 +4933,8 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             (os.readlink(public_current), state_path.read_bytes()),
             before,
         )
-        self.assertFalse(
-            os.path.lexists(MODULE._current_link(self.home, "private"))
-        )
-        self.assertFalse(
-            (self.home / "personal-sync" / "releases" / SHA_B).exists()
-        )
+        self.assertFalse(os.path.lexists(MODULE._current_link(self.home, "private")))
+        self.assertFalse((self.home / "personal-sync" / "releases" / SHA_B).exists())
         self.assertFalse(
             (
                 self.home
@@ -4978,7 +4987,9 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             **kwargs: object,
         ) -> MODULE.ReconcileTransaction | None:
             nonlocal racer_identity
-            if racer_identity is None and any(action.target == target for action in actions):
+            if racer_identity is None and any(
+                action.target == target for action in actions
+            ):
                 target.unlink()
                 target.symlink_to(previous_target, target_is_directory=True)
                 racer_identity = (target.lstat().st_dev, target.lstat().st_ino)
@@ -5064,7 +5075,9 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             **kwargs: object,
         ) -> MODULE.ReconcileTransaction | None:
             nonlocal racer_identity
-            if racer_identity is None and any(action.target == target for action in actions):
+            if racer_identity is None and any(
+                action.target == target for action in actions
+            ):
                 target.unlink()
                 target.symlink_to(previous_target, target_is_directory=True)
                 racer_identity = (target.lstat().st_dev, target.lstat().st_ino)
@@ -5370,18 +5383,15 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(
             MODULE.SyncError,
             "existing release tree does not match incoming source",
-        ):
+        ) as raised:
             install_quietly(incoming, self.home, SHA_A)
 
+        self.assertEqual(raised.exception.code, "immutable-release-drift")
         self.assertEqual(self._snapshot(), state_before)
         self.assertEqual(
-            (
-                installed
-                / "personal_codex"
-                / "skills"
-                / "old"
-                / "SKILL.md"
-            ).read_text(encoding="utf-8"),
+            (installed / "personal_codex" / "skills" / "old" / "SKILL.md").read_text(
+                encoding="utf-8"
+            ),
             "# Example\n",
         )
         self.assertFalse(
@@ -5403,11 +5413,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             / "SKILL.md"
         )
         incoming_skill = (
-            self.release_a
-            / "personal_codex"
-            / "skills"
-            / "old"
-            / "SKILL.md"
+            self.release_a / "personal_codex" / "skills" / "old" / "SKILL.md"
         )
         incoming_skill.write_text("# Different content\n", encoding="utf-8")
 
@@ -5433,15 +5439,11 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         self.assertEqual(installed.stat().st_ino, installed_inode)
         self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o755)
 
-    def test_source_mutation_after_capture_before_final_install_is_rejected(self) -> None:
+    def test_source_mutation_after_capture_before_final_install_is_rejected(
+        self,
+    ) -> None:
         state_before = self._snapshot()
-        source_skill = (
-            self.release_b
-            / "personal_codex"
-            / "skills"
-            / "new"
-            / "SKILL.md"
-        )
+        source_skill = self.release_b / "personal_codex" / "skills" / "new" / "SKILL.md"
         real_install_set = MODULE._install_release_set_unlocked
         injected = False
 
@@ -5484,9 +5486,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
 
         self.assertTrue(injected)
         self.assertEqual(self._snapshot(), state_before)
-        self.assertFalse(
-            (self.home / "personal-sync" / "releases" / SHA_B).exists()
-        )
+        self.assertFalse((self.home / "personal-sync" / "releases" / SHA_B).exists())
         self.assertEqual(source_skill.read_bytes(), b"# Changed\n")
 
     def test_unchanged_public_base_mutation_before_activation_is_rejected(
@@ -5547,11 +5547,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         self.assertEqual(public_skill.read_bytes(), b"# Changed\n")
         self.assertFalse(
             os.path.lexists(
-                self.home
-                / "personal-sync"
-                / "overlays"
-                / "private"
-                / "current"
+                self.home / "personal-sync" / "overlays" / "private" / "current"
             )
         )
         self.assertFalse(os.path.lexists(self.home / "skills" / "private"))
@@ -6171,9 +6167,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
                 removed_links,
                 state,
                 allow_cross_owner=allow_cross_owner,
-                allow_unledgered_removed_links=(
-                    allow_unledgered_removed_links
-                ),
+                allow_unledgered_removed_links=(allow_unledgered_removed_links),
             )
             plan_calls += 1
             if not injected and plan_calls == 2:
@@ -6266,9 +6260,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         self.assertEqual(state_path.read_bytes(), state_before)
         state = MODULE._load_managed_state(self.home)
         self.assertIn(PurePosixPath("skills/private"), state.links)
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
         self.assertEqual(
             tuple(sorted(path.name for path in quarantine.iterdir())),
             quarantine_before,
@@ -6326,9 +6318,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         state = MODULE._load_managed_state(self.home)
         self.assertEqual(state.owners, {MODULE.PUBLIC_OWNER: SHA_A})
         self.assertEqual(set(state.links), {PurePosixPath("skills/example")})
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
 
     def test_overlay_uninstall_without_managed_state_rolls_back_before_commit(
         self,
@@ -6382,9 +6372,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             ).link_identity,
             private_target_before.link_identity,
         )
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
 
     def test_overlay_uninstall_without_managed_state_retries_after_recovery(
         self,
@@ -6438,9 +6426,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         pending_batch = MODULE._load_pending_link_batch(self.home)
         assert pending_batch is not None
         self.assertFalse(
-            os.path.lexists(
-                pending_batch.batch_root / pending_batch.commit_marker_path
-            )
+            os.path.lexists(pending_batch.batch_root / pending_batch.commit_marker_path)
         )
         self.assertFalse(state_path.exists())
         self.assertFalse(os.path.lexists(public_target))
@@ -6563,9 +6549,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         state = MODULE._load_managed_state(self.home)
         self.assertEqual(state.owners, {MODULE.PUBLIC_OWNER: SHA_A})
         self.assertNotIn(PurePosixPath("skills/retired/private"), state.links)
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
 
     def test_retired_absence_rebinds_after_sibling_create_restores_parent(
         self,
@@ -6619,9 +6603,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         state = MODULE._load_managed_state(self.home)
         self.assertIn(PurePosixPath("skills/retired/new"), state.links)
         self.assertNotIn(PurePosixPath("skills/retired/old"), state.links)
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
 
     def test_overlay_uninstall_retired_absence_race_preserves_foreign_link(
         self,
@@ -6881,13 +6863,9 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         retained = list(releases.glob(f".retained-{SHA_B}-*"))
         self.assertEqual(len(retained), 1)
         self.assertEqual(
-            (
-                retained[0]
-                / "personal_codex"
-                / "skills"
-                / "new"
-                / "SKILL.md"
-            ).read_text(encoding="utf-8"),
+            (retained[0] / "personal_codex" / "skills" / "new" / "SKILL.md").read_text(
+                encoding="utf-8"
+            ),
             "# Concurrent mutation\n",
         )
 
@@ -6998,11 +6976,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         )
         self.assertTrue(
             (
-                displaced_staging
-                / "personal_codex"
-                / "skills"
-                / "new"
-                / "SKILL.md"
+                displaced_staging / "personal_codex" / "skills" / "new" / "SKILL.md"
             ).is_file()
         )
 
@@ -7064,11 +7038,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         )
         self.assertTrue(
             (
-                displaced_release
-                / "personal_codex"
-                / "skills"
-                / "new"
-                / "SKILL.md"
+                displaced_release / "personal_codex" / "skills" / "new" / "SKILL.md"
             ).is_file()
         )
 
@@ -7094,7 +7064,11 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             source_members: dict[PurePosixPath, tuple[str, ...]],
         ) -> None:
             nonlocal injected
-            if not injected and display_root == self.release_b and not relative_root.parts:
+            if (
+                not injected
+                and display_root == self.release_b
+                and not relative_root.parts
+            ):
                 injected = True
                 self.release_b.rename(displaced_source)
                 self.release_b.symlink_to(outside_source, target_is_directory=True)
@@ -7120,13 +7094,9 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         retained = list(releases.glob(f".retained-{SHA_B}-*"))
         self.assertEqual(len(retained), 1)
         self.assertEqual(
-            (
-                retained[0]
-                / "personal_codex"
-                / "skills"
-                / "new"
-                / "SKILL.md"
-            ).read_text(encoding="utf-8"),
+            (retained[0] / "personal_codex" / "skills" / "new" / "SKILL.md").read_text(
+                encoding="utf-8"
+            ),
             "# Example\n",
         )
 
@@ -7170,23 +7140,15 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         retained = list(releases.glob(f".retained-{SHA_B}-*"))
         self.assertEqual(len(retained), 1)
         self.assertEqual(
-            (
-                retained[0]
-                / "personal_codex"
-                / "skills"
-                / "new"
-                / "SKILL.md"
-            ).read_text(encoding="utf-8"),
+            (retained[0] / "personal_codex" / "skills" / "new" / "SKILL.md").read_text(
+                encoding="utf-8"
+            ),
             "# Example\n",
         )
 
     def test_source_file_swap_to_fifo_is_nonblocking_and_rejected(self) -> None:
-        source_file = (
-            self.release_b / "personal_codex" / "skills" / "new" / "SKILL.md"
-        )
-        relative_path = PurePosixPath(
-            "personal_codex/skills/new/SKILL.md"
-        )
+        source_file = self.release_b / "personal_codex" / "skills" / "new" / "SKILL.md"
+        relative_path = PurePosixPath("personal_codex/skills/new/SKILL.md")
         source_parent_fd, source_fd, _snapshot = MODULE._open_release_source_root(
             self.release_b
         )
@@ -7230,9 +7192,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         self.assertTrue(used_nonblock)
 
     def test_release_identity_revalidates_one_coherent_tree_snapshot(self) -> None:
-        source_file = (
-            self.release_b / "personal_codex" / "skills" / "new" / "SKILL.md"
-        )
+        source_file = self.release_b / "personal_codex" / "skills" / "new" / "SKILL.md"
         source_parent_fd, source_fd, _snapshot = MODULE._open_release_source_root(
             self.release_b
         )
@@ -7280,9 +7240,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         self,
     ) -> None:
         releases = self.home / "personal-sync" / "releases"
-        source_file = (
-            self.release_b / "personal_codex" / "skills" / "new" / "SKILL.md"
-        )
+        source_file = self.release_b / "personal_codex" / "skills" / "new" / "SKILL.md"
         source_metadata = source_file.stat()
         source_identity = (source_metadata.st_dev, source_metadata.st_ino)
         real_copy = MODULE._copy_bytes
@@ -7319,9 +7277,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
 
     def test_growing_source_file_is_rejected_after_captured_size(self) -> None:
         releases = self.home / "personal-sync" / "releases"
-        source_file = (
-            self.release_b / "personal_codex" / "skills" / "new" / "SKILL.md"
-        )
+        source_file = self.release_b / "personal_codex" / "skills" / "new" / "SKILL.md"
         real_copy = MODULE._copy_bytes
         injected = False
 
@@ -7451,11 +7407,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             (installed, 0o777),
             (installed / "personal_codex", 0o777),
             (
-                installed
-                / "personal_codex"
-                / "skills"
-                / "old"
-                / "SKILL.md",
+                installed / "personal_codex" / "skills" / "old" / "SKILL.md",
                 0o666,
             ),
         )
@@ -7484,7 +7436,9 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             "_verify_desired_entries",
             side_effect=MODULE.SyncError("injected verification failure"),
         ):
-            with self.assertRaisesRegex(MODULE.SyncError, "injected verification failure"):
+            with self.assertRaisesRegex(
+                MODULE.SyncError, "injected verification failure"
+            ):
                 install_quietly(self.release_b, self.home, SHA_B)
 
         self.assertEqual(self._snapshot(), before)
@@ -8110,9 +8064,7 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
             target_name="public-base",
         )
         install_quietly(self.public_release, self.home, SHA_A)
-        self.state_path = (
-            self.home / "personal-sync" / "state" / "managed-links.json"
-        )
+        self.state_path = self.home / "personal-sync" / "state" / "managed-links.json"
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -8307,8 +8259,8 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
             before_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
         ) -> MODULE.ManagedStateFileTransaction:
             nonlocal displaced, replacement_identity
-            displaced, replacement_identity = self._replace_state_file_with_same_content(
-                "install-original"
+            displaced, replacement_identity = (
+                self._replace_state_file_with_same_content("install-original")
             )
             return real_prepare(home, state, before_snapshot)
 
@@ -8391,7 +8343,10 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
         assert replacement_parent_identity is not None
         assert replacement_file_identity is not None
         self.assertEqual(
-            (self.state_path.parent.stat().st_dev, self.state_path.parent.stat().st_ino),
+            (
+                self.state_path.parent.stat().st_dev,
+                self.state_path.parent.stat().st_ino,
+            ),
             replacement_parent_identity,
         )
         self.assertEqual(
@@ -8475,7 +8430,10 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
         assert shared_file_identity is not None
         self.assertEqual((os.readlink(current), os.readlink(target)), before_links)
         self.assertEqual(
-            (self.state_path.parent.stat().st_dev, self.state_path.parent.stat().st_ino),
+            (
+                self.state_path.parent.stat().st_dev,
+                self.state_path.parent.stat().st_ino,
+            ),
             replacement_parent_identity,
         )
         self.assertEqual(
@@ -8489,9 +8447,7 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
             ),
             shared_file_identity,
         )
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
 
     def test_install_rejects_bound_missing_state_parent_swap_after_release_staging(
         self,
@@ -8554,9 +8510,7 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
         assert replacement_parent_identity is not None
         self.assertNotEqual(replacement_parent_identity, original_parent_identity)
         self.assertFalse(os.path.lexists(self.state_path))
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
 
     def test_managed_state_staging_snapshot_transition_rules(self) -> None:
         first_bound = (1, 2)
@@ -8638,8 +8592,8 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
             before_snapshot: MODULE.ManagedStateFileSnapshot | None = None,
         ) -> MODULE.ManagedStateFileTransaction:
             nonlocal displaced, replacement_identity
-            displaced, replacement_identity = self._replace_state_file_with_same_content(
-                "uninstall-original"
+            displaced, replacement_identity = (
+                self._replace_state_file_with_same_content("uninstall-original")
             )
             return real_prepare(home, state, before_snapshot)
 
@@ -8728,7 +8682,10 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
         assert replacement_parent_identity is not None
         assert replacement_file_identity is not None
         self.assertEqual(
-            (self.state_path.parent.stat().st_dev, self.state_path.parent.stat().st_ino),
+            (
+                self.state_path.parent.stat().st_dev,
+                self.state_path.parent.stat().st_ino,
+            ),
             replacement_parent_identity,
         )
         self.assertEqual(
@@ -8846,9 +8803,7 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
             current_before,
         )
         self.assertEqual(self.state_path.read_bytes(), state_before)
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
         self.assertFalse((MODULE._releases_root(self.home) / SHA_B).exists())
 
     def test_first_bootstrap_tombstone_still_removes_legacy_link(self) -> None:
@@ -8885,9 +8840,7 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
         final_state = MODULE._load_managed_state(self.home)
         self.assertEqual(final_state.owners, {MODULE.PUBLIC_OWNER: SHA_B})
         self.assertEqual(set(final_state.links), {PurePosixPath("skills/public-base")})
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
 
     def test_install_does_not_adopt_preexisting_exact_desired_link(self) -> None:
         private_release = self.root / "preexisting-link-private-release"
@@ -9026,9 +8979,7 @@ class ManagedStatePlanningAndAdoptionSafetyTests(unittest.TestCase):
             (added_target.lstat().st_dev, added_target.lstat().st_ino),
             added_identity,
         )
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(self.home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
 
     def test_first_bootstrap_adopts_current_legacy_managed_link(self) -> None:
         self.state_path.unlink()
@@ -9195,9 +9146,7 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
                 )
             )
         )
-        self.assertFalse(
-            os.path.lexists(batch.batch_root / "links" / "AGENTS.md")
-        )
+        self.assertFalse(os.path.lexists(batch.batch_root / "links" / "AGENTS.md"))
         self.assertEqual(foreign_leaf_snapshot(self.agents), self.foreign_before)
 
     def test_uncommitted_recovery_requires_exact_foreign_snapshot(self) -> None:
@@ -9223,13 +9172,11 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
     def test_uncommitted_recovery_preserves_exact_foreign_snapshot(self) -> None:
         _batch, state, state_snapshot = self._stage_batch()
 
-        recovered, _snapshot, did_recover = (
-            MODULE._recover_pending_link_transaction(
-                self.home,
-                state,
-                state_snapshot,
-                dry_run=False,
-            )
+        recovered, _snapshot, did_recover = MODULE._recover_pending_link_transaction(
+            self.home,
+            state,
+            state_snapshot,
+            dry_run=False,
         )
 
         self.assertTrue(did_recover)
@@ -9337,8 +9284,7 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
             record = next(
                 candidate
                 for candidate in payload["records"]
-                if candidate["action"]
-                == MODULE.PENDING_RELINQUISH_FOREIGN_ACTION
+                if candidate["action"] == MODULE.PENDING_RELINQUISH_FOREIGN_ACTION
             )
             record["planned_before"]["link_target"] = old_target
 
@@ -9357,8 +9303,7 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
             record = next(
                 candidate
                 for candidate in payload["records"]
-                if candidate["action"]
-                == MODULE.PENDING_RELINQUISH_FOREIGN_ACTION
+                if candidate["action"] == MODULE.PENDING_RELINQUISH_FOREIGN_ACTION
             )
             record["source"] = "personal_codex/AGENTS.md"
 
@@ -9468,9 +9413,7 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
         self.assertEqual(final_state.owners, {MODULE.PUBLIC_OWNER: SHA_A})
         self.assertNotIn(agents_key, final_state.links)
         self.assertFalse(os.path.lexists(self.home / "skills" / "private"))
-        self.assertFalse(
-            os.path.lexists(MODULE._current_link(self.home, "private"))
-        )
+        self.assertFalse(os.path.lexists(MODULE._current_link(self.home, "private")))
         self.assertFalse(os.path.lexists(self.pointer_path))
 
 
@@ -9524,9 +9467,10 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 MODULE.SyncError,
                 "quarantine retains too many transaction batches: 2 >= 2",
-            ):
+            ) as raised:
                 MODULE._quarantine_batch_root(self.home, [])
 
+        self.assertEqual(raised.exception.code, "quarantine-saturated")
         self.assertEqual(
             tuple(sorted(path.name for path in first.parent.iterdir())),
             before,
@@ -9856,7 +9800,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
         source_identity.assert_not_called()
         self.assertTrue(os.path.lexists(self.pointer_path))
-        self.assertIn("would recover pending personal sync transaction", stdout.getvalue())
+        self.assertIn(
+            "would recover pending personal sync transaction", stdout.getvalue()
+        )
 
     def test_github_dry_runs_stop_before_download_when_recovery_is_required(
         self,
@@ -9881,7 +9827,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             with self.subTest(entrypoint=entrypoint.__name__):
                 self._stage_crash_batch()
                 with (
-                    mock.patch.object(MODULE, "download_and_extract_release") as download,
+                    mock.patch.object(
+                        MODULE, "download_and_extract_release"
+                    ) as download,
                     contextlib.redirect_stdout(io.StringIO()) as stdout,
                 ):
                     entrypoint(*args, **kwargs)
@@ -9910,9 +9858,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
         @contextlib.contextmanager
         def clear_pending_before_lock(_home: Path) -> Iterator[None]:
-            state, state_snapshot = MODULE._load_managed_state_with_snapshot(
-                self.home
-            )
+            state, state_snapshot = MODULE._load_managed_state_with_snapshot(self.home)
             MODULE._recover_pending_link_transaction(
                 self.home,
                 state,
@@ -9943,9 +9889,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
         @contextlib.contextmanager
         def stage_pending_before_lock(_home: Path) -> Iterator[None]:
-            state, state_snapshot = MODULE._load_managed_state_with_snapshot(
-                first_home
-            )
+            state, state_snapshot = MODULE._load_managed_state_with_snapshot(first_home)
             self.assertFalse(state_snapshot.exists)
             self.assertFalse(
                 os.path.lexists(MODULE._pending_link_pointer_path(first_home))
@@ -9971,9 +9915,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
         final_state = MODULE._load_managed_state(first_home)
         self.assertIn(PurePosixPath("skills/public-base"), final_state.links)
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(first_home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(first_home)))
 
     def test_github_installs_recover_pending_before_download(self) -> None:
         entrypoints = (
@@ -10116,10 +10058,10 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         batch, actions, _state, state_snapshot = self._stage_crash_batch()
         self._publish_pending_target(batch, actions)
         self._publish_committed_state(batch, state_snapshot)
-        release_dir = (
-            MODULE._releases_root(self.home, MODULE.PUBLIC_OWNER) / SHA_B
+        release_dir = MODULE._releases_root(self.home, MODULE.PUBLIC_OWNER) / SHA_B
+        skill_file = (
+            release_dir / "personal_codex" / "skills" / "public-new" / "SKILL.md"
         )
-        skill_file = release_dir / "personal_codex" / "skills" / "public-new" / "SKILL.md"
         skill_file.write_text("# Tampered\n", encoding="utf-8")
         committed_state, committed_snapshot = MODULE._load_managed_state_with_snapshot(
             self.home
@@ -10144,9 +10086,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         batch, actions, _state, state_snapshot = self._stage_crash_batch()
         self._publish_pending_target(batch, actions)
         self._publish_committed_state(batch, state_snapshot)
-        release_dir = (
-            MODULE._releases_root(self.home, MODULE.PUBLIC_OWNER) / SHA_B
-        )
+        release_dir = MODULE._releases_root(self.home, MODULE.PUBLIC_OWNER) / SHA_B
         expected_tree, expected_directory_identity = (
             MODULE._installed_release_identity_and_directory_identity(
                 self.home,
@@ -10406,10 +10346,14 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         sentinel.write_text("keep\n", encoding="utf-8")
         shutil.rmtree(batch_root / "pending")
         (batch_root / "pending").symlink_to(outside, target_is_directory=True)
-        deep_root = batch_root / "deep" / Path(
-            *(
-                f"level-{index:02d}"
-                for index in range(MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)
+        deep_root = (
+            batch_root
+            / "deep"
+            / Path(
+                *(
+                    f"level-{index:02d}"
+                    for index in range(MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)
+                )
             )
         )
         deep_root.mkdir(parents=True)
@@ -10640,9 +10584,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
         self.assertTrue(interrupted)
         self.assertIn("post-isolation interruption", stdout.getvalue())
-        active = list(
-            batch_root.glob(f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}*")
-        )
+        active = list(batch_root.glob(f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}*"))
         self.assertEqual(len(active), 1)
         self.assertEqual(active[0].read_text(encoding="utf-8"), "cleanup\n")
 
@@ -10691,9 +10633,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         ):
             self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
 
-        active = list(
-            batch_root.glob(f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}*")
-        )
+        active = list(batch_root.glob(f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}*"))
         self.assertEqual(len(active), 1)
         expected = self.root / "cleanup-retry-file-expected"
         foreign_identity: tuple[int, int] | None = None
@@ -10806,9 +10746,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
 
         self.assertIn("mismatched-isolation interruption", stdout.getvalue())
-        active = list(
-            batch_root.glob(f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}*")
-        )
+        active = list(batch_root.glob(f"{MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}*"))
         self.assertEqual(len(active), 1)
         self.assertEqual(active[0].read_text(encoding="utf-8"), "foreign\n")
 
@@ -10915,9 +10853,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             nonlocal foreign_identity
             if (
                 source_name == temp_path.name
-                and destination_name.startswith(
-                    MODULE.PENDING_CLEANUP_RETAINED_PREFIX
-                )
+                and destination_name.startswith(MODULE.PENDING_CLEANUP_RETAINED_PREFIX)
                 and foreign_identity is None
             ):
                 temp_path.rename(expected_path)
@@ -10945,9 +10881,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
                 temp_path,
             )
 
-        retained = list(
-            index_root.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}*")
-        )
+        retained = list(index_root.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}*"))
         self.assertEqual(len(retained), 1)
         self.assertEqual(retained[0].read_bytes(), b"foreign-temp\n")
         self.assertEqual(
@@ -10982,9 +10916,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             nonlocal foreign_identity
             if (
                 source_name == temp_path.name
-                and destination_name.startswith(
-                    MODULE.PENDING_CLEANUP_RETAINED_PREFIX
-                )
+                and destination_name.startswith(MODULE.PENDING_CLEANUP_RETAINED_PREFIX)
                 and foreign_identity is None
             ):
                 temp_path.rename(expected_path)
@@ -11013,9 +10945,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
                 payload,
             )
 
-        retained = list(
-            index_root.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}*")
-        )
+        retained = list(index_root.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}*"))
         self.assertEqual(len(retained), 1)
         self.assertEqual(retained[0].read_bytes(), b"foreign-publication-temp\n")
         self.assertEqual(
@@ -11043,9 +10973,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             nonlocal foreign_identity
             if (
                 source_name == ticket_path.name
-                and destination_name.startswith(
-                    MODULE.PENDING_CLEANUP_RETAINED_PREFIX
-                )
+                and destination_name.startswith(MODULE.PENDING_CLEANUP_RETAINED_PREFIX)
                 and foreign_identity is None
             ):
                 ticket_path.rename(expected_path)
@@ -11071,9 +10999,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             MODULE._delete_pending_cleanup_ticket(self.home, ticket)
 
         retained = list(
-            ticket_path.parent.glob(
-                f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}*"
-            )
+            ticket_path.parent.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}*")
         )
         self.assertEqual(len(retained), 1)
         self.assertEqual(retained[0].read_bytes(), b"foreign-ticket\n")
@@ -11149,9 +11075,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
     def test_cleanup_resumes_from_isolated_batch_after_rmdir_failure(self) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        isolated_name = MODULE._pending_cleanup_isolated_batch_name(
-            batch_root.name
-        )
+        isolated_name = MODULE._pending_cleanup_isolated_batch_name(batch_root.name)
         isolated = batch_root.with_name(isolated_name)
         real_rmdir = os.rmdir
 
@@ -11445,7 +11369,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         self.assertEqual(MODULE._current_sha(first_home), SHA_A)
         self.assertTrue((first_home / "skills" / "public-base").is_symlink())
 
-    def test_public_install_preflight_defers_and_recovers_published_target(self) -> None:
+    def test_public_install_preflight_defers_and_recovers_published_target(
+        self,
+    ) -> None:
         batch, actions, _state, _state_snapshot = self._stage_crash_batch()
         self._publish_pending_target(batch, actions)
         first_identity = (
@@ -11557,9 +11483,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
     def test_before_state_parent_swap_with_exact_leaf_retains_pointer(self) -> None:
         batch, state, state_snapshot = self._stage_single_added_create_batch()
-        evidence_identity = self._move_exact_added_inode_under_replaced_parent(
-            batch
-        )
+        evidence_identity = self._move_exact_added_inode_under_replaced_parent(batch)
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
@@ -11581,9 +11505,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
     def test_committed_parent_swap_with_exact_leaf_retains_pointer(self) -> None:
         batch, _state, state_snapshot = self._stage_single_added_create_batch()
         self._publish_committed_state(batch, state_snapshot)
-        evidence_identity = self._move_exact_added_inode_under_replaced_parent(
-            batch
-        )
+        evidence_identity = self._move_exact_added_inode_under_replaced_parent(batch)
         committed_state, committed_snapshot = MODULE._load_managed_state_with_snapshot(
             self.home
         )
@@ -11716,16 +11638,12 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             MODULE._close_fd_quietly(state_parent_fd)
 
         rename_indexes = [
-            index
-            for index, event in enumerate(events)
-            if event[0] == "rename"
+            index for index, event in enumerate(events) if event[0] == "rename"
         ]
         self.assertEqual(len(rename_indexes), 2)
         reverse_event = events[rename_indexes[1]]
         fsynced_after_reverse = {
-            event[1]
-            for event in events[rename_indexes[1] + 1 :]
-            if event[0] == "fsync"
+            event[1] for event in events[rename_indexes[1] + 1 :] if event[0] == "fsync"
         }
         self.assertEqual(
             fsynced_after_reverse,
@@ -11767,13 +11685,11 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
                 MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION[4]
             )
         )
-        recovered, _snapshot, did_recover = (
-            MODULE._recover_pending_link_transaction(
-                self.home,
-                state,
-                state_snapshot,
-                dry_run=False,
-            )
+        recovered, _snapshot, did_recover = MODULE._recover_pending_link_transaction(
+            self.home,
+            state,
+            state_snapshot,
+            dry_run=False,
         )
 
         self.assertTrue(did_recover)
@@ -11931,13 +11847,11 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         _batch, _actions, state, state_snapshot = self._stage_crash_batch()
         parsed = MODULE._load_pending_link_batch(self.home)
         self.assertIsNotNone(parsed)
-        recovered, _snapshot, did_recover = (
-            MODULE._recover_pending_link_transaction(
-                self.home,
-                state,
-                state_snapshot,
-                dry_run=False,
-            )
+        recovered, _snapshot, did_recover = MODULE._recover_pending_link_transaction(
+            self.home,
+            state,
+            state_snapshot,
+            dry_run=False,
         )
 
         self.assertTrue(did_recover)
@@ -11966,9 +11880,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         batch, _actions, _state, _state_snapshot = self._stage_crash_batch()
         MODULE._clear_pending_link_pointer(self.home, batch)
         metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
-        after_evidence = batch.batch_root / Path(
-            *batch.state_after_evidence.parts
-        )
+        after_evidence = batch.batch_root / Path(*batch.state_after_evidence.parts)
         alias = after_evidence.with_name("after-alias")
         os.link(after_evidence, alias)
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -12173,7 +12085,11 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             expected_identity: tuple[int, int] | None = None,
         ) -> MODULE.ManagedStateFileSnapshot:
             nonlocal displaced, racer_identity
-            if path == self.pointer_path and expected_identity is not None and displaced is None:
+            if (
+                path == self.pointer_path
+                and expected_identity is not None
+                and displaced is None
+            ):
                 payload = self.pointer_path.read_bytes()
                 displaced = self.pointer_path.with_name("pending-original")
                 self.pointer_path.rename(displaced)
@@ -12195,7 +12111,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             "_read_managed_state_file_snapshot",
             side_effect=swap_pointer_before_bound_read,
         ):
-            with self.assertRaisesRegex(MODULE.SyncError, "exact cleanup was incomplete"):
+            with self.assertRaisesRegex(
+                MODULE.SyncError, "exact cleanup was incomplete"
+            ):
                 MODULE._publish_pending_link_pointer(self.home, batch)
 
         self.assertIsNotNone(displaced)
@@ -12261,9 +12179,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             home: Path,
             batch: MODULE.PendingLinkBatch,
         ) -> None:
-            after_evidence = batch.batch_root / Path(
-                *batch.state_after_evidence.parts
-            )
+            after_evidence = batch.batch_root / Path(*batch.state_after_evidence.parts)
             self.assertTrue(after_evidence.is_file())
             self.assertEqual(
                 (after_evidence.stat().st_dev, after_evidence.stat().st_ino),
@@ -12273,7 +12189,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             real_publish(home, batch)
             events.append("pointer")
 
-        def apply(*args: object, **kwargs: object) -> MODULE.ReconcileTransaction | None:
+        def apply(
+            *args: object, **kwargs: object
+        ) -> MODULE.ReconcileTransaction | None:
             self.assertIn("pointer", events)
             events.append("mutation")
             return real_apply(*args, **kwargs)
@@ -12298,7 +12216,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             return real_write(home, state, transaction)
 
         with (
-            mock.patch.object(MODULE, "_publish_pending_link_pointer", side_effect=publish),
+            mock.patch.object(
+                MODULE, "_publish_pending_link_pointer", side_effect=publish
+            ),
             mock.patch.object(MODULE, "_apply_reconcile_actions", side_effect=apply),
             mock.patch.object(MODULE, "_write_managed_state", side_effect=write),
         ):
@@ -12651,9 +12571,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             MODULE.ManagedStateFileSnapshot,
             MODULE.SymlinkSnapshot,
         ]:
-            state, state_snapshot = MODULE._load_managed_state_with_snapshot(
-                self.home
-            )
+            state, state_snapshot = MODULE._load_managed_state_with_snapshot(self.home)
             old_link = MODULE._read_symlink_snapshot_beneath(self.home, target)
             action = MODULE.ReconcileAction(
                 "quarantine-remove",
@@ -12915,7 +12833,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(private_current))
         self.assertFalse(os.path.lexists(self.pointer_path))
 
-    def test_public_preflight_reaches_locked_recovery_with_missing_current(self) -> None:
+    def test_public_preflight_reaches_locked_recovery_with_missing_current(
+        self,
+    ) -> None:
         batch, _actions, _state, _state_snapshot = self._stage_crash_batch()
         current_record = next(
             record for record in batch.records if record.scope == "current"
@@ -12978,9 +12898,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
         self.assertTrue(did_recover)
         self.assertEqual(recovered, state)
-        self.assertFalse(
-            os.path.lexists(MODULE._pending_link_pointer_path(empty_home))
-        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(empty_home)))
 
     def test_oversized_json_integer_is_normalized_to_sync_error(self) -> None:
         payload = b'{"value":' + (b"9" * 5000) + b"}"
@@ -13145,9 +13063,22 @@ class SchedulerInternalPathSafetyTests(unittest.TestCase):
 
             with (
                 mock.patch.object(
+                    MODULE.Path,
+                    "home",
+                    return_value=Path(temp_dir),
+                ),
+                mock.patch.object(
                     MODULE,
                     "_scheduler_paths",
                     return_value=paths,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_audit_scheduler_config",
+                    return_value=MODULE.SchedulerConfigAudit(
+                        config=None,
+                        snapshots=(MODULE.ManagedStateFileSnapshot(exists=False),),
+                    ),
                 ),
                 mock.patch.object(MODULE, "_validate_scheduler_runner"),
                 mock.patch.object(MODULE, "_write_plist") as write_plist,
@@ -13300,6 +13231,7 @@ class ManifestPathEncodingSafetyTests(unittest.TestCase):
 
         for error in (ValueError("embedded null byte"), OSError("unreadable path")):
             with self.subTest(error=type(error).__name__):
+
                 def invalid_os_path(_path: PurePosixPath) -> str | None:
                     raise error
 

@@ -1,0 +1,57 @@
+{
+  "canonical_commit": "e57140e16a68db24dbdd883de665283538234730",
+  "canonical_repository": "Joey-Tools/codex-personal-sync",
+  "file_set_digest": "c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad",
+  "files": [
+    {
+      "mode": "0755",
+      "sha256": "b216b85d3d4292b0b63bbfb7e53956bd3195973d51f12b999d2b1e7cdba62d3f",
+      "source_name": "engine",
+      "source_path": "scripts/codex_personal_sync.py",
+      "target_path": "scripts/codex_personal_sync.py"
+    },
+    {
+      "mode": "0644",
+      "sha256": "c6c428c87985990232218747d8713ea5566df860db72a6fafe0122987027dacc",
+      "source_name": "engine_tests",
+      "source_path": "tests/test_codex_personal_sync.py",
+      "target_path": "tests/test_codex_personal_sync.py"
+    },
+    {
+      "mode": "0644",
+      "sha256": "1050a4290ef79aa8dbd0512b5428e52108b21351e74b16d2788b1841a331b0c2",
+      "source_name": "manifest_schema",
+      "source_path": "schema/sync-manifest.schema.json",
+      "target_path": "schema/sync-manifest.schema.json"
+    },
+    {
+      "mode": "0644",
+      "sha256": "1ed909e7ca46286a18cba4b61ba2d5634e0aaa86277f7e790748d9bcebcf88a8",
+      "source_name": "reconciliation_safety_tests",
+      "source_path": "tests/test_personal_sync_reconciliation_safety.py",
+      "target_path": "tests/test_personal_sync_reconciliation_safety.py"
+    },
+    {
+      "mode": "0644",
+      "sha256": "bfc9a3be29cb08f6f9defe102ea19b8efc80407ca96382d17772b85075a197b1",
+      "source_name": "release_retention_tests",
+      "source_path": "tests/test_release_retention.py",
+      "target_path": "tests/test_release_retention.py"
+    },
+    {
+      "mode": "0644",
+      "sha256": "5a744abcedd3feef4b42437674c4eda7e2aad18e3dc632d3b6bae05a7abfd4ac",
+      "source_name": "scheduler_doctor_tests",
+      "source_path": "tests/test_scheduler_doctor.py",
+      "target_path": "tests/test_scheduler_doctor.py"
+    }
+  ],
+  "generator_contract_version": 2,
+  "hash_algorithm": "sha256",
+  "mapping_digest": "3e26648dd65526e759089c5acf5a9f429f3df0f5adc8dbe94b3856954b801ece",
+  "mirror": "toolbox",
+  "mirror_repository": "Joey-Tools/codex-toolbox",
+  "receipt_version": 1,
+  "rules_contract_version": 1,
+  "tree_digest": "7a273c8533839cd7efd13d96d4f6783ccce75442d00d1528015bed3290a6e505"
+}
