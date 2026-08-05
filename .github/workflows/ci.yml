@@ -16,18 +16,50 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - name: Verify generated mirror source lock
-        run: python3 scripts/verify_generated_sync_source_lock.py
+      - name: Prepare verified generated snapshot
+        id: generated_snapshot
+        shell: bash
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_LFS_SKIP_SMUDGE: "1"
+          GIT_NO_LAZY_FETCH: "1"
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          snapshot_root="$(mktemp -d "${RUNNER_TEMP}/generated-mirror-snapshot.XXXXXX")"
+          chmod 0700 "$snapshot_root"
+          snapshot_root="$(cd "$snapshot_root" && pwd -P)"
+          git \
+            -c core.hooksPath=/dev/null \
+            -c core.fsmonitor=false \
+            -c submodule.recurse=false \
+            clone --no-local --no-hardlinks --no-checkout \
+            "$GITHUB_WORKSPACE" "$snapshot_root"
+          git -C "$snapshot_root" \
+            -c advice.detachedHead=false \
+            -c core.hooksPath=/dev/null \
+            -c core.fsmonitor=false \
+            checkout --detach "$GITHUB_SHA"
+          test "$(git -C "$snapshot_root" rev-parse --verify HEAD)" = "$GITHUB_SHA"
+          python3 "$snapshot_root/scripts/verify_generated_sync_source_lock.py" \
+            --repo-root "$snapshot_root" \
+            --snapshot-root "$snapshot_root"
+          printf 'path=%s\n' "$snapshot_root" >> "$GITHUB_OUTPUT"
       - name: Compile
+        working-directory: ${{ steps.generated_snapshot.outputs.path }}
         run: python3 -m compileall -q scripts tests
       - name: Run tests
+        working-directory: ${{ steps.generated_snapshot.outputs.path }}
         # Discovery keeps generated retention and scheduler/doctor suites in
         # the consumer gate without a second hand-maintained module list.
         run: python3 -m unittest discover -s tests
       - name: Validate sync manifest changes
+        working-directory: ${{ steps.generated_snapshot.outputs.path }}
         env:
           BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python3 scripts/validate_sync_manifest_changes.py --base-ref "$BASE_REF"
@@ -36,12 +68,43 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.9"
-      - name: Verify generated mirror source lock
-        run: python3 scripts/verify_generated_sync_source_lock.py
+      - name: Prepare verified generated snapshot
+        id: generated_snapshot
+        shell: bash
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_LFS_SKIP_SMUDGE: "1"
+          GIT_NO_LAZY_FETCH: "1"
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          snapshot_root="$(mktemp -d "${RUNNER_TEMP}/generated-mirror-snapshot.XXXXXX")"
+          chmod 0700 "$snapshot_root"
+          snapshot_root="$(cd "$snapshot_root" && pwd -P)"
+          git \
+            -c core.hooksPath=/dev/null \
+            -c core.fsmonitor=false \
+            -c submodule.recurse=false \
+            clone --no-local --no-hardlinks --no-checkout \
+            "$GITHUB_WORKSPACE" "$snapshot_root"
+          git -C "$snapshot_root" \
+            -c advice.detachedHead=false \
+            -c core.hooksPath=/dev/null \
+            -c core.fsmonitor=false \
+            checkout --detach "$GITHUB_SHA"
+          test "$(git -C "$snapshot_root" rev-parse --verify HEAD)" = "$GITHUB_SHA"
+          python3 "$snapshot_root/scripts/verify_generated_sync_source_lock.py" \
+            --repo-root "$snapshot_root" \
+            --snapshot-root "$snapshot_root"
+          printf 'path=%s\n' "$snapshot_root" >> "$GITHUB_OUTPUT"
       - name: Compile supported runtime
+        working-directory: ${{ steps.generated_snapshot.outputs.path }}
         run: |
           python3 -m py_compile \
             scripts/codex_personal_sync.py \
@@ -49,6 +112,7 @@ jobs:
             scripts/validate_sync_manifest_changes.py \
             scripts/verify_generated_sync_source_lock.py
       - name: Run Python 3.9 compatibility regressions
+        working-directory: ${{ steps.generated_snapshot.outputs.path }}
         run: |
           python3 -m unittest \
             tests.test_personal_sync_reconciliation_safety.PendingLinkTransactionSafetyTests.test_empty_record_empty_state_transaction_parses_and_recovers \
@@ -69,12 +133,43 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - name: Verify generated mirror source lock
-        run: python3 scripts/verify_generated_sync_source_lock.py
+      - name: Prepare verified generated snapshot
+        id: generated_snapshot
+        shell: bash
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_LFS_SKIP_SMUDGE: "1"
+          GIT_NO_LAZY_FETCH: "1"
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          snapshot_root="$(mktemp -d "${RUNNER_TEMP}/generated-mirror-snapshot.XXXXXX")"
+          chmod 0700 "$snapshot_root"
+          snapshot_root="$(cd "$snapshot_root" && pwd -P)"
+          git \
+            -c core.hooksPath=/dev/null \
+            -c core.fsmonitor=false \
+            -c submodule.recurse=false \
+            clone --no-local --no-hardlinks --no-checkout \
+            "$GITHUB_WORKSPACE" "$snapshot_root"
+          git -C "$snapshot_root" \
+            -c advice.detachedHead=false \
+            -c core.hooksPath=/dev/null \
+            -c core.fsmonitor=false \
+            checkout --detach "$GITHUB_SHA"
+          test "$(git -C "$snapshot_root" rev-parse --verify HEAD)" = "$GITHUB_SHA"
+          python3 "$snapshot_root/scripts/verify_generated_sync_source_lock.py" \
+            --repo-root "$snapshot_root" \
+            --snapshot-root "$snapshot_root"
+          printf 'path=%s\n' "$snapshot_root" >> "$GITHUB_OUTPUT"
       - name: Run platform personal sync safety tests
+        working-directory: ${{ steps.generated_snapshot.outputs.path }}
         shell: bash
         run: |
           modules=(tests.test_personal_sync_reconciliation_safety)

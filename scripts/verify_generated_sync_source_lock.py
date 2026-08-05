@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import stat
 import sys
 from typing import (
@@ -108,6 +109,12 @@ class _ProtectedMetadata(NamedTuple):
     object_identity: Tuple[int, int]
     content_size: int
     access_policy: Tuple[int, int, int]
+
+
+class _CapturedObject(NamedTuple):
+    relative_path: PurePosixPath
+    payload: bytes
+    mode: int
 
 
 def _fail(message: str) -> NoReturn:
@@ -229,12 +236,11 @@ def _open_regular_at(
 
 
 def _protected_metadata(metadata: os.stat_result) -> _ProtectedMetadata:
-    # Revalidation protects three properties: device/inode object identity,
-    # byte content (the size here plus the payload/digest at each scan), and
-    # the mode/ownership access policy. Link count is not object identity, and
-    # timestamps record metadata events rather than any protected property, so
-    # benign hard-link or touch churn must not invalidate an otherwise stable
-    # object.
+    # Descriptor-stable capture protects three properties: device/inode object
+    # identity, byte content (size plus two equal reads of the same descriptor),
+    # and the mode/ownership access policy. Link count is not object identity,
+    # and timestamps record metadata events rather than a protected property,
+    # so benign hard-link or touch churn does not invalidate a stable object.
     return _ProtectedMetadata(
         object_identity=(metadata.st_dev, metadata.st_ino),
         content_size=metadata.st_size,
@@ -246,16 +252,14 @@ def _protected_metadata(metadata: os.stat_result) -> _ProtectedMetadata:
     )
 
 
-def _read_bounded_regular(
-    root_fd: int,
+def _read_descriptor_pass(
+    file_fd: int,
     relative_path: PurePosixPath,
     *,
     maximum_bytes: int,
-) -> Tuple[bytes, os.stat_result]:
-    file_fd, before = _open_regular_at(root_fd, relative_path)
+) -> bytes:
     try:
-        if before.st_size > maximum_bytes:
-            _fail(f"managed path exceeds byte limit: {relative_path}")
+        os.lseek(file_fd, 0, os.SEEK_SET)
         chunks: List[bytes] = []
         total = 0
         while True:
@@ -266,42 +270,63 @@ def _read_bounded_regular(
             total += len(chunk)
             if total > maximum_bytes:
                 _fail(f"managed path exceeds byte limit: {relative_path}")
-        after = os.fstat(file_fd)
-        if total != before.st_size or _protected_metadata(
-            before
-        ) != _protected_metadata(after):
-            _fail(f"managed path changed while being read: {relative_path}")
-        return b"".join(chunks), before
-    finally:
-        os.close(file_fd)
+        return b"".join(chunks)
+    except VerificationError:
+        raise
+    except OSError as error:
+        raise VerificationError(
+            f"managed path could not be read: {relative_path}: {error}"
+        ) from error
 
 
-def _hash_bounded_regular(
+def _require_stable_metadata(
+    before: os.stat_result,
+    after: os.stat_result,
+    relative_path: PurePosixPath,
+) -> None:
+    protected_before = _protected_metadata(before)
+    protected_after = _protected_metadata(after)
+    if protected_before.object_identity != protected_after.object_identity:
+        _fail(f"managed path object identity changed while being read: {relative_path}")
+    if protected_before.content_size != protected_after.content_size:
+        _fail(f"managed path content size changed while being read: {relative_path}")
+    if protected_before.access_policy != protected_after.access_policy:
+        _fail(f"managed path access policy changed while being read: {relative_path}")
+
+
+def _capture_bounded_regular(
     root_fd: int,
     relative_path: PurePosixPath,
     *,
     maximum_bytes: int,
-) -> Tuple[str, os.stat_result]:
+) -> Tuple[bytes, os.stat_result]:
     file_fd, before = _open_regular_at(root_fd, relative_path)
     try:
         if before.st_size > maximum_bytes:
             _fail(f"managed path exceeds byte limit: {relative_path}")
-        digest = hashlib.sha256()
-        total = 0
-        while True:
-            chunk = os.read(file_fd, min(1024 * 1024, maximum_bytes + 1 - total))
-            if not chunk:
-                break
-            digest.update(chunk)
-            total += len(chunk)
-            if total > maximum_bytes:
-                _fail(f"managed path exceeds byte limit: {relative_path}")
+        first_payload = _read_descriptor_pass(
+            file_fd,
+            relative_path,
+            maximum_bytes=maximum_bytes,
+        )
+        between = os.fstat(file_fd)
+        _require_stable_metadata(before, between, relative_path)
+        second_payload = _read_descriptor_pass(
+            file_fd,
+            relative_path,
+            maximum_bytes=maximum_bytes,
+        )
         after = os.fstat(file_fd)
-        if total != before.st_size or _protected_metadata(
-            before
-        ) != _protected_metadata(after):
-            _fail(f"managed path changed while being hashed: {relative_path}")
-        return digest.hexdigest(), before
+        _require_stable_metadata(before, after, relative_path)
+        if len(first_payload) != before.st_size or first_payload != second_payload:
+            _fail(f"managed path content changed while being read: {relative_path}")
+        return first_payload, before
+    except VerificationError:
+        raise
+    except OSError as error:
+        raise VerificationError(
+            f"managed path could not be captured: {relative_path}: {error}"
+        ) from error
     finally:
         os.close(file_fd)
 
@@ -404,9 +429,238 @@ def _parse_receipt(payload: bytes) -> Dict[str, Any]:
     return receipt
 
 
+def _open_private_snapshot_root(snapshot_root: Path) -> int:
+    if not hasattr(os, "getuid"):
+        _fail("platform lacks the uid check required for a private snapshot root")
+    snapshot_root = Path(snapshot_root)
+    if not snapshot_root.is_absolute() or snapshot_root != Path(
+        os.path.normpath(os.fspath(snapshot_root))
+    ):
+        _fail("snapshot root must be an absolute normalized path")
+
+    current_uid = os.getuid()
+    try:
+        directory_fd = os.open(os.path.sep, _open_flags(directory=True))
+    except OSError as error:
+        raise VerificationError(
+            f"snapshot root ancestry could not be opened safely: {error}"
+        ) from error
+    try:
+        for component in snapshot_root.parts[1:]:
+            parent_metadata = os.fstat(directory_fd)
+            try:
+                child_fd = os.open(
+                    component,
+                    _open_flags(directory=True),
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                raise VerificationError(
+                    f"snapshot root is missing or unsafe: {error}"
+                ) from error
+            child_metadata = os.fstat(child_fd)
+
+            trusted_uids = {0, current_uid}
+            if parent_metadata.st_uid not in trusted_uids:
+                os.close(child_fd)
+                _fail(
+                    "snapshot root path parent is not controlled by root or "
+                    "the current uid"
+                )
+            parent_mode = stat.S_IMODE(parent_metadata.st_mode)
+            writable_by_other_uid = parent_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            sticky_binding = (
+                parent_mode & stat.S_ISVTX and child_metadata.st_uid in trusted_uids
+            )
+            if writable_by_other_uid and not sticky_binding:
+                os.close(child_fd)
+                _fail("snapshot root path binding can be replaced by another uid")
+
+            os.close(directory_fd)
+            directory_fd = child_fd
+
+        metadata = os.fstat(directory_fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            _fail("snapshot root is not a directory")
+        observed_mode = stat.S_IMODE(metadata.st_mode)
+        if observed_mode != 0o700:
+            _fail(f"snapshot root mode must be 0700: observed {observed_mode:04o}")
+        if metadata.st_uid != current_uid:
+            _fail(
+                "snapshot root must be owned by the current uid: "
+                f"expected {current_uid}, observed {metadata.st_uid}"
+            )
+    except BaseException:
+        os.close(directory_fd)
+        raise
+    return directory_fd
+
+
+def _open_snapshot_parent(
+    snapshot_root_fd: int,
+    relative_path: PurePosixPath,
+) -> int:
+    if relative_path.is_absolute() or not relative_path.parts:
+        _fail(f"snapshot path is not relative: {relative_path}")
+    if any(part in {"", ".", ".."} for part in relative_path.parts):
+        _fail(f"snapshot path has an unsafe component: {relative_path}")
+
+    directory_fd = os.dup(snapshot_root_fd)
+    try:
+        for component in relative_path.parts[:-1]:
+            try:
+                child_fd = os.open(
+                    component,
+                    _open_flags(directory=True),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                except OSError as error:
+                    raise VerificationError(
+                        "snapshot parent could not be created: "
+                        f"{relative_path}: {error}"
+                    ) from error
+                try:
+                    child_fd = os.open(
+                        component,
+                        _open_flags(directory=True),
+                        dir_fd=directory_fd,
+                    )
+                except OSError as error:
+                    raise VerificationError(
+                        "snapshot parent is missing or unsafe after creation: "
+                        f"{relative_path}: {error}"
+                    ) from error
+            except OSError as error:
+                raise VerificationError(
+                    f"snapshot parent is missing or unsafe: {relative_path}: {error}"
+                ) from error
+            os.close(directory_fd)
+            directory_fd = child_fd
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _write_all(file_fd: int, payload: bytes) -> None:
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(file_fd, remaining)
+        if written <= 0:
+            raise OSError("snapshot write made no progress")
+        remaining = remaining[written:]
+
+
+def _install_captured_object(
+    snapshot_root_fd: int,
+    captured: _CapturedObject,
+) -> None:
+    parent_fd = _open_snapshot_parent(snapshot_root_fd, captured.relative_path)
+    temporary_name: Optional[str] = None
+    temporary_fd: Optional[int] = None
+    try:
+        required_names = ("O_CLOEXEC", "O_NOFOLLOW")
+        missing = [name for name in required_names if not hasattr(os, name)]
+        if missing:
+            _fail("platform lacks required snapshot write flags: " + ", ".join(missing))
+        write_flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        for _ in range(128):
+            candidate = f".generated-snapshot-{secrets.token_hex(16)}"
+            try:
+                temporary_fd = os.open(
+                    candidate,
+                    write_flags,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if temporary_fd is None or temporary_name is None:
+            _fail(
+                f"could not allocate snapshot temporary file: {captured.relative_path}"
+            )
+
+        _write_all(temporary_fd, captured.payload)
+        os.fchmod(temporary_fd, captured.mode)
+        os.fsync(temporary_fd)
+        metadata = os.fstat(temporary_fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            _fail(f"snapshot temporary object is not regular: {captured.relative_path}")
+        if metadata.st_size != len(captured.payload):
+            _fail(
+                f"snapshot temporary object has the wrong size: {captured.relative_path}"
+            )
+        if stat.S_IMODE(metadata.st_mode) != captured.mode:
+            _fail(
+                f"snapshot temporary object has the wrong mode: {captured.relative_path}"
+            )
+        if metadata.st_uid != os.getuid():
+            _fail(
+                f"snapshot temporary object has the wrong owner: {captured.relative_path}"
+            )
+
+        os.replace(
+            temporary_name,
+            captured.relative_path.parts[-1],
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        temporary_name = None
+    except VerificationError:
+        raise
+    except OSError as error:
+        raise VerificationError(
+            f"snapshot object installation failed: {captured.relative_path}: {error}"
+        ) from error
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        os.close(parent_fd)
+
+
+def _install_captured_objects(
+    snapshot_root_fd: int,
+    captured_objects: Sequence[_CapturedObject],
+) -> None:
+    expected_paths = (RECEIPT_PATH,) + tuple(
+        PurePosixPath(item["target_path"]) for item in EXPECTED_FILES
+    )
+    observed_paths = tuple(item.relative_path for item in captured_objects)
+    if observed_paths != expected_paths:
+        _fail(
+            "captured snapshot object set changed: "
+            f"expected {expected_paths}, observed {observed_paths}"
+        )
+
+    # The mode-0700 root excludes other uids. It does not prevent a malicious
+    # or cooperative same-uid process from changing the workspace after this
+    # installation succeeds, so callers must keep consumers serialized behind
+    # success and must not share the workspace with concurrent writers.
+    metadata = os.fstat(snapshot_root_fd)
+    if stat.S_IMODE(metadata.st_mode) != 0o700 or metadata.st_uid != os.getuid():
+        _fail("snapshot root privacy changed before installation")
+    for captured in captured_objects:
+        _install_captured_object(snapshot_root_fd, captured)
+
+
 def verify_generated_mirror(
     repo_root: Path,
     *,
+    snapshot_root: Path,
     expected_receipt_sha256: str = EXPECTED_RECEIPT_SHA256,
 ) -> None:
     if (
@@ -415,82 +669,72 @@ def verify_generated_mirror(
     ):
         _fail("expected receipt digest is not lowercase SHA-256")
 
-    root_fd = _open_root(Path(repo_root))
+    snapshot_root_fd = _open_private_snapshot_root(Path(snapshot_root))
     try:
-        receipt_payload, receipt_metadata = _read_bounded_regular(
-            root_fd,
-            RECEIPT_PATH,
-            maximum_bytes=MAX_RECEIPT_BYTES,
-        )
-        if stat.S_IMODE(receipt_metadata.st_mode) != 0o644:
-            _fail("provenance receipt mode must be 0644")
-        observed_receipt_sha256 = hashlib.sha256(receipt_payload).hexdigest()
-        if observed_receipt_sha256 != expected_receipt_sha256:
-            _fail(
-                "provenance receipt external digest mismatch: "
-                f"expected {expected_receipt_sha256}, observed {observed_receipt_sha256}"
-            )
-        receipt = _parse_receipt(receipt_payload)
-
-        # Preserve the first scan's object identity, content digest, and access
-        # policy. A complete second pass below binds scan-to-final-check
-        # stability for the receipt and every managed file as one fixed group.
-        first_observations: Dict[str, Tuple[str, _ProtectedMetadata]] = {}
-        for item in receipt["files"]:
-            target_path = PurePosixPath(item["target_path"])
-            observed_sha256, metadata = _hash_bounded_regular(
+        root_fd = _open_root(Path(repo_root))
+        try:
+            receipt_payload, receipt_metadata = _capture_bounded_regular(
                 root_fd,
-                target_path,
-                maximum_bytes=MAX_MANAGED_FILE_BYTES,
+                RECEIPT_PATH,
+                maximum_bytes=MAX_RECEIPT_BYTES,
             )
-            expected_mode = int(item["mode"], 8)
-            observed_mode = stat.S_IMODE(metadata.st_mode)
-            if observed_mode != expected_mode:
+            if stat.S_IMODE(receipt_metadata.st_mode) != 0o644:
+                _fail("provenance receipt mode must be 0644")
+            observed_receipt_sha256 = hashlib.sha256(receipt_payload).hexdigest()
+            if observed_receipt_sha256 != expected_receipt_sha256:
                 _fail(
-                    f"managed path mode mismatch: {target_path}: "
-                    f"expected {expected_mode:04o}, observed {observed_mode:04o}"
+                    "provenance receipt external digest mismatch: "
+                    f"expected {expected_receipt_sha256}, "
+                    f"observed {observed_receipt_sha256}"
                 )
-            if observed_sha256 != item["sha256"]:
-                _fail(
-                    f"managed path content digest mismatch: {target_path}: "
-                    f"expected {item['sha256']}, observed {observed_sha256}"
-                )
-            first_observations[item["target_path"]] = (
-                observed_sha256,
-                _protected_metadata(metadata),
-            )
+            receipt = _parse_receipt(receipt_payload)
 
-        final_receipt_payload, final_receipt_metadata = _read_bounded_regular(
-            root_fd,
-            RECEIPT_PATH,
-            maximum_bytes=MAX_RECEIPT_BYTES,
-        )
-        if (
-            final_receipt_payload != receipt_payload
-            or _protected_metadata(final_receipt_metadata)
-            != _protected_metadata(receipt_metadata)
-            or stat.S_IMODE(final_receipt_metadata.st_mode) != 0o644
-        ):
-            _fail("provenance receipt changed before final group revalidation")
-
-        for item in receipt["files"]:
-            target_path = PurePosixPath(item["target_path"])
-            final_sha256, final_metadata = _hash_bounded_regular(
-                root_fd,
-                target_path,
-                maximum_bytes=MAX_MANAGED_FILE_BYTES,
-            )
-            final_observation = (
-                final_sha256,
-                _protected_metadata(final_metadata),
-            )
-            if final_observation != first_observations[item["target_path"]]:
-                _fail(
-                    "managed path changed before final group revalidation: "
-                    f"{target_path}"
+            captured_objects = [
+                _CapturedObject(
+                    relative_path=RECEIPT_PATH,
+                    payload=receipt_payload,
+                    mode=stat.S_IMODE(receipt_metadata.st_mode),
                 )
+            ]
+            for item in receipt["files"]:
+                target_path = PurePosixPath(item["target_path"])
+                payload, metadata = _capture_bounded_regular(
+                    root_fd,
+                    target_path,
+                    maximum_bytes=MAX_MANAGED_FILE_BYTES,
+                )
+                expected_mode = int(item["mode"], 8)
+                observed_mode = stat.S_IMODE(metadata.st_mode)
+                if observed_mode != expected_mode:
+                    _fail(
+                        f"managed path mode mismatch: {target_path}: "
+                        f"expected {expected_mode:04o}, "
+                        f"observed {observed_mode:04o}"
+                    )
+                observed_sha256 = hashlib.sha256(payload).hexdigest()
+                if observed_sha256 != item["sha256"]:
+                    _fail(
+                        f"managed path content digest mismatch: {target_path}: "
+                        f"expected {item['sha256']}, observed {observed_sha256}"
+                    )
+                captured_objects.append(
+                    _CapturedObject(
+                        relative_path=target_path,
+                        payload=payload,
+                        mode=observed_mode,
+                    )
+                )
+
+            # Capture is complete before the first snapshot write. Consumers
+            # read these receipt-consistent bytes, never a later pathname lookup
+            # in the mutable source checkout. repo_root and snapshot_root may
+            # intentionally name the same private checkout because all seven
+            # payloads are resident in memory before installation begins.
+            _install_captured_objects(snapshot_root_fd, captured_objects)
+        finally:
+            os.close(root_fd)
     finally:
-        os.close(root_fd)
+        os.close(snapshot_root_fd)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -503,17 +747,29 @@ def _build_parser() -> argparse.ArgumentParser:
         default=REPOSITORY_ROOT,
         help="toolbox repository root (defaults to this script's repository)",
     )
+    parser.add_argument(
+        "--snapshot-root",
+        type=Path,
+        required=True,
+        help=(
+            "pre-existing current-uid mode-0700 workspace that receives the "
+            "verified receipt and six managed files"
+        ),
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        verify_generated_mirror(args.repo_root)
-    except VerificationError as error:
+        verify_generated_mirror(args.repo_root, snapshot_root=args.snapshot_root)
+    except (VerificationError, OSError) as error:
         print(f"generated sync source verification failed: {error}", file=sys.stderr)
         return 1
-    print(f"verified generated sync source lock ({len(EXPECTED_FILES)} files)")
+    print(
+        "verified and installed generated sync source snapshot "
+        f"({len(EXPECTED_FILES)} files)"
+    )
     return 0
 
 

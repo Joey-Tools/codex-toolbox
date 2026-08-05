@@ -20,10 +20,24 @@ never synthesize or refresh the receipt by hand.
 ## Test
 
 ```bash
-python3 scripts/verify_generated_sync_source_lock.py
-python3 -m compileall -q scripts tests
-python3 -m unittest discover -s tests
+verified_workspace="$(mktemp -d)"
+chmod 0700 "$verified_workspace"
+verified_workspace="$(cd "$verified_workspace" && pwd -P)"
+git clone --no-local --no-hardlinks --no-checkout . "$verified_workspace"
+git -C "$verified_workspace" checkout --detach "$(git rev-parse HEAD)"
+python3 "$verified_workspace/scripts/verify_generated_sync_source_lock.py" \
+  --repo-root "$verified_workspace" \
+  --snapshot-root "$verified_workspace"
+(
+  cd "$verified_workspace"
+  python3 -m compileall -q scripts tests
+  python3 -m unittest discover -s tests
+)
 ```
+
+The mode-`0700` workspace excludes other user IDs. It does not protect against
+a malicious or cooperative same-UID process changing the snapshot after the
+verifier succeeds, so do not share it with concurrent writers.
 
 ## Release
 

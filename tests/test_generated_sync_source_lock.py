@@ -6,11 +6,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
-from typing import Callable
+from typing import Callable, Optional
 from unittest import mock
 
 
@@ -109,7 +110,7 @@ def refresh_digests(receipt: dict) -> None:
 class GeneratedSyncSourceLockTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary_directory.name)
+        self.root = Path(self.temporary_directory.name).resolve()
         files = []
         for source_name, source_path, target_path, mode in TEST_FILES:
             payload = f"fixture payload for {source_name}\n".encode("utf-8")
@@ -142,6 +143,8 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
         }
         refresh_digests(self.receipt)
         self.expected_receipt_sha256 = self.write_receipt()
+        self.snapshot_root = self.root / "snapshot"
+        self.snapshot_root.mkdir(mode=0o700)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -153,26 +156,32 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
         receipt_path.chmod(0o644)
         return hashlib.sha256(payload).hexdigest()
 
-    def verify(self, expected_receipt_sha256: str = "") -> None:
+    def verify(
+        self,
+        expected_receipt_sha256: str = "",
+        *,
+        snapshot_root: Optional[Path] = None,
+    ) -> None:
         VERIFIER.verify_generated_mirror(
             self.root,
+            snapshot_root=snapshot_root or self.snapshot_root,
             expected_receipt_sha256=(
                 expected_receipt_sha256 or self.expected_receipt_sha256
             ),
         )
 
-    def _verify_with_mutation_after_first_managed_scan(
+    def _verify_with_mutation_between_descriptor_reads(
         self,
         target_path: str,
         mutation: Callable[[], None],
     ) -> None:
-        original_hash = VERIFIER._hash_bounded_regular
+        original_read = VERIFIER._read_descriptor_pass
         mutated = False
 
-        def hash_then_mutate(root_fd, relative_path, *, maximum_bytes):
+        def read_then_mutate(file_fd, relative_path, *, maximum_bytes):
             nonlocal mutated
-            result = original_hash(
-                root_fd,
+            result = original_read(
+                file_fd,
                 relative_path,
                 maximum_bytes=maximum_bytes,
             )
@@ -183,14 +192,21 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
 
         with mock.patch.object(
             VERIFIER,
-            "_hash_bounded_regular",
-            side_effect=hash_then_mutate,
+            "_read_descriptor_pass",
+            side_effect=read_then_mutate,
         ):
             self.verify()
 
     def test_production_tree_cli_passes(self) -> None:
+        snapshot_root = self.root / "production-snapshot"
+        snapshot_root.mkdir(mode=0o700)
         completed = subprocess.run(
-            [sys.executable, os.fspath(SCRIPT_PATH)],
+            [
+                sys.executable,
+                os.fspath(SCRIPT_PATH),
+                "--snapshot-root",
+                os.fspath(snapshot_root),
+            ],
             cwd=REPO_ROOT,
             check=False,
             stdout=subprocess.PIPE,
@@ -198,10 +214,36 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("verified generated sync source lock (6 files)", completed.stdout)
+        self.assertIn(
+            "verified and installed generated sync source snapshot (6 files)",
+            completed.stdout,
+        )
 
     def test_valid_fixture_passes(self) -> None:
         self.verify()
+        installed_files = sorted(
+            path.relative_to(self.snapshot_root).as_posix()
+            for path in self.snapshot_root.rglob("*")
+            if path.is_file()
+        )
+        self.assertEqual(
+            installed_files,
+            sorted(
+                ["generated-sync-source-lock.json"]
+                + [target_path for _, _, target_path, _ in TEST_FILES]
+            ),
+        )
+
+    def test_same_repository_and_snapshot_root_passes(self) -> None:
+        expected_payloads = {
+            target_path: (self.root / target_path).read_bytes()
+            for _, _, target_path, _ in TEST_FILES
+        }
+
+        self.verify(snapshot_root=self.root)
+
+        for target_path, expected_payload in expected_payloads.items():
+            self.assertEqual((self.root / target_path).read_bytes(), expected_payload)
 
     def test_rejects_receipt_external_digest_tamper(self) -> None:
         receipt_path = self.root / "generated-sync-source-lock.json"
@@ -311,7 +353,138 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
         with self.assertRaisesRegex(VERIFIER.VerificationError, "missing or unsafe"):
             self.verify()
 
-    def test_accepts_mtime_only_churn_after_first_managed_scan(self) -> None:
+    def test_rejects_non_private_snapshot_root(self) -> None:
+        self.snapshot_root.chmod(0o755)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError,
+            "snapshot root mode must be 0700",
+        ):
+            self.verify()
+
+    def test_rejects_snapshot_root_with_other_uid_replaceable_binding(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_parent_name:
+            temporary_parent = Path(temporary_parent_name).resolve()
+            temporary_parent.chmod(0o777)
+            snapshot_root = temporary_parent / "snapshot"
+            snapshot_root.mkdir(mode=0o700)
+            with self.assertRaisesRegex(
+                VERIFIER.VerificationError,
+                "path binding can be replaced by another uid",
+            ):
+                self.verify(snapshot_root=snapshot_root)
+
+    def test_rejects_wrong_owner_snapshot_root_when_uid_check_is_mocked(self) -> None:
+        with mock.patch.object(
+            VERIFIER.os,
+            "getuid",
+            return_value=os.getuid() + 1,
+        ):
+            with self.assertRaisesRegex(
+                VERIFIER.VerificationError,
+                "current uid",
+            ):
+                self.verify()
+
+    def test_rejects_symlink_snapshot_root(self) -> None:
+        target = self.root / "snapshot-target"
+        target.mkdir(mode=0o700)
+        symlink = self.root / "snapshot-symlink"
+        symlink.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError,
+            "snapshot root is missing or unsafe",
+        ):
+            self.verify(snapshot_root=symlink)
+
+    def test_rejects_non_directory_snapshot_root(self) -> None:
+        file_root = self.root / "snapshot-file"
+        file_root.write_bytes(b"not a directory\n")
+        file_root.chmod(0o700)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError,
+            "snapshot root is missing or unsafe",
+        ):
+            self.verify(snapshot_root=file_root)
+
+    def test_cli_installation_failure_has_no_success_output(self) -> None:
+        self.snapshot_root.chmod(0o755)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                os.fspath(SCRIPT_PATH),
+                "--repo-root",
+                os.fspath(self.root),
+                "--snapshot-root",
+                os.fspath(self.snapshot_root),
+            ],
+            cwd=REPO_ROOT,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertNotIn("verified and installed", completed.stdout)
+        self.assertIn("snapshot root mode must be 0700", completed.stderr)
+
+    def test_rejects_snapshot_object_installation_failure(self) -> None:
+        with mock.patch.object(
+            VERIFIER.os,
+            "replace",
+            side_effect=OSError("injected replacement failure"),
+        ):
+            with self.assertRaisesRegex(
+                VERIFIER.VerificationError,
+                "snapshot object installation failed",
+            ):
+                self.verify()
+
+        self.assertFalse(
+            (self.snapshot_root / "generated-sync-source-lock.json").exists()
+        )
+
+    def test_capture_precedes_install_for_receipt_and_early_managed_path(self) -> None:
+        receipt_path = self.root / "generated-sync-source-lock.json"
+        target_path = TEST_FILES[0][2]
+        managed_path = self.root / target_path
+        expected_receipt = receipt_path.read_bytes()
+        expected_receipt_mode = stat.S_IMODE(receipt_path.stat().st_mode)
+        expected_managed = managed_path.read_bytes()
+        expected_managed_mode = stat.S_IMODE(managed_path.stat().st_mode)
+        original_install = VERIFIER._install_captured_objects
+
+        def replace_sources_then_install(snapshot_root_fd, captured_objects):
+            replacement_receipt = receipt_path.with_name("later-receipt")
+            replacement_receipt.write_bytes(b"later receipt pathname bytes\n")
+            replacement_receipt.chmod(0o600)
+            os.replace(replacement_receipt, receipt_path)
+            replacement_managed = managed_path.with_name("later-managed")
+            replacement_managed.write_bytes(b"later managed pathname bytes\n")
+            replacement_managed.chmod(0o600)
+            os.replace(replacement_managed, managed_path)
+            original_install(snapshot_root_fd, captured_objects)
+
+        with mock.patch.object(
+            VERIFIER,
+            "_install_captured_objects",
+            side_effect=replace_sources_then_install,
+        ):
+            self.verify()
+
+        installed_receipt = self.snapshot_root / receipt_path.name
+        installed_managed = self.snapshot_root / target_path
+        self.assertEqual(installed_receipt.read_bytes(), expected_receipt)
+        self.assertEqual(
+            stat.S_IMODE(installed_receipt.stat().st_mode),
+            expected_receipt_mode,
+        )
+        self.assertEqual(installed_managed.read_bytes(), expected_managed)
+        self.assertEqual(
+            stat.S_IMODE(installed_managed.stat().st_mode),
+            expected_managed_mode,
+        )
+
+    def test_accepts_mtime_only_churn_between_descriptor_reads(self) -> None:
         target_path = TEST_FILES[0][2]
         path = self.root / target_path
         before = os.stat(path, follow_symlinks=False)
@@ -323,7 +496,7 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
                 follow_symlinks=False,
             )
 
-        self._verify_with_mutation_after_first_managed_scan(target_path, touch_mtime)
+        self._verify_with_mutation_between_descriptor_reads(target_path, touch_mtime)
 
         after = os.stat(path, follow_symlinks=False)
         self.assertNotEqual(after.st_mtime_ns, before.st_mtime_ns)
@@ -346,13 +519,13 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
             ),
         )
 
-    def test_accepts_hard_link_count_churn_after_first_managed_scan(self) -> None:
+    def test_accepts_hard_link_count_churn_between_descriptor_reads(self) -> None:
         target_path = TEST_FILES[0][2]
         path = self.root / target_path
         link_path = self.root / "managed-hard-link"
         before = os.stat(path, follow_symlinks=False)
 
-        self._verify_with_mutation_after_first_managed_scan(
+        self._verify_with_mutation_between_descriptor_reads(
             target_path,
             lambda: os.link(path, link_path),
         )
@@ -361,49 +534,64 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
         self.assertEqual(after.st_nlink, before.st_nlink + 1)
         self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
 
-    def test_rejects_object_replacement_after_first_managed_scan(self) -> None:
+    def test_rejects_object_identity_drift_during_descriptor_read(self) -> None:
         target_path = TEST_FILES[0][2]
         path = self.root / target_path
-        before = os.stat(path, follow_symlinks=False)
-        payload = path.read_bytes()
-        replacement = path.with_name(path.name + ".replacement")
-        replacement.write_bytes(payload)
-        replacement.chmod(before.st_mode & 0o7777)
+        target_inode = path.stat().st_ino
+        original_fstat = VERIFIER.os.fstat
+        target_calls = 0
 
-        with self.assertRaisesRegex(
-            VERIFIER.VerificationError,
-            "changed before final group revalidation",
+        def fstat_with_identity_drift(file_fd):
+            nonlocal target_calls
+            metadata = original_fstat(file_fd)
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_ino == target_inode:
+                target_calls += 1
+                if target_calls == 2:
+                    fields = list(metadata)
+                    fields[stat.ST_INO] += 1
+                    return os.stat_result(fields)
+            return metadata
+
+        with mock.patch.object(
+            VERIFIER.os,
+            "fstat",
+            side_effect=fstat_with_identity_drift,
         ):
-            self._verify_with_mutation_after_first_managed_scan(
-                target_path,
-                lambda: os.replace(replacement, path),
-            )
+            with self.assertRaisesRegex(
+                VERIFIER.VerificationError,
+                "object identity changed while being read",
+            ):
+                self.verify()
 
-        after = os.stat(path, follow_symlinks=False)
-        self.assertNotEqual(
-            (after.st_dev, after.st_ino), (before.st_dev, before.st_ino)
-        )
-        self.assertEqual(path.read_bytes(), payload)
-        self.assertEqual(
-            (after.st_size, after.st_mode, after.st_uid, after.st_gid),
-            (before.st_size, before.st_mode, before.st_uid, before.st_gid),
-        )
-
-    def test_rejects_change_after_first_managed_scan(self) -> None:
+    def test_rejects_content_drift_between_descriptor_reads(self) -> None:
         target_path = TEST_FILES[0][2]
         path = self.root / target_path
+        initial_payload = path.read_bytes()
 
         def change_content() -> None:
-            path.write_bytes(path.read_bytes() + b"post-scan drift\n")
+            path.write_bytes(b"x" * len(initial_payload))
             path.chmod(0o755)
 
         with self.assertRaisesRegex(
             VERIFIER.VerificationError,
-            "changed before final group revalidation",
+            "content changed while being read",
         ):
-            self._verify_with_mutation_after_first_managed_scan(
+            self._verify_with_mutation_between_descriptor_reads(
                 target_path,
                 change_content,
+            )
+
+    def test_rejects_access_policy_drift_between_descriptor_reads(self) -> None:
+        target_path = TEST_FILES[0][2]
+        path = self.root / target_path
+
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError,
+            "access policy changed while being read",
+        ):
+            self._verify_with_mutation_between_descriptor_reads(
+                target_path,
+                lambda: path.chmod(0o700),
             )
 
 

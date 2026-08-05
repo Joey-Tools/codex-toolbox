@@ -15,16 +15,19 @@ superseded_by:
 ## Summary
 
 - Toolbox consumer guidance, CI/release discovery, and the generated mirror
-  are bound to the squash-landed canonical personal-sync release input.
+  are bound to one private receipt-consistent snapshot of the squash-landed
+  canonical personal-sync release input per consumer job.
 
 ## Current State
 
 - Root guidance distinguishes consumer-owned release aggregation from
   receipt-bound generated sources owned by `Joey-Tools/codex-personal-sync`.
-- Every CI job that imports or executes generated code and both release build
-  paths first verify the exact generated receipt and its six managed files.
-  Test discovery then includes generated retention and scheduler/doctor
-  suites.
+- Every CI and release job creates a unique mode-`0700` workspace, locally
+  clones without local-object or hard-link sharing and without checkout,
+  checks out detached exact `GITHUB_SHA`, and exposes the path only after the
+  verifier successfully installs its captured snapshot. All later compile,
+  test, manifest-validation, package-build, package-verification, and publish
+  consumers in that job use that same step-output working directory.
 - The six canonical files and `generated-sync-source-lock.json` bind landed
   canonical commit `14914ca17172f00a5759758a50cf7c0295e4a42f`, tree
   `e5d81cb98194cc56872b9a4cdea83aee88c0fd2a`.
@@ -38,9 +41,20 @@ superseded_by:
   `04b8be42769d63872ba0643dcf593f3956a0ec88f42014aa39a00c24e13bdc07`
   outside the receipt itself, then checks the exact canonical identity,
   closed six-file mapping, recomputed digests, target modes, and target bytes
-  before CI tests or either release package build can proceed.
-- Whole-group revalidation protects object identity, content, and access
-  policy while accepting benign timestamp and hard-link-count churn.
+  before any generated-code consumer can proceed.
+- Each receipt or managed file is captured by two equal bounded reads from one
+  open regular-file descriptor. Device/inode identity, byte content and size,
+  and mode/UID/GID access policy are protected; timestamps and hard-link count
+  are intentionally excluded as benign metadata churn. Only after all seven
+  captured objects validate does the verifier install their exact bytes and
+  modes through no-follow directory descriptors and exclusive temporary files.
+  The snapshot path is canonicalized and every ancestor binding is opened
+  without symlink following and checked against other-UID replacement before
+  the root descriptor is accepted.
+- The private root's mode excludes other UIDs. The design does not guarantee
+  protection against a malicious or cooperative same-UID process mutating the
+  snapshot after successful installation; workflows serialize consumers
+  behind success and start no concurrent consumer beforehand.
 
 ## Next Steps
 
@@ -74,3 +88,14 @@ superseded_by:
   and 3.9, and 28 Python 3.9 compatibility tests. Production receipt
   verification, actionlint, Ruff lint/format, manifest validation, project
   journal validation, and diff checks also passed.
+- A later fresh named-single review found that sequential live-tree
+  revalidation still left a final pathname-replacement window before each
+  consumer. The consumer-side follow-up replaces that claim with immutable
+  in-memory capture plus one private verified snapshot per workflow job;
+  structured workflow tests parse jobs and steps and require every later run
+  step to use the identical snapshot working directory.
+- Snapshot follow-up gates passed 35 focused verifier/consumer-contract tests,
+  standalone production receipt verification, and focused `py_compile` on
+  Python 3.13.0 and 3.9.6. An exact local clone/detached-checkout/same-root
+  installation probe remained Git-clean; actionlint, Ruff lint/format,
+  project-journal validation, and diff checks also passed.
