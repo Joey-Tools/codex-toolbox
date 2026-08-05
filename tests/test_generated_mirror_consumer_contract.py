@@ -6,6 +6,7 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_REPOSITORY = "Joey-Tools/codex-personal-sync"
+VERIFY_COMMAND = "python3 scripts/verify_generated_sync_source_lock.py"
 COMPILE_COMMAND = "python3 -m compileall -q scripts tests"
 DISCOVERY_COMMAND = "python3 -m unittest discover -s tests"
 
@@ -24,20 +25,33 @@ class GeneratedMirrorConsumerContractTests(unittest.TestCase):
         readme = self.read("README.md")
         self.assertIn(CANONICAL_REPOSITORY, readme)
         self.assertIn("generated-sync-source-lock.json", readme)
+        self.assertIn(VERIFY_COMMAND, readme)
         self.assertIn(COMPILE_COMMAND, readme)
         self.assertIn(DISCOVERY_COMMAND, readme)
 
     def test_ci_discovers_every_generated_test_module(self) -> None:
         workflow = self.read(".github/workflows/ci.yml")
+        self.assertIn(VERIFY_COMMAND, workflow)
         self.assertIn(COMPILE_COMMAND, workflow)
         self.assertIn(DISCOVERY_COMMAND, workflow)
+        self.assertLess(workflow.index(VERIFY_COMMAND), workflow.index(COMPILE_COMMAND))
         self.assertIn("tests/test_release_retention.py", workflow)
         self.assertIn("tests/test_scheduler_doctor.py", workflow)
 
     def test_release_gate_discovers_every_generated_test_module(self) -> None:
         workflow = self.read(".github/workflows/release.yml")
+        self.assertEqual(workflow.count(VERIFY_COMMAND), 2)
         self.assertIn(COMPILE_COMMAND, workflow)
         self.assertIn(DISCOVERY_COMMAND, workflow)
+        release_job, publish_job = workflow.split("\n  publish:\n", maxsplit=1)
+        self.assertLess(
+            release_job.index(VERIFY_COMMAND),
+            release_job.index("python3 scripts/build_personal_codex_package.py"),
+        )
+        self.assertLess(
+            publish_job.index(VERIFY_COMMAND),
+            publish_job.index("python3 scripts/build_personal_codex_package.py"),
+        )
         self.assertEqual(workflow.count('- "generated-sync-source-lock.json"'), 2)
         self.assertEqual(workflow.count('- "schema/**"'), 2)
 

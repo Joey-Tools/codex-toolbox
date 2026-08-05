@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - name: Verify generated mirror source lock
+        run: python3 scripts/verify_generated_sync_source_lock.py
       - name: Compile
         run: python3 -m compileall -q scripts tests
       - name: Run tests
@@ -42,7 +44,8 @@ jobs:
           python3 -m py_compile \
             scripts/codex_personal_sync.py \
             scripts/build_personal_codex_package.py \
-            scripts/validate_sync_manifest_changes.py
+            scripts/validate_sync_manifest_changes.py \
+            scripts/verify_generated_sync_source_lock.py
       - name: Run Python 3.9 compatibility regressions
         run: |
           python3 -m unittest \
@@ -54,7 +57,8 @@ jobs:
             tests.test_release_manifest_baseline.ReleaseManifestBaselineTests.test_release_baseline_accepts_verified_release_history \
             tests.test_sync_manifest_changes.SyncManifestChangeTests.test_manifest_transition_counts_same_target_change_once \
             tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_deep_raw_json_is_reported_as_validation_error \
-            tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_oversized_integer_is_reported_as_validation_error
+            tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_oversized_integer_is_reported_as_validation_error \
+            tests.test_generated_sync_source_lock
 
   platform-safety:
     strategy:

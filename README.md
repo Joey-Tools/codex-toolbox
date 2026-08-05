@@ -20,6 +20,7 @@ never synthesize or refresh the receipt by hand.
 ## Test
 
 ```bash
+python3 scripts/verify_generated_sync_source_lock.py
 python3 -m compileall -q scripts tests
 python3 -m unittest discover -s tests
 ```
