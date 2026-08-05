@@ -21542,26 +21542,6 @@ def _read_scheduler_regular_file(path: Path, maximum_bytes: int) -> bytes:
             _close_fd_quietly(parent_fd)
 
 
-def _scheduler_argument_value(
-    arguments: list[str],
-    name: str,
-    *,
-    required: bool,
-) -> str | None:
-    matches = [
-        arguments[index + 1]
-        for index, argument in enumerate(arguments[:-1])
-        if argument == name
-    ]
-    if len(matches) > 1:
-        raise SyncError(f"scheduler config repeats {name}")
-    if not matches:
-        if required:
-            raise SyncError(f"scheduler config is missing {name}")
-        return None
-    return matches[0]
-
-
 def _parse_scheduler_program_arguments(
     arguments: object,
     *,
@@ -21580,51 +21560,75 @@ def _parse_scheduler_program_arguments(
     flags = arguments[2:]
     if len(flags) % 2:
         raise SyncError("scheduler program arguments must use option/value pairs")
-    supported_flags = {
-        "--mode",
-        "--repo",
-        "--base-repo",
-        "--owner",
-        "--home",
+    command_flag_contracts = {
+        "install": (
+            ("--repo", "--home"),
+            ("--repo", "--home"),
+        ),
+        "install-private": (
+            ("--repo", "--base-repo", "--owner", "--home"),
+            ("--repo", "--base-repo", "--owner", "--home"),
+        ),
+        "run-scheduled": (
+            ("--mode", "--repo", "--base-repo", "--owner", "--home"),
+            ("--mode", "--repo", "--home"),
+        ),
     }
+    contract = command_flag_contracts.get(command)
+    if contract is None:
+        raise SyncError(f"scheduler config has unsupported command: {command}")
+    allowed_flags, required_flags = contract
+    parsed_flags: dict[str, str] = {}
     for index in range(0, len(flags), 2):
-        if flags[index] not in supported_flags:
+        name = flags[index]
+        if name in parsed_flags:
+            raise SyncError(f"scheduler config repeats {name}")
+        value = flags[index + 1]
+        if value.startswith("-"):
             raise SyncError(
-                f"scheduler config has unsupported argument: {flags[index]}"
+                f"scheduler config value for {name} must not be an option token"
             )
+        parsed_flags[name] = value
+    for name in parsed_flags:
+        if name not in allowed_flags:
+            raise SyncError(
+                f"scheduler config command {command} does not allow {name}"
+            )
+    for name in required_flags:
+        if name not in parsed_flags:
+            raise SyncError(f"scheduler config is missing {name}")
 
     if command == "install":
         mode = "public"
     elif command == "install-private":
         mode = "private"
-    elif command == "run-scheduled":
-        mode = _scheduler_argument_value(flags, "--mode", required=True)
+    else:
+        mode = parsed_flags["--mode"]
         if mode not in {"public", "private"}:
             raise SyncError(f"scheduler config has unsupported mode: {mode}")
-    else:
-        raise SyncError(f"scheduler config has unsupported command: {command}")
 
-    repo = _scheduler_argument_value(flags, "--repo", required=True)
-    if repo is None or REPOSITORY_RE.fullmatch(repo) is None:
+    repo = parsed_flags["--repo"]
+    if REPOSITORY_RE.fullmatch(repo) is None:
         raise SyncError("scheduler repository must be an owner/repo string")
-    raw_home = _scheduler_argument_value(flags, "--home", required=True)
-    assert raw_home is not None
+    raw_home = parsed_flags["--home"]
     configured_home = Path(raw_home).expanduser()
     if mode == "private":
-        base_repo = _scheduler_argument_value(flags, "--base-repo", required=True)
-        owner = _scheduler_argument_value(flags, "--owner", required=True)
-        if base_repo is None or REPOSITORY_RE.fullmatch(base_repo) is None:
+        for name in ("--base-repo", "--owner"):
+            if name not in parsed_flags:
+                raise SyncError(f"scheduler config is missing {name}")
+        base_repo = parsed_flags["--base-repo"]
+        owner = parsed_flags["--owner"]
+        if REPOSITORY_RE.fullmatch(base_repo) is None:
             raise SyncError("scheduler base repository must be an owner/repo string")
-        assert owner is not None
         owner = _validate_owner(owner, "scheduler owner")
         if owner == PUBLIC_OWNER:
             raise SyncError("private scheduler owner must not be public")
     else:
         base_repo = repo
         owner = PUBLIC_OWNER
-        if _scheduler_argument_value(flags, "--base-repo", required=False) is not None:
+        if "--base-repo" in parsed_flags:
             raise SyncError("public scheduler must not configure --base-repo")
-        if _scheduler_argument_value(flags, "--owner", required=False) is not None:
+        if "--owner" in parsed_flags:
             raise SyncError("public scheduler must not configure --owner")
     return SchedulerConfig(
         platform=platform_name,

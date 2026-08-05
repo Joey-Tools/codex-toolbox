@@ -29,16 +29,16 @@ superseded_by:
   test, manifest-validation, package-build, package-verification, and publish
   consumers in that job use that same step-output working directory.
 - The six canonical files and `generated-sync-source-lock.json` bind landed
-  canonical commit `14914ca17172f00a5759758a50cf7c0295e4a42f`, tree
-  `e5d81cb98194cc56872b9a4cdea83aee88c0fd2a`.
+  canonical commit `e57140e16a68db24dbdd883de665283538234730`, tree
+  `13470ade1303992d81d02dc606ad66da7b6dd3a7`.
 - The generated receipt records mapping digest
   `3e26648dd65526e759089c5acf5a9f429f3df0f5adc8dbe94b3856954b801ece`,
   file-set digest
   `c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad`,
   and tree digest
-  `b52444964c14b4703edd477790fedee46dd52d8698bcbd38cabfb936854e67df`.
+  `7a273c8533839cd7efd13d96d4f6783ccce75442d00d1528015bed3290a6e505`.
 - The consumer verifier pins the complete receipt SHA-256
-  `04b8be42769d63872ba0643dcf593f3956a0ec88f42014aa39a00c24e13bdc07`
+  `ff1a2dad1b3d473568c0a7b785110dfbe5094747f8d3fa31ade7ab5b2a0fdb9e`
   outside the receipt itself, then checks the exact canonical identity,
   closed six-file mapping, recomputed digests, target modes, and target bytes
   before any generated-code consumer can proceed.
@@ -66,8 +66,10 @@ superseded_by:
 
 - Branch `codex/personal-sync-generated-mirror-bridge`
 - Toolbox PR #20
-- Canonical workstream: `Joey-Tools/codex-personal-sync` PR #6
-- Canonical landed commit `14914ca17172f00a5759758a50cf7c0295e4a42f`
+- Canonical workstream: `Joey-Tools/codex-personal-sync` PR #8
+- Canonical reviewed head `8f3e8aed813fd1e15c59916ff1c5a7f6f4315781`
+  and squash-landed commit `e57140e16a68db24dbdd883de665283538234730`
+  have the identical tree `13470ade1303992d81d02dc606ad66da7b6dd3a7`.
 - Initial generated-head BL delivery gates: Python 3.13 compile, 1,108-test
   discovery with two expected skips, and the nine-test Python 3.9
   compatibility lane.

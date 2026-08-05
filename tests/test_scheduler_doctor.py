@@ -8475,6 +8475,128 @@ class SchedulerDoctorTests(unittest.TestCase):
         runner.chmod(0o755)
         return runner
 
+    def write_legacy_scheduler_config(
+        self,
+        platform_name: str,
+        runner: Path,
+        *,
+        include_mode: bool,
+    ) -> tuple[MODULE.SchedulerPaths, Callable[[MODULE.SchedulerPaths], object], str]:
+        paths = MODULE._scheduler_paths(platform_name, self.home)
+        if platform_name == "macos":
+            assert paths.launchd_plist is not None
+            paths.launchd_plist.parent.mkdir(parents=True, exist_ok=True)
+            command = "install"
+            arguments = [str(runner), command]
+            if include_mode:
+                arguments.extend(("--mode", "public"))
+            arguments.extend(
+                ("--repo", "owner/public-sync", "--home", str(self.home))
+            )
+            payload = MODULE._launchd_plist(
+                self.home,
+                "owner/public-sync",
+                19,
+                runner,
+            )
+            payload["ProgramArguments"] = arguments
+            paths.launchd_plist.write_bytes(plistlib.dumps(payload, sort_keys=True))
+            return paths, MODULE._load_macos_scheduler_config, command
+        assert platform_name == "linux"
+        assert paths.systemd_service is not None
+        assert paths.systemd_timer is not None
+        paths.systemd_service.parent.mkdir(parents=True, exist_ok=True)
+        command = "install-private"
+        arguments = [str(runner), command]
+        if include_mode:
+            arguments.extend(("--mode", "private"))
+        arguments.extend(
+            (
+                "--repo",
+                "owner/private-sync",
+                "--base-repo",
+                "owner/public-sync",
+                "--owner",
+                "private",
+                "--home",
+                str(self.home),
+            )
+        )
+        legacy_exec = " ".join(
+            MODULE._systemd_quote(argument) for argument in arguments
+        )
+        service_lines = MODULE._systemd_service(
+            self.home,
+            "owner/private-sync",
+            runner,
+            mode="private",
+            base_repo="owner/public-sync",
+            owner="private",
+        ).splitlines()
+        paths.systemd_service.write_text(
+            "\n".join(
+                f"ExecStart={legacy_exec}"
+                if line.startswith("ExecStart=")
+                else line
+                for line in service_lines
+            ),
+            encoding="utf-8",
+        )
+        paths.systemd_timer.write_text(
+            MODULE._systemd_timer(19),
+            encoding="utf-8",
+        )
+        return paths, MODULE._load_linux_scheduler_config, command
+
+    def scheduler_status(
+        self,
+        platform_name: str,
+        *,
+        daemon_enabled: bool,
+        strict: bool,
+    ) -> tuple[int, dict[str, object], mock.Mock]:
+        output = io.StringIO()
+        arguments = [
+            "status-scheduler",
+            "--home",
+            str(self.home),
+            "--platform",
+            platform_name,
+            "--json",
+        ]
+        if strict:
+            arguments.append("--strict")
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_scheduler_runtime_state",
+                return_value=None,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_current_releases_for_scheduler",
+                return_value=(),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_scheduler_release_integrity_issues",
+                return_value=(),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_scheduler_daemon_enabled",
+                return_value=daemon_enabled,
+            ) as daemon_query,
+            mock.patch.object(
+                MODULE,
+                "_quarantine_batch_count",
+                return_value=0,
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            status = MODULE.main(arguments)
+        return status, json.loads(output.getvalue()), daemon_query
+
     def install_scheduler_quietly(
         self,
         repo: str,
@@ -8640,6 +8762,132 @@ class SchedulerDoctorTests(unittest.TestCase):
                     )
                 )
         return results
+
+    def test_scheduler_program_arguments_enforce_per_command_contracts(self) -> None:
+        runner = str(self.home / "bin" / "runner")
+        public = [
+            runner,
+            "install",
+            "--repo",
+            "owner/public-sync",
+            "--home",
+            str(self.home),
+        ]
+        private = [
+            runner,
+            "install-private",
+            "--repo",
+            "owner/private-sync",
+            "--base-repo",
+            "owner/public-sync",
+            "--owner",
+            "private",
+            "--home",
+            str(self.home),
+        ]
+        scheduled_public = [
+            runner,
+            "run-scheduled",
+            "--mode",
+            "public",
+            *public[2:],
+        ]
+        scheduled_private = [
+            runner,
+            "run-scheduled",
+            "--mode",
+            "private",
+            *private[2:],
+        ]
+
+        def parse(arguments: list[str]) -> MODULE.SchedulerConfig:
+            return MODULE._parse_scheduler_program_arguments(
+                arguments,
+                platform_name="linux",
+                config_paths=(self.home / "scheduler",),
+                interval_minutes=17,
+            )
+
+        valid_cases = (
+            (public, ("public", "owner/public-sync", "owner/public-sync", "public")),
+            (
+                private,
+                ("private", "owner/private-sync", "owner/public-sync", "private"),
+            ),
+            (
+                scheduled_public,
+                ("public", "owner/public-sync", "owner/public-sync", "public"),
+            ),
+            (
+                scheduled_private,
+                ("private", "owner/private-sync", "owner/public-sync", "private"),
+            ),
+        )
+        for arguments, expected in valid_cases:
+            with self.subTest(valid=arguments[1]):
+                config = parse(arguments)
+                self.assertEqual(
+                    (config.mode, config.repo, config.base_repo, config.owner),
+                    expected,
+                )
+
+        invalid_flags = (
+            (public, "--mode"),
+            (public, "--base-repo"),
+            (public, "--owner"),
+            (private, "--mode"),
+            (scheduled_public, "--unknown"),
+        )
+        for arguments, flag in invalid_flags:
+            with (
+                self.subTest(command=arguments[1], invalid=flag),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    re.escape(f"command {arguments[1]} does not allow {flag}"),
+                ),
+            ):
+                parse([*arguments, flag, "value"])
+            with (
+                self.subTest(command=arguments[1], duplicate_invalid=flag),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    re.escape(f"scheduler config repeats {flag}"),
+                ),
+            ):
+                parse([*arguments, flag, "value", flag, "value"])
+
+        for arguments in (public, private, scheduled_private):
+            for index in range(2, len(arguments), 2):
+                flag = arguments[index]
+                with (
+                    self.subTest(command=arguments[1], duplicate=flag),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        re.escape(f"scheduler config repeats {flag}"),
+                    ),
+                ):
+                    parse([*arguments, flag, arguments[index + 1]])
+                with (
+                    self.subTest(command=arguments[1], missing=flag),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        re.escape(f"scheduler config is missing {flag}"),
+                    ),
+                ):
+                    parse([*arguments[:index], *arguments[index + 2 :]])
+                option_like_value = [*arguments]
+                option_like_value[index + 1] = "--unexpected"
+                with (
+                    self.subTest(command=arguments[1], option_like_value=flag),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        re.escape(
+                            f"scheduler config value for {flag} "
+                            "must not be an option token"
+                        ),
+                    ),
+                ):
+                    parse(option_like_value)
 
     def test_macos_scheduler_config_parses_private_run_scheduled(self) -> None:
         runner = self.home / "bin" / "runner with spaces"
@@ -9655,6 +9903,111 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(payload["owner"], "private")
         self.assertEqual(payload["interval_minutes"], 47)
         self.assertTrue(payload["migration_needed"])
+
+    def test_status_preserves_legal_legacy_scheduler_migrations(self) -> None:
+        runner = self.write_runner()
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                self.write_legacy_scheduler_config(
+                    platform_name,
+                    runner,
+                    include_mode=False,
+                )
+                status, report, daemon_query = self.scheduler_status(
+                    platform_name,
+                    daemon_enabled=True,
+                    strict=False,
+                )
+
+                self.assertEqual(status, 0, report)
+                self.assertTrue(report["installed"])
+                self.assertTrue(report["migration_needed"])
+                self.assertNotEqual(
+                    report["failure_code"],
+                    "scheduler-config-invalid",
+                )
+                daemon_query.assert_called_once()
+
+    def test_legacy_mode_flag_is_invalid_for_loaders_and_strict_status(self) -> None:
+        runner = self.write_runner()
+        for platform_name in ("macos", "linux"):
+            with self.subTest(platform=platform_name):
+                paths, loader, command = self.write_legacy_scheduler_config(
+                    platform_name,
+                    runner,
+                    include_mode=True,
+                )
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    re.escape(f"command {command} does not allow --mode"),
+                ):
+                    loader(paths)
+
+                status, report, daemon_query = self.scheduler_status(
+                    platform_name,
+                    daemon_enabled=True,
+                    strict=True,
+                )
+
+                daemon_query.assert_not_called()
+                self.assertEqual(status, 1)
+                self.assertFalse(report["installed"])
+                self.assertEqual(report["failure_code"], "scheduler-config-invalid")
+                self.assertIn("does not allow --mode", report["failure_reason"])
+
+    def test_linux_option_like_value_is_invalid_for_loader_and_strict_status(
+        self,
+    ) -> None:
+        runner = self.write_runner()
+        paths = MODULE._scheduler_paths("linux", self.home)
+        assert paths.systemd_service is not None
+        assert paths.systemd_timer is not None
+        paths.systemd_service.parent.mkdir(parents=True)
+        arguments = [
+            str(runner),
+            "run-scheduled",
+            "--mode",
+            "public",
+            "--repo",
+            "owner/public-sync",
+            "--home",
+            "--unexpected",
+        ]
+        exec_start = " ".join(
+            MODULE._systemd_quote(argument) for argument in arguments
+        )
+        service_lines = MODULE._systemd_service(
+            self.home,
+            "owner/public-sync",
+            runner,
+        ).splitlines()
+        paths.systemd_service.write_text(
+            "\n".join(
+                f"ExecStart={exec_start}"
+                if line.startswith("ExecStart=")
+                else line
+                for line in service_lines
+            ),
+            encoding="utf-8",
+        )
+        paths.systemd_timer.write_text(MODULE._systemd_timer(17), encoding="utf-8")
+
+        expected = "scheduler config value for --home must not be an option token"
+        with self.assertRaisesRegex(MODULE.SyncError, re.escape(expected)):
+            MODULE._load_linux_scheduler_config(paths)
+
+        status, report, daemon_query = self.scheduler_status(
+            "linux",
+            daemon_enabled=True,
+            strict=True,
+        )
+
+        daemon_query.assert_not_called()
+        self.assertEqual(status, 1)
+        self.assertFalse(report["installed"])
+        self.assertEqual(report["failure_code"], "scheduler-config-invalid")
+        self.assertEqual(report["failure_reason"], expected)
 
     def test_macos_status_marks_gui_domain_for_background_migration(self) -> None:
         runner = self.write_runner()
