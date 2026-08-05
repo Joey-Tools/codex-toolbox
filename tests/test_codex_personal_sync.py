@@ -7562,10 +7562,68 @@ while True:
             ],
         )
         self.assertEqual(
-            payload["EnvironmentVariables"]["PATH"],
-            MODULE.MACOS_SCHEDULER_PATH,
+            payload["EnvironmentVariables"],
+            {
+                "HOME": str(self.user_home),
+                "PATH": MODULE.MACOS_SCHEDULER_PATH,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
         )
+        self.assertEqual(payload["LimitLoadToSessionType"], "Background")
+        self.assertEqual(payload["ProcessType"], "Background")
+        self.assertIs(payload["LowPriorityIO"], True)
+        self.assertEqual(payload["ThrottleInterval"], 60)
+        self.assertEqual(payload["Umask"], 0o077)
+        self.assertEqual(payload["WorkingDirectory"], str(self.user_home))
         self.assertIn("codex-personal-sync.out.log", payload["StandardOutPath"])
+
+    def test_bare_install_scheduler_migrates_legacy_gui_plist_to_background(
+        self,
+    ) -> None:
+        home = self.user_home / ".codex"
+        runner = write_scheduler_runner(home)
+        paths = MODULE._scheduler_paths("macos", home)
+        assert paths.launchd_plist is not None
+        paths.launchd_plist.parent.mkdir(parents=True)
+        legacy = MODULE._launchd_plist(
+            home,
+            "owner/repo",
+            71,
+            runner,
+        )
+        for key in (
+            "LimitLoadToSessionType",
+            "LowPriorityIO",
+            "ProcessType",
+            "ThrottleInterval",
+            "Umask",
+            "WorkingDirectory",
+        ):
+            legacy.pop(key, None)
+        legacy["EnvironmentVariables"].pop("HOME", None)
+        paths.launchd_plist.write_bytes(plistlib.dumps(legacy, sort_keys=True))
+
+        self.run_quietly(
+            MODULE.install_scheduler,
+            home,
+            None,
+            None,
+            "macos",
+            None,
+            dry_run=False,
+            enable=False,
+        )
+
+        with paths.launchd_plist.open("rb") as file:
+            migrated = plistlib.load(file)
+        self.assertEqual(migrated["LimitLoadToSessionType"], "Background")
+        self.assertEqual(migrated["ProcessType"], "Background")
+        self.assertEqual(migrated["WorkingDirectory"], str(self.user_home))
+        self.assertEqual(
+            migrated["EnvironmentVariables"]["HOME"],
+            str(self.user_home),
+        )
+        self.assertEqual(migrated["StartInterval"], 71 * 60)
 
     def test_bare_install_scheduler_preserves_legacy_private_target(self) -> None:
         home = self.user_home / ".codex"
@@ -7727,12 +7785,20 @@ while True:
             / "LaunchAgents"
             / f"{MODULE.LAUNCHD_LABEL}.plist"
         )
-        domain = f"gui/{os.getuid()}"
-        self.assertIn(["/bin/launchctl", "bootout", domain, str(plist_path)], calls)
-        self.assertIn(["/bin/launchctl", "bootstrap", domain, str(plist_path)], calls)
-        self.assertIn(
-            ["/bin/launchctl", "enable", f"{domain}/{MODULE.LAUNCHD_LABEL}"],
-            calls,
+        uid = os.getuid()
+        gui_target = f"gui/{uid}/{MODULE.LAUNCHD_LABEL}"
+        user_domain = f"user/{uid}"
+        user_target = f"{user_domain}/{MODULE.LAUNCHD_LABEL}"
+        current_identity_calls = [
+            ["/bin/launchctl", "bootout", gui_target],
+            ["/bin/launchctl", "disable", gui_target],
+            ["/bin/launchctl", "bootout", user_target],
+            ["/bin/launchctl", "bootstrap", user_domain, str(plist_path)],
+            ["/bin/launchctl", "enable", user_target],
+        ]
+        self.assertEqual(
+            [call for call in calls if call in current_identity_calls],
+            current_identity_calls,
         )
         self.assertFalse(
             any(call[:2] == ["/bin/launchctl", "kickstart"] for call in calls)
@@ -8787,68 +8853,81 @@ while True:
         self,
     ) -> None:
         uid = str(os.getuid())
-        domain = f"gui/{uid}"
         for label in (MODULE.LAUNCHD_LABEL, *MODULE.LEGACY_LAUNCHD_LABELS):
-            args = ["launchctl", "bootout", f"{domain}/{label}"]
-            for description, evidence, accepted in (
-                (
-                    "exact",
-                    f'Could not find service "{label}" in domain for user gui: {uid}',
-                    True,
-                ),
-                (
-                    "label case drift",
-                    f'Could not find service "{label.upper()}" '
-                    f"in domain for user gui: {uid}",
-                    False,
-                ),
-                (
-                    "wrong uid",
-                    f'Could not find service "{label}" '
-                    f"in domain for user gui: {int(uid) + 1}",
-                    False,
-                ),
+            for domain_kind, evidence_domain in (
+                ("gui", f"user gui: {uid}"),
+                ("user", f"uid: {uid}"),
             ):
-                with self.subTest(label=label, description=description):
-                    completed = subprocess.CompletedProcess(
-                        args,
-                        113,
-                        "",
-                        f"Bad request.\n{evidence}\n",
-                    )
-                    self.assertEqual(
-                        MODULE._native_scheduler_failure_is_already_absent(
-                            args,
-                            completed,
+                args = [
+                    "launchctl",
+                    "bootout",
+                    f"{domain_kind}/{uid}/{label}",
+                ]
+                other_evidence_domain = (
+                    f"uid: {uid}" if domain_kind == "gui" else f"user gui: {uid}"
+                )
+                for description, evidence, accepted in (
+                    (
+                        "exact",
+                        f'Could not find service "{label}" '
+                        f"in domain for {evidence_domain}",
+                        True,
+                    ),
+                    (
+                        "cross-domain",
+                        f'Could not find service "{label}" '
+                        f"in domain for {other_evidence_domain}",
+                        False,
+                    ),
+                    (
+                        "label case drift",
+                        f'Could not find service "{label.upper()}" '
+                        f"in domain for {evidence_domain}",
+                        False,
+                    ),
+                    (
+                        "wrong uid",
+                        f'Could not find service "{label}" '
+                        f"in domain for "
+                        + (
+                            f"user gui: {int(uid) + 1}"
+                            if domain_kind == "gui"
+                            else f"uid: {int(uid) + 1}"
                         ),
-                        accepted,
-                    )
+                        False,
+                    ),
+                ):
+                    with self.subTest(
+                        label=label,
+                        domain=domain_kind,
+                        description=description,
+                    ):
+                        completed = subprocess.CompletedProcess(
+                            args,
+                            113,
+                            "",
+                            f"Bad request.\n{evidence}\n",
+                        )
+                        self.assertEqual(
+                            MODULE._native_scheduler_failure_is_already_absent(
+                                args,
+                                completed,
+                            ),
+                            accepted,
+                        )
 
     def test_uninstall_scheduler_runs_macos_disable_commands(self) -> None:
         home = self.root / "home" / ".codex"
-        (self.root / "home" / "Library" / "LaunchAgents").mkdir(parents=True)
-        query_count = 0
-
-        def run_native(
-            args: list[str],
-            **_kwargs: object,
-        ) -> subprocess.CompletedProcess[str]:
-            nonlocal query_count
-            if args[1:2] == ["print"]:
-                query_count += 1
-                if query_count == 1:
-                    return subprocess.CompletedProcess(args, 0, "", "")
-                return subprocess.CompletedProcess(
-                    args,
-                    113,
-                    "",
-                    (
-                        "Bad request.\n"
-                        f'Could not find service "{MODULE.LAUNCHD_LABEL}" '
-                        f"in domain for user gui: {os.getuid()}"
-                    ),
-                )
-            return subprocess.CompletedProcess(args, 0, "", "")
+        plist_path = (
+            self.root
+            / "home"
+            / "Library"
+            / "LaunchAgents"
+            / f"{MODULE.LAUNCHD_LABEL}.plist"
+        )
+        plist_path.parent.mkdir(parents=True)
+        plist_path.write_text("plist\n", encoding="utf-8")
+        completed = subprocess.CompletedProcess([], 0, "", "")
 
         with (
             mock.patch.object(
@@ -8859,7 +8938,7 @@ while True:
             mock.patch.object(
                 MODULE,
                 "_run_bounded_scheduler_process",
-                side_effect=run_native,
+                return_value=completed,
             ) as run,
         ):
             self.run_quietly(
@@ -8870,21 +8949,12 @@ while True:
                 disable=True,
             )
 
-        domain = f"gui/{os.getuid()}"
+        uid = os.getuid()
         calls = [call.args[0] for call in run.call_args_list]
-        self.assertEqual(query_count, 2)
-        self.assertIn(
-            [
-                "/bin/launchctl",
-                "bootout",
-                f"{domain}/{MODULE.LAUNCHD_LABEL}",
-            ],
-            calls,
-        )
-        self.assertIn(
-            ["/bin/launchctl", "disable", f"{domain}/{MODULE.LAUNCHD_LABEL}"],
-            calls,
-        )
+        for domain in (f"user/{uid}", f"gui/{uid}"):
+            target = f"{domain}/{MODULE.LAUNCHD_LABEL}"
+            self.assertIn(["/bin/launchctl", "bootout", target], calls)
+            self.assertIn(["/bin/launchctl", "disable", target], calls)
 
 
 if __name__ == "__main__":

@@ -1,18 +1,18 @@
 {
-  "canonical_commit": "6d078594d547598db037ce358c89c8a8ac58c881",
+  "canonical_commit": "14914ca17172f00a5759758a50cf7c0295e4a42f",
   "canonical_repository": "Joey-Tools/codex-personal-sync",
   "file_set_digest": "c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad",
   "files": [
     {
       "mode": "0755",
-      "sha256": "ba433d61f4b5aa8c3e4a17f8365488ca5089c58511e091b32e4bc2ae6b872a8a",
+      "sha256": "238fb180805ed4b441e70b0376fec473583839ab80913e7cb640dfde2f671b92",
       "source_name": "engine",
       "source_path": "scripts/codex_personal_sync.py",
       "target_path": "scripts/codex_personal_sync.py"
     },
     {
       "mode": "0644",
-      "sha256": "1e8f7a856bbfad79908c619673c1652ad48b4e9eb3617f51d1dac2ed15fbb392",
+      "sha256": "c6c428c87985990232218747d8713ea5566df860db72a6fafe0122987027dacc",
       "source_name": "engine_tests",
       "source_path": "tests/test_codex_personal_sync.py",
       "target_path": "tests/test_codex_personal_sync.py"
@@ -40,7 +40,7 @@
     },
     {
       "mode": "0644",
-      "sha256": "221b14d53262afa3c622722693947a0baf5b4c9c76396679a723cf52d1f7e877",
+      "sha256": "07a310e903a0c93645b96c803fde469d1874459a12d6e9bc243a0318664ea0f0",
       "source_name": "scheduler_doctor_tests",
       "source_path": "tests/test_scheduler_doctor.py",
       "target_path": "tests/test_scheduler_doctor.py"
@@ -53,5 +53,5 @@
   "mirror_repository": "Joey-Tools/codex-toolbox",
   "receipt_version": 1,
   "rules_contract_version": 1,
-  "tree_digest": "af893613662074521adc6d75bfa669d731148a2a332c243e63996493270bd16a"
+  "tree_digest": "b52444964c14b4703edd477790fedee46dd52d8698bcbd38cabfb936854e67df"
 }
