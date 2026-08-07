@@ -13,6 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 import plistlib
 import re
+import selectors
 import shutil
 import socket
 import stat
@@ -69,6 +70,7 @@ _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_DEPTH_LIMIT = 64
 _SCHEDULER_DOCTOR_TEST_STALE_CLEANUP_TIMEOUT_SECONDS = 30.0
 _SCHEDULER_DOCTOR_TEST_LEASE_TIMEOUT_SECONDS = 60.0
 _SCHEDULER_DOCTOR_TEST_LEASE_RETRY_SECONDS = 0.05
+_SCHEDULER_DOCTOR_TEST_GUARDIAN_EOF_TIMEOUT_SECONDS = 5.0
 _SCHEDULER_DOCTOR_TEST_DARWIN_TEMP_SCAN_ENTRY_LIMIT = 4096
 _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_TEMP_ROOT = Path("/tmp")
 _SCHEDULER_DOCTOR_TEST_LINUX_STICKY_FALLBACK_PREFIX = (
@@ -82,6 +84,36 @@ _SCHEDULER_DOCTOR_TEST_SESSION_CLEANUP_FAILURE: (
 _SCHEDULER_DOCTOR_TEST_HOST_PLATFORM = sys.platform
 _SCHEDULER_DOCTOR_TEST_ORIGINAL_POPEN = subprocess.Popen
 _SCHEDULER_DOCTOR_TEST_POPEN_INSTALLED = False
+
+
+def _wait_for_scheduler_guardian_fifo_eof(
+    read_fd: int,
+    *,
+    deadline: float,
+) -> None:
+    # kqueue does not consistently surface a post-read FIFO writer close as a
+    # fresh event on macOS; select(2) does, while retaining an event-driven
+    # absolute-deadline wait.
+    with selectors.SelectSelector() as selector:
+        selector.register(read_fd, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    "a launched process still retains the FIFO liveness writer"
+                )
+            events = selector.select(remaining)
+            if not events:
+                continue
+            try:
+                terminal = os.read(read_fd, 1)
+            except BlockingIOError:
+                continue
+            if terminal:
+                raise AssertionError(
+                    "the FIFO liveness channel contained unexpected payload bytes"
+                )
+            return
 
 
 class _SchedulerDoctorTestCandidateUnavailable(RuntimeError):
@@ -9644,6 +9676,132 @@ class SchedulerDoctorTests(unittest.TestCase):
                 self.assertTrue(recovered.enabled)
                 self.assertEqual(recovered.interval_minutes, 31)
 
+    def test_macos_activation_retry_enables_background_label_before_bootstrap(
+        self,
+    ) -> None:
+        self.write_runner()
+        paths = MODULE._scheduler_paths("macos", self.home)
+        assert paths.launchd_plist is not None
+        marker = MODULE._scheduler_activation_transaction_path(paths)
+        uid = os.getuid()
+        gui_target = f"{MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN}/{uid}"
+        background_target = f"{MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN}/{uid}"
+        label = MODULE.LAUNCHD_LABEL
+        failed_calls: list[list[str]] = []
+
+        def fail_bootstrap(
+            args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool | str = False,
+        ) -> None:
+            del dry_run, allow_fail
+            failed_calls.append(args)
+            if args[:2] == ["launchctl", "bootstrap"]:
+                raise MODULE.SyncError("simulated bootstrap failure")
+
+        with (
+            mock.patch.object(MODULE, "LEGACY_LAUNCHD_LABELS", ()),
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=fail_bootstrap,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "simulated bootstrap failure",
+            ),
+        ):
+            MODULE.install_scheduler(
+                self.home,
+                "owner/macos-activation-order",
+                31,
+                "macos",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        self.assertEqual(
+            failed_calls,
+            [
+                ["launchctl", "bootout", f"{gui_target}/{label}"],
+                ["launchctl", "disable", f"{gui_target}/{label}"],
+                ["launchctl", "bootout", f"{background_target}/{label}"],
+                ["launchctl", "enable", f"{background_target}/{label}"],
+                [
+                    "launchctl",
+                    "bootstrap",
+                    background_target,
+                    str(paths.launchd_plist),
+                ],
+            ],
+        )
+        self.assertTrue(marker.exists())
+        config_before = (
+            paths.launchd_plist.read_bytes(),
+            paths.launchd_plist.stat().st_dev,
+            paths.launchd_plist.stat().st_ino,
+        )
+        retry_calls: list[list[str]] = []
+
+        def record_retry(
+            args: list[str],
+            *,
+            dry_run: bool,
+            allow_fail: bool | str = False,
+        ) -> None:
+            del dry_run, allow_fail
+            retry_calls.append(args)
+
+        with (
+            mock.patch.object(MODULE, "LEGACY_LAUNCHD_LABELS", ()),
+            mock.patch.object(MODULE, "_write_plist") as write_plist,
+            mock.patch.object(
+                MODULE,
+                "_run_native_command",
+                side_effect=record_retry,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            MODULE.install_scheduler(
+                self.home,
+                "owner/macos-activation-order",
+                None,
+                "macos",
+                None,
+                dry_run=False,
+                enable=True,
+            )
+
+        write_plist.assert_not_called()
+        self.assertEqual(
+            retry_calls,
+            [
+                ["launchctl", "bootout", f"{gui_target}/{label}"],
+                ["launchctl", "disable", f"{gui_target}/{label}"],
+                ["launchctl", "bootout", f"{background_target}/{label}"],
+                ["launchctl", "enable", f"{background_target}/{label}"],
+                [
+                    "launchctl",
+                    "bootstrap",
+                    background_target,
+                    str(paths.launchd_plist),
+                ],
+                ["launchctl", "enable", f"{background_target}/{label}"],
+            ],
+        )
+        self.assertFalse(marker.exists())
+        self.assertEqual(
+            (
+                paths.launchd_plist.read_bytes(),
+                paths.launchd_plist.stat().st_dev,
+                paths.launchd_plist.stat().st_ino,
+            ),
+            config_before,
+        )
+
     def test_invalid_activation_state_fails_closed_and_uninstall_clears_it(
         self,
     ) -> None:
@@ -13044,7 +13202,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                     "",
                     "",
                 )
-                for _ in range(len(MODULE.LEGACY_LAUNCHD_LABELS) * 4 + 3)
+                for _ in range(len(MODULE.LEGACY_LAUNCHD_LABELS) * 4 + 4)
             ),
         ]
         native_calls: list[list[str]] = []
@@ -13090,7 +13248,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             [args[1] for args in native_calls],
             ["bootout", "disable", "bootout", "disable"]
             * len(MODULE.LEGACY_LAUNCHD_LABELS)
-            + ["bootout", "disable", "bootout", "bootstrap", "enable"],
+            + ["bootout", "disable", "bootout", "enable", "bootstrap", "enable"],
         )
         self.assertFalse(legacy.exists())
         with mock.patch.object(
@@ -13113,7 +13271,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         label = MODULE.LEGACY_LAUNCHD_LABELS[0]
         case_index = 0
         for initial_legacy_exists in (False, True):
-            for current_action_offset in range(5):
+            for current_action_offset in range(6):
                 case_index += 1
                 with self.subTest(
                     initial_legacy_exists=initial_legacy_exists,
@@ -13246,7 +13404,7 @@ class SchedulerDoctorTests(unittest.TestCase):
 
         self.assertEqual(
             native_calls,
-            len(MODULE.LEGACY_LAUNCHD_LABELS) * 4 + 5,
+            len(MODULE.LEGACY_LAUNCHD_LABELS) * 4 + 6,
         )
         self.assertIsNotNone(MODULE._load_macos_scheduler_config(paths))
 
@@ -16002,8 +16160,53 @@ class SchedulerDoctorTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0)
             self.assertEqual(os.read(read_fd, 1), b"R")
-            self.assertEqual(os.read(read_fd, 1), b"")
+            _wait_for_scheduler_guardian_fifo_eof(
+                read_fd,
+                deadline=(
+                    time.monotonic()
+                    + _SCHEDULER_DOCTOR_TEST_GUARDIAN_EOF_TIMEOUT_SECONDS
+                ),
+            )
         finally:
+            os.close(read_fd)
+
+    def test_scheduler_guardian_fifo_eof_wait_requires_writer_exit(self) -> None:
+        fifo = self.root / "guardian-liveness-negative-control.fifo"
+        os.mkfifo(fifo, 0o600)
+        read_fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        write_fd = -1
+        writer: subprocess.Popen[bytes] | None = None
+        try:
+            write_fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            writer = subprocess.Popen(
+                [sys.executable, "-c", "import time;time.sleep(30)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                pass_fds=(write_fd,),
+            )
+            os.close(write_fd)
+            write_fd = -1
+            with self.assertRaisesRegex(
+                AssertionError,
+                "still retains the FIFO liveness writer",
+            ):
+                _wait_for_scheduler_guardian_fifo_eof(
+                    read_fd,
+                    deadline=time.monotonic() + 0.01,
+                )
+            writer.kill()
+            writer.wait(timeout=5.0)
+            _wait_for_scheduler_guardian_fifo_eof(
+                read_fd,
+                deadline=time.monotonic() + 1.0,
+            )
+        finally:
+            if write_fd >= 0:
+                os.close(write_fd)
+            if writer is not None and writer.poll() is None:
+                writer.kill()
+                writer.wait(timeout=5.0)
             os.close(read_fd)
 
     def test_bounded_scheduler_selector_close_failure_preserves_primary(
@@ -19174,7 +19377,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         ):
             audit = MODULE._mirror_quarantine_audit()
 
-        self.assertNotEqual(audit.classification, "inconclusive")
+        self.assertNotEqual(audit.classification, "inconclusive", audit)
 
     def test_mirror_quarantine_registry_reports_same_uid_legacy_pending(
         self,
@@ -19221,6 +19424,669 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(audit.entry_count, 1)
         self.assertIn("original root", audit.detail)
         self.assertEqual(snapshot_tree(shared_parent), before)
+
+    @contextlib.contextmanager
+    def retained_recovery_scope(self, name: str):
+        shared_parent = self.root / f"legacy-retained-parent-{name}"
+        shared_parent.mkdir(mode=0o700)
+        tool = shared_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        quarantine = shared_parent / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        evidence = quarantine / "retained-evidence"
+        evidence.write_bytes(b"retained\n")
+        evidence.chmod(0o600)
+        primary_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_PRIMARY_ROOT_ID,
+            parent_path=self.mirror_private_control_parent,
+            allocate=True,
+            account_home=self.root,
+            shared_parent=False,
+        )
+        legacy_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        plan_path = self.root / f"{name}-recovery-plan.json"
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, legacy_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+        ):
+            yield {
+                "evidence": evidence,
+                "plan_path": plan_path,
+                "quarantine": quarantine,
+                "shared_parent": shared_parent,
+                "tool": tool,
+            }
+
+    def assert_retained_recovery_unpublished(self) -> None:
+        self.assertFalse(
+            (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            ).exists()
+        )
+        self.assertFalse(
+            (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            ).exists()
+        )
+
+    def test_retained_recovery_rejects_plan_and_evidence_drift(self) -> None:
+        with self.retained_recovery_scope("tampered-plan") as fixture:
+            plan_path = fixture["plan_path"]
+            assert isinstance(plan_path, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            tampered = json.loads(plan_path.read_text(encoding="utf-8"))
+            evidence_entry = next(
+                entry
+                for entry in tampered["inventory"]["entries"]
+                if entry["locator"]["path"] == "retained-evidence"
+            )
+            evidence_entry["sha256"] = "0" * 64
+            tampered["plan_digest"] = MODULE._pc_recovery_digest(
+                MODULE._pc_recovery_protected_plan(tampered)
+            )
+            plan_path.write_bytes(
+                MODULE._pc_recovery_json_bytes(tampered, pretty=True)
+            )
+            plan_path.chmod(0o600)
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "plan no longer matches retained evidence",
+            ):
+                MODULE.execute_private_control_recovery(
+                    MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+            self.assert_retained_recovery_unpublished()
+
+        with self.retained_recovery_scope("changed-evidence") as fixture:
+            plan_path = fixture["plan_path"]
+            evidence = fixture["evidence"]
+            assert isinstance(plan_path, Path)
+            assert isinstance(evidence, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            original_identity = MODULE._pc_recovery_identity(
+                os.stat(evidence, follow_symlinks=False)
+            )
+            original_access = MODULE._pc_recovery_access(
+                os.stat(evidence, follow_symlinks=False)
+            )
+            evidence.write_bytes(b"changed!\n")
+            changed_metadata = os.stat(evidence, follow_symlinks=False)
+            self.assertEqual(
+                MODULE._pc_recovery_identity(changed_metadata),
+                original_identity,
+            )
+            self.assertEqual(
+                MODULE._pc_recovery_access(changed_metadata),
+                original_access,
+            )
+            self.assertEqual(changed_metadata.st_size, len(b"retained\n"))
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "plan no longer matches retained evidence",
+            ):
+                MODULE.execute_private_control_recovery(
+                    MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+            self.assert_retained_recovery_unpublished()
+
+        with self.retained_recovery_scope("replaced-evidence") as fixture:
+            plan_path = fixture["plan_path"]
+            evidence = fixture["evidence"]
+            assert isinstance(plan_path, Path)
+            assert isinstance(evidence, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            original_metadata = os.stat(evidence, follow_symlinks=False)
+            original_identity = MODULE._pc_recovery_identity(original_metadata)
+            original_access = MODULE._pc_recovery_access(original_metadata)
+            replacement = evidence.with_name("replacement-evidence")
+            replacement.write_bytes(evidence.read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, evidence)
+            replacement_metadata = os.stat(evidence, follow_symlinks=False)
+            self.assertNotEqual(
+                MODULE._pc_recovery_identity(replacement_metadata),
+                original_identity,
+            )
+            self.assertEqual(
+                MODULE._pc_recovery_access(replacement_metadata),
+                original_access,
+            )
+            self.assertEqual(evidence.read_bytes(), b"retained\n")
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "plan no longer matches retained evidence",
+            ):
+                MODULE.execute_private_control_recovery(
+                    MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+            self.assert_retained_recovery_unpublished()
+
+    def test_retained_recovery_rejects_a_busy_legacy_lease(self) -> None:
+        with self.retained_recovery_scope("second-busy-lease") as fixture:
+            tool = fixture["tool"]
+            quarantine = fixture["quarantine"]
+            plan_path = fixture["plan_path"]
+            assert isinstance(tool, Path)
+            assert isinstance(quarantine, Path)
+            assert isinstance(plan_path, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            quarantine_identity = MODULE._pc_recovery_identity(
+                os.stat(quarantine, follow_symlinks=False)
+            )
+            real_flock = fcntl.flock
+
+            def fail_second_lease(file_fd: int, operation: int) -> None:
+                if (
+                    operation == fcntl.LOCK_EX | fcntl.LOCK_NB
+                    and MODULE._pc_recovery_identity(os.fstat(file_fd))
+                    == quarantine_identity
+                ):
+                    raise BlockingIOError(
+                        errno.EWOULDBLOCK,
+                        "simulated quarantine lock conflict",
+                    )
+                real_flock(file_fd, operation)
+
+            with mock.patch.object(
+                MODULE.fcntl,
+                "flock",
+                side_effect=fail_second_lease,
+            ):
+                with self.assertRaisesRegex(MODULE.SyncError, "busy"):
+                    MODULE.execute_private_control_recovery(
+                        MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                        plan_path,
+                    )
+            self.assertEqual(MODULE._PC_RECOVERY_RETAINED_CLOSE_FENCE, ())
+            tool_fd = os.open(
+                tool,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                fcntl.flock(tool_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                fcntl.flock(tool_fd, fcntl.LOCK_UN)
+                os.close(tool_fd)
+            self.assert_retained_recovery_unpublished()
+
+    def test_retained_recovery_receipt_only_state_is_retryable(self) -> None:
+        with self.retained_recovery_scope("receipt-only") as fixture:
+            plan_path = fixture["plan_path"]
+            assert isinstance(plan_path, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            original_publish = MODULE._pc_recovery_publish_document
+
+            def fail_before_marker(*args: object, **kwargs: object):
+                if args[1] == MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME:
+                    raise MODULE.SyncError("simulated marker crash")
+                return original_publish(*args, **kwargs)
+
+            with mock.patch.object(
+                MODULE,
+                "_pc_recovery_publish_document",
+                side_effect=fail_before_marker,
+            ):
+                with self.assertRaisesRegex(MODULE.SyncError, "simulated marker crash"):
+                    MODULE.execute_private_control_recovery(
+                        MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                        plan_path,
+                    )
+            receipt_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            )
+            marker_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            )
+            self.assertTrue(receipt_path.is_file())
+            self.assertFalse(marker_path.exists())
+            receipt_metadata = os.stat(receipt_path, follow_symlinks=False)
+            receipt_payload = receipt_path.read_bytes()
+            blocked = MODULE._mirror_quarantine_audit()
+            self.assertEqual(blocked.classification, "inconclusive")
+            self.assertEqual(
+                blocked.reason_code,
+                MODULE.MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+            )
+            self.assertIn(
+                "receipt exists without its cutover marker",
+                blocked.detail,
+            )
+            result = MODULE.execute_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            self.assertEqual(result["status"], "executed")
+            self.assertTrue(marker_path.is_file())
+            final_receipt = os.stat(receipt_path, follow_symlinks=False)
+            self.assertEqual(
+                MODULE._pc_recovery_identity(final_receipt),
+                MODULE._pc_recovery_identity(receipt_metadata),
+            )
+            self.assertEqual(
+                MODULE._pc_recovery_access(final_receipt),
+                MODULE._pc_recovery_access(receipt_metadata),
+            )
+            self.assertEqual(receipt_path.read_bytes(), receipt_payload)
+            marker = MODULE._pc_recovery_load_json(
+                marker_path.read_bytes(),
+                "test cutover marker",
+            )
+            self.assertEqual(marker["primary_receipt"], result["execute"]["receipt"])
+
+    def test_retained_recovery_partial_pending_receipt_is_retryable(self) -> None:
+        with self.retained_recovery_scope("pending-receipt") as fixture:
+            plan_path = fixture["plan_path"]
+            assert isinstance(plan_path, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            real_write = os.write
+            injected = False
+
+            def fail_after_partial_write(file_fd: int, payload: bytes) -> int:
+                nonlocal injected
+                if not injected:
+                    injected = True
+                    real_write(file_fd, payload[: max(1, len(payload) // 2)])
+                    raise OSError(errno.EIO, "simulated interrupted receipt write")
+                return real_write(file_fd, payload)
+
+            with mock.patch.object(
+                MODULE.os,
+                "write",
+                side_effect=fail_after_partial_write,
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "cannot write pending primary recovery receipt",
+                ):
+                    MODULE.execute_private_control_recovery(
+                        MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                        plan_path,
+                    )
+            pending = tuple(
+                self.mirror_private_control_parent.glob(
+                    f".{MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME}"
+                    ".pending-*"
+                )
+            )
+            self.assertTrue(injected)
+            self.assertEqual(len(pending), 1)
+            pending_identity = MODULE._pc_recovery_identity(
+                os.stat(pending[0], follow_symlinks=False)
+            )
+            self.assert_retained_recovery_unpublished()
+            result = MODULE.execute_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            self.assertEqual(result["status"], "executed")
+            receipt_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            )
+            self.assertEqual(
+                MODULE._pc_recovery_identity(
+                    os.stat(receipt_path, follow_symlinks=False)
+                ),
+                pending_identity,
+            )
+            self.assertEqual(
+                tuple(
+                    self.mirror_private_control_parent.glob(
+                        f".{MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME}"
+                        ".pending-*"
+                    )
+                ),
+                (),
+            )
+            self.assertEqual(
+                tuple(
+                    self.mirror_private_control_parent.glob(
+                        f".{MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME}"
+                        ".pending-*"
+                    )
+                ),
+                (),
+            )
+
+    def test_retained_recovery_retry_rejects_receipt_replacement(self) -> None:
+        with self.retained_recovery_scope("receipt-replacement") as fixture:
+            plan_path = fixture["plan_path"]
+            assert isinstance(plan_path, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            result = MODULE.execute_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            self.assertEqual(result["status"], "executed")
+            receipt_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            )
+            marker_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            )
+            receipt_payload = receipt_path.read_bytes()
+            receipt_metadata = os.stat(receipt_path, follow_symlinks=False)
+            marker_metadata = os.stat(marker_path, follow_symlinks=False)
+            marker_payload = marker_path.read_bytes()
+            replacement = receipt_path.with_name("replacement-receipt")
+            replacement.write_bytes(receipt_payload)
+            replacement.chmod(0o400)
+            os.replace(replacement, receipt_path)
+            replaced_metadata = os.stat(receipt_path, follow_symlinks=False)
+            self.assertNotEqual(
+                MODULE._pc_recovery_identity(replaced_metadata),
+                MODULE._pc_recovery_identity(receipt_metadata),
+            )
+            self.assertEqual(
+                MODULE._pc_recovery_access(replaced_metadata),
+                MODULE._pc_recovery_access(receipt_metadata),
+            )
+            self.assertEqual(receipt_path.read_bytes(), receipt_payload)
+            blocked = MODULE._mirror_quarantine_audit()
+            self.assertEqual(blocked.classification, "inconclusive")
+            self.assertEqual(
+                blocked.reason_code,
+                MODULE.MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE,
+            )
+            self.assertIn(
+                "cutover marker receipt binding changed",
+                blocked.detail,
+            )
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "marker receipt binding changed",
+            ):
+                MODULE.execute_private_control_recovery(
+                    MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+            final_marker = os.stat(marker_path, follow_symlinks=False)
+            self.assertEqual(
+                MODULE._pc_recovery_identity(final_marker),
+                MODULE._pc_recovery_identity(marker_metadata),
+            )
+            self.assertEqual(marker_path.read_bytes(), marker_payload)
+
+    def test_retained_recovery_marker_durability_retry_preserves_identity(
+        self,
+    ) -> None:
+        with self.retained_recovery_scope("marker-retry") as fixture:
+            plan_path = fixture["plan_path"]
+            assert isinstance(plan_path, Path)
+            MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            receipt_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            )
+            marker_path = (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            )
+            real_fsync = os.fsync
+            injected = False
+
+            def fail_after_marker_publish(file_fd: int) -> None:
+                nonlocal injected
+                if marker_path.exists():
+                    parent_identity = MODULE._pc_recovery_identity(
+                        os.stat(
+                            self.mirror_private_control_parent,
+                            follow_symlinks=False,
+                        )
+                    )
+                    if (
+                        not injected
+                        and MODULE._pc_recovery_identity(os.fstat(file_fd))
+                        == parent_identity
+                    ):
+                        injected = True
+                        real_fsync(file_fd)
+                        raise OSError(
+                            errno.EIO,
+                            "simulated marker-parent fsync failure",
+                        )
+                real_fsync(file_fd)
+
+            with mock.patch.object(
+                MODULE.os,
+                "fsync",
+                side_effect=fail_after_marker_publish,
+            ):
+                with self.assertRaisesRegex(MODULE.SyncError, "cannot durably bind"):
+                    MODULE.execute_private_control_recovery(
+                        MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                        plan_path,
+                    )
+            self.assertTrue(injected)
+            self.assertTrue(receipt_path.is_file())
+            self.assertTrue(marker_path.is_file())
+            marker_metadata = os.stat(marker_path, follow_symlinks=False)
+            marker_payload = marker_path.read_bytes()
+
+            primary_identity = MODULE._pc_recovery_identity(
+                os.stat(
+                    self.mirror_private_control_parent,
+                    follow_symlinks=False,
+                )
+            )
+            retry_fsyncs = 0
+
+            def track_primary_fsync(file_fd: int) -> None:
+                nonlocal retry_fsyncs
+                if MODULE._pc_recovery_identity(os.fstat(file_fd)) == primary_identity:
+                    retry_fsyncs += 1
+                real_fsync(file_fd)
+
+            with mock.patch.object(
+                MODULE.os,
+                "fsync",
+                side_effect=track_primary_fsync,
+            ):
+                result = MODULE.execute_private_control_recovery(
+                    MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                    plan_path,
+                )
+            self.assertEqual(result["status"], "executed")
+            self.assertGreaterEqual(retry_fsyncs, 1)
+            final_marker = os.stat(marker_path, follow_symlinks=False)
+            self.assertEqual(
+                MODULE._pc_recovery_identity(final_marker),
+                MODULE._pc_recovery_identity(marker_metadata),
+            )
+            self.assertEqual(
+                MODULE._pc_recovery_access(final_marker),
+                MODULE._pc_recovery_access(marker_metadata),
+            )
+            self.assertEqual(marker_path.read_bytes(), marker_payload)
+
+    def test_retained_recovery_transitions_audit_and_strict_doctor(
+        self,
+    ) -> None:
+        shared_parent = self.root / "legacy-retained-parent"
+        shared_parent.mkdir(mode=0o700)
+        tool = shared_parent / MODULE.MIRROR_PRIVATE_TOOL_ROOT_NAME
+        quarantine = shared_parent / MODULE.MIRROR_DURABLE_QUARANTINE_ROOT_NAME
+        tool.mkdir(mode=0o700)
+        quarantine.mkdir(mode=0o700)
+        evidence = quarantine / "retained-evidence"
+        evidence.write_bytes(b"retained\n")
+        evidence.chmod(0o600)
+        primary_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_PRIMARY_ROOT_ID,
+            parent_path=self.mirror_private_control_parent,
+            allocate=True,
+            account_home=self.root,
+            shared_parent=False,
+        )
+        legacy_spec = MODULE.MirrorPrivateControlRootSpec(
+            root_id=MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+            parent_path=shared_parent,
+            allocate=False,
+            account_home=None,
+            shared_parent=True,
+        )
+        before = snapshot_tree(shared_parent)
+        plan_path = self.root / "legacy-retained-recovery-plan.json"
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MIRROR_PRIVATE_CONTROL_ROOT_SPECS",
+                (primary_spec, legacy_spec),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_mirror_legacy_shared_parent_policy_is_valid",
+                return_value=True,
+            ),
+        ):
+            pending_audit = MODULE._mirror_quarantine_audit()
+            plan = MODULE.plan_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            result = MODULE.execute_private_control_recovery(
+                MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+                plan_path,
+            )
+            adopted_audit = MODULE._mirror_quarantine_audit()
+
+        self.assertEqual(pending_audit.classification, "inconclusive")
+        self.assertEqual(
+            pending_audit.reason_code,
+            MODULE.MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING,
+        )
+        self.assertEqual(plan["disposition"], "adopt-retained-in-place")
+        self.assertEqual(result["status"], "executed")
+        adopted_legacy_audit = next(
+            root_audit
+            for root_audit in adopted_audit.root_audits
+            if root_audit.root_id == MODULE.MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID
+        )
+        self.assertEqual(
+            adopted_legacy_audit.classification,
+            "adopted-retained-in-place",
+        )
+        self.assertNotIn(
+            adopted_audit.classification,
+            {"saturated", "inconclusive"},
+        )
+        self.assertIsNone(adopted_audit.reason_code)
+        self.assertEqual(snapshot_tree(shared_parent), before)
+        self.assertTrue(
+            (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            ).is_file()
+        )
+        self.assertTrue(
+            (
+                self.mirror_private_control_parent
+                / MODULE.MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            ).is_file()
+        )
+
+        def report(audit: MODULE.MirrorQuarantineAudit) -> MODULE.SchedulerReport:
+            return MODULE.SchedulerReport(
+                platform="linux",
+                installed=True,
+                enabled=True,
+                config_paths=(self.root / "scheduler.timer",),
+                interval_minutes=17,
+                runner=self.home / "bin" / "codex-personal-sync",
+                stable_runner=True,
+                mode="public",
+                base_repo="owner/public-sync",
+                private_repo=None,
+                last_attempt=None,
+                recent_success=None,
+                current_releases=(),
+                failure_reason=None,
+                command="run-scheduled",
+                repo="owner/public-sync",
+                owner=MODULE.PUBLIC_OWNER,
+                quarantine_batches=0,
+                mirror_quarantine=audit,
+                daemon_query=MODULE.SchedulerDaemonQuery("enabled"),
+            )
+
+        for audit, expected_status in (
+            (pending_audit, 1),
+            (adopted_audit, 0),
+        ):
+            with (
+                self.subTest(classification=audit.classification),
+                mock.patch.object(
+                    MODULE,
+                    "scheduler_report",
+                    return_value=report(audit),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "audit_active_skills",
+                    return_value=[],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                status = MODULE.main(
+                    [
+                        "doctor",
+                        "--home",
+                        str(self.home),
+                        "--platform",
+                        "linux",
+                        "--strict",
+                    ]
+                )
+            self.assertEqual(status, expected_status)
 
     def test_mirror_primary_alias_matrix_is_rejected_before_child_open(
         self,

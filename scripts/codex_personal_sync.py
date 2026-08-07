@@ -22,6 +22,7 @@ import plistlib
 import posixpath
 import pwd
 import re
+import secrets
 import selectors
 import shutil
 import signal
@@ -294,8 +295,36 @@ MIRROR_PRIVATE_CONTROL_REASON_LEGACY_PENDING = "legacy-recovery-pending"
 MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE = "private-control-root-inconclusive"
 MIRROR_PRIVATE_CONTROL_MAX_ANCESTORS = 256
 MIRROR_PRIVATE_CONTROL_PREALLOCATION_ALLOWED_STATES = frozenset(
-    {"absent", "duplicate", "foreign-unrelated", "same-uid-empty"}
+    {
+        "absent",
+        "adopted-retained-in-place",
+        "duplicate",
+        "foreign-unrelated",
+        "same-uid-empty",
+    }
 )
+MIRROR_PRIVATE_CONTROL_RECOVERY_CONTRACT = "codex-private-control-recovery"
+MIRROR_PRIVATE_CONTROL_RECOVERY_VERSION = 1
+MIRROR_PRIVATE_CONTROL_RECOVERY_DISPOSITION = "adopt-retained-in-place"
+MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME = (
+    ".legacy-shared-v0-retained-in-place-receipt-v1.json"
+)
+MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME = (
+    ".legacy-shared-v0-retained-in-place-cutover-v1.json"
+)
+MIRROR_PRIVATE_CONTROL_RECOVERY_LOCK_ORDER = ("tool-root", "quarantine")
+MIRROR_PRIVATE_CONTROL_RECOVERY_LOCK_MODE = "LOCK_EX|LOCK_NB"
+MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ENTRIES = 100_000
+MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_LOGICAL_BYTES = 512 * 1024 * 1024
+MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ALLOCATED_BYTES = 1024 * 1024 * 1024
+MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_DEPTH = 256
+MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PATH_BYTES = 4 * 1024 * 1024
+MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES = 64 * 1024 * 1024
+MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES = 8
+MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES = (
+    8 * MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+)
+MIRROR_PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -492,6 +521,3872 @@ class SyncError(RuntimeError):
     def __init__(self, message: str, *, code: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+
+
+class _PrivateControlRecoveryInitialAbsence(SyncError):
+    pass
+
+
+@dataclass
+class _PrivateControlRecoveryBinding:
+    label: str
+    path: Path
+    fd: int
+    identity: tuple[int, int, int]
+    access: tuple[int, int, int]
+    locked: bool = False
+    close_state: str = "open"
+
+
+@dataclass
+class _PrivateControlRecoveryPendingDescriptorCustody:
+    label: str
+    path: Path
+    fd: int
+    parent_identity: tuple[int, int, int]
+    identity: tuple[int, int, int] | None
+    access: tuple[int, int, int] | None
+    state: str = "open"
+
+
+_PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY: tuple[
+    _PrivateControlRecoveryPendingDescriptorCustody, ...
+] = ()
+_PC_RECOVERY_RETAINED_CLOSE_FENCE: tuple[_PrivateControlRecoveryBinding, ...] = ()
+
+
+_MIRROR_PRIVATE_CONTROL_RECOVERY_PLAN_FIELDS = frozenset(
+    {
+        "caps",
+        "contract",
+        "disposition",
+        "inventory",
+        "leases",
+        "paths",
+        "plan_digest",
+        "primary_root_id",
+        "root_id",
+        "roots",
+        "segment_locator",
+        "version",
+    }
+)
+_MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_FIELDS = frozenset(
+    {
+        "contract",
+        "disposition",
+        "plan_digest",
+        "primary_receipt",
+        "root_id",
+        "status",
+        "terminal_registry",
+        "version",
+    }
+)
+_MIRROR_PRIVATE_CONTROL_RECOVERY_PRIMARY_RECEIPT_FIELDS = frozenset(
+    {
+        "contract",
+        "disposition",
+        "plan",
+        "plan_digest",
+        "publication",
+        "root_id",
+        "version",
+    }
+)
+
+
+def _pc_recovery_json_bytes(value: object, *, pretty: bool) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            indent=2 if pretty else None,
+            separators=None if pretty else (",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _pc_recovery_digest(value: object) -> str:
+    return hashlib.sha256(_pc_recovery_json_bytes(value, pretty=False)).hexdigest()
+
+
+def _pc_recovery_canonical_documents_equal(left: object, right: object) -> bool:
+    try:
+        return _pc_recovery_json_bytes(
+            left,
+            pretty=False,
+        ) == _pc_recovery_json_bytes(right, pretty=False)
+    except (TypeError, ValueError):
+        return False
+
+
+def _pc_recovery_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _pc_recovery_access(metadata: os.stat_result) -> tuple[int, int, int]:
+    return stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid
+
+
+def _pc_recovery_identity_document(
+    identity: tuple[int, int, int],
+) -> dict[str, int]:
+    return {"dev": identity[0], "ino": identity[1], "type": identity[2]}
+
+
+def _pc_recovery_access_document(
+    access: tuple[int, int, int],
+) -> dict[str, int | str]:
+    return {"gid": access[2], "mode": f"{access[0]:04o}", "uid": access[1]}
+
+
+def _pc_recovery_record(
+    identity: tuple[int, int, int],
+    access: tuple[int, int, int],
+) -> dict[str, object]:
+    return {
+        "access": _pc_recovery_access_document(access),
+        "identity": _pc_recovery_identity_document(identity),
+    }
+
+
+def _pc_recovery_root_specs() -> tuple[MirrorPrivateControlRootSpec, ...]:
+    return MIRROR_PRIVATE_CONTROL_ROOT_SPECS
+
+
+def _pc_recovery_specs(
+    requested_root_id: str,
+) -> tuple[MirrorPrivateControlRootSpec, MirrorPrivateControlRootSpec]:
+    if requested_root_id != MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID:
+        raise SyncError(
+            "recover-private-control supports only --root-id "
+            f"{MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID}"
+        )
+    specs = _pc_recovery_root_specs()
+    root_ids = [spec.root_id for spec in specs]
+    if len(root_ids) != len(set(root_ids)):
+        raise SyncError("private-control root ids must be unique")
+    primary = [spec for spec in specs if spec.allocate]
+    legacy = [spec for spec in specs if spec.root_id == requested_root_id]
+    if len(primary) != 1 or len(legacy) != 1:
+        raise SyncError("private-control recovery registry is incomplete")
+    primary_spec = primary[0]
+    legacy_spec = legacy[0]
+    if (
+        primary_spec.shared_parent
+        or primary_spec.account_home is None
+        or primary_spec.parent_path
+        != primary_spec.account_home / MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME
+        or legacy_spec.allocate
+        or not legacy_spec.shared_parent
+        or legacy_spec.account_home is not None
+    ):
+        raise SyncError("private-control recovery root schema is invalid")
+    return primary_spec, legacy_spec
+
+
+def _pc_recovery_close_bindings(
+    bindings: tuple[_PrivateControlRecoveryBinding | None, ...],
+) -> None:
+    bindings_by_fd: dict[int, list[_PrivateControlRecoveryBinding]] = {}
+    for binding in bindings:
+        if binding is None or binding.fd < 0:
+            continue
+        bindings_by_fd.setdefault(binding.fd, []).append(binding)
+    retained = tuple(
+        binding
+        for same_fd_bindings in bindings_by_fd.values()
+        for binding in same_fd_bindings
+    )
+    if not retained:
+        return
+    if (
+        _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+        or _PC_RECOVERY_RETAINED_CLOSE_FENCE
+    ):
+        _pc_recovery_retain_close_fence(retained)
+        _pc_recovery_require_no_close_fence()
+    _pc_recovery_retain_close_fence(retained)
+    for file_fd, same_fd_bindings in bindings_by_fd.items():
+        binding = same_fd_bindings[0]
+        for item in same_fd_bindings:
+            item.close_state = "close-uncertain"
+        try:
+            os.close(file_fd)
+        except BaseException as error:
+            if isinstance(error, OSError):
+                raise SyncError(f"cannot close {binding.label}: {error}") from error
+            raise
+        for item in same_fd_bindings:
+            item.fd = -1
+            item.locked = False
+            item.close_state = "closed"
+        _pc_recovery_release_close_fence(tuple(same_fd_bindings))
+
+
+def _pc_recovery_prepare_pending_descriptor(
+    parent: _PrivateControlRecoveryBinding,
+    name: str,
+    label: str,
+    identity: tuple[int, int, int] | None,
+    access: tuple[int, int, int] | None,
+) -> _PrivateControlRecoveryPendingDescriptorCustody:
+    global _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+    custody = _PrivateControlRecoveryPendingDescriptorCustody(
+        label=label,
+        path=parent.path / name,
+        fd=-1,
+        parent_identity=parent.identity,
+        identity=identity,
+        access=access,
+        state="opening",
+    )
+    _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY += (custody,)
+    return custody
+
+
+def _pc_recovery_activate_pending_descriptor(
+    custody: _PrivateControlRecoveryPendingDescriptorCustody,
+    file_fd: int,
+) -> None:
+    custody.fd = file_fd
+    custody.state = "open"
+
+
+def _pc_recovery_release_pending_descriptor(
+    custody: _PrivateControlRecoveryPendingDescriptorCustody,
+) -> None:
+    global _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+    if custody.fd < 0 or custody.state != "open":
+        raise SyncError(
+            f"pending {custody.label} descriptor cannot be handed off"
+        )
+    custody.state = "handed-off"
+    _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = tuple(
+        item
+        for item in _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+        if item is not custody
+    )
+
+
+def _pc_recovery_open_pending_descriptor(
+    parent: _PrivateControlRecoveryBinding,
+    name: str,
+    label: str,
+    flags: int,
+    mode: int | None,
+    identity: tuple[int, int, int] | None,
+    access: tuple[int, int, int] | None,
+) -> _PrivateControlRecoveryPendingDescriptorCustody:
+    global _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+    custody = _pc_recovery_prepare_pending_descriptor(
+        parent,
+        name,
+        label,
+        identity,
+        access,
+    )
+    file_fd = -1
+    try:
+        if mode is None:
+            file_fd = os.open(name, flags, dir_fd=parent.fd)
+        else:
+            file_fd = os.open(name, flags, mode, dir_fd=parent.fd)
+        _pc_recovery_activate_pending_descriptor(custody, file_fd)
+        return custody
+    except BaseException:
+        if file_fd < 0:
+            custody.state = "open-result-uncertain"
+        else:
+            custody.fd = file_fd
+            custody.state = "open"
+            _pc_recovery_close_pending_descriptor(custody)
+        raise
+
+
+def _pc_recovery_close_pending_descriptor(
+    custody: _PrivateControlRecoveryPendingDescriptorCustody,
+) -> None:
+    global _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+    custody.state = "close-uncertain"
+    try:
+        os.close(custody.fd)
+    except BaseException as error:
+        if isinstance(error, OSError):
+            raise SyncError(
+                f"cannot close pending {custody.label} descriptor: {error}"
+            ) from error
+        raise
+    custody.state = "closed"
+    _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = tuple(
+        item
+        for item in _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+        if item is not custody
+    )
+
+
+def _pc_recovery_retain_close_fence(
+    bindings: tuple[_PrivateControlRecoveryBinding | None, ...],
+) -> None:
+    global _PC_RECOVERY_RETAINED_CLOSE_FENCE
+    retained = list(_PC_RECOVERY_RETAINED_CLOSE_FENCE)
+    seen = {id(binding) for binding in retained}
+    for binding in bindings:
+        if binding is None or binding.fd < 0 or id(binding) in seen:
+            continue
+        seen.add(id(binding))
+        retained.append(binding)
+    _PC_RECOVERY_RETAINED_CLOSE_FENCE = tuple(retained)
+
+
+def _pc_recovery_release_close_fence(
+    bindings: tuple[_PrivateControlRecoveryBinding, ...],
+) -> None:
+    global _PC_RECOVERY_RETAINED_CLOSE_FENCE
+    released = {id(binding) for binding in bindings}
+    _PC_RECOVERY_RETAINED_CLOSE_FENCE = tuple(
+        binding
+        for binding in _PC_RECOVERY_RETAINED_CLOSE_FENCE
+        if id(binding) not in released
+    )
+
+
+def _pc_recovery_require_no_close_fence() -> None:
+    if (
+        _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+        or _PC_RECOVERY_RETAINED_CLOSE_FENCE
+    ):
+        raise SyncError(
+            "recovery descriptor close remains uncertain; "
+            "restart the process before another recovery attempt"
+        )
+
+
+def _pc_recovery_bind_directory(
+    path: Path,
+    label: str,
+) -> _PrivateControlRecoveryBinding:
+    path = Path(os.path.abspath(path))
+    try:
+        path_metadata = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise SyncError(f"cannot inspect {label}: {path}: {error}") from error
+    if not stat.S_ISDIR(path_metadata.st_mode) or stat.S_ISLNK(path_metadata.st_mode):
+        raise SyncError(f"{label} must be a non-symlink directory: {path}")
+    try:
+        directory_fd = os.open(path, _source_directory_flags())
+        descriptor_metadata = os.fstat(directory_fd)
+    except OSError as error:
+        if "directory_fd" in locals():
+            os.close(directory_fd)
+        raise SyncError(f"cannot bind {label}: {path}: {error}") from error
+    if _pc_recovery_identity(path_metadata) != _pc_recovery_identity(
+        descriptor_metadata
+    ) or _pc_recovery_access(path_metadata) != _pc_recovery_access(descriptor_metadata):
+        os.close(directory_fd)
+        raise SyncError(f"{label} changed while binding it: {path}")
+    return _PrivateControlRecoveryBinding(
+        label=label,
+        path=path,
+        fd=directory_fd,
+        identity=_pc_recovery_identity(descriptor_metadata),
+        access=_pc_recovery_access(descriptor_metadata),
+    )
+
+
+def _pc_recovery_bind_child_directory(
+    parent: _PrivateControlRecoveryBinding,
+    name: str,
+    label: str,
+) -> _PrivateControlRecoveryBinding:
+    try:
+        path_metadata = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise _PrivateControlRecoveryInitialAbsence(
+            f"cannot inspect {label}: {parent.path / name}: {error}"
+        ) from error
+    except OSError as error:
+        raise SyncError(
+            f"cannot inspect {label}: {parent.path / name}: {error}"
+        ) from error
+    if not stat.S_ISDIR(path_metadata.st_mode) or stat.S_ISLNK(path_metadata.st_mode):
+        raise SyncError(
+            f"{label} must be a non-symlink directory: {parent.path / name}"
+        )
+    try:
+        directory_fd = os.open(name, _source_directory_flags(), dir_fd=parent.fd)
+        descriptor_metadata = os.fstat(directory_fd)
+    except OSError as error:
+        if "directory_fd" in locals():
+            os.close(directory_fd)
+        raise SyncError(
+            f"cannot bind {label}: {parent.path / name}: {error}"
+        ) from error
+    identity = _pc_recovery_identity(descriptor_metadata)
+    access = _pc_recovery_access(descriptor_metadata)
+    if (
+        _pc_recovery_identity(path_metadata) != identity
+        or _pc_recovery_access(path_metadata) != access
+    ):
+        os.close(directory_fd)
+        raise SyncError(f"{label} changed while binding it")
+    return _PrivateControlRecoveryBinding(
+        label=label,
+        path=parent.path / name,
+        fd=directory_fd,
+        identity=identity,
+        access=access,
+    )
+
+
+def _pc_recovery_revalidate_directory(
+    binding: _PrivateControlRecoveryBinding,
+) -> None:
+    try:
+        path_metadata = os.stat(binding.path, follow_symlinks=False)
+        descriptor_metadata = os.fstat(binding.fd)
+    except OSError as error:
+        raise SyncError(
+            f"{binding.label} became unavailable: {binding.path}: {error}"
+        ) from error
+    for metadata in (path_metadata, descriptor_metadata):
+        if _pc_recovery_identity(metadata) != binding.identity:
+            raise SyncError(f"{binding.label} was replaced")
+        if _pc_recovery_access(metadata) != binding.access:
+            raise SyncError(f"{binding.label} access policy changed")
+
+
+def _pc_recovery_fsync_directory(
+    binding: _PrivateControlRecoveryBinding,
+) -> None:
+    try:
+        os.fsync(binding.fd)
+    except OSError as error:
+        raise SyncError(f"cannot durably bind {binding.label}: {error}") from error
+    _pc_recovery_revalidate_directory(binding)
+
+
+def _pc_recovery_acquire_exclusive(
+    binding: _PrivateControlRecoveryBinding,
+) -> None:
+    try:
+        fcntl.flock(binding.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise SyncError(f"{binding.label} is busy") from error
+    except OSError as error:
+        raise SyncError(
+            f"cannot acquire exclusive {binding.label} lease: {error}"
+        ) from error
+    binding.locked = True
+
+
+def _pc_recovery_capacity_bytes(metadata: os.stat_result) -> int:
+    blocks = getattr(metadata, "st_blocks", 0)
+    if type(blocks) is not int or blocks < 0:
+        raise SyncError("filesystem returned an invalid allocated-byte count")
+    return blocks * 512
+
+
+def _pc_recovery_check_deadline(deadline: float, label: str) -> None:
+    if time.monotonic() > deadline:
+        raise SyncError(f"private-control recovery timed out while {label}")
+
+
+def _pc_recovery_write_all(
+    file_fd: int,
+    payload: bytes,
+    *,
+    label: str,
+) -> None:
+    deadline = time.monotonic() + MIRROR_PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS
+    remaining = memoryview(payload)
+    while remaining:
+        _pc_recovery_check_deadline(deadline, label)
+        written = os.write(file_fd, remaining)
+        if written <= 0:
+            raise OSError("private-control recovery write made no progress")
+        remaining = remaining[written:]
+
+
+def _pc_recovery_read_file(
+    parent_fd: int,
+    name: str,
+    path: Path,
+    expected: os.stat_result,
+    *,
+    deadline: float,
+    payload_limit: int | None,
+) -> tuple[int, str, bytes | None, os.stat_result]:
+    try:
+        file_fd = os.open(name, _source_regular_file_flags(), dir_fd=parent_fd)
+    except OSError as error:
+        raise SyncError(
+            f"cannot bind recovery evidence file {path}: {error}"
+        ) from error
+    try:
+        before = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or _pc_recovery_identity(before) != _pc_recovery_identity(expected)
+            or _pc_recovery_access(before) != _pc_recovery_access(expected)
+            or before.st_size != expected.st_size
+        ):
+            raise SyncError(f"recovery evidence file changed while binding: {path}")
+
+        if payload_limit is not None and before.st_size > payload_limit:
+            raise SyncError(
+                f"recovery evidence payload exceeds its capture limit: {path}"
+            )
+
+        def read_once(*, capture: bool) -> tuple[int, str, bytes | None]:
+            _pc_recovery_check_deadline(deadline, f"reading {path}")
+            os.lseek(file_fd, 0, os.SEEK_SET)
+            digest = hashlib.sha256()
+            payload = bytearray() if capture else None
+            size = 0
+            while size <= before.st_size:
+                _pc_recovery_check_deadline(deadline, f"reading {path}")
+                chunk = os.read(
+                    file_fd,
+                    min(1024 * 1024, before.st_size + 1 - size),
+                )
+                if not chunk:
+                    break
+                size += len(chunk)
+                digest.update(chunk)
+                if payload is not None:
+                    payload.extend(chunk)
+                    if payload_limit is None or len(payload) > payload_limit:
+                        raise SyncError(
+                            f"recovery evidence payload exceeds its capture limit: {path}"
+                        )
+            if size != before.st_size:
+                raise SyncError(f"recovery evidence file size changed: {path}")
+            return (
+                size,
+                digest.hexdigest(),
+                bytes(payload) if payload is not None else None,
+            )
+
+        first_size, first_digest, payload = read_once(capture=payload_limit is not None)
+        second_size, second_digest, _second_payload = read_once(capture=False)
+        after = os.fstat(file_fd)
+        final_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            first_size != second_size
+            or first_digest != second_digest
+            or _pc_recovery_identity(after) != _pc_recovery_identity(before)
+            or _pc_recovery_access(after) != _pc_recovery_access(before)
+            or after.st_size != before.st_size
+            or _pc_recovery_identity(final_path) != _pc_recovery_identity(before)
+            or _pc_recovery_access(final_path) != _pc_recovery_access(before)
+            or final_path.st_size != before.st_size
+        ):
+            raise SyncError(f"recovery evidence file changed while reading: {path}")
+        return first_size, first_digest, payload, after
+    except OSError as error:
+        raise SyncError(
+            f"cannot read recovery evidence file {path}: {error}"
+        ) from error
+    finally:
+        os.close(file_fd)
+
+
+def _pc_recovery_owner_pairs(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate owner field: {key}")
+        result[key] = value
+    return result
+
+
+def _pc_recovery_owner_candidate(relative_path: str) -> bool:
+    if "/" in relative_path or not relative_path.endswith(".owner.json"):
+        return False
+    private_name = relative_path[: -len(".owner.json")]
+    return MIRROR_PRIVATE_SNAPSHOT_RE.fullmatch(private_name) is not None
+
+
+def _pc_recovery_decode_owner(
+    relative_path: str,
+    payload: bytes,
+    access: tuple[int, int, int],
+) -> dict[str, object] | None:
+    if not _pc_recovery_owner_candidate(relative_path):
+        return None
+    private_name = relative_path[: -len(".owner.json")]
+    if len(payload) > MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES:
+        raise SyncError(
+            f"legacy owner payload exceeds {MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES} bytes: "
+            f"{relative_path}"
+        )
+    try:
+        record = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_pc_recovery_owner_pairs,
+            parse_int=_bounded_json_integer,
+            parse_constant=_reject_json_constant,
+        )
+    except (
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+        RecursionError,
+    ) as error:
+        raise SyncError(
+            f"legacy owner payload is invalid: {relative_path}: {error}"
+        ) from error
+    root_scope = _mirror_private_owner_record_root_scope(
+        record,
+        MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,
+    )
+    if not isinstance(record, dict) or root_scope not in {
+        "accepted-legacy",
+        "accepted-current",
+    }:
+        raise SyncError(
+            f"legacy owner payload root/schema is unsupported: {relative_path}"
+        )
+    private_identity = record.get("private_identity")
+    valid = (
+        type(record.get("owner_pid")) is int
+        and record["owner_pid"] > 0
+        and type(record.get("owner_uid")) is int
+        and record["owner_uid"] == os.geteuid()
+        and type(record.get("owner_gid")) is int
+        and record["owner_gid"] == os.getegid()
+        and isinstance(record.get("owner_nonce"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", record["owner_nonce"]) is not None
+        and isinstance(record.get("phase"), str)
+        and record["phase"] in MIRROR_PRIVATE_OWNER_RECORD_PHASES
+        and record.get("private_name") == private_name
+        and isinstance(private_identity, list)
+        and len(private_identity) == 3
+        and all(type(item) is int and item >= 0 for item in private_identity)
+        and access == (0o600, os.geteuid(), os.getegid())
+    )
+    if not valid:
+        raise SyncError(
+            f"legacy owner payload fields/policy are invalid: {relative_path}"
+        )
+    decoded = dict(record)
+    decoded["root_scope"] = root_scope
+    decoded["private_state"] = "unvalidated"
+    return decoded
+
+
+def _pc_recovery_protected_entry(entry: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in entry.items() if key != "allocated_bytes"}
+
+
+def _pc_recovery_scan_directory(
+    binding: _PrivateControlRecoveryBinding,
+    segment: str,
+    *,
+    deadline: float,
+    state: dict[str, int],
+) -> tuple[list[dict[str, object]], str]:
+    entries: list[dict[str, object]] = []
+
+    def scan(
+        directory_fd: int, relative_parent: str, depth: int
+    ) -> tuple[list[dict[str, object]], str]:
+        _pc_recovery_check_deadline(deadline, f"inventorying {binding.path}")
+        if depth > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_DEPTH:
+            raise SyncError("private-control recovery manifest exceeds its depth cap")
+        names: list[str] = []
+        collisions: dict[str, str] = {}
+        remaining = MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ENTRIES - state["entries"]
+        try:
+            with os.scandir(directory_fd) as iterator:
+                for item in iterator:
+                    _pc_recovery_check_deadline(
+                        deadline, f"inventorying {binding.path}"
+                    )
+                    name = item.name
+                    if (
+                        not isinstance(name, str)
+                        or name in {"", ".", ".."}
+                        or "/" in name
+                        or "\x00" in name
+                    ):
+                        raise SyncError(
+                            f"private-control recovery found an unsafe name: {name!r}"
+                        )
+                    try:
+                        name.encode("utf-8", "strict")
+                    except UnicodeEncodeError as error:
+                        raise SyncError(
+                            f"private-control recovery name is not strict UTF-8: {name!r}"
+                        ) from error
+                    collision_key = unicodedata.normalize("NFC", name).casefold()
+                    prior = collisions.get(collision_key)
+                    if prior is not None and prior != name:
+                        raise SyncError(
+                            "private-control recovery found a portable name alias: "
+                            f"{prior!r} and {name!r}"
+                        )
+                    collisions[collision_key] = name
+                    names.append(name)
+                    if len(names) > remaining:
+                        raise SyncError(
+                            "private-control recovery manifest exceeds its entry cap"
+                        )
+        except OSError as error:
+            raise SyncError(
+                f"cannot inventory recovery evidence directory {binding.path}: {error}"
+            ) from error
+        names.sort()
+        reserved_paths: list[tuple[str, str]] = []
+        for name in names:
+            relative_path = name if not relative_parent else f"{relative_parent}/{name}"
+            byte_count = len(relative_path.encode("utf-8"))
+            if (
+                state["path_bytes"] + byte_count
+                > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PATH_BYTES
+            ):
+                raise SyncError(
+                    "private-control recovery manifest exceeds its path-byte cap"
+                )
+            state["path_bytes"] += byte_count
+            state["entries"] += 1
+            reserved_paths.append((name, relative_path))
+        local: list[dict[str, object]] = []
+        for name, relative_path in reserved_paths:
+            _pc_recovery_check_deadline(deadline, f"inventorying {relative_path}")
+            try:
+                path_metadata = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise SyncError(
+                    f"cannot inspect recovery evidence {relative_path}: {error}"
+                ) from error
+            identity = _pc_recovery_identity(path_metadata)
+            is_regular_file = stat.S_ISREG(path_metadata.st_mode)
+            is_directory = stat.S_ISDIR(path_metadata.st_mode)
+            if not is_regular_file and not is_directory:
+                raise SyncError(
+                    "private-control recovery rejects symlink/special evidence: "
+                    f"{segment}/{relative_path}"
+                )
+            access = _pc_recovery_access(path_metadata)
+            if access[1] != os.geteuid() or access[0] & 0o022:
+                raise SyncError(
+                    "recovery evidence owner/access policy is unsafe: "
+                    f"{segment}/{relative_path}"
+                )
+            allocated = _pc_recovery_capacity_bytes(path_metadata)
+            if (
+                state["allocated_bytes"] + allocated
+                > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ALLOCATED_BYTES
+            ):
+                raise SyncError(
+                    "private-control recovery manifest exceeds its allocated-byte cap"
+                )
+            state["allocated_bytes"] += allocated
+            if is_regular_file:
+                if path_metadata.st_nlink != 1:
+                    raise SyncError(
+                        "private-control recovery rejects a hard-link alias: "
+                        f"{segment}/{relative_path}"
+                    )
+                if path_metadata.st_size < 0 or (
+                    state["logical_bytes"] + path_metadata.st_size
+                    > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_LOGICAL_BYTES
+                ):
+                    raise SyncError(
+                        "private-control recovery manifest exceeds its logical-byte cap"
+                    )
+                owner_candidate = segment == "tool-root" and (
+                    _pc_recovery_owner_candidate(relative_path)
+                )
+                if (
+                    owner_candidate
+                    and path_metadata.st_size > MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES
+                ):
+                    raise SyncError(
+                        "legacy owner payload exceeds "
+                        f"{MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES} bytes: {relative_path}"
+                    )
+                size, digest, payload, final_metadata = _pc_recovery_read_file(
+                    directory_fd,
+                    name,
+                    binding.path / relative_path,
+                    path_metadata,
+                    deadline=deadline,
+                    payload_limit=(
+                        MAX_MIRROR_PRIVATE_OWNER_RECORD_BYTES
+                        if owner_candidate
+                        else None
+                    ),
+                )
+                state["logical_bytes"] += size
+                owner = (
+                    _pc_recovery_decode_owner(relative_path, payload, access)
+                    if owner_candidate and payload is not None
+                    else None
+                )
+                record: dict[str, object] = {
+                    "access": _pc_recovery_access_document(access),
+                    "allocated_bytes": allocated,
+                    "identity": _pc_recovery_identity_document(identity),
+                    "locator": {"path": relative_path, "segment": segment},
+                    "owner": owner,
+                    "sha256": digest,
+                    "size": size,
+                    "type": "regular-file",
+                }
+                if _pc_recovery_identity(final_metadata) != identity:
+                    raise SyncError(
+                        f"recovery evidence identity changed: {segment}/{relative_path}"
+                    )
+            elif is_directory:
+                child_fd = -1
+                try:
+                    child_fd = os.open(
+                        name, _source_directory_flags(), dir_fd=directory_fd
+                    )
+                    child_metadata = os.fstat(child_fd)
+                except OSError as error:
+                    if child_fd >= 0:
+                        os.close(child_fd)
+                    raise SyncError(
+                        f"cannot bind recovery evidence directory {relative_path}: {error}"
+                    ) from error
+                try:
+                    if (
+                        _pc_recovery_identity(child_metadata) != identity
+                        or _pc_recovery_access(child_metadata) != access
+                    ):
+                        raise SyncError(
+                            f"recovery evidence directory changed: {relative_path}"
+                        )
+                    descendants, directory_digest = scan(
+                        child_fd,
+                        relative_path,
+                        depth + 1,
+                    )
+                    try:
+                        final_path = os.stat(
+                            name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError as error:
+                        raise SyncError(
+                            "recovery evidence directory is missing during "
+                            f"final revalidation: {segment}/{relative_path}"
+                        ) from error
+                    except OSError as error:
+                        raise SyncError(
+                            "cannot revalidate recovery evidence directory path "
+                            f"{segment}/{relative_path}: {error}"
+                        ) from error
+                    try:
+                        final_descriptor = os.fstat(child_fd)
+                    except OSError as error:
+                        raise SyncError(
+                            "cannot revalidate recovery evidence directory "
+                            f"descriptor {segment}/{relative_path}: {error}"
+                        ) from error
+                    for metadata in (final_path, final_descriptor):
+                        if (
+                            _pc_recovery_identity(metadata) != identity
+                            or _pc_recovery_access(metadata) != access
+                        ):
+                            raise SyncError(
+                                "recovery evidence directory identity/access changed: "
+                                f"{relative_path}"
+                            )
+                finally:
+                    os.close(child_fd)
+                record = {
+                    "access": _pc_recovery_access_document(access),
+                    "allocated_bytes": allocated,
+                    "identity": _pc_recovery_identity_document(identity),
+                    "locator": {"path": relative_path, "segment": segment},
+                    "owner": None,
+                    "sha256": directory_digest,
+                    "size": 0,
+                    "type": "directory",
+                }
+                local.extend(descendants)
+            else:
+                raise SyncError(
+                    "private-control recovery rejects symlink/special evidence: "
+                    f"{segment}/{relative_path}"
+                )
+            local.append(record)
+        protected_children = [
+            _pc_recovery_protected_entry(item)
+            for item in sorted(
+                local,
+                key=lambda item: (
+                    str(item["locator"]["segment"]),
+                    str(item["locator"]["path"]),
+                ),
+            )
+            if str(item["locator"]["path"]).count("/")
+            == relative_parent.count("/") + (1 if relative_parent else 0)
+        ]
+        return local, _pc_recovery_digest(protected_children)
+
+    entries, root_digest = scan(binding.fd, "", 1)
+    entries.sort(
+        key=lambda item: (
+            str(item["locator"]["segment"]),
+            str(item["locator"]["path"]),
+        )
+    )
+    return entries, root_digest
+
+
+def _pc_recovery_validate_owner_links(entries: list[dict[str, object]]) -> None:
+    by_locator = {
+        (str(entry["locator"]["segment"]), str(entry["locator"]["path"])): entry
+        for entry in entries
+    }
+    for entry in entries:
+        owner = entry.get("owner")
+        if not isinstance(owner, dict):
+            continue
+        private_name = owner.get("private_name")
+        expected_identity = owner.get("private_identity")
+        private_entry = by_locator.get(("tool-root", str(private_name)))
+        if private_entry is None:
+            owner["private_state"] = "missing"
+            continue
+        observed_identity = private_entry.get("identity")
+        expected_document = {
+            "dev": expected_identity[0],
+            "ino": expected_identity[1],
+            "type": expected_identity[2],
+        }
+        if (
+            private_entry.get("type") != "directory"
+            or observed_identity != expected_document
+        ):
+            raise SyncError(
+                "legacy owner payload aliases or mismatches its private directory: "
+                f"{entry['locator']['path']}"
+            )
+        owner["private_state"] = "matching"
+
+
+def _pc_recovery_directory_is_at_or_below(
+    candidate_fd: int,
+    ancestor_identity: tuple[int, int, int],
+) -> bool:
+    return _mirror_directory_is_at_or_below(
+        candidate_fd,
+        ancestor_identity,
+        label="private-control recovery directory",
+    )
+
+
+def _pc_recovery_validate_topology(
+    parent: _PrivateControlRecoveryBinding,
+    tool: _PrivateControlRecoveryBinding,
+    quarantine: _PrivateControlRecoveryBinding,
+    primary_parent: _PrivateControlRecoveryBinding | None = None,
+) -> None:
+    identities = {parent.identity, tool.identity, quarantine.identity}
+    if len(identities) != 3:
+        raise SyncError("private-control recovery root roles alias")
+    if tool.identity[0] != quarantine.identity[0]:
+        raise SyncError(
+            "private-control recovery tool and quarantine roots cross filesystems"
+        )
+    for child in (tool, quarantine):
+        if not _pc_recovery_directory_is_at_or_below(
+            child.fd, parent.identity
+        ) or _pc_recovery_directory_is_at_or_below(parent.fd, child.identity):
+            raise SyncError(f"{child.label} is not a strict child of the legacy parent")
+    if _pc_recovery_directory_is_at_or_below(tool.fd, quarantine.identity) or (
+        _pc_recovery_directory_is_at_or_below(quarantine.fd, tool.identity)
+    ):
+        raise SyncError("private-control recovery fixed roots overlap")
+    if primary_parent is not None:
+        if primary_parent.identity in identities:
+            raise SyncError("primary and legacy private-control roots alias")
+        for legacy in (parent, tool, quarantine):
+            if _pc_recovery_directory_is_at_or_below(
+                legacy.fd,
+                primary_parent.identity,
+            ) or _pc_recovery_directory_is_at_or_below(
+                primary_parent.fd,
+                legacy.identity,
+            ):
+                raise SyncError("primary and legacy private-control roots overlap")
+
+
+def _pc_recovery_existing_primary_parent(
+    primary_spec: MirrorPrivateControlRootSpec,
+) -> _PrivateControlRecoveryBinding | None:
+    assert primary_spec.account_home is not None
+    home = _pc_recovery_bind_trusted_home(primary_spec.account_home)
+    binding: _PrivateControlRecoveryBinding | None = None
+    try:
+        try:
+            binding = _pc_recovery_bind_child_directory(
+                home,
+                MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME,
+                f"primary private-control parent [{primary_spec.root_id}]",
+            )
+        except _PrivateControlRecoveryInitialAbsence:
+            _pc_recovery_revalidate_directory(home)
+            _pc_recovery_close_bindings((home,))
+            return None
+        if binding.access[0] != 0o700 or binding.access[1] != os.geteuid():
+            raise SyncError(
+                "primary private-control parent must be mode 0700 and current-owned"
+            )
+        _pc_recovery_revalidate_directory(home)
+        _pc_recovery_revalidate_directory(binding)
+        _pc_recovery_close_bindings((home,))
+        return binding
+    except BaseException as error:
+        try:
+            _pc_recovery_close_bindings((binding, home))
+        except SyncError as cleanup_error:
+            raise SyncError(
+                f"{error}; secondary primary-parent lookup cleanup failure: "
+                f"{cleanup_error}"
+            ) from error
+        raise
+
+
+def _pc_recovery_bind_legacy(
+    requested_root_id: str,
+    *,
+    exclusive: bool,
+) -> tuple[
+    MirrorPrivateControlRootSpec,
+    MirrorPrivateControlRootSpec,
+    _PrivateControlRecoveryBinding,
+    _PrivateControlRecoveryBinding,
+    _PrivateControlRecoveryBinding,
+    _PrivateControlRecoveryBinding | None,
+]:
+    primary_spec, legacy_spec = _pc_recovery_specs(requested_root_id)
+    parent: _PrivateControlRecoveryBinding | None = None
+    tool: _PrivateControlRecoveryBinding | None = None
+    quarantine: _PrivateControlRecoveryBinding | None = None
+    primary_parent: _PrivateControlRecoveryBinding | None = None
+    try:
+        parent = _pc_recovery_bind_directory(
+            legacy_spec.parent_path,
+            f"legacy private-control parent [{legacy_spec.root_id}]",
+        )
+        if not _mirror_legacy_shared_parent_policy_is_valid(parent.access):
+            raise SyncError(
+                "legacy private-control parent must be root-owned mode 1777"
+            )
+        tool = _pc_recovery_bind_child_directory(
+            parent,
+            MIRROR_PRIVATE_TOOL_ROOT_NAME,
+            f"legacy private-control tool root [{legacy_spec.root_id}]",
+        )
+        if tool.access[0] != 0o700 or tool.access[1] != os.geteuid():
+            raise SyncError(
+                "legacy private-control tool root must be mode 0700 and "
+                "current uid owned"
+            )
+        if exclusive:
+            _pc_recovery_acquire_exclusive(tool)
+        quarantine = _pc_recovery_bind_child_directory(
+            parent,
+            MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+            f"legacy private-control quarantine [{legacy_spec.root_id}]",
+        )
+        if quarantine.access[0] != 0o700 or quarantine.access[1] != os.geteuid():
+            raise SyncError(
+                "legacy private-control quarantine must be mode 0700 and "
+                "current uid owned"
+            )
+        if exclusive:
+            _pc_recovery_acquire_exclusive(quarantine)
+        primary_parent = _pc_recovery_existing_primary_parent(primary_spec)
+        _pc_recovery_validate_topology(
+            parent,
+            tool,
+            quarantine,
+            primary_parent,
+        )
+        for binding in (parent, tool, quarantine):
+            _pc_recovery_revalidate_directory(binding)
+        return (
+            primary_spec,
+            legacy_spec,
+            parent,
+            tool,
+            quarantine,
+            primary_parent,
+        )
+    except BaseException as error:
+        try:
+            _pc_recovery_close_bindings((primary_parent, quarantine, tool, parent))
+        except SyncError as cleanup_error:
+            raise SyncError(
+                f"{error}; secondary recovery bind cleanup failure: {cleanup_error}"
+            ) from error
+        raise
+
+
+def _pc_recovery_caps_document() -> dict[str, int | float]:
+    return {
+        "max_allocated_bytes": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ALLOCATED_BYTES,
+        "max_depth": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_DEPTH,
+        "max_entries": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ENTRIES,
+        "max_logical_bytes": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_LOGICAL_BYTES,
+        "max_pending_bytes": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES,
+        "max_pending_entries": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES,
+        "max_path_bytes": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PATH_BYTES,
+        "max_receipt_bytes": MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES,
+        "timeout_seconds": MIRROR_PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS,
+    }
+
+
+def _pc_recovery_manifest(
+    parent: _PrivateControlRecoveryBinding,
+    tool: _PrivateControlRecoveryBinding,
+    quarantine: _PrivateControlRecoveryBinding,
+) -> dict[str, object]:
+    deadline = time.monotonic() + MIRROR_PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS
+    state = {
+        "allocated_bytes": 0,
+        "entries": 0,
+        "logical_bytes": 0,
+        "path_bytes": 0,
+    }
+    for binding in (tool, quarantine):
+        metadata = os.fstat(binding.fd)
+        allocated = _pc_recovery_capacity_bytes(metadata)
+        if (
+            state["allocated_bytes"] + allocated
+            > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ALLOCATED_BYTES
+        ):
+            raise SyncError(
+                "private-control recovery roots exceed the allocated-byte cap"
+            )
+        state["allocated_bytes"] += allocated
+    tool_entries, tool_digest = _pc_recovery_scan_directory(
+        tool,
+        "tool-root",
+        deadline=deadline,
+        state=state,
+    )
+    quarantine_entries, quarantine_digest = _pc_recovery_scan_directory(
+        quarantine,
+        "quarantine",
+        deadline=deadline,
+        state=state,
+    )
+    entries = sorted(
+        [*tool_entries, *quarantine_entries],
+        key=lambda item: (
+            str(item["locator"]["segment"]),
+            str(item["locator"]["path"]),
+        ),
+    )
+    _pc_recovery_validate_owner_links(entries)
+    seen_identities = {parent.identity, tool.identity, quarantine.identity}
+    for entry in entries:
+        identity_document = entry["identity"]
+        identity = (
+            identity_document["dev"],
+            identity_document["ino"],
+            identity_document["type"],
+        )
+        if identity in seen_identities:
+            raise SyncError(
+                "private-control recovery manifest contains an object alias: "
+                f"{entry['locator']['segment']}/{entry['locator']['path']}"
+            )
+        seen_identities.add(identity)
+    roots = {
+        "parent": _pc_recovery_record(parent.identity, parent.access),
+        "quarantine": _pc_recovery_record(quarantine.identity, quarantine.access),
+        "tool_root": _pc_recovery_record(tool.identity, tool.access),
+    }
+    protected = {
+        "entries": [_pc_recovery_protected_entry(entry) for entry in entries],
+        "roots": roots,
+        "tree_digests": {
+            "quarantine": quarantine_digest,
+            "tool_root": tool_digest,
+        },
+    }
+    return {
+        "allocated_bytes": state["allocated_bytes"],
+        "digest": _pc_recovery_digest(protected),
+        "entries": entries,
+        "entry_count": state["entries"],
+        "logical_bytes": state["logical_bytes"],
+        "path_bytes": state["path_bytes"],
+        "tree_digests": protected["tree_digests"],
+    }
+
+
+def _pc_recovery_plan_from_bindings(
+    primary_spec: MirrorPrivateControlRootSpec,
+    legacy_spec: MirrorPrivateControlRootSpec,
+    parent: _PrivateControlRecoveryBinding,
+    tool: _PrivateControlRecoveryBinding,
+    quarantine: _PrivateControlRecoveryBinding,
+) -> dict[str, object]:
+    inventory = _pc_recovery_manifest(parent, tool, quarantine)
+    primary_parent = Path(os.path.abspath(primary_spec.parent_path))
+    legacy_parent = Path(os.path.abspath(legacy_spec.parent_path))
+    plan: dict[str, object] = {
+        "caps": _pc_recovery_caps_document(),
+        "contract": MIRROR_PRIVATE_CONTROL_RECOVERY_CONTRACT,
+        "disposition": MIRROR_PRIVATE_CONTROL_RECOVERY_DISPOSITION,
+        "inventory": inventory,
+        "leases": [
+            {
+                "mode": MIRROR_PRIVATE_CONTROL_RECOVERY_LOCK_MODE,
+                "order": order,
+                "role": role,
+            }
+            for order, role in enumerate(MIRROR_PRIVATE_CONTROL_RECOVERY_LOCK_ORDER)
+        ],
+        "paths": {
+            "parent": str(legacy_parent),
+            "primary_marker": str(
+                primary_parent / MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+            ),
+            "primary_parent": str(primary_parent),
+            "primary_receipt": str(
+                primary_parent / MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+            ),
+            "quarantine": str(legacy_parent / MIRROR_DURABLE_QUARANTINE_ROOT_NAME),
+            "tool_root": str(legacy_parent / MIRROR_PRIVATE_TOOL_ROOT_NAME),
+        },
+        "primary_root_id": primary_spec.root_id,
+        "root_id": legacy_spec.root_id,
+        "roots": {
+            "parent": _pc_recovery_record(parent.identity, parent.access),
+            "quarantine": _pc_recovery_record(
+                quarantine.identity,
+                quarantine.access,
+            ),
+            "tool_root": _pc_recovery_record(tool.identity, tool.access),
+        },
+        "segment_locator": {
+            "parent_path": str(legacy_parent),
+            "quarantine_name": MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+            "root_id": legacy_spec.root_id,
+            "tool_root_name": MIRROR_PRIVATE_TOOL_ROOT_NAME,
+        },
+        "version": MIRROR_PRIVATE_CONTROL_RECOVERY_VERSION,
+    }
+    plan["plan_digest"] = _pc_recovery_digest(_pc_recovery_protected_plan(plan))
+    return plan
+
+
+def _pc_recovery_protected_plan(plan: dict[str, object]) -> dict[str, object]:
+    protected = dict(plan)
+    protected.pop("plan_digest", None)
+    inventory = protected.get("inventory")
+    if isinstance(inventory, dict):
+        clean_inventory = dict(inventory)
+        clean_inventory.pop("allocated_bytes", None)
+        entries = clean_inventory.get("entries")
+        if isinstance(entries, list):
+            clean_inventory["entries"] = [
+                _pc_recovery_protected_entry(entry)
+                if isinstance(entry, dict)
+                else entry
+                for entry in entries
+            ]
+        protected["inventory"] = clean_inventory
+    return protected
+
+
+def _pc_recovery_expected_paths(
+    primary_spec: MirrorPrivateControlRootSpec,
+    legacy_spec: MirrorPrivateControlRootSpec,
+) -> dict[str, str]:
+    primary_parent = Path(os.path.abspath(primary_spec.parent_path))
+    legacy_parent = Path(os.path.abspath(legacy_spec.parent_path))
+    return {
+        "parent": str(legacy_parent),
+        "primary_marker": str(
+            primary_parent / MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME
+        ),
+        "primary_parent": str(primary_parent),
+        "primary_receipt": str(
+            primary_parent / MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME
+        ),
+        "quarantine": str(legacy_parent / MIRROR_DURABLE_QUARANTINE_ROOT_NAME),
+        "tool_root": str(legacy_parent / MIRROR_PRIVATE_TOOL_ROOT_NAME),
+    }
+
+
+def _pc_recovery_validate_plan_document(
+    raw: object,
+) -> dict[str, object]:
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != _MIRROR_PRIVATE_CONTROL_RECOVERY_PLAN_FIELDS
+    ):
+        raise SyncError("private-control recovery plan schema is invalid")
+    plan = raw
+    primary_spec, legacy_spec = _pc_recovery_specs(str(plan.get("root_id")))
+    digest = plan.get("plan_digest")
+    expected_leases = [
+        {
+            "mode": MIRROR_PRIVATE_CONTROL_RECOVERY_LOCK_MODE,
+            "order": order,
+            "role": role,
+        }
+        for order, role in enumerate(MIRROR_PRIVATE_CONTROL_RECOVERY_LOCK_ORDER)
+    ]
+    expected_segment = {
+        "parent_path": str(Path(os.path.abspath(legacy_spec.parent_path))),
+        "quarantine_name": MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+        "root_id": legacy_spec.root_id,
+        "tool_root_name": MIRROR_PRIVATE_TOOL_ROOT_NAME,
+    }
+    if (
+        plan.get("contract") != MIRROR_PRIVATE_CONTROL_RECOVERY_CONTRACT
+        or type(plan.get("version")) is not int
+        or plan["version"] != MIRROR_PRIVATE_CONTROL_RECOVERY_VERSION
+        or plan.get("disposition") != MIRROR_PRIVATE_CONTROL_RECOVERY_DISPOSITION
+        or plan.get("primary_root_id") != primary_spec.root_id
+        or not _pc_recovery_canonical_documents_equal(
+            plan.get("paths"),
+            _pc_recovery_expected_paths(primary_spec, legacy_spec),
+        )
+        or not _pc_recovery_canonical_documents_equal(
+            plan.get("caps"),
+            _pc_recovery_caps_document(),
+        )
+        or not _pc_recovery_canonical_documents_equal(
+            plan.get("leases"),
+            expected_leases,
+        )
+        or not _pc_recovery_canonical_documents_equal(
+            plan.get("segment_locator"),
+            expected_segment,
+        )
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or digest != _pc_recovery_digest(_pc_recovery_protected_plan(plan))
+    ):
+        raise SyncError("private-control recovery plan contract is invalid")
+    inventory = plan.get("inventory")
+    roots = plan.get("roots")
+    if not isinstance(inventory, dict) or set(inventory) != {
+        "allocated_bytes",
+        "digest",
+        "entries",
+        "entry_count",
+        "logical_bytes",
+        "path_bytes",
+        "tree_digests",
+    }:
+        raise SyncError("private-control recovery inventory schema is invalid")
+    entries = inventory.get("entries")
+    if (
+        not isinstance(entries, list)
+        or not isinstance(roots, dict)
+        or set(roots) != {"parent", "quarantine", "tool_root"}
+        or not all(
+            _pc_recovery_record_document_is_valid(
+                roots.get(role),
+                expected_type=stat.S_IFDIR,
+            )
+            for role in ("parent", "quarantine", "tool_root")
+        )
+    ):
+        raise SyncError("private-control recovery inventory is invalid")
+    tree_digests = inventory.get("tree_digests")
+    if (
+        not isinstance(inventory.get("digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", inventory["digest"]) is None
+        or not isinstance(tree_digests, dict)
+        or set(tree_digests) != {"quarantine", "tool_root"}
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in tree_digests.values()
+        )
+    ):
+        raise SyncError("private-control recovery inventory digests are invalid")
+    numeric_limits = (
+        (inventory.get("entry_count"), MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ENTRIES),
+        (
+            inventory.get("logical_bytes"),
+            MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_LOGICAL_BYTES,
+        ),
+        (
+            inventory.get("allocated_bytes"),
+            MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ALLOCATED_BYTES,
+        ),
+        (inventory.get("path_bytes"), MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PATH_BYTES),
+    )
+    if any(
+        type(value) is not int or value < 0 or value > limit
+        for value, limit in numeric_limits
+    ):
+        raise SyncError("private-control recovery inventory exceeds its caps")
+    if inventory.get("entry_count") != len(entries):
+        raise SyncError("private-control recovery entry count is inconsistent")
+    locators: list[tuple[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {
+            "access",
+            "allocated_bytes",
+            "identity",
+            "locator",
+            "owner",
+            "sha256",
+            "size",
+            "type",
+        }:
+            raise SyncError("private-control recovery entry schema is invalid")
+        locator = entry.get("locator")
+        if (
+            not isinstance(locator, dict)
+            or set(locator) != {"path", "segment"}
+            or locator.get("segment") not in {"tool-root", "quarantine"}
+            or not isinstance(locator.get("path"), str)
+            or not locator["path"]
+        ):
+            raise SyncError("private-control recovery entry locator is invalid")
+        locators.append((locator["segment"], locator["path"]))
+        entry_type = entry.get("type")
+        expected_entry_type = (
+            stat.S_IFDIR if entry_type == "directory" else stat.S_IFREG
+        )
+        if (
+            entry_type not in {"directory", "regular-file"}
+            or type(entry.get("size")) is not int
+            or entry["size"] < 0
+            or type(entry.get("allocated_bytes")) is not int
+            or entry["allocated_bytes"] < 0
+            or not isinstance(entry.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+            or not _pc_recovery_record_document_is_valid(
+                {
+                    "access": entry.get("access"),
+                    "identity": entry.get("identity"),
+                },
+                expected_type=expected_entry_type,
+            )
+            or not _pc_recovery_owner_document_is_valid(entry.get("owner"))
+            or (
+                entry.get("owner") is not None
+                and (
+                    entry_type != "regular-file"
+                    or locator.get("segment") != "tool-root"
+                )
+            )
+        ):
+            raise SyncError("private-control recovery entry fields are invalid")
+    if locators != sorted(locators) or len(locators) != len(set(locators)):
+        raise SyncError("private-control recovery entries are not uniquely sorted")
+    _pc_recovery_validate_primary_receipt_capacity(plan)
+    return plan
+
+
+def _pc_recovery_path_is_at_or_below(candidate: Path, root: Path) -> bool:
+    try:
+        return os.path.commonpath((str(candidate), str(root))) == str(root)
+    except ValueError:
+        return False
+
+
+def _pc_recovery_external_plan_path(
+    path: Path,
+    requested_root_id: str,
+) -> Path:
+    primary_spec, legacy_spec = _pc_recovery_specs(requested_root_id)
+    candidate = Path(os.path.abspath(path))
+    for protected in (
+        Path(os.path.abspath(primary_spec.parent_path)),
+        Path(os.path.abspath(legacy_spec.parent_path)) / MIRROR_PRIVATE_TOOL_ROOT_NAME,
+        Path(os.path.abspath(legacy_spec.parent_path))
+        / MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+    ):
+        if _pc_recovery_path_is_at_or_below(candidate, protected):
+            raise SyncError(
+                "external recovery plan must be outside private-control roots"
+            )
+    return candidate
+
+
+def _pc_recovery_bind_external_plan_parent(
+    path: Path,
+) -> _PrivateControlRecoveryBinding:
+    path = Path(os.path.abspath(path))
+    parent_path = path.parent
+    if path == Path("/") or not path.name:
+        raise SyncError("external recovery plan path must name a file")
+    components = parent_path.parts[1:]
+    if len(components) > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_DEPTH:
+        raise SyncError("external recovery plan parent exceeds its depth cap")
+    current_path = Path("/")
+    try:
+        current_fd = os.open(current_path, _source_directory_flags())
+    except OSError as error:
+        raise SyncError(f"cannot bind external recovery plan root: {error}") from error
+    try:
+        for component in components:
+            child_fd = -1
+            try:
+                path_metadata = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(path_metadata.st_mode) or stat.S_ISLNK(
+                    path_metadata.st_mode
+                ):
+                    raise SyncError(
+                        "external recovery plan parent contains a symlink or "
+                        f"non-directory: {current_path / component}"
+                    )
+                child_fd = os.open(
+                    component, _source_directory_flags(), dir_fd=current_fd
+                )
+                descriptor_metadata = os.fstat(child_fd)
+                if _pc_recovery_identity(descriptor_metadata) != _pc_recovery_identity(
+                    path_metadata
+                ) or _pc_recovery_access(descriptor_metadata) != _pc_recovery_access(
+                    path_metadata
+                ):
+                    raise SyncError(
+                        "external recovery plan parent changed while binding: "
+                        f"{current_path / component}"
+                    )
+            except BaseException:
+                if child_fd >= 0:
+                    os.close(child_fd)
+                raise
+            os.close(current_fd)
+            current_fd = child_fd
+            current_path /= component
+        metadata = os.fstat(current_fd)
+        result = _PrivateControlRecoveryBinding(
+            label="external recovery plan parent",
+            path=parent_path,
+            fd=current_fd,
+            identity=_pc_recovery_identity(metadata),
+            access=_pc_recovery_access(metadata),
+        )
+        current_fd = -1
+        return result
+    except OSError as error:
+        raise SyncError(
+            f"cannot bind external recovery plan parent {parent_path}: {error}"
+        ) from error
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+
+
+def _pc_recovery_reject_plan_parent_overlap(
+    parent: _PrivateControlRecoveryBinding,
+    protected_bindings: tuple[_PrivateControlRecoveryBinding | None, ...],
+) -> None:
+    for protected in protected_bindings:
+        if protected is None:
+            continue
+        if (
+            parent.identity == protected.identity
+            or _pc_recovery_directory_is_at_or_below(
+                parent.fd,
+                protected.identity,
+            )
+        ):
+            raise SyncError(
+                "external recovery plan parent overlaps a private-control root"
+            )
+
+
+def _pc_recovery_write_plan(
+    path: Path,
+    plan: dict[str, object],
+    protected_bindings: tuple[_PrivateControlRecoveryBinding | None, ...],
+) -> None:
+    payload = _pc_recovery_json_bytes(plan, pretty=True)
+    if len(payload) > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+        raise SyncError("private-control recovery plan exceeds its byte cap")
+    _pc_recovery_validate_primary_receipt_capacity(plan)
+    parent = _pc_recovery_bind_external_plan_parent(path)
+    try:
+        _pc_recovery_reject_plan_parent_overlap(parent, protected_bindings)
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            file_fd = os.open(path.name, flags, 0o600, dir_fd=parent.fd)
+        except OSError as error:
+            raise SyncError(f"cannot create recovery plan {path}: {error}") from error
+        try:
+            _pc_recovery_write_all(
+                file_fd,
+                payload,
+                label=f"writing recovery plan {path}",
+            )
+            os.fchmod(file_fd, 0o600)
+            os.fsync(file_fd)
+            metadata = os.fstat(file_fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or _pc_recovery_access(metadata) != (0o600, os.geteuid(), os.getegid())
+                or metadata.st_size != len(payload)
+            ):
+                raise SyncError("published recovery plan access/content is invalid")
+        except OSError as error:
+            raise SyncError(f"cannot write recovery plan {path}: {error}") from error
+        finally:
+            os.close(file_fd)
+        try:
+            os.fsync(parent.fd)
+            _pc_recovery_revalidate_directory(parent)
+        except OSError as error:
+            raise SyncError(
+                f"cannot durably publish recovery plan {path}: {error}"
+            ) from error
+    finally:
+        _pc_recovery_close_bindings((parent,))
+
+
+def _pc_recovery_read_external_plan(
+    path: Path,
+    requested_root_id: str,
+) -> dict[str, object]:
+    path = _pc_recovery_external_plan_path(path, requested_root_id)
+    parent = _pc_recovery_bind_external_plan_parent(path)
+    file_fd = -1
+    try:
+        try:
+            path_metadata = os.stat(
+                path.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(path_metadata.st_mode) or stat.S_ISLNK(
+                path_metadata.st_mode
+            ):
+                raise SyncError("recovery plan must be a non-symlink regular file")
+            if (
+                path_metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(path_metadata.st_mode) & 0o022
+                or path_metadata.st_size
+                > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+            ):
+                raise SyncError("recovery plan owner/access/size is invalid")
+            file_fd = os.open(path.name, _source_regular_file_flags(), dir_fd=parent.fd)
+        except OSError as error:
+            raise SyncError(f"cannot bind recovery plan {path}: {error}") from error
+        descriptor_metadata = os.fstat(file_fd)
+        if _pc_recovery_identity(descriptor_metadata) != _pc_recovery_identity(
+            path_metadata
+        ) or _pc_recovery_access(descriptor_metadata) != _pc_recovery_access(
+            path_metadata
+        ):
+            raise SyncError("recovery plan changed while binding it")
+
+        def read_once() -> bytes:
+            os.lseek(file_fd, 0, os.SEEK_SET)
+            payload = bytearray()
+            while len(payload) <= MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+                chunk = os.read(
+                    file_fd,
+                    min(
+                        1024 * 1024,
+                        MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+                        + 1
+                        - len(payload),
+                    ),
+                )
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+                raise SyncError("recovery plan exceeds its byte cap")
+            return bytes(payload)
+
+        first = read_once()
+        second = read_once()
+        final_descriptor = os.fstat(file_fd)
+        final_path = os.stat(
+            path.name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        if (
+            first != second
+            or _pc_recovery_identity(final_descriptor)
+            != _pc_recovery_identity(descriptor_metadata)
+            or _pc_recovery_access(final_descriptor)
+            != _pc_recovery_access(descriptor_metadata)
+            or final_descriptor.st_size != descriptor_metadata.st_size
+            or _pc_recovery_identity(final_path)
+            != _pc_recovery_identity(descriptor_metadata)
+            or _pc_recovery_access(final_path)
+            != _pc_recovery_access(descriptor_metadata)
+        ):
+            raise SyncError("recovery plan changed while reading it")
+        _pc_recovery_revalidate_directory(parent)
+    except OSError as error:
+        raise SyncError(f"cannot read recovery plan {path}: {error}") from error
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        _pc_recovery_close_bindings((parent,))
+    try:
+        raw = json.loads(
+            first.decode("utf-8"),
+            object_pairs_hook=_pc_recovery_owner_pairs,
+            parse_int=_bounded_json_integer,
+            parse_constant=_reject_json_constant,
+        )
+    except (
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+        RecursionError,
+    ) as error:
+        raise SyncError(f"recovery plan JSON is invalid: {error}") from error
+    return _pc_recovery_validate_plan_document(raw)
+
+
+def plan_private_control_recovery(
+    requested_root_id: str,
+    output_receipt: Path,
+) -> dict[str, object]:
+    _pc_recovery_require_no_close_fence()
+    output_path = _pc_recovery_external_plan_path(
+        output_receipt,
+        requested_root_id,
+    )
+    bindings: tuple[_PrivateControlRecoveryBinding | None, ...] = ()
+    try:
+        (
+            primary_spec,
+            legacy_spec,
+            parent,
+            tool,
+            quarantine,
+            primary_parent,
+        ) = _pc_recovery_bind_legacy(requested_root_id, exclusive=True)
+        bindings = (primary_parent, quarantine, tool, parent)
+        first = _pc_recovery_plan_from_bindings(
+            primary_spec,
+            legacy_spec,
+            parent,
+            tool,
+            quarantine,
+        )
+        for binding in (parent, tool, quarantine):
+            _pc_recovery_revalidate_directory(binding)
+        second = _pc_recovery_plan_from_bindings(
+            primary_spec,
+            legacy_spec,
+            parent,
+            tool,
+            quarantine,
+        )
+        if _pc_recovery_protected_plan(first) != _pc_recovery_protected_plan(second):
+            raise SyncError("private-control recovery evidence changed during dry-run")
+        _pc_recovery_write_plan(
+            output_path,
+            second,
+            (primary_parent, quarantine, tool, parent),
+        )
+        return second
+    finally:
+        if bindings:
+            _pc_recovery_close_bindings(bindings)
+
+
+def _pc_recovery_bind_trusted_home(path: Path) -> _PrivateControlRecoveryBinding:
+    path = Path(os.path.abspath(path))
+    if not path.is_absolute() or path == Path("/"):
+        raise SyncError("primary account home must be an absolute child path")
+    components = path.parts[1:]
+    if not components or len(components) > MIRROR_PRIVATE_CONTROL_MAX_ANCESTORS:
+        raise SyncError("primary account home exceeds its ancestor cap")
+    current_path = Path("/")
+    current_fd = os.open(current_path, _source_directory_flags())
+    try:
+        for component in components:
+            child_fd = -1
+            try:
+                path_metadata = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(path_metadata.st_mode) or stat.S_ISLNK(
+                    path_metadata.st_mode
+                ):
+                    raise SyncError(
+                        f"primary account-home ancestor is unsafe: {current_path / component}"
+                    )
+                child_fd = os.open(
+                    component, _source_directory_flags(), dir_fd=current_fd
+                )
+                child_metadata = os.fstat(child_fd)
+                if _pc_recovery_identity(child_metadata) != _pc_recovery_identity(
+                    path_metadata
+                ) or _pc_recovery_access(child_metadata) != _pc_recovery_access(
+                    path_metadata
+                ):
+                    raise SyncError(
+                        f"primary account-home ancestor changed: {current_path / component}"
+                    )
+                mode, uid, _gid = _pc_recovery_access(child_metadata)
+                if uid not in {0, os.geteuid()} or mode & 0o022:
+                    raise SyncError(
+                        "primary account-home ancestors must be root/current-owned "
+                        f"and not group/world writable: {current_path / component}"
+                    )
+            except BaseException:
+                if child_fd >= 0:
+                    os.close(child_fd)
+                raise
+            os.close(current_fd)
+            current_fd = child_fd
+            current_path /= component
+        metadata = os.fstat(current_fd)
+        access = _pc_recovery_access(metadata)
+        if access[1] != os.geteuid() or access[0] & 0o022:
+            raise SyncError(
+                "primary account home must be current-owned and not group/world writable"
+            )
+        result = _PrivateControlRecoveryBinding(
+            label="primary account home",
+            path=path,
+            fd=current_fd,
+            identity=_pc_recovery_identity(metadata),
+            access=access,
+        )
+        current_fd = -1
+        return result
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+
+
+def _pc_recovery_directory_is_empty(directory_fd: int, label: str) -> bool:
+    def scan() -> tuple[str, ...]:
+        names: list[str] = []
+        with os.scandir(directory_fd) as iterator:
+            for entry in iterator:
+                names.append(entry.name)
+                if len(names) > 1:
+                    break
+        return tuple(names)
+
+    try:
+        first = scan()
+        second = scan()
+    except OSError as error:
+        raise SyncError(f"cannot inspect {label}: {error}") from error
+    if first != second:
+        raise SyncError(f"{label} namespace changed during inspection")
+    return not first
+
+
+def _pc_recovery_pending_read_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _pc_recovery_pending_publication_scope(
+    requested_name: str,
+) -> tuple[tuple[str, str], str, str]:
+    prefixes = (
+        f".{MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME}.pending-",
+        f".{MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME}.pending-",
+    )
+    requested_prefix: str | None = None
+    requested_plan_digest: str | None = None
+    for prefix in prefixes:
+        if requested_name.startswith(prefix):
+            suffix = requested_name[len(prefix) :]
+            match = re.fullmatch(r"([0-9a-f]{64})-[0-9a-f]{32}", suffix)
+            if match is not None:
+                requested_prefix = prefix
+                requested_plan_digest = match.group(1)
+            break
+    if requested_prefix is None or requested_plan_digest is None:
+        raise SyncError("pending recovery publication name is invalid")
+    return prefixes, requested_prefix, requested_plan_digest
+
+
+def _pc_recovery_stable_pending_publications(
+    parent: _PrivateControlRecoveryBinding,
+    prefixes: tuple[str, str],
+) -> tuple[tuple[str, tuple[int, int, int], tuple[int, int, int], int], ...]:
+    deadline = time.monotonic() + MIRROR_PRIVATE_CONTROL_RECOVERY_TIMEOUT_SECONDS
+
+    def snapshot() -> tuple[
+        tuple[str, tuple[int, int, int], tuple[int, int, int], int], ...
+    ]:
+        names: list[str] = []
+        scanned_entries = 0
+        try:
+            with os.scandir(parent.fd) as iterator:
+                for entry in iterator:
+                    _pc_recovery_check_deadline(
+                        deadline,
+                        "inventorying pending recovery publications",
+                    )
+                    scanned_entries += 1
+                    if scanned_entries > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_ENTRIES:
+                        raise SyncError(
+                            "pending recovery publication inventory exceeds its "
+                            "scan cap"
+                        )
+                    name = entry.name
+                    if name.startswith(prefixes):
+                        try:
+                            name.encode("utf-8", "strict")
+                        except UnicodeEncodeError as error:
+                            raise SyncError(
+                                "pending recovery publication name is not strict UTF-8"
+                            ) from error
+                        names.append(name)
+        except SyncError:
+            raise
+        except OSError as error:
+            raise SyncError(
+                f"cannot inventory pending recovery publications: {error}"
+            ) from error
+        names.sort()
+        records: list[tuple[str, tuple[int, int, int], tuple[int, int, int], int]] = []
+        for name in names:
+            _pc_recovery_check_deadline(
+                deadline,
+                "inspecting pending recovery publications",
+            )
+            try:
+                metadata = os.stat(
+                    name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise SyncError(
+                    f"cannot inspect pending recovery publication {name}: {error}"
+                ) from error
+            identity = _pc_recovery_identity(metadata)
+            access = _pc_recovery_access(metadata)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or access
+                not in {
+                    (0o400, os.geteuid(), os.getegid()),
+                    (0o600, os.geteuid(), os.getegid()),
+                }
+                or metadata.st_size < 0
+                or metadata.st_size > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+            ):
+                raise SyncError(
+                    f"pending recovery publication policy is invalid: {name}"
+                )
+            records.append((name, identity, access, metadata.st_size))
+        return tuple(records)
+
+    _pc_recovery_revalidate_directory(parent)
+    first = snapshot()
+    second = snapshot()
+    _pc_recovery_revalidate_directory(parent)
+    if first != second:
+        raise SyncError(
+            "pending recovery publication namespace changed during accounting"
+        )
+    return first
+
+
+def _pc_recovery_select_pending_publication(
+    parent: _PrivateControlRecoveryBinding,
+    requested_name: str,
+) -> tuple[
+    str,
+    int,
+    tuple[tuple[int, int, int], tuple[int, int, int], int] | None,
+]:
+    if not parent.locked:
+        raise SyncError(
+            "pending recovery publication accounting requires the parent lease"
+        )
+    if (
+        MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES < 1
+        or MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES
+        < MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+    ):
+        raise SyncError("pending recovery publication caps are invalid")
+    prefixes, requested_prefix, requested_plan_digest = (
+        _pc_recovery_pending_publication_scope(requested_name)
+    )
+    first = _pc_recovery_stable_pending_publications(parent, prefixes)
+    logical_bytes = sum(record[3] for record in first)
+    same_plan_prefix = f"{requested_prefix}{requested_plan_digest}-"
+    reusable = [
+        record
+        for record in first
+        if record[0].startswith(same_plan_prefix)
+        and re.fullmatch(r"[0-9a-f]{32}", record[0][len(same_plan_prefix) :])
+        is not None
+    ]
+    if reusable:
+        selected = max(reusable, key=lambda record: (record[3], record[0]))
+        return (
+            selected[0],
+            logical_bytes,
+            (selected[1], selected[2], selected[3]),
+        )
+    if len(first) >= MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_ENTRIES:
+        raise SyncError("pending recovery publication entry cap would be exceeded")
+    if (
+        logical_bytes
+        > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES
+        - MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+    ):
+        raise SyncError(
+            "pending recovery publication aggregate-byte cap would be exceeded"
+        )
+    return requested_name, logical_bytes, None
+
+
+def _pc_recovery_remove_superseded_pending_publications(
+    parent: _PrivateControlRecoveryBinding,
+    requested_name: str,
+    label: str,
+) -> None:
+    if not parent.locked:
+        raise SyncError(
+            "pending recovery publication cleanup requires the parent lease"
+        )
+    prefixes, requested_prefix, requested_plan_digest = (
+        _pc_recovery_pending_publication_scope(requested_name)
+    )
+    records = _pc_recovery_stable_pending_publications(parent, prefixes)
+    same_plan_prefix = f"{requested_prefix}{requested_plan_digest}-"
+    targets = tuple(
+        record
+        for record in records
+        if record[0].startswith(same_plan_prefix)
+        and re.fullmatch(r"[0-9a-f]{32}", record[0][len(same_plan_prefix) :])
+        is not None
+    )
+    for name, identity, access, size in targets:
+        file_fd = -1
+        custody: _PrivateControlRecoveryPendingDescriptorCustody | None = None
+        try:
+            try:
+                path_metadata = os.stat(
+                    name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+                custody = _pc_recovery_open_pending_descriptor(
+                    parent,
+                    name,
+                    label,
+                    _pc_recovery_pending_read_flags(),
+                    None,
+                    identity,
+                    access,
+                )
+                file_fd = custody.fd
+                descriptor = os.fstat(file_fd)
+            except OSError as error:
+                raise SyncError(
+                    f"cannot bind superseded pending {label} {name}: {error}"
+                ) from error
+            if (
+                _pc_recovery_identity(path_metadata) != identity
+                or _pc_recovery_identity(descriptor) != identity
+                or _pc_recovery_access(path_metadata) != access
+                or _pc_recovery_access(descriptor) != access
+                or path_metadata.st_nlink != 1
+                or descriptor.st_nlink != 1
+                or path_metadata.st_size != size
+                or descriptor.st_size != size
+            ):
+                raise SyncError(f"superseded pending {label} changed: {name}")
+            try:
+                os.unlink(name, dir_fd=parent.fd)
+            except OSError as error:
+                raise SyncError(
+                    f"cannot remove superseded pending {label} {name}: {error}"
+                ) from error
+            try:
+                os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise SyncError(
+                    f"cannot verify superseded pending {label} removal {name}: "
+                    f"{error}"
+                ) from error
+            else:
+                raise SyncError(
+                    f"superseded pending {label} was replaced during removal: {name}"
+                )
+        finally:
+            if custody is not None and custody.state == "open":
+                _pc_recovery_close_pending_descriptor(custody)
+    if targets:
+        _pc_recovery_fsync_directory(parent)
+        _pc_recovery_revalidate_directory(parent)
+
+
+def _pc_recovery_remove_empty_staged_primary_parent(
+    home: _PrivateControlRecoveryBinding,
+    temporary: _PrivateControlRecoveryBinding,
+    temporary_name: str,
+) -> None:
+    expected_path = home.path / temporary_name
+    if temporary.path != expected_path:
+        raise SyncError("staged primary private-control parent cleanup path changed")
+
+    def revalidate_staging() -> None:
+        try:
+            path_metadata = os.stat(
+                temporary_name,
+                dir_fd=home.fd,
+                follow_symlinks=False,
+            )
+            descriptor_metadata = os.fstat(temporary.fd)
+        except FileNotFoundError as error:
+            raise SyncError(
+                "staged primary private-control parent is missing during cleanup"
+            ) from error
+        except OSError as error:
+            raise SyncError(
+                "cannot inspect staged primary private-control parent during "
+                f"cleanup: {error}"
+            ) from error
+        if (
+            _pc_recovery_identity(path_metadata) != temporary.identity
+            or _pc_recovery_identity(descriptor_metadata) != temporary.identity
+            or _pc_recovery_access(path_metadata) != temporary.access
+            or _pc_recovery_access(descriptor_metadata) != temporary.access
+        ):
+            raise SyncError(
+                "staged primary private-control parent changed during cleanup"
+            )
+        if temporary.access[0] != 0o700 or temporary.access[1] != os.geteuid():
+            raise SyncError(
+                "staged primary private-control parent cleanup policy is invalid"
+            )
+
+    _pc_recovery_revalidate_directory(home)
+    revalidate_staging()
+    if not _pc_recovery_directory_is_empty(
+        temporary.fd,
+        "staged primary private-control parent cleanup",
+    ):
+        raise SyncError(
+            "staged primary private-control parent is not empty during cleanup"
+        )
+    revalidate_staging()
+    _pc_recovery_revalidate_directory(home)
+    try:
+        os.rmdir(temporary_name, dir_fd=home.fd)
+    except OSError as error:
+        raise SyncError(
+            f"cannot remove staged primary private-control parent: {error}"
+        ) from error
+    try:
+        os.stat(temporary_name, dir_fd=home.fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise SyncError(
+            "cannot verify staged primary private-control parent removal: "
+            f"{error}"
+        ) from error
+    else:
+        raise SyncError(
+            "staged primary private-control parent was replaced during cleanup"
+        )
+    try:
+        descriptor_metadata = os.fstat(temporary.fd)
+    except OSError as error:
+        raise SyncError(
+            "cannot revalidate removed staged primary private-control parent: "
+            f"{error}"
+        ) from error
+    if (
+        _pc_recovery_identity(descriptor_metadata) != temporary.identity
+        or _pc_recovery_access(descriptor_metadata) != temporary.access
+    ):
+        raise SyncError(
+            "removed staged primary private-control parent changed during cleanup"
+        )
+    _pc_recovery_fsync_directory(home)
+
+
+def _pc_recovery_open_or_create_primary_parent(
+    primary_spec: MirrorPrivateControlRootSpec,
+    plan_digest: str,
+    *,
+    allow_create: bool,
+) -> tuple[_PrivateControlRecoveryBinding, _PrivateControlRecoveryBinding]:
+    assert primary_spec.account_home is not None
+    home = _pc_recovery_bind_trusted_home(primary_spec.account_home)
+    parent: _PrivateControlRecoveryBinding | None = None
+    temporary: _PrivateControlRecoveryBinding | None = None
+    temporary_name = f".private-control-recovery-parent-{plan_digest}"
+    try:
+        try:
+            parent = _pc_recovery_bind_child_directory(
+                home,
+                MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME,
+                f"primary private-control parent [{primary_spec.root_id}]",
+            )
+        except _PrivateControlRecoveryInitialAbsence:
+            if not allow_create:
+                raise SyncError(
+                    "primary private-control parent disappeared after initial binding"
+                )
+            created_temporary = False
+            try:
+                os.mkdir(temporary_name, 0o700, dir_fd=home.fd)
+            except FileExistsError:
+                pass
+            except OSError as error:
+                raise SyncError(
+                    f"cannot stage primary private-control parent: {error}"
+                ) from error
+            else:
+                created_temporary = True
+            temporary = _pc_recovery_bind_child_directory(
+                home,
+                temporary_name,
+                "staged primary private-control parent",
+            )
+            if created_temporary:
+                try:
+                    os.fsync(home.fd)
+                except OSError as error:
+                    try:
+                        _pc_recovery_remove_empty_staged_primary_parent(
+                            home,
+                            temporary,
+                            temporary_name,
+                        )
+                    except SyncError as cleanup_error:
+                        raise SyncError(
+                            "cannot stage primary private-control parent: "
+                            f"{error}; secondary staged primary-parent cleanup "
+                            f"failure: {cleanup_error}"
+                        ) from error
+                    raise SyncError(
+                        f"cannot stage primary private-control parent: {error}"
+                    ) from error
+            if temporary.access[0] != 0o700 or temporary.access[1] != os.geteuid():
+                raise SyncError(
+                    "staged primary private-control parent policy is invalid"
+                )
+            if not _pc_recovery_directory_is_empty(
+                temporary.fd,
+                "staged primary private-control parent",
+            ):
+                raise SyncError("staged primary private-control parent is not empty")
+            try:
+                _rename_noreplace_at(
+                    home.fd,
+                    temporary_name,
+                    home.fd,
+                    MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME,
+                )
+            except OSError as error:
+                try:
+                    _pc_recovery_remove_empty_staged_primary_parent(
+                        home,
+                        temporary,
+                        temporary_name,
+                    )
+                except SyncError as cleanup_error:
+                    raise SyncError(
+                        "cannot publish primary private-control parent: "
+                        f"{error}; secondary staged primary-parent cleanup "
+                        f"failure: {cleanup_error}"
+                    ) from error
+                raise SyncError(
+                    f"cannot publish primary private-control parent: {error}"
+                ) from error
+            temporary.path = home.path / MIRROR_PRIVATE_CONTROL_NAMESPACE_NAME
+            temporary.label = f"primary private-control parent [{primary_spec.root_id}]"
+            parent = temporary
+            temporary = None
+        else:
+            if allow_create:
+                raise SyncError(
+                    "primary private-control parent appeared after initial absence"
+                )
+        if parent.access[0] != 0o700 or parent.access[1] != os.geteuid():
+            raise SyncError(
+                "primary private-control parent must be mode 0700 and current uid owned"
+            )
+        _pc_recovery_acquire_exclusive(parent)
+        _pc_recovery_revalidate_directory(home)
+        _pc_recovery_revalidate_directory(parent)
+        _pc_recovery_fsync_directory(home)
+        _pc_recovery_revalidate_directory(parent)
+        return home, parent
+    except BaseException as error:
+        try:
+            _pc_recovery_close_bindings((temporary, parent, home))
+        except SyncError as cleanup_error:
+            raise SyncError(
+                f"{error}; secondary primary-parent cleanup failure: {cleanup_error}"
+            ) from error
+        raise
+
+
+def _pc_recovery_read_bound_file(
+    parent: _PrivateControlRecoveryBinding,
+    name: str,
+    label: str,
+) -> tuple[_PrivateControlRecoveryBinding, bytes]:
+    try:
+        path_metadata = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+    except OSError as error:
+        raise SyncError(f"cannot inspect {label}: {error}") from error
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or stat.S_ISLNK(path_metadata.st_mode)
+        or path_metadata.st_size > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+    ):
+        raise SyncError(f"{label} type/size is invalid")
+    try:
+        file_fd = os.open(name, _source_regular_file_flags(), dir_fd=parent.fd)
+    except OSError as error:
+        raise SyncError(f"cannot bind {label}: {error}") from error
+    binding = _PrivateControlRecoveryBinding(
+        label=label,
+        path=parent.path / name,
+        fd=file_fd,
+        identity=(-1, -1, -1),
+        access=(-1, -1, -1),
+    )
+    try:
+        descriptor = os.fstat(file_fd)
+        binding.identity = _pc_recovery_identity(descriptor)
+        binding.access = _pc_recovery_access(descriptor)
+        if (
+            binding.identity != _pc_recovery_identity(path_metadata)
+            or binding.access != _pc_recovery_access(path_metadata)
+            or binding.access != (0o400, os.geteuid(), os.getegid())
+        ):
+            raise SyncError(f"{label} identity/access policy is invalid")
+
+        def read_once() -> bytes:
+            os.lseek(file_fd, 0, os.SEEK_SET)
+            payload = bytearray()
+            while len(payload) <= MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+                chunk = os.read(
+                    file_fd,
+                    min(
+                        1024 * 1024,
+                        MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+                        + 1
+                        - len(payload),
+                    ),
+                )
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+                raise SyncError(f"{label} exceeds its byte cap")
+            return bytes(payload)
+
+        first = read_once()
+        second = read_once()
+        final_descriptor = os.fstat(file_fd)
+        final_path = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+        if (
+            first != second
+            or _pc_recovery_identity(final_descriptor) != binding.identity
+            or _pc_recovery_access(final_descriptor) != binding.access
+            or final_descriptor.st_size != len(first)
+            or _pc_recovery_identity(final_path) != binding.identity
+            or _pc_recovery_access(final_path) != binding.access
+            or final_path.st_size != len(first)
+        ):
+            raise SyncError(f"{label} changed while reading it")
+        return binding, first
+    except BaseException:
+        os.close(file_fd)
+        binding.fd = -1
+        raise
+
+
+def _pc_recovery_revalidate_bound_file(
+    parent: _PrivateControlRecoveryBinding,
+    name: str,
+    binding: _PrivateControlRecoveryBinding,
+    expected_payload: bytes,
+) -> None:
+    def read_once() -> bytes:
+        os.lseek(binding.fd, 0, os.SEEK_SET)
+        payload = bytearray()
+        while len(payload) <= MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+            chunk = os.read(
+                binding.fd,
+                min(
+                    1024 * 1024,
+                    MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+                    + 1
+                    - len(payload),
+                ),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+            raise SyncError(f"{binding.label} exceeds its byte cap")
+        return bytes(payload)
+
+    try:
+        first = read_once()
+        second = read_once()
+        descriptor = os.fstat(binding.fd)
+        path_metadata = os.stat(
+            name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise SyncError(f"cannot revalidate {binding.label}: {error}") from error
+    if (
+        first != expected_payload
+        or second != expected_payload
+        or _pc_recovery_identity(descriptor) != binding.identity
+        or _pc_recovery_access(descriptor) != binding.access
+        or descriptor.st_size != len(expected_payload)
+        or _pc_recovery_identity(path_metadata) != binding.identity
+        or _pc_recovery_access(path_metadata) != binding.access
+        or path_metadata.st_size != len(expected_payload)
+    ):
+        raise SyncError(f"{binding.label} changed during verification")
+
+
+def _pc_recovery_file_record(
+    name: str,
+    binding: _PrivateControlRecoveryBinding,
+    payload: bytes,
+) -> dict[str, object]:
+    return {
+        "access": _pc_recovery_access_document(binding.access),
+        "identity": _pc_recovery_identity_document(binding.identity),
+        "name": name,
+        "path": str(binding.path),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size": len(payload),
+    }
+
+
+def _pc_recovery_open_pending_publication_for_reuse(
+    parent: _PrivateControlRecoveryBinding,
+    name: str,
+    expected: tuple[tuple[int, int, int], tuple[int, int, int], int],
+    label: str,
+) -> _PrivateControlRecoveryPendingDescriptorCustody:
+    expected_identity, expected_access, expected_size = expected
+    read_custody: _PrivateControlRecoveryPendingDescriptorCustody | None = None
+    custody: _PrivateControlRecoveryPendingDescriptorCustody | None = None
+    handoff = False
+    try:
+        try:
+            path_metadata = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            read_custody = _pc_recovery_open_pending_descriptor(
+                parent,
+                name,
+                label,
+                _pc_recovery_pending_read_flags(),
+                None,
+                expected_identity,
+                expected_access,
+            )
+            read_fd = read_custody.fd
+            descriptor = os.fstat(read_fd)
+        except OSError as error:
+            raise SyncError(
+                f"cannot bind pending {label} for reuse: {error}"
+            ) from error
+        if (
+            _pc_recovery_identity(path_metadata) != expected_identity
+            or _pc_recovery_identity(descriptor) != expected_identity
+            or _pc_recovery_access(path_metadata) != expected_access
+            or _pc_recovery_access(descriptor) != expected_access
+            or path_metadata.st_nlink != 1
+            or descriptor.st_nlink != 1
+            or path_metadata.st_size != expected_size
+            or descriptor.st_size != expected_size
+        ):
+            raise SyncError(f"pending {label} changed before reuse")
+        if expected_access[0] == 0o400:
+            try:
+                os.fchmod(read_fd, 0o600)
+            except OSError as error:
+                raise SyncError(
+                    f"cannot make pending {label} reusable: {error}"
+                ) from error
+        writable_access = (0o600, os.geteuid(), os.getegid())
+        assert read_custody is not None
+        read_custody.access = writable_access
+        try:
+            descriptor = os.fstat(read_fd)
+            path_metadata = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise SyncError(
+                f"cannot revalidate pending {label} for reuse: {error}"
+            ) from error
+        if (
+            _pc_recovery_identity(path_metadata) != expected_identity
+            or _pc_recovery_identity(descriptor) != expected_identity
+            or _pc_recovery_access(path_metadata) != writable_access
+            or _pc_recovery_access(descriptor) != writable_access
+            or path_metadata.st_nlink != 1
+            or descriptor.st_nlink != 1
+            or path_metadata.st_size != expected_size
+            or descriptor.st_size != expected_size
+        ):
+            raise SyncError(f"pending {label} changed while enabling reuse")
+        flags = (
+            os.O_WRONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            custody = _pc_recovery_open_pending_descriptor(
+                parent,
+                name,
+                label,
+                flags,
+                None,
+                expected_identity,
+                writable_access,
+            )
+            file_fd = custody.fd
+            descriptor = os.fstat(file_fd)
+            path_metadata = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            read_descriptor = os.fstat(read_custody.fd)
+        except OSError as error:
+            raise SyncError(
+                f"cannot open pending {label} for reuse: {error}"
+            ) from error
+        if (
+            _pc_recovery_identity(path_metadata) != expected_identity
+            or _pc_recovery_identity(descriptor) != expected_identity
+            or _pc_recovery_identity(read_descriptor) != expected_identity
+            or _pc_recovery_access(path_metadata) != writable_access
+            or _pc_recovery_access(descriptor) != writable_access
+            or _pc_recovery_access(read_descriptor) != writable_access
+            or path_metadata.st_nlink != 1
+            or descriptor.st_nlink != 1
+            or read_descriptor.st_nlink != 1
+            or path_metadata.st_size != expected_size
+            or descriptor.st_size != expected_size
+            or read_descriptor.st_size != expected_size
+        ):
+            raise SyncError(f"pending {label} changed before rewrite")
+        _pc_recovery_close_pending_descriptor(read_custody)
+        handoff = True
+        assert custody is not None
+        return custody
+    finally:
+        if custody is not None and custody.state == "open" and not handoff:
+            _pc_recovery_close_pending_descriptor(custody)
+        if read_custody is not None and read_custody.state == "open":
+            _pc_recovery_close_pending_descriptor(read_custody)
+
+
+def _pc_recovery_handoff_pending_writer_to_reader(
+    parent: _PrivateControlRecoveryBinding,
+    name: str,
+    label: str,
+    custody: _PrivateControlRecoveryPendingDescriptorCustody,
+    expected_payload: bytes,
+) -> tuple[
+    _PrivateControlRecoveryBinding,
+    bytes,
+    _PrivateControlRecoveryPendingDescriptorCustody,
+]:
+    binding: _PrivateControlRecoveryBinding | None = None
+    reader_custody: _PrivateControlRecoveryPendingDescriptorCustody | None = None
+    try:
+        try:
+            path_metadata = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            reader_custody = _pc_recovery_open_pending_descriptor(
+                parent,
+                name,
+                f"{label} verifier",
+                _pc_recovery_pending_read_flags(),
+                None,
+                custody.identity,
+                custody.access,
+            )
+            descriptor = os.fstat(reader_custody.fd)
+        except OSError as error:
+            raise SyncError(f"cannot bind pending {label}: {error}") from error
+        binding = _PrivateControlRecoveryBinding(
+            label=f"pending {label}",
+            path=parent.path / name,
+            fd=reader_custody.fd,
+            identity=_pc_recovery_identity(descriptor),
+            access=_pc_recovery_access(descriptor),
+        )
+        if (
+            custody.identity is None
+            or custody.access is None
+            or binding.identity != custody.identity
+            or binding.access != custody.access
+            or _pc_recovery_identity(path_metadata) != custody.identity
+            or _pc_recovery_access(path_metadata) != custody.access
+            or descriptor.st_nlink != 1
+            or path_metadata.st_nlink != 1
+            or descriptor.st_size != len(expected_payload)
+            or path_metadata.st_size != len(expected_payload)
+        ):
+            raise SyncError(f"pending {label} verifier policy is invalid")
+
+        def read_once() -> bytes:
+            os.lseek(binding.fd, 0, os.SEEK_SET)
+            payload = bytearray()
+            while len(payload) <= MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+                chunk = os.read(
+                    binding.fd,
+                    min(
+                        1024 * 1024,
+                        MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+                        + 1
+                        - len(payload),
+                    ),
+                )
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+                raise SyncError(f"pending {label} exceeds its byte cap")
+            return bytes(payload)
+
+        first = read_once()
+        second = read_once()
+        final_descriptor = os.fstat(binding.fd)
+        final_path = os.stat(
+            name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        if (
+            first != second
+            or first != expected_payload
+            or _pc_recovery_identity(final_descriptor) != binding.identity
+            or _pc_recovery_access(final_descriptor) != binding.access
+            or final_descriptor.st_nlink != 1
+            or final_descriptor.st_size != len(first)
+            or _pc_recovery_identity(final_path) != binding.identity
+            or _pc_recovery_access(final_path) != binding.access
+            or final_path.st_nlink != 1
+            or final_path.st_size != len(first)
+        ):
+            raise SyncError(f"pending {label} changed while reading it")
+        writer = os.fstat(custody.fd)
+        path_metadata = os.stat(
+            name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        if (
+            custody.parent_identity != parent.identity
+            or custody.identity is None
+            or custody.access is None
+            or _pc_recovery_identity(writer) != custody.identity
+            or _pc_recovery_access(writer) != custody.access
+            or writer.st_nlink != 1
+            or writer.st_size != len(expected_payload)
+            or _pc_recovery_identity(path_metadata) != custody.identity
+            or _pc_recovery_access(path_metadata) != custody.access
+            or path_metadata.st_nlink != 1
+            or path_metadata.st_size != len(expected_payload)
+            or binding.identity != custody.identity
+            or binding.access != custody.access
+            or first != expected_payload
+        ):
+            raise SyncError(f"pending {label} changed before writer handoff")
+        _pc_recovery_close_pending_descriptor(custody)
+        _pc_recovery_revalidate_bound_file(
+            parent,
+            name,
+            binding,
+            first,
+        )
+        return binding, first, reader_custody
+    except BaseException:
+        if custody.state == "open":
+            _pc_recovery_close_pending_descriptor(custody)
+        if custody.state == "close-uncertain":
+            raise
+        if reader_custody is not None and reader_custody.state == "open":
+            _pc_recovery_close_pending_descriptor(reader_custody)
+        raise
+
+
+def _pc_recovery_publish_document(
+    parent: _PrivateControlRecoveryBinding,
+    final_name: str,
+    pending_name: str,
+    label: str,
+    document_builder: Callable[[tuple[int, int, int]], dict[str, object]],
+) -> tuple[_PrivateControlRecoveryBinding, bytes]:
+    try:
+        final_binding, final_payload = _pc_recovery_read_bound_file(
+            parent,
+            final_name,
+            label,
+        )
+    except SyncError as final_error:
+        try:
+            os.stat(final_name, dir_fd=parent.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise final_error
+        else:
+            raise
+    else:
+        expected = _pc_recovery_json_bytes(
+            document_builder(final_binding.identity),
+            pretty=True,
+        )
+        if final_payload != expected:
+            _pc_recovery_close_bindings((final_binding,))
+            raise SyncError(f"existing {label} does not match this plan")
+        try:
+            _pc_recovery_fsync_directory(parent)
+            _pc_recovery_revalidate_bound_file(
+                parent,
+                final_name,
+                final_binding,
+                final_payload,
+            )
+            _pc_recovery_remove_superseded_pending_publications(
+                parent,
+                pending_name,
+                label,
+            )
+        except BaseException:
+            _pc_recovery_close_bindings((final_binding,))
+            raise
+        return final_binding, final_payload
+
+    pending_binding: _PrivateControlRecoveryBinding | None = None
+    reader_custody: _PrivateControlRecoveryPendingDescriptorCustody | None = None
+    try:
+        try:
+            pending_binding, pending_payload = _pc_recovery_read_bound_file(
+                parent,
+                pending_name,
+                f"pending {label}",
+            )
+        except SyncError as pending_error:
+            try:
+                os.stat(pending_name, dir_fd=parent.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pending_payload = b""
+            except OSError:
+                raise pending_error
+            else:
+                raise
+        if pending_binding is None:
+            (
+                pending_name,
+                pending_logical_bytes,
+                reusable,
+            ) = _pc_recovery_select_pending_publication(parent, pending_name)
+            identity: tuple[int, int, int] | None = None
+            payload: bytes | None = None
+            custody: _PrivateControlRecoveryPendingDescriptorCustody | None = None
+            if reusable is None:
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                try:
+                    custody = _pc_recovery_open_pending_descriptor(
+                        parent,
+                        pending_name,
+                        label,
+                        flags,
+                        0o600,
+                        None,
+                        None,
+                    )
+                    file_fd = custody.fd
+                except OSError as error:
+                    raise SyncError(
+                        f"cannot create pending {label}: {error}"
+                    ) from error
+            else:
+                identity = reusable[0]
+                payload = _pc_recovery_json_bytes(
+                    document_builder(identity),
+                    pretty=True,
+                )
+                if len(payload) > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
+                    raise SyncError(f"reused pending {label} exceeds its byte cap")
+                projected_logical_bytes = (
+                    pending_logical_bytes - reusable[2] + len(payload)
+                )
+                if projected_logical_bytes > max(
+                    MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_PENDING_BYTES,
+                    pending_logical_bytes,
+                ):
+                    raise SyncError(
+                        "pending recovery publication aggregate-byte cap "
+                        "would be exceeded"
+                    )
+                custody = _pc_recovery_open_pending_publication_for_reuse(
+                    parent,
+                    pending_name,
+                    reusable,
+                    label,
+                )
+                file_fd = custody.fd
+            try:
+                if identity is None:
+                    metadata = os.fstat(file_fd)
+                    identity = _pc_recovery_identity(metadata)
+                    assert custody is not None
+                    custody.identity = identity
+                    custody.access = _pc_recovery_access(metadata)
+                    payload = _pc_recovery_json_bytes(
+                        document_builder(identity),
+                        pretty=True,
+                    )
+                assert payload is not None
+                if (
+                    len(payload)
+                    > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+                ):
+                    raise SyncError(f"{label} exceeds its byte cap")
+                if reusable is not None:
+                    os.ftruncate(file_fd, 0)
+                _pc_recovery_write_all(
+                    file_fd,
+                    payload,
+                    label=f"writing pending {label}",
+                )
+                os.fchmod(file_fd, 0o400)
+                assert custody is not None
+                custody.access = (0o400, os.geteuid(), os.getegid())
+                os.fsync(file_fd)
+                pending_binding, pending_payload, reader_custody = (
+                    _pc_recovery_handoff_pending_writer_to_reader(
+                        parent,
+                        pending_name,
+                        label,
+                        custody,
+                        payload,
+                    )
+                )
+            except OSError as error:
+                raise SyncError(f"cannot write pending {label}: {error}") from error
+            finally:
+                if custody is not None and custody.state == "open":
+                    _pc_recovery_close_pending_descriptor(custody)
+        expected_pending = _pc_recovery_json_bytes(
+            document_builder(pending_binding.identity),
+            pretty=True,
+        )
+        if pending_payload != expected_pending:
+            raise SyncError(f"pending {label} does not match this plan")
+        try:
+            _rename_noreplace_at(
+                parent.fd,
+                pending_name,
+                parent.fd,
+                final_name,
+            )
+        except OSError as error:
+            raise SyncError(f"cannot publish {label}: {error}") from error
+        pending_binding.path = parent.path / final_name
+        pending_binding.label = label
+        if reader_custody is not None:
+            reader_custody.path = pending_binding.path
+            reader_custody.label = label
+        _pc_recovery_fsync_directory(parent)
+        final_metadata = os.stat(final_name, dir_fd=parent.fd, follow_symlinks=False)
+        if (
+            _pc_recovery_identity(final_metadata) != pending_binding.identity
+            or _pc_recovery_access(final_metadata) != pending_binding.access
+        ):
+            raise SyncError(f"{label} changed during publication")
+        _pc_recovery_remove_superseded_pending_publications(
+            parent,
+            pending_name,
+            label,
+        )
+        if reader_custody is not None:
+            _pc_recovery_release_pending_descriptor(reader_custody)
+        return pending_binding, pending_payload
+    except BaseException:
+        other_pending_uncertainty = any(
+            item is not reader_custody
+            for item in _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+        )
+        if (
+            reader_custody is not None
+            and reader_custody.state == "open"
+            and not other_pending_uncertainty
+        ):
+            try:
+                _pc_recovery_close_pending_descriptor(reader_custody)
+            except BaseException:
+                if pending_binding is not None and pending_binding.fd >= 0:
+                    _pc_recovery_retain_close_fence((pending_binding,))
+                    pending_binding = None
+                raise
+            if pending_binding is not None:
+                pending_binding.fd = -1
+        if pending_binding is not None and pending_binding.fd >= 0:
+            if (
+                _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+                or _PC_RECOVERY_RETAINED_CLOSE_FENCE
+            ):
+                _pc_recovery_retain_close_fence((pending_binding,))
+            else:
+                _pc_recovery_close_bindings((pending_binding,))
+        raise
+
+
+def _pc_recovery_load_json(payload: bytes, label: str) -> dict[str, object]:
+    try:
+        raw = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_pc_recovery_owner_pairs,
+            parse_int=_bounded_json_integer,
+            parse_constant=_reject_json_constant,
+        )
+    except (
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+        RecursionError,
+    ) as error:
+        raise SyncError(f"{label} JSON is invalid: {error}") from error
+    if not isinstance(raw, dict):
+        raise SyncError(f"{label} must be a JSON object")
+    return raw
+
+
+def _pc_recovery_optional_file(
+    parent: _PrivateControlRecoveryBinding,
+    name: str,
+    label: str,
+) -> tuple[_PrivateControlRecoveryBinding, bytes] | None:
+    try:
+        os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SyncError(f"cannot inspect {label}: {error}") from error
+    return _pc_recovery_read_bound_file(parent, name, label)
+
+
+def _pc_recovery_primary_child_records(
+    primary_parent: _PrivateControlRecoveryBinding,
+    legacy_bindings: tuple[
+        _PrivateControlRecoveryBinding,
+        _PrivateControlRecoveryBinding,
+        _PrivateControlRecoveryBinding,
+    ],
+) -> dict[str, object | None]:
+    children: dict[str, object | None] = {}
+    bound_children: list[_PrivateControlRecoveryBinding] = []
+    try:
+        for role, name in (
+            ("tool_root", MIRROR_PRIVATE_TOOL_ROOT_NAME),
+            ("quarantine", MIRROR_DURABLE_QUARANTINE_ROOT_NAME),
+        ):
+            try:
+                os.stat(name, dir_fd=primary_parent.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                children[role] = None
+                continue
+            except OSError as error:
+                raise SyncError(
+                    f"cannot inspect primary private-control {role}: {error}"
+                ) from error
+            child = _pc_recovery_bind_child_directory(
+                primary_parent,
+                name,
+                f"primary private-control {role}",
+            )
+            bound_children.append(child)
+            if child.access[0] != 0o700 or child.access[1] != os.geteuid():
+                raise SyncError(f"primary private-control {role} policy is invalid")
+            if child.identity in {binding.identity for binding in legacy_bindings}:
+                raise SyncError(
+                    f"primary private-control {role} aliases legacy evidence"
+                )
+            if not _pc_recovery_directory_is_at_or_below(
+                child.fd, primary_parent.identity
+            ) or _pc_recovery_directory_is_at_or_below(
+                primary_parent.fd,
+                child.identity,
+            ):
+                raise SyncError(f"primary private-control {role} topology is invalid")
+            children[role] = _pc_recovery_record(child.identity, child.access)
+        if (
+            children.get("tool_root") is not None
+            and children.get("quarantine") is not None
+        ):
+            tool_identity = bound_children[0].identity
+            quarantine_identity = bound_children[1].identity
+            if tool_identity == quarantine_identity or (
+                tool_identity[0] != quarantine_identity[0]
+            ):
+                raise SyncError(
+                    "primary private-control fixed children alias or cross filesystems"
+                )
+            if _pc_recovery_directory_is_at_or_below(
+                bound_children[0].fd,
+                quarantine_identity,
+            ) or _pc_recovery_directory_is_at_or_below(
+                bound_children[1].fd,
+                tool_identity,
+            ):
+                raise SyncError("primary private-control fixed children overlap")
+        return children
+    finally:
+        if bound_children:
+            _pc_recovery_close_bindings(tuple(reversed(bound_children)))
+
+
+def _pc_recovery_terminal_registry(
+    plan: dict[str, object],
+    primary_parent: _PrivateControlRecoveryBinding,
+    receipt_record: dict[str, object],
+    legacy_bindings: tuple[
+        _PrivateControlRecoveryBinding,
+        _PrivateControlRecoveryBinding,
+        _PrivateControlRecoveryBinding,
+    ],
+) -> dict[str, object]:
+    parent, tool, quarantine = legacy_bindings
+    primary_children = _pc_recovery_primary_child_records(
+        primary_parent,
+        legacy_bindings,
+    )
+    inventory = plan["inventory"]
+    roots = [
+        {
+            "fixed_children": primary_children,
+            "parent": _pc_recovery_record(
+                primary_parent.identity,
+                primary_parent.access,
+            ),
+            "primary_receipt": receipt_record,
+            "root_id": plan["primary_root_id"],
+        },
+        {
+            "inventory": {
+                "digest": inventory["digest"],
+                "entry_count": inventory["entry_count"],
+                "logical_bytes": inventory["logical_bytes"],
+                "path_bytes": inventory["path_bytes"],
+            },
+            "parent": _pc_recovery_record(parent.identity, parent.access),
+            "quarantine": _pc_recovery_record(
+                quarantine.identity,
+                quarantine.access,
+            ),
+            "root_id": plan["root_id"],
+            "tool_root": _pc_recovery_record(tool.identity, tool.access),
+        },
+    ]
+    return {"digest": _pc_recovery_digest(roots), "roots": roots}
+
+
+def _pc_recovery_primary_receipt_document(
+    plan: dict[str, object],
+    receipt_identity: tuple[int, int, int],
+) -> dict[str, object]:
+    paths = plan["paths"]
+    receipt_uid = os.geteuid()
+    receipt_gid = os.getegid()
+    late_bound_limit = (10**MAX_JSON_INTEGER_DIGITS) - 1
+    if (
+        not isinstance(receipt_identity, tuple)
+        or len(receipt_identity) != 3
+        or receipt_identity[2] != stat.S_IFREG
+        or any(
+            type(value) is not int or value < 0 or value > late_bound_limit
+            for value in (
+                receipt_identity[0],
+                receipt_identity[1],
+                receipt_uid,
+                receipt_gid,
+            )
+        )
+    ):
+        raise SyncError(
+            "primary recovery receipt late-bound identity is unsupported"
+        )
+    return {
+        "contract": MIRROR_PRIVATE_CONTROL_RECOVERY_CONTRACT,
+        "disposition": MIRROR_PRIVATE_CONTROL_RECOVERY_DISPOSITION,
+        "plan": plan,
+        "plan_digest": plan["plan_digest"],
+        "publication": {
+            "marker_name": MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+            "receipt": {
+                "access": _pc_recovery_access_document(
+                    (0o400, receipt_uid, receipt_gid)
+                ),
+                "identity": _pc_recovery_identity_document(receipt_identity),
+                "name": MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+                "path": paths["primary_receipt"],
+            },
+        },
+        "root_id": plan["root_id"],
+        "version": MIRROR_PRIVATE_CONTROL_RECOVERY_VERSION,
+    }
+
+
+def _pc_recovery_validate_primary_receipt_capacity(
+    plan: dict[str, object],
+) -> None:
+    # The receipt identity and access record are not known until publication.
+    # Reserve the builder-enforced digit bound for dev, ino, uid, and gid so a
+    # plan accepted here fits for every later receipt binding.
+    remaining = (
+        MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
+        - 1
+        - (4 * MAX_JSON_INTEGER_DIGITS)
+    )
+    if remaining < 0:
+        raise SyncError("primary recovery receipt exceeds its byte cap")
+    document = _pc_recovery_primary_receipt_document(
+        plan,
+        (0, 0, stat.S_IFREG),
+    )
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    for chunk in encoder.iterencode(document):
+        remaining -= len(chunk.encode("utf-8"))
+        if remaining < 0:
+            raise SyncError("primary recovery receipt exceeds its byte cap")
+
+
+def _pc_recovery_marker_document(
+    plan: dict[str, object],
+    receipt_record: dict[str, object],
+    terminal_registry: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "contract": MIRROR_PRIVATE_CONTROL_RECOVERY_CONTRACT,
+        "disposition": MIRROR_PRIVATE_CONTROL_RECOVERY_DISPOSITION,
+        "plan_digest": plan["plan_digest"],
+        "primary_receipt": receipt_record,
+        "root_id": plan["root_id"],
+        "status": "committed",
+        "terminal_registry": terminal_registry,
+        "version": MIRROR_PRIVATE_CONTROL_RECOVERY_VERSION,
+    }
+
+
+def _pc_recovery_validate_primary_receipt(
+    payload: bytes,
+    binding: _PrivateControlRecoveryBinding,
+) -> tuple[dict[str, object], dict[str, object]]:
+    document = _pc_recovery_load_json(payload, "primary recovery receipt")
+    if set(document) != _MIRROR_PRIVATE_CONTROL_RECOVERY_PRIMARY_RECEIPT_FIELDS:
+        raise SyncError("primary recovery receipt schema is invalid")
+    plan = _pc_recovery_validate_plan_document(document.get("plan"))
+    expected = _pc_recovery_primary_receipt_document(plan, binding.identity)
+    if not _pc_recovery_canonical_documents_equal(document, expected):
+        raise SyncError("primary recovery receipt does not match its binding")
+    return document, plan
+
+
+def _pc_recovery_owner_document_is_valid(owner: object) -> bool:
+    if owner is None:
+        return True
+    if not isinstance(owner, dict):
+        return False
+    version = owner.get("version")
+    root_scope = owner.get("root_scope")
+    fields = set(owner)
+    if type(version) is not int:
+        return False
+    if version == MIRROR_PRIVATE_OWNER_RECORD_LEGACY_VERSION:
+        expected_fields = MIRROR_PRIVATE_OWNER_RECORD_LEGACY_FIELDS | {
+            "private_state",
+            "root_scope",
+        }
+        if fields != expected_fields or root_scope != "accepted-legacy":
+            return False
+    elif version == MIRROR_PRIVATE_OWNER_RECORD_VERSION:
+        expected_fields = MIRROR_PRIVATE_OWNER_RECORD_FIELDS | {
+            "private_state",
+            "root_scope",
+        }
+        if (
+            fields != expected_fields
+            or root_scope != "accepted-current"
+            or owner.get("root_id") != MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID
+        ):
+            return False
+    else:
+        return False
+    private_identity = owner.get("private_identity")
+    return bool(
+        type(owner.get("owner_pid")) is int
+        and owner["owner_pid"] > 0
+        and type(owner.get("owner_uid")) is int
+        and owner["owner_uid"] >= 0
+        and type(owner.get("owner_gid")) is int
+        and owner["owner_gid"] >= 0
+        and isinstance(owner.get("owner_nonce"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", owner["owner_nonce"]) is not None
+        and isinstance(owner.get("phase"), str)
+        and owner.get("phase") in MIRROR_PRIVATE_OWNER_RECORD_PHASES
+        and isinstance(owner.get("private_name"), str)
+        and owner["private_name"]
+        and isinstance(private_identity, list)
+        and len(private_identity) == 3
+        and all(type(item) is int and item >= 0 for item in private_identity)
+        and isinstance(owner.get("private_state"), str)
+        and owner.get("private_state") in {"matching", "missing"}
+    )
+
+
+def _pc_recovery_record_document_is_valid(
+    record: object,
+    *,
+    expected_type: int,
+) -> bool:
+    if not isinstance(record, dict) or set(record) != {"access", "identity"}:
+        return False
+    access = record.get("access")
+    identity = record.get("identity")
+    return bool(
+        isinstance(access, dict)
+        and set(access) == {"gid", "mode", "uid"}
+        and isinstance(access.get("mode"), str)
+        and re.fullmatch(r"[0-7]{4}", access["mode"]) is not None
+        and type(access.get("uid")) is int
+        and access["uid"] >= 0
+        and type(access.get("gid")) is int
+        and access["gid"] >= 0
+        and isinstance(identity, dict)
+        and set(identity) == {"dev", "ino", "type"}
+        and type(identity.get("dev")) is int
+        and identity["dev"] >= 0
+        and type(identity.get("ino")) is int
+        and identity["ino"] >= 0
+        and type(identity.get("type")) is int
+        and identity["type"] == expected_type
+    )
+
+
+def _pc_recovery_file_record_document_is_valid(record: object) -> bool:
+    if not isinstance(record, dict) or set(record) != {
+        "access",
+        "identity",
+        "name",
+        "path",
+        "sha256",
+        "size",
+    }:
+        return False
+    return bool(
+        _pc_recovery_record_document_is_valid(
+            {
+                "access": record.get("access"),
+                "identity": record.get("identity"),
+            },
+            expected_type=stat.S_IFREG,
+        )
+        and isinstance(record.get("name"), str)
+        and record["name"]
+        and isinstance(record.get("path"), str)
+        and record["path"]
+        and isinstance(record.get("sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is not None
+        and type(record.get("size")) is int
+        and record["size"] >= 0
+    )
+
+
+def _pc_recovery_validate_marker(
+    payload: bytes,
+) -> dict[str, object]:
+    document = _pc_recovery_load_json(payload, "private-control cutover marker")
+    if set(document) != _MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_FIELDS or (
+        document.get("contract") != MIRROR_PRIVATE_CONTROL_RECOVERY_CONTRACT
+        or type(document.get("version")) is not int
+        or document["version"] != MIRROR_PRIVATE_CONTROL_RECOVERY_VERSION
+        or document.get("disposition") != MIRROR_PRIVATE_CONTROL_RECOVERY_DISPOSITION
+        or document.get("root_id") != MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID
+        or document.get("status") != "committed"
+        or not isinstance(document.get("plan_digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", document["plan_digest"]) is None
+        or not _pc_recovery_file_record_document_is_valid(
+            document.get("primary_receipt")
+        )
+    ):
+        raise SyncError("private-control cutover marker schema is invalid")
+    terminal = document.get("terminal_registry")
+    roots = terminal.get("roots") if isinstance(terminal, dict) else None
+    if (
+        not isinstance(terminal, dict)
+        or set(terminal) != {"digest", "roots"}
+        or not isinstance(roots, list)
+        or len(roots) != 2
+        or not all(isinstance(root, dict) for root in roots)
+        or set(roots[0]) != {"fixed_children", "parent", "primary_receipt", "root_id"}
+        or set(roots[1])
+        != {"inventory", "parent", "quarantine", "root_id", "tool_root"}
+        or roots[0].get("root_id") != MIRROR_PRIVATE_CONTROL_PRIMARY_ROOT_ID
+        or roots[1].get("root_id") != MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID
+        or not _pc_recovery_record_document_is_valid(
+            roots[0].get("parent"),
+            expected_type=stat.S_IFDIR,
+        )
+        or not _pc_recovery_record_document_is_valid(
+            roots[1].get("parent"),
+            expected_type=stat.S_IFDIR,
+        )
+        or not _pc_recovery_record_document_is_valid(
+            roots[1].get("tool_root"),
+            expected_type=stat.S_IFDIR,
+        )
+        or not _pc_recovery_record_document_is_valid(
+            roots[1].get("quarantine"),
+            expected_type=stat.S_IFDIR,
+        )
+        or not isinstance(roots[0].get("fixed_children"), dict)
+        or set(roots[0]["fixed_children"]) != {"quarantine", "tool_root"}
+        or any(
+            child is not None
+            and not _pc_recovery_record_document_is_valid(
+                child,
+                expected_type=stat.S_IFDIR,
+            )
+            for child in roots[0]["fixed_children"].values()
+        )
+        or not isinstance(roots[0].get("primary_receipt"), dict)
+        or not _pc_recovery_file_record_document_is_valid(
+            roots[0].get("primary_receipt")
+        )
+        or not isinstance(roots[1].get("inventory"), dict)
+        or set(roots[1]["inventory"])
+        != {"digest", "entry_count", "logical_bytes", "path_bytes"}
+        or not isinstance(roots[1]["inventory"].get("digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", roots[1]["inventory"]["digest"])
+        is None
+        or any(
+            type(roots[1]["inventory"].get(field)) is not int
+            or roots[1]["inventory"][field] < 0
+            for field in ("entry_count", "logical_bytes", "path_bytes")
+        )
+        or not isinstance(terminal.get("digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", terminal["digest"]) is None
+        or terminal.get("digest") != _pc_recovery_digest(roots)
+    ):
+        raise SyncError("cutover marker terminal registry is invalid")
+    return document
+
+
+def _pc_recovery_verify_adoption_locked(
+    primary_parent: _PrivateControlRecoveryBinding,
+    parent: _PrivateControlRecoveryBinding,
+    tool: _PrivateControlRecoveryBinding,
+    quarantine: _PrivateControlRecoveryBinding,
+    *,
+    expected_plan_digest: str | None = None,
+) -> dict[str, object]:
+    marker_result = _pc_recovery_optional_file(
+        primary_parent,
+        MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+        "private-control cutover marker",
+    )
+    if marker_result is None:
+        receipt_result = _pc_recovery_optional_file(
+            primary_parent,
+            MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+            "primary recovery receipt",
+        )
+        if receipt_result is not None:
+            _pc_recovery_close_bindings((receipt_result[0],))
+            raise SyncError(
+                "private-control recovery cutover is incomplete: receipt exists "
+                "without its commit marker"
+            )
+        raise SyncError("private-control recovery cutover marker is absent")
+    marker_binding, marker_payload = marker_result
+    receipt_binding: _PrivateControlRecoveryBinding | None = None
+    try:
+        marker = _pc_recovery_validate_marker(marker_payload)
+        receipt_result = _pc_recovery_optional_file(
+            primary_parent,
+            MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+            "primary recovery receipt",
+        )
+        if receipt_result is None:
+            raise SyncError(
+                "private-control recovery marker exists without its receipt"
+            )
+        receipt_binding, receipt_payload = receipt_result
+        receipt_record = _pc_recovery_file_record(
+            MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+            receipt_binding,
+            receipt_payload,
+        )
+        if not _pc_recovery_canonical_documents_equal(
+            marker.get("primary_receipt"),
+            receipt_record,
+        ):
+            raise SyncError("private-control cutover marker receipt binding changed")
+        _receipt, plan = _pc_recovery_validate_primary_receipt(
+            receipt_payload,
+            receipt_binding,
+        )
+        if marker.get("plan_digest") != plan.get("plan_digest") or (
+            expected_plan_digest is not None
+            and plan.get("plan_digest") != expected_plan_digest
+        ):
+            raise SyncError("private-control recovery plan digest changed")
+        primary_spec, legacy_spec = _pc_recovery_specs(str(plan["root_id"]))
+        live_plan = _pc_recovery_plan_from_bindings(
+            primary_spec,
+            legacy_spec,
+            parent,
+            tool,
+            quarantine,
+        )
+        if not _pc_recovery_canonical_documents_equal(
+            _pc_recovery_protected_plan(plan),
+            _pc_recovery_protected_plan(live_plan),
+        ):
+            raise SyncError(
+                "private-control retained evidence no longer matches its receipt"
+            )
+        terminal = marker["terminal_registry"]
+        roots = terminal["roots"]
+        expected_legacy_inventory = {
+            "digest": plan["inventory"]["digest"],
+            "entry_count": plan["inventory"]["entry_count"],
+            "logical_bytes": plan["inventory"]["logical_bytes"],
+            "path_bytes": plan["inventory"]["path_bytes"],
+        }
+        if (
+            roots[0].get("root_id") != plan["primary_root_id"]
+            or roots[1].get("root_id") != plan["root_id"]
+            or not _pc_recovery_canonical_documents_equal(
+                roots[0].get("parent"),
+                _pc_recovery_record(primary_parent.identity, primary_parent.access),
+            )
+            or not _pc_recovery_canonical_documents_equal(
+                roots[0].get("primary_receipt"),
+                receipt_record,
+            )
+            or not _pc_recovery_canonical_documents_equal(
+                roots[1].get("parent"),
+                _pc_recovery_record(parent.identity, parent.access),
+            )
+            or not _pc_recovery_canonical_documents_equal(
+                roots[1].get("tool_root"),
+                _pc_recovery_record(tool.identity, tool.access),
+            )
+            or not _pc_recovery_canonical_documents_equal(
+                roots[1].get("quarantine"),
+                _pc_recovery_record(quarantine.identity, quarantine.access),
+            )
+            or not _pc_recovery_canonical_documents_equal(
+                roots[1].get("inventory"),
+                expected_legacy_inventory,
+            )
+        ):
+            raise SyncError(
+                "private-control cutover terminal registry binding is invalid"
+            )
+        for binding in (parent, tool, quarantine, primary_parent):
+            _pc_recovery_revalidate_directory(binding)
+        _pc_recovery_revalidate_bound_file(
+            primary_parent,
+            MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+            marker_binding,
+            marker_payload,
+        )
+        _pc_recovery_revalidate_bound_file(
+            primary_parent,
+            MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+            receipt_binding,
+            receipt_payload,
+        )
+        return {
+            "marker": _pc_recovery_file_record(
+                MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+                marker_binding,
+                marker_payload,
+            ),
+            "plan": plan,
+            "receipt": receipt_record,
+            "terminal_registry": terminal,
+        }
+    finally:
+        _pc_recovery_close_bindings((receipt_binding, marker_binding))
+
+
+def _pc_recovery_execution_receipt(
+    verification: dict[str, object],
+    primary_parent: _PrivateControlRecoveryBinding,
+    parent: _PrivateControlRecoveryBinding,
+    tool: _PrivateControlRecoveryBinding,
+    quarantine: _PrivateControlRecoveryBinding,
+) -> dict[str, object]:
+    plan = verification["plan"]
+    current_terminal = {
+        "digest": _pc_recovery_digest(
+            [
+                {
+                    "parent": _pc_recovery_record(
+                        primary_parent.identity,
+                        primary_parent.access,
+                    ),
+                    "root_id": plan["primary_root_id"],
+                },
+                {
+                    "inventory_digest": plan["inventory"]["digest"],
+                    "parent": _pc_recovery_record(parent.identity, parent.access),
+                    "quarantine": _pc_recovery_record(
+                        quarantine.identity,
+                        quarantine.access,
+                    ),
+                    "root_id": plan["root_id"],
+                    "tool_root": _pc_recovery_record(tool.identity, tool.access),
+                },
+            ]
+        ),
+        "root_ids": [plan["primary_root_id"], plan["root_id"]],
+        "status": "verified",
+    }
+    return {
+        "contract": MIRROR_PRIVATE_CONTROL_RECOVERY_CONTRACT,
+        "disposition": MIRROR_PRIVATE_CONTROL_RECOVERY_DISPOSITION,
+        "execute": {
+            "marker": verification["marker"],
+            "receipt": verification["receipt"],
+        },
+        "plan_digest": plan["plan_digest"],
+        "root_id": plan["root_id"],
+        "status": "executed",
+        "terminal_whole_registry_revalidation": current_terminal,
+        "version": MIRROR_PRIVATE_CONTROL_RECOVERY_VERSION,
+    }
+
+
+def execute_private_control_recovery(
+    requested_root_id: str,
+    receipt_path: Path,
+) -> dict[str, object]:
+    _pc_recovery_require_no_close_fence()
+    plan = _pc_recovery_read_external_plan(receipt_path, requested_root_id)
+    legacy_bindings: tuple[_PrivateControlRecoveryBinding | None, ...] = ()
+    primary_bindings: tuple[_PrivateControlRecoveryBinding | None, ...] = ()
+    receipt_binding: _PrivateControlRecoveryBinding | None = None
+    marker_binding: _PrivateControlRecoveryBinding | None = None
+    try:
+        (
+            primary_spec,
+            legacy_spec,
+            parent,
+            tool,
+            quarantine,
+            initial_primary_parent,
+        ) = _pc_recovery_bind_legacy(requested_root_id, exclusive=True)
+        legacy_bindings = (initial_primary_parent, quarantine, tool, parent)
+        live_plan = _pc_recovery_plan_from_bindings(
+            primary_spec,
+            legacy_spec,
+            parent,
+            tool,
+            quarantine,
+        )
+        if not _pc_recovery_canonical_documents_equal(
+            _pc_recovery_protected_plan(plan),
+            _pc_recovery_protected_plan(live_plan),
+        ):
+            raise SyncError(
+                "private-control recovery plan no longer matches retained evidence"
+            )
+        home, primary_parent = _pc_recovery_open_or_create_primary_parent(
+            primary_spec,
+            str(plan["plan_digest"]),
+            allow_create=initial_primary_parent is None,
+        )
+        primary_bindings = (primary_parent, home)
+        if initial_primary_parent is not None and (
+            initial_primary_parent.identity != primary_parent.identity
+            or initial_primary_parent.access != primary_parent.access
+        ):
+            raise SyncError(
+                "primary private-control parent changed after plan revalidation"
+            )
+        _pc_recovery_validate_topology(
+            parent,
+            tool,
+            quarantine,
+            primary_parent,
+        )
+
+        existing_marker = _pc_recovery_optional_file(
+            primary_parent,
+            MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+            "private-control cutover marker",
+        )
+        if existing_marker is not None:
+            existing_marker_binding, existing_marker_payload = existing_marker
+            try:
+                existing_marker_record = _pc_recovery_file_record(
+                    MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+                    existing_marker_binding,
+                    existing_marker_payload,
+                )
+                first_verification = _pc_recovery_verify_adoption_locked(
+                    primary_parent,
+                    parent,
+                    tool,
+                    quarantine,
+                    expected_plan_digest=str(plan["plan_digest"]),
+                )
+                if not _pc_recovery_canonical_documents_equal(
+                    first_verification["marker"],
+                    existing_marker_record,
+                ):
+                    raise SyncError(
+                        "private-control cutover marker changed before durability retry"
+                    )
+                _pc_recovery_fsync_directory(primary_parent)
+                _pc_recovery_revalidate_bound_file(
+                    primary_parent,
+                    MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+                    existing_marker_binding,
+                    existing_marker_payload,
+                )
+                verification = _pc_recovery_verify_adoption_locked(
+                    primary_parent,
+                    parent,
+                    tool,
+                    quarantine,
+                    expected_plan_digest=str(plan["plan_digest"]),
+                )
+                if (
+                    not _pc_recovery_canonical_documents_equal(
+                        verification,
+                        first_verification,
+                    )
+                    or not _pc_recovery_canonical_documents_equal(
+                        verification["marker"],
+                        existing_marker_record,
+                    )
+                ):
+                    raise SyncError(
+                        "private-control cutover state changed during durability retry"
+                    )
+                for final_name, label in (
+                    (
+                        MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+                        "primary recovery receipt",
+                    ),
+                    (
+                        MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+                        "private-control cutover marker",
+                    ),
+                ):
+                    _pc_recovery_remove_superseded_pending_publications(
+                        primary_parent,
+                        f".{final_name}.pending-{plan['plan_digest']}-{'0' * 32}",
+                        label,
+                    )
+                return _pc_recovery_execution_receipt(
+                    verification,
+                    primary_parent,
+                    parent,
+                    tool,
+                    quarantine,
+                )
+            finally:
+                _pc_recovery_close_bindings((existing_marker_binding,))
+
+        receipt_pending_name = (
+            f".{MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME}.pending-"
+            f"{plan['plan_digest']}-{secrets.token_hex(16)}"
+        )
+        receipt_binding, receipt_payload = _pc_recovery_publish_document(
+            primary_parent,
+            MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+            receipt_pending_name,
+            "primary recovery receipt",
+            lambda identity: _pc_recovery_primary_receipt_document(plan, identity),
+        )
+        receipt_record = _pc_recovery_file_record(
+            MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+            receipt_binding,
+            receipt_payload,
+        )
+
+        post_receipt_plan = _pc_recovery_plan_from_bindings(
+            primary_spec,
+            legacy_spec,
+            parent,
+            tool,
+            quarantine,
+        )
+        if not _pc_recovery_canonical_documents_equal(
+            _pc_recovery_protected_plan(plan),
+            _pc_recovery_protected_plan(post_receipt_plan),
+        ):
+            raise SyncError(
+                "private-control retained evidence changed after receipt publication"
+            )
+        terminal_registry = _pc_recovery_terminal_registry(
+            plan,
+            primary_parent,
+            receipt_record,
+            (parent, tool, quarantine),
+        )
+        marker_document = _pc_recovery_marker_document(
+            plan,
+            receipt_record,
+            terminal_registry,
+        )
+        marker_pending_name = (
+            f".{MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME}.pending-"
+            f"{plan['plan_digest']}-{secrets.token_hex(16)}"
+        )
+        marker_binding, marker_payload = _pc_recovery_publish_document(
+            primary_parent,
+            MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+            marker_pending_name,
+            "private-control cutover marker",
+            lambda _identity: marker_document,
+        )
+        marker_record = _pc_recovery_file_record(
+            MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+            marker_binding,
+            marker_payload,
+        )
+        _pc_recovery_close_bindings((receipt_binding,))
+        receipt_binding = None
+
+        verification = _pc_recovery_verify_adoption_locked(
+            primary_parent,
+            parent,
+            tool,
+            quarantine,
+            expected_plan_digest=str(plan["plan_digest"]),
+        )
+        _pc_recovery_revalidate_bound_file(
+            primary_parent,
+            MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+            marker_binding,
+            marker_payload,
+        )
+        if verification["marker"] != marker_record:
+            raise SyncError(
+                "private-control cutover marker changed during final verification"
+            )
+        return _pc_recovery_execution_receipt(
+            verification,
+            primary_parent,
+            parent,
+            tool,
+            quarantine,
+        )
+    finally:
+        active_error = sys.exc_info()[1]
+        cleanup_errors: list[str] = []
+        cleanup_groups = (
+            (marker_binding, receipt_binding),
+            primary_bindings,
+            legacy_bindings,
+        )
+        cleanup_bindings = tuple(
+            binding
+            for bindings in cleanup_groups
+            for binding in bindings
+            if binding is not None
+        )
+        if (
+            _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
+            or _PC_RECOVERY_RETAINED_CLOSE_FENCE
+        ):
+            _pc_recovery_retain_close_fence(cleanup_bindings)
+        elif cleanup_bindings:
+            try:
+                _pc_recovery_close_bindings(cleanup_bindings)
+            except SyncError as error:
+                cleanup_errors.append(str(error))
+        if cleanup_errors:
+            cleanup_detail = "private-control recovery cleanup failed: " + "; ".join(
+                cleanup_errors
+            )
+            if active_error is None:
+                raise SyncError(cleanup_detail)
+            print(f"warning: {cleanup_detail}", file=sys.stderr)
 
 
 def _bounded_json_integer(raw_value: str) -> int:
@@ -1078,6 +4973,7 @@ class MirrorQuarantineRootReceipt:
     absence_name: str | None = None
     absence_anchor_identity: tuple[int, int, int] | None = None
     absence_anchor_access_policy: tuple[int, int, int] | None = None
+    adoption_plan_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -21591,9 +25487,7 @@ def _parse_scheduler_program_arguments(
         parsed_flags[name] = value
     for name in parsed_flags:
         if name not in allowed_flags:
-            raise SyncError(
-                f"scheduler config command {command} does not allow {name}"
-            )
+            raise SyncError(f"scheduler config command {command} does not allow {name}")
     for name in required_flags:
         if name not in parsed_flags:
             raise SyncError(f"scheduler config is missing {name}")
@@ -26510,6 +30404,15 @@ def _install_scheduler_transaction_with_bindings(
                 _run_native_scheduler_action(
                     [
                         "launchctl",
+                        "enable",
+                        f"{background_domain}/{LAUNCHD_LABEL}",
+                    ],
+                    dry_run=dry_run,
+                    activation_bindings=bindings,
+                )
+                _run_native_scheduler_action(
+                    [
+                        "launchctl",
                         "bootstrap",
                         background_domain,
                         str(paths.launchd_plist),
@@ -30424,6 +34327,93 @@ def _audit_mirror_owner_record(
                 ) from error
 
 
+def _pc_recovery_audit_adoption_locked(
+    spec: MirrorPrivateControlRootSpec,
+    parent: _PrivateControlRecoveryBinding,
+    tool: _PrivateControlRecoveryBinding | None,
+    quarantine: _PrivateControlRecoveryBinding | None,
+    *,
+    expected_plan_digest: str | None = None,
+) -> str | None:
+    primary_spec, legacy_spec = _pc_recovery_specs(spec.root_id)
+    if spec != legacy_spec:
+        raise SyncError("private-control recovery audit registry entry changed")
+    primary_binding = _bind_mirror_primary_control_parent(primary_spec)
+    if primary_binding is None:
+        return None
+    primary_fd, primary_identity, primary_access = primary_binding
+    primary = _PrivateControlRecoveryBinding(
+        label=f"primary private-control parent [{primary_spec.root_id}]",
+        path=Path(os.path.abspath(primary_spec.parent_path)),
+        fd=primary_fd,
+        identity=primary_identity,
+        access=primary_access,
+    )
+    try:
+        try:
+            os.stat(
+                MIRROR_PRIVATE_CONTROL_RECOVERY_MARKER_NAME,
+                dir_fd=primary.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            try:
+                os.stat(
+                    MIRROR_PRIVATE_CONTROL_RECOVERY_RECEIPT_NAME,
+                    dir_fd=primary.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                _pc_recovery_revalidate_directory(primary)
+                return None
+            except OSError as error:
+                raise SyncError(
+                    f"cannot inspect retained-in-place recovery receipt: {error}"
+                ) from error
+            raise SyncError(
+                "retained-in-place recovery receipt exists without its cutover marker"
+            )
+        except OSError as error:
+            raise SyncError(
+                f"cannot inspect retained-in-place recovery cutover marker: {error}"
+            ) from error
+        if tool is None or quarantine is None:
+            raise SyncError(
+                "retained-in-place recovery cutover requires its exact legacy "
+                "tool and quarantine roots"
+            )
+        _pc_recovery_validate_topology(
+            parent,
+            tool,
+            quarantine,
+            primary,
+        )
+        verification = _pc_recovery_verify_adoption_locked(
+            primary,
+            parent,
+            tool,
+            quarantine,
+            expected_plan_digest=expected_plan_digest,
+        )
+        plan = verification["plan"]
+        plan_digest = plan["plan_digest"]
+        if not isinstance(plan_digest, str):
+            raise SyncError("verified recovery plan digest is invalid")
+        return plan_digest
+    finally:
+        active_error = sys.exc_info()[1]
+        try:
+            _pc_recovery_close_bindings((primary,))
+        except SyncError as cleanup_error:
+            if active_error is None:
+                raise
+            _raise_sync_with_secondary_cleanup(
+                active_error,
+                "recovery audit primary-parent cleanup failure",
+                (str(cleanup_error),),
+            )
+
+
 def _mirror_quarantine_root_audit(
     spec: MirrorPrivateControlRootSpec,
     seen_parent_identities: set[tuple[int, int, int]] | None = None,
@@ -30455,6 +34445,7 @@ def _mirror_quarantine_root_audit(
     first_tool: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
     first_quarantine: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
     fixed_metadata_captured = False
+    adoption_plan_digest: str | None = None
     forced_reason_code: str | None = None
     prior_parent_identities = (
         set() if seen_parent_identities is None else seen_parent_identities
@@ -30834,10 +34825,73 @@ def _mirror_quarantine_root_audit(
                     quarantine_coordination_ready = False
                     audit_errors.append(str(error))
 
+        if not spec.allocate and spec.root_id == MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID:
+            if parent_identity is None or parent_access_policy is None:
+                audit_errors.append(
+                    "legacy private-control parent binding is incomplete"
+                )
+            else:
+                recovery_parent = _PrivateControlRecoveryBinding(
+                    label=f"legacy private-control parent [{spec.root_id}]",
+                    path=parent_path,
+                    fd=parent_fd,
+                    identity=parent_identity,
+                    access=parent_access_policy,
+                )
+                recovery_tool = (
+                    _PrivateControlRecoveryBinding(
+                        label=f"legacy private-control tool root [{spec.root_id}]",
+                        path=tool_path,
+                        fd=tool_fd,
+                        identity=tool_identity,
+                        access=tool_access_policy,
+                    )
+                    if (
+                        tool_coordination_ready
+                        and tool_was_present
+                        and tool_lease_attempted
+                        and tool_fd >= 0
+                        and tool_identity is not None
+                        and tool_access_policy is not None
+                    )
+                    else None
+                )
+                recovery_quarantine = (
+                    _PrivateControlRecoveryBinding(
+                        label=f"legacy quarantine [{spec.root_id}]",
+                        path=quarantine_path,
+                        fd=quarantine_fd,
+                        identity=segment_identity,
+                        access=segment_access_policy,
+                    )
+                    if (
+                        quarantine_coordination_ready
+                        and quarantine_was_present
+                        and quarantine_lease_attempted
+                        and quarantine_fd >= 0
+                        and segment_identity is not None
+                        and segment_access_policy is not None
+                    )
+                    else None
+                )
+                try:
+                    adoption_plan_digest = _pc_recovery_audit_adoption_locked(
+                        spec,
+                        recovery_parent,
+                        recovery_tool,
+                        recovery_quarantine,
+                    )
+                except SyncError as error:
+                    audit_errors.append(
+                        f"{MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE} "
+                        f"[{spec.root_id}]: {error}"
+                    )
+
         if (
             tool_coordination_ready
             and tool_was_present
             and quarantine_coordination_ready
+            and adoption_plan_digest is None
         ):
             try:
                 tool_names, tool_overflow = _bounded_mirror_directory_names(
@@ -31031,6 +35085,8 @@ def _mirror_quarantine_root_audit(
             )
             else forced_reason_code or MIRROR_PRIVATE_CONTROL_REASON_INCONCLUSIVE
         )
+    elif adoption_plan_digest is not None:
+        classification = "adopted-retained-in-place"
     elif not spec.allocate and (
         tool_names or (entry_count is not None and entry_count > 0)
     ):
@@ -31057,6 +35113,11 @@ def _mirror_quarantine_root_audit(
             parent_access_policy=parent_access_policy,
             tool_record=first_tool if fixed_metadata_captured else None,
             quarantine_record=first_quarantine if fixed_metadata_captured else None,
+            adoption_plan_digest=(
+                adoption_plan_digest
+                if classification == "adopted-retained-in-place"
+                else None
+            ),
         )
     return MirrorQuarantineAudit(
         classification=classification,
@@ -31104,12 +35165,15 @@ def _revalidate_mirror_quarantine_root_receipt(
     spec: MirrorPrivateControlRootSpec,
     audit: MirrorQuarantineAudit,
 ) -> str:
-    """Revalidate fixed identity/access policy, not directory-entry contents.
+    """Revalidate the receipt's selected protected property.
 
     Identity is dev/inode/type and access policy is mode/uid/gid. An anchored
     missing fixed name is protected as absence. Directory timestamps and child
     listings are deliberately excluded so benign child-entry churn is not
     mistaken for replacement, content mutation, or access-policy drift.
+    Adopted retained-in-place receipts additionally protect the complete
+    inventory and publication binding. Timestamps and allocated-block counts
+    remain excluded; allocated bytes are an admission cap, not content identity.
     """
 
     receipt = audit.root_receipt
@@ -31134,6 +35198,8 @@ def _revalidate_mirror_quarantine_root_receipt(
             or receipt.parent_access_policy is not None
             or receipt.tool_record is not None
             or receipt.quarantine_record is not None
+            or receipt.adoption_plan_digest is not None
+            or audit.classification == "adopted-retained-in-place"
             or any(field is None for field in absence_fields)
         ):
             raise SyncError("absent-parent root receipt is incomplete")
@@ -31148,6 +35214,20 @@ def _revalidate_mirror_quarantine_root_receipt(
         return "stable(parent-absent)"
     if receipt.scope not in {"parent-only", "fixed-metadata"}:
         raise SyncError(f"root receipt scope is invalid: {receipt.scope}")
+    adopted = audit.classification == "adopted-retained-in-place"
+    if adopted:
+        if (
+            spec.allocate
+            or spec.root_id != MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID
+            or receipt.scope != "fixed-metadata"
+            or receipt.tool_record is None
+            or receipt.quarantine_record is None
+            or not isinstance(receipt.adoption_plan_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", receipt.adoption_plan_digest) is None
+        ):
+            raise SyncError("adopted retained-in-place root receipt is incomplete")
+    elif receipt.adoption_plan_digest is not None:
+        raise SyncError("non-adopted root receipt has a recovery plan digest")
     if (
         receipt.parent_identity is None
         or receipt.parent_access_policy is None
@@ -31229,6 +35309,151 @@ def _revalidate_mirror_quarantine_root_receipt(
             raise SyncError(
                 "private-control fixed-name identity or access policy changed"
             )
+        if adopted:
+            assert receipt.adoption_plan_digest is not None
+            adopted_tool_fd = -1
+            adopted_quarantine_fd = -1
+            adopted_tool_locked = False
+            adopted_quarantine_locked = False
+            with _mirror_descriptor_cleanup_scope(
+                lambda: (
+                    (
+                        f"terminal adopted quarantine [{spec.root_id}]",
+                        adopted_quarantine_fd,
+                        adopted_quarantine_locked,
+                    ),
+                    (
+                        f"terminal adopted tool root [{spec.root_id}]",
+                        adopted_tool_fd,
+                        adopted_tool_locked,
+                    ),
+                ),
+                label="terminal adopted recovery cleanup failures",
+            ):
+                (
+                    adopted_tool_fd,
+                    adopted_tool_identity,
+                    adopted_tool_access,
+                ) = _bind_mirror_audit_child_directory(
+                    parent_fd,
+                    parent_path,
+                    MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                    f"terminal adopted tool root [{spec.root_id}]",
+                )
+                if (
+                    adopted_tool_identity,
+                    adopted_tool_access,
+                ) != receipt.tool_record:
+                    raise SyncError(
+                        "adopted legacy tool root changed before terminal binding"
+                    )
+                _acquire_mirror_audit_shared_lock(
+                    adopted_tool_fd,
+                    f"terminal adopted tool root [{spec.root_id}]",
+                )
+                adopted_tool_locked = True
+                (
+                    adopted_quarantine_fd,
+                    adopted_quarantine_identity,
+                    adopted_quarantine_access,
+                ) = _bind_mirror_audit_child_directory(
+                    parent_fd,
+                    parent_path,
+                    MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                    f"terminal adopted quarantine [{spec.root_id}]",
+                )
+                if (
+                    adopted_quarantine_identity,
+                    adopted_quarantine_access,
+                ) != receipt.quarantine_record:
+                    raise SyncError(
+                        "adopted legacy quarantine changed before terminal binding"
+                    )
+                _validate_mirror_private_control_bound_topology(
+                    root_id=spec.root_id,
+                    parent_fd=parent_fd,
+                    parent_identity=parent_identity,
+                    tool_fd=adopted_tool_fd,
+                    tool_identity=adopted_tool_identity,
+                    quarantine_fd=adopted_quarantine_fd,
+                    quarantine_identity=adopted_quarantine_identity,
+                )
+                _acquire_mirror_audit_shared_lock(
+                    adopted_quarantine_fd,
+                    f"terminal adopted quarantine [{spec.root_id}]",
+                )
+                adopted_quarantine_locked = True
+                recovery_parent = _PrivateControlRecoveryBinding(
+                    label=f"terminal legacy parent [{spec.root_id}]",
+                    path=parent_path,
+                    fd=parent_fd,
+                    identity=parent_identity,
+                    access=parent_access_policy,
+                )
+                recovery_tool = _PrivateControlRecoveryBinding(
+                    label=f"terminal legacy tool root [{spec.root_id}]",
+                    path=parent_path / MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                    fd=adopted_tool_fd,
+                    identity=adopted_tool_identity,
+                    access=adopted_tool_access,
+                )
+                recovery_quarantine = _PrivateControlRecoveryBinding(
+                    label=f"terminal legacy quarantine [{spec.root_id}]",
+                    path=parent_path / MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                    fd=adopted_quarantine_fd,
+                    identity=adopted_quarantine_identity,
+                    access=adopted_quarantine_access,
+                )
+                terminal_digest = _pc_recovery_audit_adoption_locked(
+                    spec,
+                    recovery_parent,
+                    recovery_tool,
+                    recovery_quarantine,
+                    expected_plan_digest=receipt.adoption_plan_digest,
+                )
+                if terminal_digest != receipt.adoption_plan_digest:
+                    raise SyncError(
+                        "adopted retained-in-place recovery publication disappeared"
+                    )
+                final_tool = _mirror_legacy_child_metadata(
+                    parent_fd,
+                    MIRROR_PRIVATE_TOOL_ROOT_NAME,
+                    spec.root_id,
+                )
+                final_quarantine = _mirror_legacy_child_metadata(
+                    parent_fd,
+                    MIRROR_DURABLE_QUARANTINE_ROOT_NAME,
+                    spec.root_id,
+                )
+                if (
+                    final_tool != receipt.tool_record
+                    or final_quarantine != receipt.quarantine_record
+                ):
+                    raise SyncError(
+                        "adopted legacy fixed roots changed during terminal verification"
+                    )
+                _revalidate_mirror_audit_directory(
+                    recovery_tool.path,
+                    recovery_tool.fd,
+                    recovery_tool.identity,
+                    recovery_tool.access,
+                    recovery_tool.label,
+                )
+                _revalidate_mirror_audit_directory(
+                    recovery_quarantine.path,
+                    recovery_quarantine.fd,
+                    recovery_quarantine.identity,
+                    recovery_quarantine.access,
+                    recovery_quarantine.label,
+                )
+                _revalidate_mirror_audit_directory(
+                    parent_path,
+                    parent_fd,
+                    parent_identity,
+                    parent_access_policy,
+                    f"terminal private-control parent [{spec.root_id}]",
+                )
+                return "stable(adopted-retained-in-place)"
         _revalidate_mirror_audit_directory(
             parent_path,
             parent_fd,
@@ -31382,6 +35607,8 @@ def _mirror_quarantine_audit() -> MirrorQuarantineAudit:
         (
             audit.reason_code
             if audit.reason_code is not None
+            else "adopted-retained-in-place"
+            if audit.classification == "adopted-retained-in-place"
             else "foreign-unrelated"
             if audit.classification == "foreign-unrelated"
             else "absent"
@@ -32514,6 +36741,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prune_parser.add_argument("--dry-run", action="store_true")
 
+    recovery_parser = subparsers.add_parser(
+        "recover-private-control",
+        help="Adopt exact legacy private-control evidence without moving it",
+    )
+    recovery_parser.add_argument(
+        "--root-id",
+        required=True,
+        choices=(MIRROR_PRIVATE_CONTROL_LEGACY_ROOT_ID,),
+    )
+    recovery_mode = recovery_parser.add_mutually_exclusive_group(required=True)
+    recovery_mode.add_argument("--dry-run", action="store_true")
+    recovery_mode.add_argument("--execute", action="store_true")
+    recovery_parser.add_argument("--output-receipt", type=Path)
+    recovery_parser.add_argument("--receipt", type=Path)
+
     return parser
 
 
@@ -32599,6 +36841,26 @@ def main(argv: list[str] | None = None) -> int:
                 args.owners,
                 dry_run=args.dry_run,
             )
+        elif args.command == "recover-private-control":
+            if args.dry_run:
+                if args.output_receipt is None or args.receipt is not None:
+                    raise SyncError(
+                        "--dry-run requires --output-receipt and rejects --receipt"
+                    )
+                receipt = plan_private_control_recovery(
+                    args.root_id,
+                    args.output_receipt,
+                )
+            else:
+                if args.receipt is None or args.output_receipt is not None:
+                    raise SyncError(
+                        "--execute requires --receipt and rejects --output-receipt"
+                    )
+                receipt = execute_private_control_recovery(
+                    args.root_id,
+                    args.receipt,
+                )
+            sys.stdout.buffer.write(_pc_recovery_json_bytes(receipt, pretty=True))
         else:
             parser.error(f"unknown command: {args.command}")
     except SyncError as error:
