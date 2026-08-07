@@ -7793,6 +7793,7 @@ while True:
             ["/bin/launchctl", "bootout", gui_target],
             ["/bin/launchctl", "disable", gui_target],
             ["/bin/launchctl", "bootout", user_target],
+            ["/bin/launchctl", "enable", user_target],
             ["/bin/launchctl", "bootstrap", user_domain, str(plist_path)],
             ["/bin/launchctl", "enable", user_target],
         ]

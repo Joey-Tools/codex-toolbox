@@ -3,7 +3,7 @@ id: 20260801-psm001
 title: Personal Sync Generated Mirror Bridge
 status: completed
 created: 2026-08-01
-updated: 2026-08-05
+updated: 2026-08-07
 branch: codex/personal-sync-generated-mirror-bridge
 pr: 20
 supersedes: []
@@ -29,16 +29,16 @@ superseded_by:
   test, manifest-validation, package-build, package-verification, and publish
   consumers in that job use that same step-output working directory.
 - The six canonical files and `generated-sync-source-lock.json` bind landed
-  canonical commit `e57140e16a68db24dbdd883de665283538234730`, tree
-  `13470ade1303992d81d02dc606ad66da7b6dd3a7`.
+  canonical commit `b4e74d7f35226801483a63ebe605b1298d60dc8e`, tree
+  `d7313b8dce755f58d13726dccfe60d1fb4cfee6c`.
 - The generated receipt records mapping digest
   `3e26648dd65526e759089c5acf5a9f429f3df0f5adc8dbe94b3856954b801ece`,
   file-set digest
   `c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad`,
   and tree digest
-  `7a273c8533839cd7efd13d96d4f6783ccce75442d00d1528015bed3290a6e505`.
+  `f9c8bf7d92b5c25d8d0c2ccee256f3f205ce4e57c4f7adbf9b9123f1775ebaba`.
 - The consumer verifier pins the complete receipt SHA-256
-  `ff1a2dad1b3d473568c0a7b785110dfbe5094747f8d3fa31ade7ab5b2a0fdb9e`
+  `822a1d96512043149d9b95311a6009be69ac12a12821b38ec470349e9e5bfbd1`
   outside the receipt itself, then checks the exact canonical identity,
   closed six-file mapping, recomputed digests, target modes, and target bytes
   before any generated-code consumer can proceed.
@@ -59,8 +59,8 @@ superseded_by:
 ## Next Steps
 
 - Preserve the generated receipt as the source of truth for this toolbox tree.
-- After squash landing, downstream private generation must bind the actual
-  landed toolbox commit and prove its tree equals the reviewed PR-head tree.
+- Downstream private generation must bind the actual landed toolbox commit
+  and prove its tree equals the reviewed PR-head tree.
 
 ## Evidence
 
@@ -101,3 +101,17 @@ superseded_by:
   Python 3.13.0 and 3.9.6. An exact local clone/detached-checkout/same-root
   installation probe remained Git-clean; actionlint, Ruff lint/format,
   project-journal validation, and diff checks also passed.
+- Canonical Personal Sync PR #11 reviewed exact head
+  `e8d13b419666f928b1d60adf6b249983b6cfc4e4` and squash-landed commit
+  `b4e74d7f35226801483a63ebe605b1298d60dc8e` with identical tree
+  `d7313b8dce755f58d13726dccfe60d1fb4cfee6c`. That follow-up adds the
+  consumer-visible retained-recovery failure matrix and the corrected marker
+  parent-`fsync` after-effect regression; production runtime semantics are
+  unchanged.
+- Stock generation from the exact landed commit updated the engine, engine
+  tests, scheduler/doctor tests, and receipt. The mapping digest remains
+  `3e26648dd65526e759089c5acf5a9f429f3df0f5adc8dbe94b3856954b801ece`
+  and the file-set digest remains
+  `c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad`;
+  the consumer-owned verifier independently pins the new canonical commit and
+  complete receipt SHA-256 before generated code can run.
