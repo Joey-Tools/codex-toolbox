@@ -14,13 +14,14 @@ superseded_by:
 
 ## Summary
 
-- Added public personal guidance for invalid `spawn_agent` fork shapes and exhausted agent-tree handling.
+- Added public personal guidance for invalid collaboration fork shapes and exhausted agent-tree handling across supported runtime schemas.
 
 ## Current State
 
-- Full-history forks inherit the parent agent role and omit `agent_type`.
-- Specialized agent roles use `fork_turns: "none"` or a positive inherited-turn count.
-- An unchanged exhausted agent tree is inspected once rather than receiving repeated `spawn_agent` or `followup_task` attempts.
+- Full-history forks do not combine with role, model, or reasoning overrides.
+- Specialized agents use the active runtime's zero-history or bounded-history field instead of assuming one schema's parameter names.
+- An unchanged exhausted agent tree is inspected once rather than receiving repeated spawn, follow-up, or resume attempts.
+- Recovery uses only status, messaging, or safe-close operations actually exposed by the active tool contract.
 - Consumer-owned regression coverage keeps both invariants in public personal packages without modifying generated Personal Sync tests.
 
 ## Next Steps

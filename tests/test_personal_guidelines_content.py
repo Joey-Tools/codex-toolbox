@@ -14,24 +14,26 @@ class PersonalGuidelinesContentTests(unittest.TestCase):
         cls.agents = PERSONAL_AGENTS_PATH.read_text(encoding="utf-8")
 
     def test_spawn_agent_fork_contract_is_documented(self) -> None:
-        self.assertIn("When using `spawn_agent`", self.agents)
-        self.assertIn("do not combine an `agent_type` override", self.agents)
-        self.assertIn("`fork_turns` omitted or `\"all\"`", self.agents)
-        self.assertIn("omit `agent_type` to inherit the parent role", self.agents)
+        self.assertIn("When a collaboration spawn call applies", self.agents)
+        self.assertIn("do not pair it with the runtime's full-history fork", self.agents)
+        self.assertIn("omit the override", self.agents)
         self.assertIn(
-            "set `fork_turns` to `\"none\"` or a positive turn count",
+            "`fork_turns=\"none\"` or a positive turn count",
             self.agents,
         )
+        self.assertIn("`fork_context=false`", self.agents)
+        self.assertIn("active tool contract", self.agents)
 
     def test_agent_thread_limit_contract_is_documented(self) -> None:
-        self.assertIn("After `agent thread limit reached`", self.agents)
-        self.assertIn("inspect `list_agents` once", self.agents)
+        self.assertIn("After an agent-thread or agent-tree capacity error", self.agents)
+        self.assertIn("query collaboration status once", self.agents)
         self.assertIn(
-            "do not repeat the same `spawn_agent` or `followup_task`",
+            "Do not repeat spawn, follow-up, or resume attempts",
             self.agents,
         )
         self.assertIn(
-            "reuse an existing running owner with `send_message`",
+            "reuse a running owner through the exposed message or input operation",
             self.agents,
         )
+        self.assertIn("only when a safe close operation is exposed", self.agents)
         self.assertIn("fresh root task", self.agents)
