@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-10
 updated: 2026-08-10
 branch: codex/daily-skill-friction-20260810-agent-collaboration-guardrails
-pr:
+pr: 22
 supersedes: []
 superseded_by:
 ---
@@ -29,5 +29,6 @@ superseded_by:
 
 ## Evidence
 
+- https://github.com/Joey-Tools/codex-toolbox/pull/22
 - `personal_codex/AGENTS.md`
 - `tests/test_personal_guidelines_content.py`
