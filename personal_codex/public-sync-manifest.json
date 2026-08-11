@@ -22,6 +22,11 @@
       "kind": "file"
     },
     {
+      "source": "personal_codex/skills/grilling",
+      "target": "skills/grilling",
+      "kind": "skill"
+    },
+    {
       "source": "personal_codex/skills/submodule-linked-worktrees",
       "target": "skills/submodule-linked-worktrees",
       "kind": "skill"
