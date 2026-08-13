@@ -57,13 +57,6 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         self.assertIn(
             "on:\n"
             "  workflow_call:\n"
-            "    inputs:\n"
-            "      repository:\n"
-            "        required: true\n"
-            "        type: string\n"
-            "      ref:\n"
-            "        required: true\n"
-            "        type: string\n"
             "\n"
             "permissions:\n",
             workflow,
@@ -75,14 +68,16 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         checkout = checkout_steps(workflow)
         self.assertGreater(len(checkout), 0)
         self.assertEqual(
-            workflow.count("repository: ${{ inputs.repository }}"), len(checkout)
+            workflow.count("repository: ${{ github.repository }}"), len(checkout)
         )
-        self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), len(checkout))
+        self.assertEqual(workflow.count("ref: ${{ github.sha }}"), len(checkout))
         self.assertEqual(workflow.count("persist-credentials: false"), len(checkout))
         for step in checkout:
-            self.assertIn("repository: ${{ inputs.repository }}", step)
-            self.assertIn("ref: ${{ inputs.ref }}", step)
+            self.assertIn("repository: ${{ github.repository }}", step)
+            self.assertIn("ref: ${{ github.sha }}", step)
             self.assertEqual(step.count("persist-credentials: false"), 1)
+        self.assertNotIn("inputs.repository", workflow)
+        self.assertNotIn("inputs.ref", workflow)
         self.assertIn(
             'clone --no-local --no-hardlinks --no-checkout \\',
             workflow,
