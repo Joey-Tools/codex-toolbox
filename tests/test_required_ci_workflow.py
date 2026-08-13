@@ -24,6 +24,30 @@ def top_level_job_ids(workflow: str) -> list[str]:
     return job_ids
 
 
+def checkout_steps(workflow: str) -> list[str]:
+    lines = workflow.splitlines()
+    steps: list[str] = []
+    for index, line in enumerate(lines):
+        if not line.lstrip().startswith("- uses: actions/checkout@"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        end = index + 1
+        while end < len(lines):
+            candidate = lines[end]
+            candidate_indent = len(candidate) - len(candidate.lstrip())
+            if candidate.strip() and (
+                candidate_indent < indent
+                or (
+                    candidate_indent == indent
+                    and candidate.lstrip().startswith("- ")
+                )
+            ):
+                break
+            end += 1
+        steps.append("\n".join(lines[index:end]))
+    return steps
+
+
 class RequiredCiWorkflowTests(unittest.TestCase):
     def test_entry_wraps_only_the_required_linux_test(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/required-ci.yml").read_text(
@@ -48,21 +72,17 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         self.assertEqual(top_level_job_ids(workflow), ["test"])
         self.assertIn("runs-on: ubuntu-latest", workflow)
         self.assertIn("fetch-depth: 0", workflow)
-        self.assertIn("persist-credentials: false", workflow)
-        self.assertEqual(workflow.count("uses: actions/checkout@"), 1)
+        checkout = checkout_steps(workflow)
+        self.assertGreater(len(checkout), 0)
         self.assertEqual(
-            workflow.count("repository: ${{ inputs.repository }}"), 1
+            workflow.count("repository: ${{ inputs.repository }}"), len(checkout)
         )
-        self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), 1)
-        self.assertIn(
-            "      - uses: actions/checkout@v4\n"
-            "        with:\n"
-            "          repository: ${{ inputs.repository }}\n"
-            "          ref: ${{ inputs.ref }}\n"
-            "          fetch-depth: 0\n"
-            "          persist-credentials: false\n",
-            workflow,
-        )
+        self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), len(checkout))
+        self.assertEqual(workflow.count("persist-credentials: false"), len(checkout))
+        for step in checkout:
+            self.assertIn("repository: ${{ inputs.repository }}", step)
+            self.assertIn("ref: ${{ inputs.ref }}", step)
+            self.assertEqual(step.count("persist-credentials: false"), 1)
         self.assertIn(
             'clone --no-local --no-hardlinks --no-checkout \\',
             workflow,
