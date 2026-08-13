@@ -30,12 +30,39 @@ class RequiredCiWorkflowTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("on:\n  workflow_call:\n", workflow)
+        self.assertIn(
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      repository:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "      ref:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "\n"
+            "permissions:\n",
+            workflow,
+        )
         self.assertIn("permissions:\n  contents: read\n", workflow)
         self.assertEqual(top_level_job_ids(workflow), ["test"])
         self.assertIn("runs-on: ubuntu-latest", workflow)
         self.assertIn("fetch-depth: 0", workflow)
         self.assertIn("persist-credentials: false", workflow)
+        self.assertEqual(workflow.count("uses: actions/checkout@"), 1)
+        self.assertEqual(
+            workflow.count("repository: ${{ inputs.repository }}"), 1
+        )
+        self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), 1)
+        self.assertIn(
+            "      - uses: actions/checkout@v4\n"
+            "        with:\n"
+            "          repository: ${{ inputs.repository }}\n"
+            "          ref: ${{ inputs.ref }}\n"
+            "          fetch-depth: 0\n"
+            "          persist-credentials: false\n",
+            workflow,
+        )
         self.assertIn(
             'clone --no-local --no-hardlinks --no-checkout \\',
             workflow,
