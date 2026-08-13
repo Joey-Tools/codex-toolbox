@@ -10,9 +10,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      - name: Reject unexpected repository
+        if: ${{ github.repository != 'Joey-Tools/codex-toolbox' }}
+        run: exit 1
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository }}
+          repository: Joey-Tools/codex-toolbox
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
