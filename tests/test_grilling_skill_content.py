@@ -40,6 +40,15 @@ class GrillingSkillContentTests(unittest.TestCase):
         self.assertIn(
             "Do not set or describe a timeout, countdown", self.skill_words
         )
+        self.assertIn(
+            "In Default mode, use the text fallback below", self.skill_words
+        )
+        self.assertIn(
+            "Treat an empty `answers` object as unanswered", self.skill_words
+        )
+        self.assertNotIn(
+            "Wait indefinitely for the user's response", self.skill_words
+        )
         self.assertIn("After every answer batch, recompute", self.skill_words)
 
     def test_public_manifest_distributes_skill(self) -> None:

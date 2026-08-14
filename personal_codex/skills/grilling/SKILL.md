@@ -31,8 +31,9 @@ depend on it.
 
 ## Ask with `request_user_input`
 
-When the `request_user_input` tool is available, use it for every decision
-batch and for the final confirmation.
+When the `request_user_input` tool is available in Plan mode, use it for every
+decision batch and for the final confirmation. In Default mode, use the text
+fallback below.
 
 - Put one to three questions in each tool call.
 - Give every question exactly three mutually exclusive choices. Put the
@@ -40,12 +41,15 @@ batch and for the final confirmation.
 - Make each option description state its practical impact or tradeoff.
 - Do not add an `Other` option. The client supplies the free-form answer path.
 - Do not set or describe a timeout, countdown, auto-submit behavior, or
-  silence-based default. Wait indefinitely for the user's response.
+  silence-based default.
+- Treat an empty `answers` object as unanswered. Re-ask the same batch through
+  the text fallback and wait for explicit user input; never continue or select
+  the recommended choice.
 - Do not select the recommended choice merely because the user has not replied.
 
-When the tool is unavailable, ask the same batch in text. Number every question,
-include exactly three choices plus an explicit free-form-answer invitation, and
-format each question like this:
+When the tool is unavailable or the collaboration mode is Default, ask the same
+batch in text. Number every question, include exactly three choices plus an
+explicit free-form-answer invitation, and format each question like this:
 
 ```
 ❓ **Q1** - **<question title>**: <question body and three choices>
@@ -72,8 +76,8 @@ a recommendation and wait for their answer.
 The session is ready to finish only when the frontier is empty: every reachable
 branch has been visited and nothing remains silently assumed. Summarize the
 shared understanding, then ask the user to confirm it. When
-`request_user_input` is available, use three choices: confirm and proceed,
-revise the design, or pause, with confirm and proceed recommended.
+`request_user_input` is available in Plan mode, use three choices: confirm and
+proceed, revise the design, or pause, with confirm and proceed recommended.
 
 Do not act on the resulting plan, decision, or idea until the user explicitly
 confirms the shared understanding.
