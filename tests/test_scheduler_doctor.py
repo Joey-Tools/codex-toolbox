@@ -8525,7 +8525,7 @@ class SchedulerDoctorTests(unittest.TestCase):
             arguments.extend(
                 ("--repo", "owner/public-sync", "--home", str(self.home))
             )
-            payload = MODULE._launchd_plist(
+            payload = MODULE._legacy_background_launchd_plist(
                 self.home,
                 "owner/public-sync",
                 19,
@@ -8957,7 +8957,11 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(config.owner, "private")
         self.assertEqual(
             config.launchd_domain,
-            MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+            MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+        )
+        self.assertEqual(
+            config.launchd_profile,
+            MODULE.MACOS_LAUNCHD_PROFILE_AQUA,
         )
 
     def test_linux_scheduler_config_parses_private_run_scheduled(self) -> None:
@@ -9001,7 +9005,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(config.owner, "private")
         self.assertIsNone(config.launchd_domain)
 
-    def test_macos_loader_accepts_only_exact_background_and_gui_profiles(
+    def test_macos_loader_accepts_only_exact_aqua_and_legacy_profiles(
         self,
     ) -> None:
         runner = self.home / "bin" / "runner"
@@ -9010,15 +9014,29 @@ class SchedulerDoctorTests(unittest.TestCase):
         paths.launchd_plist.parent.mkdir(parents=True)
         profiles = (
             (
+                "aqua",
                 MODULE._launchd_plist(
                     self.home,
                     "owner/public-sync",
                     19,
                     runner,
                 ),
-                MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+                MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+                MODULE.MACOS_LAUNCHD_PROFILE_AQUA,
             ),
             (
+                "background",
+                MODULE._legacy_background_launchd_plist(
+                    self.home,
+                    "owner/public-sync",
+                    19,
+                    runner,
+                ),
+                MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+                MODULE.MACOS_LAUNCHD_PROFILE_BACKGROUND,
+            ),
+            (
+                "loose-gui",
                 MODULE._legacy_gui_launchd_plist(
                     self.home,
                     "owner/public-sync",
@@ -9026,10 +9044,11 @@ class SchedulerDoctorTests(unittest.TestCase):
                     runner,
                 ),
                 MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+                MODULE.MACOS_LAUNCHD_PROFILE_GUI,
             ),
         )
-        for payload, expected_domain in profiles:
-            with self.subTest(domain=expected_domain):
+        for profile, payload, expected_domain, expected_launchd_profile in profiles:
+            with self.subTest(profile=profile):
                 paths.launchd_plist.write_bytes(plistlib.dumps(payload, sort_keys=True))
 
                 config = MODULE._load_macos_scheduler_config(paths)
@@ -9037,6 +9056,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                 self.assertIsNotNone(config)
                 assert config is not None
                 self.assertEqual(config.launchd_domain, expected_domain)
+                self.assertEqual(config.launchd_profile, expected_launchd_profile)
 
         for mutation in ("unknown-key", "unknown-session", "unknown-process"):
             with self.subTest(mutation=mutation):
@@ -9049,7 +9069,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                 if mutation == "unknown-key":
                     payload["KeepAlive"] = True
                 elif mutation == "unknown-session":
-                    payload["LimitLoadToSessionType"] = "Aqua"
+                    payload["LimitLoadToSessionType"] = "LoginWindow"
                 else:
                     payload["ProcessType"] = "Interactive"
                 paths.launchd_plist.write_bytes(plistlib.dumps(payload, sort_keys=True))
@@ -9089,12 +9109,16 @@ class SchedulerDoctorTests(unittest.TestCase):
         paths.launchd_plist.parent.mkdir(parents=True)
         profiles = (
             (
-                MODULE._launchd_plist,
+                "background",
+                MODULE._legacy_background_launchd_plist,
                 MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+                MODULE.MACOS_LAUNCHD_PROFILE_BACKGROUND,
             ),
             (
+                "loose-gui",
                 MODULE._legacy_gui_launchd_plist,
                 MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+                MODULE.MACOS_LAUNCHD_PROFILE_GUI,
             ),
         )
         commands = (
@@ -9129,9 +9153,9 @@ class SchedulerDoctorTests(unittest.TestCase):
                 "private",
             ),
         )
-        for builder, expected_domain in profiles:
+        for profile, builder, expected_domain, expected_launchd_profile in profiles:
             for command, arguments, repo, mode in commands:
-                with self.subTest(domain=expected_domain, command=command):
+                with self.subTest(profile=profile, command=command):
                     payload = builder(
                         self.home,
                         repo,
@@ -9153,9 +9177,37 @@ class SchedulerDoctorTests(unittest.TestCase):
                     assert config is not None
                     self.assertEqual(config.command, command)
                     self.assertEqual(config.launchd_domain, expected_domain)
+                    self.assertEqual(
+                        config.launchd_profile,
+                        expected_launchd_profile,
+                    )
 
-        for builder, expected_domain in profiles:
+        for command, arguments, repo, mode in commands:
+            with self.subTest(profile="aqua", command=command):
+                payload = MODULE._launchd_plist(
+                    self.home,
+                    repo,
+                    19,
+                    runner,
+                    mode=mode,
+                    base_repo="owner/public-sync",
+                    owner="private",
+                )
+                payload["ProgramArguments"] = arguments
+                del payload["EnvironmentVariables"]["PYTHONDONTWRITEBYTECODE"]
+                paths.launchd_plist.write_bytes(
+                    plistlib.dumps(payload, sort_keys=True)
+                )
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "unsupported execution semantics",
+                ):
+                    MODULE._load_macos_scheduler_config(paths)
+
+        for profile, builder, expected_domain, _expected_launchd_profile in profiles:
             with self.subTest(
+                profile=profile,
                 domain=expected_domain,
                 command="run-scheduled",
             ):
@@ -9173,6 +9225,82 @@ class SchedulerDoctorTests(unittest.TestCase):
                     "unsupported execution semantics",
                 ):
                     MODULE._load_macos_scheduler_config(paths)
+
+    def test_macos_install_preserves_aqua_and_migrates_legacy_profiles(
+        self,
+    ) -> None:
+        runner = self.write_runner()
+        paths = MODULE._scheduler_paths("macos", self.home)
+        assert paths.launchd_plist is not None
+        paths.launchd_plist.parent.mkdir(parents=True)
+        marker = MODULE._scheduler_activation_transaction_path(paths)
+        canonical = MODULE._launchd_plist(
+            self.home,
+            "owner/public-sync",
+            19,
+            runner,
+        )
+        profiles = (
+            ("aqua", canonical, False),
+            (
+                "background",
+                MODULE._legacy_background_launchd_plist(
+                    self.home,
+                    "owner/public-sync",
+                    19,
+                    runner,
+                ),
+                True,
+            ),
+            (
+                "loose-gui",
+                MODULE._legacy_gui_launchd_plist(
+                    self.home,
+                    "owner/public-sync",
+                    19,
+                    runner,
+                ),
+                True,
+            ),
+        )
+        for profile, payload, expected_migration in profiles:
+            with self.subTest(profile=profile):
+                marker.unlink(missing_ok=True)
+                before = plistlib.dumps(payload, sort_keys=True)
+                paths.launchd_plist.write_bytes(before)
+                output = io.StringIO()
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_write_plist",
+                        wraps=MODULE._write_plist,
+                    ) as write_plist,
+                    contextlib.redirect_stdout(output),
+                ):
+                    MODULE.install_scheduler(
+                        self.home,
+                        "owner/public-sync",
+                        None,
+                        "macos",
+                        None,
+                        dry_run=False,
+                        enable=False,
+                    )
+
+                self.assertEqual(write_plist.call_count, int(expected_migration))
+                self.assertEqual(
+                    plistlib.loads(paths.launchd_plist.read_bytes()),
+                    canonical,
+                )
+                self.assertEqual(marker.exists(), expected_migration)
+                if expected_migration:
+                    self.assertNotEqual(paths.launchd_plist.read_bytes(), before)
+                else:
+                    self.assertEqual(paths.launchd_plist.read_bytes(), before)
+                    self.assertIn(
+                        "already matches audited configuration",
+                        output.getvalue(),
+                    )
 
     def test_scheduler_config_read_tolerates_mtime_only_churn(self) -> None:
         runner = self.home / "bin" / "runner"
@@ -9312,7 +9440,7 @@ class SchedulerDoctorTests(unittest.TestCase):
         paths = MODULE._scheduler_paths("macos", self.home)
         assert paths.launchd_plist is not None
         paths.launchd_plist.parent.mkdir(parents=True)
-        legacy_payload = MODULE._launchd_plist(
+        legacy_payload = MODULE._legacy_background_launchd_plist(
             self.home,
             "owner/old-sync",
             17,
@@ -9676,7 +9804,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                 self.assertTrue(recovered.enabled)
                 self.assertEqual(recovered.interval_minutes, 31)
 
-    def test_macos_activation_retry_enables_background_label_before_bootstrap(
+    def test_macos_activation_retry_migrates_background_before_aqua_bootstrap(
         self,
     ) -> None:
         self.write_runner()
@@ -9726,14 +9854,14 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(
             failed_calls,
             [
-                ["launchctl", "bootout", f"{gui_target}/{label}"],
-                ["launchctl", "disable", f"{gui_target}/{label}"],
                 ["launchctl", "bootout", f"{background_target}/{label}"],
-                ["launchctl", "enable", f"{background_target}/{label}"],
+                ["launchctl", "disable", f"{background_target}/{label}"],
+                ["launchctl", "bootout", f"{gui_target}/{label}"],
+                ["launchctl", "enable", f"{gui_target}/{label}"],
                 [
                     "launchctl",
                     "bootstrap",
-                    background_target,
+                    gui_target,
                     str(paths.launchd_plist),
                 ],
             ],
@@ -9779,17 +9907,17 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(
             retry_calls,
             [
-                ["launchctl", "bootout", f"{gui_target}/{label}"],
-                ["launchctl", "disable", f"{gui_target}/{label}"],
                 ["launchctl", "bootout", f"{background_target}/{label}"],
-                ["launchctl", "enable", f"{background_target}/{label}"],
+                ["launchctl", "disable", f"{background_target}/{label}"],
+                ["launchctl", "bootout", f"{gui_target}/{label}"],
+                ["launchctl", "enable", f"{gui_target}/{label}"],
                 [
                     "launchctl",
                     "bootstrap",
-                    background_target,
+                    gui_target,
                     str(paths.launchd_plist),
                 ],
-                ["launchctl", "enable", f"{background_target}/{label}"],
+                ["launchctl", "enable", f"{gui_target}/{label}"],
             ],
         )
         self.assertFalse(marker.exists())
@@ -10167,13 +10295,14 @@ class SchedulerDoctorTests(unittest.TestCase):
         self.assertEqual(report["failure_code"], "scheduler-config-invalid")
         self.assertEqual(report["failure_reason"], expected)
 
-    def test_macos_status_marks_gui_domain_for_background_migration(self) -> None:
+    def test_macos_status_marks_legacy_profiles_for_aqua_migration(self) -> None:
         runner = self.write_runner()
         paths = MODULE._scheduler_paths("macos", self.home)
         assert paths.launchd_plist is not None
         paths.launchd_plist.parent.mkdir(parents=True)
         profiles = (
             (
+                "aqua",
                 MODULE._launchd_plist(
                     self.home,
                     "owner/public-sync",
@@ -10183,6 +10312,17 @@ class SchedulerDoctorTests(unittest.TestCase):
                 False,
             ),
             (
+                "background",
+                MODULE._legacy_background_launchd_plist(
+                    self.home,
+                    "owner/public-sync",
+                    17,
+                    runner,
+                ),
+                True,
+            ),
+            (
+                "loose-gui",
                 MODULE._legacy_gui_launchd_plist(
                     self.home,
                     "owner/public-sync",
@@ -10192,8 +10332,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                 True,
             ),
         )
-        for payload, expected_migration in profiles:
-            with self.subTest(migration=expected_migration):
+        for profile, payload, expected_migration in profiles:
+            with self.subTest(profile=profile):
                 paths.launchd_plist.write_bytes(plistlib.dumps(payload, sort_keys=True))
                 with (
                     mock.patch.object(
@@ -15616,11 +15756,19 @@ class SchedulerDoctorTests(unittest.TestCase):
                 ]
                 self.assertEqual(
                     len(gui_disable_targets),
-                    1 + len(MODULE.LEGACY_LAUNCHD_LABELS),
+                    (
+                        len(MODULE.LEGACY_LAUNCHD_LABELS)
+                        if operation == "install"
+                        else 1 + len(MODULE.LEGACY_LAUNCHD_LABELS)
+                    ),
                 )
                 self.assertEqual(
                     output.getvalue().count("ignored already-absent scheduler command"),
-                    2 * (1 + len(MODULE.LEGACY_LAUNCHD_LABELS)),
+                    (
+                        1 + 2 * len(MODULE.LEGACY_LAUNCHD_LABELS)
+                        if operation == "install"
+                        else 2 * (1 + len(MODULE.LEGACY_LAUNCHD_LABELS))
+                    ),
                 )
                 assert paths.launchd_plist is not None
                 self.assertEqual(
@@ -16797,7 +16945,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                 "enabled",
                 "disabled",
                 "enabled",
-                None,
+                "legacy Background",
             ),
             (
                 "both-disabled",
@@ -16816,12 +16964,12 @@ class SchedulerDoctorTests(unittest.TestCase):
                 "duplicate",
             ),
             (
-                "unexpected-gui-only",
+                "canonical-gui-only",
                 None,
                 "disabled",
                 "enabled",
                 "enabled",
-                "legacy GUI",
+                None,
             ),
             (
                 "audited-background-domain-mismatch",
@@ -16908,6 +17056,8 @@ class SchedulerDoctorTests(unittest.TestCase):
                 self.assertEqual(query.classification, expected_classification)
                 if reason is not None:
                     self.assertIn(reason, query.reason or "")
+                elif label == "canonical-gui-only":
+                    self.assertIsNone(query.reason)
 
     def test_macos_daemon_query_rejects_loaded_legacy_services(self) -> None:
         legacy_label = MODULE.LEGACY_LAUNCHD_LABELS[0]
@@ -17727,7 +17877,7 @@ class SchedulerDoctorTests(unittest.TestCase):
                         domain, _uid, label = args[2].split("/", 2)
                         state = (
                             "enabled"
-                            if domain == MODULE.MACOS_BACKGROUND_LAUNCHD_DOMAIN
+                            if domain == MODULE.MACOS_LEGACY_GUI_LAUNCHD_DOMAIN
                             and label == MODULE.LAUNCHD_LABEL
                             else "disabled"
                         )

@@ -133,7 +133,7 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
             "rules_contract_version": 1,
             "hash_algorithm": "sha256",
             "canonical_repository": "Joey-Tools/codex-personal-sync",
-            "canonical_commit": "b4e74d7f35226801483a63ebe605b1298d60dc8e",
+            "canonical_commit": "0392f733e5ba79b6ffed62f46f2be2dd1536a8db",
             "mirror": "toolbox",
             "mirror_repository": "Joey-Tools/codex-toolbox",
             "mapping_digest": "",

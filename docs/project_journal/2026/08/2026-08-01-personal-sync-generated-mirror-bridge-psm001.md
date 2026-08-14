@@ -3,7 +3,7 @@ id: 20260801-psm001
 title: Personal Sync Generated Mirror Bridge
 status: completed
 created: 2026-08-01
-updated: 2026-08-07
+updated: 2026-08-14
 branch: codex/personal-sync-generated-mirror-bridge
 pr: 20
 supersedes: []
@@ -29,16 +29,16 @@ superseded_by:
   test, manifest-validation, package-build, package-verification, and publish
   consumers in that job use that same step-output working directory.
 - The six canonical files and `generated-sync-source-lock.json` bind landed
-  canonical commit `b4e74d7f35226801483a63ebe605b1298d60dc8e`, tree
-  `d7313b8dce755f58d13726dccfe60d1fb4cfee6c`.
+  canonical commit `0392f733e5ba79b6ffed62f46f2be2dd1536a8db`, tree
+  `83ce082f641ae829d85fa6ed447c7f180496193f`.
 - The generated receipt records mapping digest
   `3e26648dd65526e759089c5acf5a9f429f3df0f5adc8dbe94b3856954b801ece`,
   file-set digest
   `c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad`,
   and tree digest
-  `f9c8bf7d92b5c25d8d0c2ccee256f3f205ce4e57c4f7adbf9b9123f1775ebaba`.
+  `4593ff889a6cae26aba000806480fee3510ac84c386b65dcf00756436b8e7ff9`.
 - The consumer verifier pins the complete receipt SHA-256
-  `822a1d96512043149d9b95311a6009be69ac12a12821b38ec470349e9e5bfbd1`
+  `59d06d78e886bcd7ddd377bd6e717c563562bff9be750482fd1b18f1d2b0d9aa`
   outside the receipt itself, then checks the exact canonical identity,
   closed six-file mapping, recomputed digests, target modes, and target bytes
   before any generated-code consumer can proceed.
@@ -115,3 +115,8 @@ superseded_by:
   `c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad`;
   the consumer-owned verifier independently pins the new canonical commit and
   complete receipt SHA-256 before generated code can run.
+- Canonical Personal Sync PR #13 reviewed exact head
+  `5f0a90e3413f4f7f4798f41fdd3957249e2ed6ce` and squash-landed commit
+  `0392f733e5ba79b6ffed62f46f2be2dd1536a8db`. The generated mirror carries
+  the hardened Aqua scheduler profile and terminal whole-release identity
+  revalidation used by the private role-aware sync controller.
