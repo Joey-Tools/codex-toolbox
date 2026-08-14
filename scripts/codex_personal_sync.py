@@ -273,6 +273,10 @@ MACOS_SCHEDULER_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin
 MACOS_BACKGROUND_LAUNCHD_DOMAIN = "user"
 MACOS_LEGACY_GUI_LAUNCHD_DOMAIN = "gui"
 MACOS_BACKGROUND_SESSION_TYPE = "Background"
+MACOS_AQUA_SESSION_TYPE = "Aqua"
+MACOS_LAUNCHD_PROFILE_AQUA = "hardened-aqua"
+MACOS_LAUNCHD_PROFILE_BACKGROUND = "legacy-hardened-background"
+MACOS_LAUNCHD_PROFILE_GUI = "legacy-minimal-gui"
 LINUX_SCHEDULER_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 SCHEDULER_STATUS_RELATIVE_PATH = Path("state/scheduler-status.json")
 SCHEDULER_STATUS_PUBLICATION_MARKER_NAME = (
@@ -4578,6 +4582,11 @@ class ManifestData:
 
 ReleaseTreeIdentity = tuple[dict[str, Any], ManifestData, str]
 ReleaseTreeExpectation = tuple[ReleaseTreeIdentity, tuple[int, int]]
+ReleaseTreeDirectoryEvidence = tuple[
+    ReleaseTreeIdentity,
+    tuple[int, int],
+    tuple[int, int, int],
+]
 
 
 @dataclass
@@ -4855,6 +4864,7 @@ class SchedulerConfig:
     base_repo: str | None
     owner: str | None
     launchd_domain: str | None = None
+    launchd_profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -18642,17 +18652,31 @@ def _release_tree_identity_from_directory_fd(
     return identity
 
 
-def _installed_release_identity_and_directory_identity(
+def _release_directory_identity_and_access_policy(
+    directory_fd: int,
+) -> tuple[tuple[int, int], tuple[int, int, int]]:
+    metadata = os.fstat(directory_fd)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SyncError("bound path is no longer a directory")
+    return (
+        (metadata.st_dev, metadata.st_ino),
+        (stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid),
+    )
+
+
+def _installed_release_identity_and_directory_evidence(
     home: Path,
     owner: str,
     sha: str,
-) -> ReleaseTreeExpectation:
+) -> ReleaseTreeDirectoryEvidence:
     owner = _validate_owner(owner)
     sha = _validate_release_sha(sha, f"installed release SHA for owner {owner}")
     release_root = _releases_root(home, owner) / sha
     release_fd = _open_installed_release_directory_fd(home, owner, sha)
     try:
-        directory_identity = _directory_identity(release_fd)
+        directory_identity, directory_access_policy = (
+            _release_directory_identity_and_access_policy(release_fd)
+        )
         identity = _release_tree_identity_from_directory_fd(
             release_fd,
             release_root,
@@ -18664,11 +18688,28 @@ def _installed_release_identity_and_directory_identity(
             )
         if not _bound_directory_matches(home, release_root, release_fd):
             raise SyncError(f"installed release directory changed: {release_root}")
-        if _directory_identity(release_fd) != directory_identity:
+        terminal_directory_evidence = _release_directory_identity_and_access_policy(
+            release_fd
+        )
+        if terminal_directory_evidence != (
+            directory_identity,
+            directory_access_policy,
+        ):
             raise SyncError(f"installed release directory changed: {release_root}")
-        return identity, directory_identity
+        return identity, directory_identity, directory_access_policy
     finally:
         _close_fd_quietly(release_fd)
+
+
+def _installed_release_identity_and_directory_identity(
+    home: Path,
+    owner: str,
+    sha: str,
+) -> ReleaseTreeExpectation:
+    identity, directory_identity, _directory_access_policy = (
+        _installed_release_identity_and_directory_evidence(home, owner, sha)
+    )
+    return identity, directory_identity
 
 
 def _pending_release_expectations_for_state(
@@ -25574,7 +25615,7 @@ def _load_macos_scheduler_config(
         config_paths=(paths.launchd_plist,),
         interval_minutes=interval_seconds // 60,
     )
-    expected_background = _launchd_plist(
+    expected_aqua = _launchd_plist(
         config.home,
         config.repo,
         config.interval_minutes,
@@ -25583,7 +25624,16 @@ def _load_macos_scheduler_config(
         base_repo=config.base_repo or config.repo,
         owner=config.owner or PUBLIC_OWNER,
     )
-    expected_gui = _legacy_gui_launchd_plist(
+    expected_background = _legacy_background_launchd_plist(
+        config.home,
+        config.repo,
+        config.interval_minutes,
+        config.runner,
+        mode=config.mode,
+        base_repo=config.base_repo or config.repo,
+        owner=config.owner or PUBLIC_OWNER,
+    )
+    expected_legacy_gui = _legacy_gui_launchd_plist(
         config.home,
         config.repo,
         config.interval_minutes,
@@ -25594,11 +25644,29 @@ def _load_macos_scheduler_config(
     )
     if config.command != "run-scheduled":
         expected_background["ProgramArguments"] = data.get("ProgramArguments")
-        expected_gui["ProgramArguments"] = data.get("ProgramArguments")
-    accepted_profiles: list[tuple[dict[str, Any], str]] = [
-        (expected_background, MACOS_BACKGROUND_LAUNCHD_DOMAIN),
-        (expected_gui, MACOS_LEGACY_GUI_LAUNCHD_DOMAIN),
+        expected_legacy_gui["ProgramArguments"] = data.get("ProgramArguments")
+    legacy_profiles = [
+        (
+            expected_background,
+            MACOS_BACKGROUND_LAUNCHD_DOMAIN,
+            MACOS_LAUNCHD_PROFILE_BACKGROUND,
+        ),
+        (
+            expected_legacy_gui,
+            MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+            MACOS_LAUNCHD_PROFILE_GUI,
+        ),
     ]
+    accepted_profiles: list[tuple[dict[str, Any], str, str]] = []
+    if config.command == "run-scheduled":
+        accepted_profiles.append(
+            (
+                expected_aqua,
+                MACOS_LEGACY_GUI_LAUNCHD_DOMAIN,
+                MACOS_LAUNCHD_PROFILE_AQUA,
+            )
+        )
+    accepted_profiles.extend(legacy_profiles)
     if config.command != "run-scheduled":
         # Older published schedulers predate the no-bytecode environment
         # hardening. Admit only those two otherwise-exact historical profiles
@@ -25615,19 +25683,20 @@ def _load_macos_scheduler_config(
                         },
                     },
                     domain,
+                    profile,
                 )
-                for expected, domain in tuple(accepted_profiles)
+                for expected, domain, profile in legacy_profiles
             )
         )
-    launchd_domain = next(
+    matched_profile = next(
         (
-            domain
-            for expected, domain in accepted_profiles
+            (domain, profile)
+            for expected, domain, profile in accepted_profiles
             if _plist_value_matches_exactly(data, expected)
         ),
         None,
     )
-    if launchd_domain is None:
+    if matched_profile is None:
         raise SyncError(
             f"launchd scheduler config has unsupported execution semantics: "
             f"{paths.launchd_plist}"
@@ -25639,7 +25708,12 @@ def _load_macos_scheduler_config(
         raise SyncError(
             f"launchd scheduler config changed during audit: {paths.launchd_plist}"
         )
-    return replace(config, launchd_domain=launchd_domain)
+    launchd_domain, launchd_profile = matched_profile
+    return replace(
+        config,
+        launchd_domain=launchd_domain,
+        launchd_profile=launchd_profile,
+    )
 
 
 def _plist_value_matches_exactly(actual: Any, expected: Any) -> bool:
@@ -26252,6 +26326,29 @@ def _legacy_gui_launchd_plist(
 
 
 def _launchd_plist(
+    home: Path,
+    repo: str,
+    interval_minutes: int,
+    runner: Path,
+    *,
+    mode: str = "public",
+    base_repo: str = DEFAULT_PUBLIC_RELEASE_REPO,
+    owner: str = "private",
+) -> dict[str, Any]:
+    payload = _legacy_background_launchd_plist(
+        home,
+        repo,
+        interval_minutes,
+        runner,
+        mode=mode,
+        base_repo=base_repo,
+        owner=owner,
+    )
+    payload["LimitLoadToSessionType"] = MACOS_AQUA_SESSION_TYPE
+    return payload
+
+
+def _legacy_background_launchd_plist(
     home: Path,
     repo: str,
     interval_minutes: int,
@@ -27982,8 +28079,8 @@ def _scheduler_daemon_enabled(
         return SchedulerDaemonQuery(
             "enabled",
             (
-                "launchd scheduler is loaded in the legacy GUI domain"
-                if loaded_domain == MACOS_LEGACY_GUI_LAUNCHD_DOMAIN
+                "launchd scheduler is loaded in the legacy Background domain"
+                if loaded_domain == MACOS_BACKGROUND_LAUNCHD_DOMAIN
                 else None
             ),
         )
@@ -30300,7 +30397,7 @@ def _install_scheduler_transaction_with_bindings(
         and existing.owner == desired_owner
         and (
             selected_platform != "macos"
-            or existing.launchd_domain == MACOS_BACKGROUND_LAUNCHD_DOMAIN
+            or existing.launchd_profile == MACOS_LAUNCHD_PROFILE_AQUA
         )
     )
     if config_matches:
@@ -30375,7 +30472,7 @@ def _install_scheduler_transaction_with_bindings(
                     [
                         "launchctl",
                         "bootout",
-                        f"{gui_domain}/{LAUNCHD_LABEL}",
+                        f"{background_domain}/{LAUNCHD_LABEL}",
                     ],
                     dry_run=dry_run,
                     allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
@@ -30385,7 +30482,7 @@ def _install_scheduler_transaction_with_bindings(
                     [
                         "launchctl",
                         "disable",
-                        f"{gui_domain}/{LAUNCHD_LABEL}",
+                        f"{background_domain}/{LAUNCHD_LABEL}",
                     ],
                     dry_run=dry_run,
                     allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
@@ -30395,7 +30492,7 @@ def _install_scheduler_transaction_with_bindings(
                     [
                         "launchctl",
                         "bootout",
-                        f"{background_domain}/{LAUNCHD_LABEL}",
+                        f"{gui_domain}/{LAUNCHD_LABEL}",
                     ],
                     dry_run=dry_run,
                     allow_fail=NATIVE_FAILURE_ALREADY_ABSENT,
@@ -30405,7 +30502,7 @@ def _install_scheduler_transaction_with_bindings(
                     [
                         "launchctl",
                         "enable",
-                        f"{background_domain}/{LAUNCHD_LABEL}",
+                        f"{gui_domain}/{LAUNCHD_LABEL}",
                     ],
                     dry_run=dry_run,
                     activation_bindings=bindings,
@@ -30414,7 +30511,7 @@ def _install_scheduler_transaction_with_bindings(
                     [
                         "launchctl",
                         "bootstrap",
-                        background_domain,
+                        gui_domain,
                         str(paths.launchd_plist),
                     ],
                     dry_run=dry_run,
@@ -30424,7 +30521,7 @@ def _install_scheduler_transaction_with_bindings(
                     [
                         "launchctl",
                         "enable",
-                        f"{background_domain}/{LAUNCHD_LABEL}",
+                        f"{gui_domain}/{LAUNCHD_LABEL}",
                     ],
                     dry_run=dry_run,
                     activation_bindings=bindings,
@@ -33021,7 +33118,7 @@ def _capture_scheduler_release_trees(
     owners = [PUBLIC_OWNER]
     if mode == "private":
         owners.append(owner)
-    evidence: dict[str, dict[str, str]] = {}
+    initial_shas: dict[str, str] = {}
     for release_owner in owners:
         sha = _current_sha(home, release_owner)
         if sha is None:
@@ -33029,16 +33126,120 @@ def _capture_scheduler_release_trees(
                 f"scheduler current release is missing for owner {release_owner}",
                 code="current-release-unverifiable",
             )
-        _payload, _manifest, tree_sha256 = _installed_release_identity(
-            home,
-            release_owner,
-            sha,
+        initial_shas[release_owner] = sha
+    initial_expectations: dict[str, ReleaseTreeDirectoryEvidence] = {}
+    for release_owner in owners:
+        sha = initial_shas[release_owner]
+        initial_expectations[release_owner] = (
+            _installed_release_identity_and_directory_evidence(
+                home,
+                release_owner,
+                sha,
+            )
+        )
+    terminal_expectations: dict[str, ReleaseTreeDirectoryEvidence] = {}
+    for release_owner in owners:
+        sha = initial_shas[release_owner]
+        terminal_expectations[release_owner] = (
+            _installed_release_identity_and_directory_evidence(
+                home,
+                release_owner,
+                sha,
+            )
+        )
+    for release_owner in owners:
+        sha = initial_shas[release_owner]
+        if terminal_expectations[release_owner] != initial_expectations[release_owner]:
+            raise SyncError(
+                "scheduler release tree changed during identity validation: "
+                f"{release_owner}@{sha}",
+                code="current-release-unverifiable",
+            )
+    validation_expectations: dict[str, ReleaseTreeDirectoryEvidence] = {}
+    for release_owner in owners:
+        sha = initial_shas[release_owner]
+        validation_expectations[release_owner] = (
+            _installed_release_identity_and_directory_evidence(
+                home,
+                release_owner,
+                sha,
+            )
+        )
+    for release_owner in owners:
+        sha = initial_shas[release_owner]
+        if (
+            validation_expectations[release_owner]
+            != terminal_expectations[release_owner]
+        ):
+            raise SyncError(
+                "scheduler release tree changed during identity validation: "
+                f"{release_owner}@{sha}",
+                code="current-release-unverifiable",
+            )
+    evidence: dict[str, dict[str, str]] = {}
+    for release_owner in owners:
+        sha = initial_shas[release_owner]
+        terminal_identity, _directory_identity_value, _directory_access_policy = (
+            terminal_expectations[release_owner]
         )
         evidence[release_owner] = {
             "sha": sha,
-            "tree_sha256": tree_sha256,
+            "tree_sha256": terminal_identity[2],
         }
+    final_shas = {
+        release_owner: _current_sha(home, release_owner)
+        for release_owner in owners
+    }
+    if final_shas != initial_shas:
+        raise SyncError(
+            "scheduler current release changed during identity validation",
+            code="current-release-unverifiable",
+        )
     return dict(sorted(evidence.items()))
+
+
+def release_identities(
+    home: Path,
+    *,
+    mode: str,
+    owner: str,
+) -> dict[str, Any]:
+    home = home.expanduser()
+    if mode not in {"public", "private"}:
+        raise SyncError(f"unsupported release identity mode: {mode}")
+    owner = _validate_owner(owner)
+    if mode == "public":
+        owner = PUBLIC_OWNER
+    elif owner == PUBLIC_OWNER:
+        raise SyncError("private release identity owner must not be public")
+    try:
+        lock = installation_lock(home, create=False)
+        with lock:
+            releases = _capture_scheduler_release_trees(
+                home,
+                mode=mode,
+                owner=owner,
+            )
+    except (FileNotFoundError, OSError) as error:
+        raise SyncError(
+            "release identity state is unavailable",
+            code="current-release-unverifiable",
+        ) from error
+    expected_owners = (
+        {PUBLIC_OWNER, owner}
+        if mode == "private"
+        else {PUBLIC_OWNER}
+    )
+    if set(releases) != expected_owners:
+        raise SyncError(
+            "active release identity owner set is incomplete",
+            code="current-release-unverifiable",
+        )
+    return {
+        "version": 1,
+        "mode": mode,
+        "release_trees": releases,
+    }
 
 
 def run_scheduled(
@@ -36202,7 +36403,7 @@ def scheduler_report(home: Path, platform_name: str) -> SchedulerReport:
                 config.command != "run-scheduled"
                 or (
                     config.platform == "macos"
-                    and config.launchd_domain != MACOS_BACKGROUND_LAUNCHD_DOMAIN
+                    and config.launchd_profile != MACOS_LAUNCHD_PROFILE_AQUA
                 )
             )
         ),
@@ -36602,6 +36803,17 @@ def build_parser() -> argparse.ArgumentParser:
     verify_overlay_parser.add_argument("--home", default="~/.codex")
     verify_overlay_parser.add_argument("--owner", default="private")
 
+    release_identities_parser = subparsers.add_parser(
+        "release-identities",
+        help="Validate and report active release identities",
+    )
+    release_identities_parser.add_argument(
+        "--mode", choices=("public", "private"), required=True
+    )
+    release_identities_parser.add_argument("--owner", default="private")
+    release_identities_parser.add_argument("--home", default="~/.codex")
+    release_identities_parser.add_argument("--json", action="store_true")
+
     uninstall_overlay_parser = subparsers.add_parser(
         "uninstall-overlay",
         help="Remove an overlay and restore public links for declared overrides",
@@ -36781,6 +36993,20 @@ def main(argv: list[str] | None = None) -> int:
             rollback(Path(args.home), args.to, args.owner)
         elif args.command == "verify-overlay":
             verify_overlay(Path(args.home), args.owner)
+        elif args.command == "release-identities":
+            payload = release_identities(
+                Path(args.home),
+                mode=args.mode,
+                owner=args.owner,
+            )
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                for release_owner, identity in payload["release_trees"].items():
+                    print(
+                        f"{release_owner} {identity['sha']} "
+                        f"{identity['tree_sha256']}"
+                    )
         elif args.command == "uninstall-overlay":
             uninstall_overlay(Path(args.home), args.owner, dry_run=args.dry_run)
         elif args.command == "install-scheduler":
