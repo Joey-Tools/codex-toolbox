@@ -29,16 +29,16 @@ superseded_by:
   test, manifest-validation, package-build, package-verification, and publish
   consumers in that job use that same step-output working directory.
 - The six canonical files and `generated-sync-source-lock.json` bind landed
-  canonical commit `36a6f06222dec0ac22560c70d1199bc0e2862d2a`, tree
-  `6a463ee1362c4887d95ce58ce128c1f4aa138cef`.
+  canonical commit `7803eebe63782f5539c22e1b7f0d7a7ec587ac3f`, tree
+  `76b266a41c92b21db9367949edcebf50b7272368`.
 - The generated receipt records mapping digest
   `3e26648dd65526e759089c5acf5a9f429f3df0f5adc8dbe94b3856954b801ece`,
   file-set digest
   `c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad`,
   and tree digest
-  `3b1d1771a4c0ee97c2a34a9f948f8665779d76445cca47aa883480394f1b7b74`.
+  `f98d13ca1e4491659528a777e5a3a035f752a95b9068cf0029d160746fa679dd`.
 - The consumer verifier pins the complete receipt SHA-256
-  `356f79a1008d269284c4908b28b1d72966b2050d17abfd788393be83ccaed292`
+  `9ea6cd232867fafaa7a72aa46586f8905dbb91ef97de2e5d2baeb75a918efa0a`
   outside the receipt itself, then checks the exact canonical identity,
   closed six-file mapping, recomputed digests, target modes, and target bytes
   before any generated-code consumer can proceed.
@@ -149,3 +149,30 @@ superseded_by:
   project-journal validation, and `git diff --check` also passed. The generated
   canonical files remain byte-for-byte stock output and are intentionally not
   reformatted by the consumer.
+- Canonical Personal Sync PR #15 reviewed exact head
+  `58ec5681769fd8174bd8ccc008303b3a053ca7b3` and squash-landed commit
+  `7803eebe63782f5539c22e1b7f0d7a7ec587ac3f` with identical tree
+  `76b266a41c92b21db9367949edcebf50b7272368`. The change makes Darwin
+  access-policy admission use coherent pre/ACL/post samples from one bound FD,
+  retry one safe metadata churn, and reject identity or policy drift.
+- The canonical `Sync toolbox mirror` run `31949367675` stopped at its initial
+  credential gate because `CODEX_TOOLBOX_SYNC_TOKEN` was absent and published
+  no target branch or pull request. Local stock generation from exact ordinary,
+  non-hardlinked, non-promisor clones changed only the engine, engine tests,
+  and receipt; its immediate generator `check` passed.
+- The mapping and file-set digests remain
+  `3e26648dd65526e759089c5acf5a9f429f3df0f5adc8dbe94b3856954b801ece`
+  and `c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad`;
+  the new generated tree digest is
+  `f98d13ca1e4491659528a777e5a3a035f752a95b9068cf0029d160746fa679dd`,
+  and the consumer verifier pins the complete receipt SHA-256
+  `9ea6cd232867fafaa7a72aa46586f8905dbb91ef97de2e5d2baeb75a918efa0a`.
+- Coherent-sample mirror gates passed 910 generated engine, reconciliation,
+  retention, and scheduler/doctor tests on Python 3.13.0 with two expected
+  skips, plus 35 focused verifier/consumer-contract tests. The complete
+  pre-commit discovery passed 1,233 tests with the same two expected skips in
+  192.765 seconds. Python 3.9.6 passed the four CI compile targets and its exact
+  38-test compatibility matrix. A mode-`0700` production verifier snapshot,
+  Python 3.13 compilation, Ruff lint and consumer-owned format checks,
+  actionlint, manifest-change validation, project-journal validation, and
+  `git diff --check` also passed.
