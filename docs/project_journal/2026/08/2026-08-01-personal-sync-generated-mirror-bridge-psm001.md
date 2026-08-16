@@ -3,7 +3,7 @@ id: 20260801-psm001
 title: Personal Sync Generated Mirror Bridge
 status: completed
 created: 2026-08-01
-updated: 2026-08-14
+updated: 2026-08-16
 branch: codex/personal-sync-generated-mirror-bridge
 pr: 20
 supersedes: []
@@ -29,16 +29,16 @@ superseded_by:
   test, manifest-validation, package-build, package-verification, and publish
   consumers in that job use that same step-output working directory.
 - The six canonical files and `generated-sync-source-lock.json` bind landed
-  canonical commit `0392f733e5ba79b6ffed62f46f2be2dd1536a8db`, tree
-  `83ce082f641ae829d85fa6ed447c7f180496193f`.
+  canonical commit `36a6f06222dec0ac22560c70d1199bc0e2862d2a`, tree
+  `6a463ee1362c4887d95ce58ce128c1f4aa138cef`.
 - The generated receipt records mapping digest
   `3e26648dd65526e759089c5acf5a9f429f3df0f5adc8dbe94b3856954b801ece`,
   file-set digest
   `c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad`,
   and tree digest
-  `4593ff889a6cae26aba000806480fee3510ac84c386b65dcf00756436b8e7ff9`.
+  `3b1d1771a4c0ee97c2a34a9f948f8665779d76445cca47aa883480394f1b7b74`.
 - The consumer verifier pins the complete receipt SHA-256
-  `59d06d78e886bcd7ddd377bd6e717c563562bff9be750482fd1b18f1d2b0d9aa`
+  `356f79a1008d269284c4908b28b1d72966b2050d17abfd788393be83ccaed292`
   outside the receipt itself, then checks the exact canonical identity,
   closed six-file mapping, recomputed digests, target modes, and target bytes
   before any generated-code consumer can proceed.
@@ -120,3 +120,32 @@ superseded_by:
   `0392f733e5ba79b6ffed62f46f2be2dd1536a8db`. The generated mirror carries
   the hardened Aqua scheduler profile and terminal whole-release identity
   revalidation used by the private role-aware sync controller.
+- Canonical Personal Sync PR #14 reviewed exact head
+  `b4aa42e8ed1f36e0e96eb980acd4ae81fe35e707` and squash-landed commit
+  `36a6f06222dec0ac22560c70d1199bc0e2862d2a` with identical tree
+  `6a463ee1362c4887d95ce58ce128c1f4aa138cef`. The change adds Darwin UID,
+  POSIX write-authority, and extended-ACL admission; bounded retained-FD
+  content revalidation; directory closure; and install FD-budget protection.
+- The canonical `Sync toolbox mirror` run `31937481557` stopped at its initial
+  credential gate because `CODEX_TOOLBOX_SYNC_TOKEN` was absent. It performed
+  no target checkout, branch publication, or pull-request mutation. The mirror
+  was therefore generated locally from the exact clean landed commit into
+  owner-private, non-hardlinked source and consumer clones.
+- Stock generation changed only the engine, engine tests, and receipt. The
+  generator's immediate `check` passed; the mapping and file-set digests stayed
+  `3e26648dd65526e759089c5acf5a9f429f3df0f5adc8dbe94b3856954b801ece`
+  and `c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad`,
+  while the generated tree digest became
+  `3b1d1771a4c0ee97c2a34a9f948f8665779d76445cca47aa883480394f1b7b74`.
+- The consumer verifier now pins the landed canonical commit and receipt
+  SHA-256 `356f79a1008d269284c4908b28b1d72966b2050d17abfd788393be83ccaed292`.
+  A mode-`0700` production verifier probe installed all six generated files
+  into a private snapshot successfully.
+- Pre-commit delivery gates passed 35 focused verifier/consumer-contract tests
+  and 899 generated engine, reconciliation, retention, and scheduler/doctor
+  tests on Python 3.13.0 with two expected skips. Python 3.9.6 passed the four
+  CI compile targets and its exact 38-test compatibility matrix. Ruff lint,
+  consumer-owned Ruff format checks, actionlint, manifest-change validation,
+  project-journal validation, and `git diff --check` also passed. The generated
+  canonical files remain byte-for-byte stock output and are intentionally not
+  reformatted by the consumer.
