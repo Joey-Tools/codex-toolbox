@@ -1,0 +1,192 @@
+---
+id: 20260724-spr001
+title: Recursive Shared Prefix Receipts
+status: completed
+created: 2026-07-24
+updated: 2026-08-01
+branch: codex/toolbox-skill-sync-refactor
+pr: https://github.com/Joey-Tools/codex-toolbox/pull/18
+supersedes: []
+superseded_by:
+---
+
+# Recursive Shared Prefix Receipts
+
+## Summary
+
+- Bound shared directory prefixes created by recursive parent checkout before planned child worktrees are materialized.
+- Added transactional rollback so a failed prefix binding does not retain a registered parent worktree or plan receipts.
+- Closed the GitHub review gaps in filter admission by running index, tree,
+  `info/attributes`, and local filter-config queries only against the
+  descriptor-bound private checkout execution view.
+- Bound recursive `.gitmodules` parsing to the exact `ls-tree` blob object by
+  recomputing its SHA-1 or SHA-256 Git object ID before accepting content.
+- Closed the remaining checkout-control findings by deriving filter path sets
+  from verified private tree bytes, binding the new admin index as absent
+  through the child exec gate, and requiring a writable registry-parent policy.
+
+## Current State
+
+- Only strict shared prefixes whose complete participant set belongs to the current parent's direct planned children are eligible.
+- Prefix traversal is descriptor-relative and no-follow from the held parent target; receipts bind directory-entry/object identity, owner, group, mode, and effective write/search access.
+- Parent-root and checkout-created shared-prefix receipts are validated and published as one plan-state update.
+- Deeper descendants collapse to their nearest direct-child worktree subtree when a recursive parent authorizes a shared prefix; ownership stops at each direct child's final root.
+- Unrelated checkout paths, final target roots, symlinks, replacement objects, and unsafe access policy remain untrusted.
+- New leaf and recursive-parent registrations remain provisional through final source, HEAD, common-gitdir, object-closure, and receipt validation.
+- Registration failures remove the exact worktree through the held parent descriptor, verify target and registry cleanup, and remove only still-matching transaction-created parent directories.
+- Pre-registration materialization failures remove exact created directory identities in reverse order; replacement, access drift, and non-empty state are preserved with a structured recovery location.
+- The target `.git` marker and admin backlink now retain their original descriptors through postvalidation and receipt publication; final HEAD, `commondir`, and index bindings are read only through that retained admin descriptor and are revalidated immediately before and after publication.
+- Capture and every final revalidation now prove `.git -> admin`, admin backlink, and `commondir -> source` endpoints through component-by-component no-follow descriptor chains, with the pointer file bound again after each endpoint walk.
+- Managed and new checkout paths share one pre-Git gate that binds a fresh source lease to both preflight source fingerprints and retains it through checkout or rollback.
+- Ambiguous-registration and final rollback registry queries now run through that retained source lease's subprocess identity gate and revalidate it before and after parsing; source replacement preserves recovery state instead of authorizing target-parent cleanup.
+- New registrations also retain a bounded, descriptor-bound raw inventory of direct `worktrees/` admin entries before and after add. Missing or invalid `gitdir` records that Git omits from its semantic list are preserved with a `worktree-registration-recovery-v1` locator; only unchanged direct-entry identity/access state authorizes cleanup.
+- The post-add inventory is bound to the same held `worktrees/` parent object as the managed control receipt. Normal and recovered-control rollback remain disabled until the raw transition proves ownership of exactly that new receipt-bound admin entry.
+- Known rollback gives recursive `git worktree remove` a child exec gate over the materialized target's held parent/name/object descriptors, verifies the exact receipt-bound admin name is absent from its held parent, and requires the raw inventory to return to its pre-add baseline before transaction-created target parents can be removed. A target-entry replacement visible before exec preserves both registration and replacement for recovery; internal files changing inside an unchanged peer admin directory do not alter the protected direct-entry property.
+- Recursive shared-prefix policy failures no longer widen permissions on surviving managed checkouts; owner access is adjusted only for a newly registered transaction-owned parent that proceeds through full-worktree rollback.
+- Finalization parses the immutable descriptor-captured index bytes, rejects zero skip-hash checksums, noncanonical ordering, conflict/hidden/unknown extension state, validates any cache-tree against the target tree, and requires the complete canonical stage-0 mode/object-id/raw-path sequence to equal that tree. Cache-tree siblings use Git's `subtree_name_cmp`/`write_one` length-first then raw-byte ordering, which is distinct from tree-entry ordering. The protected property is the captured index semantics, not working-tree stat-cache or file-content bytes.
+- Managed preflight and final revalidation now descriptor-read that raw index and run the same parser against the current HEAD before the checkout probe or real checkout can be invoked; split-index `link` state and unknown optional extensions therefore fail before mutation.
+- Authorized fetch URL classification now recognizes username-less `host:path` and other Git-compatible scp-style forms before generic schemes, so every Git-SSH form receives the private SSH executable snapshot while `://` schemes retain strict allowlisting.
+- Valueless supported fetch booleans preserve Git's implicit-`true` meaning; explicit empty fsck remains `false`, explicit empty `core.sharedRepository` becomes `umask`, and explicit fsck values are normalized through the bound Git runtime's boolean parser. Unsupported valueless keys and malformed boolean values remain blocked.
+- Shared-prefix publication and revalidation require both the bound owner write/search mode bits and effective write/search access, so root or another DAC-bypass context cannot bless a `0555` ancestor.
+- Superproject split-index discovery preserves existing `link` state for the read-only `--shared-index-path` query and binds the shared index object alongside the primary index; same-content shared-index replacement blocks apply before worktree mutation.
+- Selected stage-0 gitlink rows are derived directly from the already bound primary/shared index byte strings by a bounded source-only parser. It checksum-validates SHA-1/SHA-256 v2/v3/v4 entries, rejects unsupported mandatory and sparse-index semantics, binds the exact shared checksum/name, and applies split-index replacement, deletion, and addition semantics from range-checked disjoint EWAH bitmaps. The protected property is the selected stage-0 mapping from those exact retained bytes; no stock Git child receives a primary/shared pathname, closing the same-UID final-digest-to-open gap left by a mode-`0400` private copy. Live object identity, content, and access are still revalidated separately, while a deterministic same-inode/same-size valid-index ABA that keeps attacker bytes live during all three parse passes cannot alter the captured selection.
+- Authorized fetch receipts bind all 257 direct writable object children—`pack` plus all 256 lower-case loose-object fanout names—as absent or exact accessible directory objects. Existing symlinks are rejected, and an absent/present/symlink drift visible at the child exec gate retains the fetch recovery fence before Git writes.
+- Authorized fetch launch now also retains descriptor-bound leases for the private control gitdir, its internal control directories, and the exact bytes of `config`, `HEAD`, and optional `shallow`. A gitdir/control-file replacement or same-inode content rewrite visible at the final child gate prevents Git from starting while preserving the persistent fetch recovery identity.
+- Every Git launch now retains the no-follow snapshot and parent descriptors through a final child-side path/object/access/full-byte gate. Stable metadata no longer skips hashing; Linux uses the inherited `/proc/self/fd` object when available, while fallback platforms use the validated fixed path after the gate.
+- An initially absent private `shallow` plus `config.lock`, `HEAD.lock`, and `shallow.lock` now have explicit absent-entry leases. A regular-file or symlink injection visible before exec fails with the source fetch recovery fence retained, while Git-created post-exec output remains governed by the fetch receipt.
+- Private fetch `config`, `HEAD`, and `shallow` bindings retain independent 4 MiB, 64 KiB, and 64 MiB limits, allowing valid shallow boundaries larger than the config ceiling while rejecting content beyond the shallow cap.
+- Existing source shallow replacement locks must preserve the receipt-bound owner, group, and mode before exchange. A shared-repository process that cannot reproduce that policy fails closed without changing the original boundary.
+- A same-source, same-HEAD redirect to another worktree admin cannot satisfy finalization. New-target rollback atomically preserves each unexpected marker/backlink entry while temporarily restoring the retained original bytes for Git unregister, then verifies target, registry, materialized-parent, and plan-receipt restoration.
+- Receipt-bound file, HTTP, and HTTPS transports now use an owner-private `GIT_EXEC_PATH` containing exact-byte snapshots of `git-upload-pack`, `git-remote-http`, and `git-remote-https`. The runtime binds the source helper directory and every source/snapshot helper object, retains no-follow execution leases through the child lifetime, and revalidates the closure before release; local-only Git commands do not expose the unused helper path.
+- Bounded Git children now run in fresh process groups under a first-signal latch for `SIGINT`, `SIGTERM`, and `SIGHUP`. The original signal is forwarded before bounded TERM/KILL, pipes are drained, the direct child is reaped, mutation-specific recovery is published, and the CLI then exits under the original signal. Already reaped group leaders are never signalled because their numeric PID/PGID may have been reused.
+- Owner-private executable and fetch-control temporary roots now use descriptor-anchored cleanup. The exact root is atomically quarantined before no-follow recursive removal; pre-cleanup replacement, check-to-rename replacement, access drift, unreadable state, or partial cleanup retains a structured `owner-private-temporary-cleanup-v1` recovery location instead of invoking pathname-recursive deletion.
+- Signal ownership is now reentrant and transaction-wide rather than child-local. Fetch postprocessing retains the latch through object availability, shallow-boundary publication, complete closure validation, and durable fence clearing; managed checkout retains it through final validation and receipt publication; add rollback defers delivery until registry, target, materialization, and control-receipt cleanup finish. Receipt publication is the add commit boundary, so post-publication signals preserve the committed worktree and plan receipts instead of entering rollback.
+- Process-group cleanup no longer polls before signalling. An exited but unreaped leader pins the original PGID while descendants may hold inherited stdout/stderr; successful cleanup now proves both direct-child reap and EOF on both tracked streams. An already reaped leader with an open stream returns structured `process-group-cleanup-v1` incomplete state instead of signalling a potentially reused group.
+- Git executable/helper snapshots, private fetch gitdirs, SSH snapshots, transport plans, and source-fetch transaction descriptors now have explicit owners and active-guard registrations with recovery identities. The registry retains critical guards strongly until explicit release, terminal-signal cleanup drains every remaining registration before restoring handlers, and those guards no longer use `__del__` as a cleanup path.
+- Managed and new content checkout now consume an owner-private common-gitdir view containing descriptor-captured source config and common `info/attributes` bytes or absence plus an exact private no-delta object pack. `GIT_OBJECT_DIRECTORY` names only that private directory, never the live source object database. The pack's canonical v2 index must equal the complete verified target closure—or the current/target union needed by managed status—and private streaming OID verification must reproduce every source manifest before checkout.
+- The private pack and index are owner-private regular files under retained directory-entry leases. Index bytes are retained and checksum/inventory bound; potentially large pack bytes stay on a held no-follow descriptor and are rehashed at the child exec gate without a second retained-memory copy. Exact inventories cover the complete private common-gitdir, `info`, `objects`, `objects/info`, `objects/pack`, and `refs` directories, leaving no alternate/promisor/lazy-fetch, loose-object, shallow/ref, commit-graph, multi-pack-index, bitmap, reverse-index, or extra-pack input. Pack creation inherits the existing time, object-count, logical-byte, input, and derived file-size bounds without relaxing a stricter inherited file-size limit.
+- Managed plan-only and `--dry-run` preflight now give tracked `git status` and `read-tree --dry-run` their own short-lived copy of that complete private view. Both conversion-capable probes explicitly name the managed worktree and carry every source/private directory, exact-inventory, control-file, index, pack-digest, and source-absence lease into the child pre-exec gate; the exact inventories are repeated after the potentially long pack digest. Launch-window source config/attributes injection still fails before Git starts; a temporary forged `.gitattributes` loose object during private pack capture likewise cannot execute its dormant filter or publish target/registry state. A separate real-checkout regression rewrites and restores that live loose object only across the actual checkout launch: checkout succeeds from the frozen private pack, and the dormant filter never runs.
+- Managed preflight now captures and parses the raw live admin index before its first tracked-status command, retains the target/control/index descriptors through both probes, and gives Git only a mode-`0400` private index through absolute `GIT_INDEX_FILE`, explicit bound `--git-dir`, and the held target `cwd`. The semantic receipt excludes benign stat-cache metadata, while terminal raw-index revalidation still rejects object replacement, persistent content change, unreadable state, or access-policy drift. A same-inode exact-byte live-index ABA that temporarily enables `assume-valid` is harmless because neither probe reads the live bytes; the deterministic regression toggles and restores that flag around two status launches while both continue to report the dirty tracked file.
+- Filter selection now runs after that private view exists. `check-attr
+  --cached` consumes only the retained private index, while tree
+  `check-attr` and `git config` consume only the copied common gitdir,
+  `info/attributes`, config, and exact private object pack. Every relevant
+  descriptor and inventory lease reaches the child pre-exec gate and is
+  revalidated after the query.
+- Recursive planning accepts only canonical 40- or 64-hex `.gitmodules` blob
+  IDs and hashes `blob <size>\0` plus the bounded payload with the matching
+  algorithm before decoding metadata. Same-size source-object substitution
+  therefore cannot authorize nested targets from bytes that do not match the
+  selected tree entry.
+- Filter admission derives its complete target path set with `ls-tree` inside
+  the already verified private checkout view. A forged live source tree cannot
+  omit a filtered path while the later private checkout still contains it.
+- New registrations bind the receipt-owned admin `index` name as absent from
+  post-`--no-checkout` validation through the checkout child's final exec gate.
+  The source `worktrees/` parent and managed-control parent binding both require
+  owner write/search bits and effective read/write/search access, so rollback
+  does not silently depend on DAC override.
+- Private pack admission now retains every verified object size and computes an overflow-safe output limit from the exact Git pack header/trailer, each exact variable-length object header, and zlib's per-object `compressBound`; the canonical v2 index has an independent exact limit. `pack-objects` receives the larger of those two file limits, terminal inspection applies the file-specific bound, and a one-byte overflow fails closed. Boundary regressions cover zlib's 4 KiB, 16 KiB, 64 KiB, and 32 MiB shifts plus a pure-integer 13 GiB object calculation without payload allocation.
+
+## Next Steps
+
+- Keep recursive-parent checkout tests in the full helper regression suite when extending nested target planning.
+
+## Evidence
+
+- `personal_codex/skills/submodule-linked-worktrees/scripts/submodule_worktree_sync.py`
+- `personal_codex/skills/submodule-linked-worktrees/SKILL.md`
+- `personal_codex/skills/submodule-linked-worktrees/references/workflow.md`
+- `tests/test_submodule_worktree_sync.py`
+- Eight focused recursive-parent/shared-prefix regressions passed in 45.770 seconds.
+- The complete helper suite passed 153 tests in 153.742 seconds.
+- Fresh-review follow-up: 16 shared-prefix/finalization/materialization regressions passed in 53.219 seconds, plus the access-policy drift regression passed independently.
+- The updated complete helper suite passed 160 tests in 147.698 seconds.
+- Final control-transaction follow-up: the complete helper suite passed 165 tests in 157.442 seconds, including same-source/same-HEAD marker retargeting at every finalization phase, admin-backlink retargeting, HEAD/common-dir/index replacement, managed-target coverage, and recursive receipt rollback.
+- Ruff lint/format, Python compilation, helper `--help`, skill validation, project-journal validation, and `git diff --check` passed.
+- Final fresh-review fixes: the complete helper suite passed 171 tests in 214.607 seconds, including intermediate-symlink pointer retargeting, managed/new source-lease replacement, real skip-hash, v2/v3/v4, cache-tree, hidden-extension, noncanonical-order, and valid-alternate-index regressions.
+- The repository-level test matrix passed 892 tests in 360.907 seconds. Repository-wide Ruff lint, changed-file Ruff format, Python compilation, helper `--help`, isolated PyYAML skill validation, project-journal validation, sync-manifest validation, and `git diff --check` also passed.
+- Final endpoint/index follow-up: the complete helper suite passed 172 tests in 214.185 seconds, including capture/revalidation races across long index validation, Git cache-tree sibling ordering, EOIE suppression, and non-root empty-tree semantics; the bounded focused re-review reported no actionable findings.
+- The final repository-level test matrix passed 931 tests in 376.481 seconds. Ruff lint, changed-file Ruff format, Python compilation, helper `--help`, isolated PyYAML skill validation, project-journal validation, sync-manifest validation, and `git diff --check` passed.
+- Registry-query/access-policy follow-up: seven focused rollback, source-lease, recursive-prefix, and finalization regressions passed in 34.311 seconds; the three new same-UID source replacement, post-query drift, and managed-mode regressions passed again in 8.047 seconds.
+- The complete helper suite passed 175 tests in 243.375 seconds.
+- Complete repository coverage passed 934 tests: the README module matrix passed 896 tests in 469.508 seconds, and its omitted public-release workflow module passed 38 tests in 0.599 seconds.
+- Repository-wide Ruff lint, changed-file Ruff format, Python compilation, helper `--help`, isolated PyYAML skill validation, project-journal validation, sync-manifest validation, and `git diff --check` passed.
+- An independent read-only diff audit reported no actionable findings; it confirmed both guarded registry-query failure paths, managed-mode preservation, and the documented stock-Git residual race boundary.
+- Raw admin-inventory follow-up: six focused partial-registration, source-replacement, final-query, exact-admin-removal, and full finalization-rollback regressions passed in 25.514 seconds.
+- The complete helper suite passed 178 tests in 344.134 seconds. Missing and zero-byte `gitdir` partial admin entries remained at their exact recovery locations even though Git's semantic registry did not report the target.
+- Complete repository coverage passed 937 tests: the README module matrix passed 899 tests in 636.607 seconds, and its omitted public-release workflow module passed 38 tests in 0.639 seconds.
+- Repository-wide Ruff lint, changed-file Ruff format, Python compilation, helper `--help`, isolated PyYAML skill validation, project-journal validation, sync-manifest validation, and `git diff --check` passed for the raw admin-inventory follow-up.
+- Ownership/root-binding follow-up: seven focused partial-admin, exact-removal, normal-control, recovered-control, inventory-parent-binding, and final-query regressions passed in 22.429 seconds. The original independent read-only auditor then reported no actionable findings.
+- The final complete helper suite passed 181 tests in 498.252 seconds.
+- Final repository coverage passed 940 tests: the README module matrix passed 902 tests in 1022.017 seconds, and its omitted public-release workflow module passed 38 tests in 1.264 seconds.
+- Repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, Python compilation, helper `--help`, isolated PyYAML skill validation, project-journal validation, sync-manifest validation, and `git diff --check` passed. An exploratory Ruff 0.16.0 all-rules invocation reported 592 project-wide style and modernization findings; that unconfigured rule set is not the repository's lint gate.
+- Exact-head GitHub review follow-up: 11 focused scp-style URL, valueless/native Git boolean, raw split-index, unknown-index-extension, and final-index regressions passed in 10.827 seconds.
+- The final reviewer follow-up covering explicit-empty shared-repository policy passed five focused regressions in 5.610 seconds; the read-only re-review reported no findings.
+- The final exact-head follow-up complete helper suite passed 190 tests in 451.303 seconds.
+- Final complete repository coverage passed 949 tests: the README module matrix passed 911 tests in 654.769 seconds, and its omitted public-release workflow module passed 38 tests in 1.838 seconds.
+- GitHub round-two follow-up: 12 focused owner-mode, shared-index, loose-object fanout, and shallow-policy regressions passed in 10.017 seconds; four strengthened race and shared-policy cases passed independently in 1.290 seconds.
+- The final complete helper suite passed 196 tests in 133.095 seconds, and the final repository-level module matrix passed 917 tests in 255.066 seconds.
+- Repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, Python compilation, helper `--help`, skill validation, and `git diff --check` passed. An independent read-only diff audit reported no actionable findings.
+- Formal single follow-up: eight focused pack/fanout, rollback target-entry, and cache-tree ordering regressions passed in 4.011 seconds.
+- The complete helper suite passed 201 tests in 210.714 seconds, and the complete repository module matrix passed 922 tests in 334.778 seconds.
+- The cache-tree ordering finding was refuted by upstream and a real Git 2.53.0 fixture: Git's `cache-tree.c` compares subtree name length before raw bytes, and real indexes serialized `b` before `aa` and `z` before `aa`; the forged tree-entry-style `aa, b` order remains rejected.
+- README Python compilation, Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, helper `--help`, skill validation, project-journal validation, sync-manifest validation, and `git diff --check` passed for the formal-single follow-up.
+- GitHub round-three control-plane follow-up: 14 private gitdir/config, source object/pack/fanout, fetch-policy, shallow-boundary, frozen-environment, and successful-fetch regressions passed in 5.353 seconds.
+- The final complete helper suite passed 204 tests in 146.556 seconds, and the final complete repository module matrix passed 925 tests in 247.637 seconds.
+- README Python compilation, repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, helper `--help`, skill validation, project-journal validation, sync-manifest validation, and `git diff --check` passed for the control-plane follow-up.
+- GitHub round-four launch/absence/cap follow-up: nine focused executable-path, same-inode executable rewrite, private shallow regular/symlink injection, independent-limit, control-file race, and successful-fetch regressions passed in 5.013 seconds.
+- The complete helper suite passed 209 tests in 243.690 seconds, and the complete repository module matrix passed 930 tests in 338.345 seconds.
+- Python compilation, repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, helper `--help`, skill validation, project-journal validation, sync-manifest validation, and `git diff --check` passed for the launch/absence/cap follow-up.
+- GitHub round-five transport/signal/cleanup follow-up: 14 focused regressions passed under Xcode Python 3.9.6 in 9.293 seconds, covering relocated helper prefixes, exact-byte helper drift, real file and HTTP transports, process-group signal forwarding, already-reaped PGID safety, descriptor-anchored quarantine cleanup, and fetch/add/checkout recovery publication.
+- The final complete helper suite passed 223 tests in 286.400 seconds, and the final complete repository module matrix passed 944 tests in 366.568 seconds.
+- Repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, current-Python and Python 3.9 compilation, helper `--help`, skill validation, project-journal validation, sync-manifest validation, and `git diff --check` passed for the transport/signal/cleanup follow-up.
+- Terminal-signal closure follow-up: 18 focused leader-exit, inherited-pipe, fetch/checkout phase-latch, post-publication commit, rollback-deferral, explicit-plan-close, source-transaction descriptor, and active-guard recovery regressions passed in 24.118 seconds.
+- The final complete helper suite passed 235 tests in 270.658 seconds, including the real loopback HTTP transport fixture and class-terminal active-guard cleanup.
+- The final complete repository module matrix passed 956 tests in 413.642 seconds.
+- Xcode Python 3.9.6 passed the original 14 transport/signal regressions plus all 12 new terminal-closure regressions: 26 tests in 32.643 seconds.
+- Repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, current-Python and Python 3.9 compilation, helper `--help`, skill validation, project-journal validation, sync-manifest validation, and `git diff --check` passed for the terminal-signal closure follow-up.
+- Checkout execution-view follow-up: the final complete repository module matrix passed 972 tests in 445.234 seconds. Python 3.9.6 compilation and 14 focused config/attributes launch-window, managed-control, shallow-boundary, filter, and cache-tree regressions passed in 22.825 seconds.
+- Managed preflight execution-view follow-up: four focused tracked-status, checkout-probe, managed-worktree selection, and status launch-window injection regressions passed in 2.799 seconds. The complete helper suite passed 254 tests in 379.364 seconds.
+- Xcode Python 3.9.6 passed 17 focused config/attributes/filter/managed-preflight regressions in 16.918 seconds. The complete README module matrix passed 975 tests in 468.265 seconds.
+- Current-Python and Python 3.9 compilation, repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, helper `--help`, isolated PyYAML skill validation, project-journal validation, sync-manifest validation from `6443af48ca61079d731399b59681952e21d7bab3`, and `git diff --check` passed for the managed-preflight execution-view follow-up. Python 3.9 bytecode output was redirected to the task-scoped cache because Xcode Python's default user cache is outside the sandbox.
+- Private checkout-object follow-up: five focused actual new/managed checkout plus pre-exec and digest-window private-object injection regressions passed in 11.548 seconds. A separate capture/live-launch/digest-window trio passed in 4.361 seconds, proving that forged source bytes cannot enter the private closure, a temporary live-source rewrite across real checkout cannot execute the dormant filter, and a late private pack entry is caught after pack hashing.
+- The complete helper suite passed 258 tests in 345.365 seconds. The complete README module matrix passed 979 tests in 454.956 seconds, and its omitted public-release workflow module passed 38 tests in 0.423 seconds.
+- Xcode 26.6.0 Python 3.9.6 passed the nine CI minimum-version regressions plus six private-object-view success/race regressions: 15 tests in 15.486 seconds.
+- Current-Python and Python 3.9 compilation, repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, helper `--help`, skill validation, project-journal validation, sync-manifest validation from `6443af48ca61079d731399b59681952e21d7bab3`, and `git diff --check` passed for the private checkout-object follow-up. Python 3.9 bytecode remained redirected to the task-scoped cache because Xcode Python's default user cache is outside the sandbox.
+- Managed-index/pack-bound fresh-review follow-up: the complete helper suite passed 261 tests in 352.422 seconds, including the deterministic same-inode exact-byte `assume-valid` ABA regression and zlib/large-object pack-bound boundaries. The complete README module matrix passed 982 tests in 532.841 seconds, and its omitted public-release workflow module passed 38 tests in 0.476 seconds.
+- Xcode 26.6.0 Python 3.9.6 passed the nine CI minimum-version regressions, the prior six private-object-view success/race regressions, and all three new managed-index/pack-bound regressions: 18 tests in 15.445 seconds.
+- Current-Python and Python 3.9 compilation, repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, helper `--help`, skill validation, project-journal validation, sync-manifest validation from `6443af48ca61079d731399b59681952e21d7bab3`, and `git diff --check` passed for the managed-index/pack-bound follow-up. Python 3.9 bytecode remained redirected to the task-scoped cache.
+- Superproject selected-gitlink snapshot follow-up: the complete helper suite passed 262 tests in 374.147 seconds, including the deterministic same-inode/same-size valid-index ABA and private split-index sibling regressions. The complete README module matrix passed 983 tests in 464.175 seconds, and its omitted public-release workflow module passed 38 tests in 0.402 seconds.
+- Xcode 26.6.0 Python 3.9.6 compiled the supported runtime and passed the nine CI minimum-version regressions, six private-object-view regressions, three managed-index/pack-bound regressions, and both new superproject-index regressions: 20 tests in 11.279 seconds.
+- Current-Python compilation, repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, helper `--help`, skill validation, project-journal validation, sync-manifest validation from `6443af48ca61079d731399b59681952e21d7bab3`, and `git diff --check` passed for the selected-gitlink snapshot follow-up. Python 3.9 bytecode remained redirected to the task-scoped cache.
+- Source-only selected-gitlink parser follow-up: nine focused SHA-1/SHA-256, v2/v3/v4, split delete/replace/add overlay, stage, identity, and deterministic post-digest same-inode/same-size valid-index ABA regressions passed in 4.965 seconds. Xcode 26.6.0 Python 3.9.6 passed the same nine regressions in 4.183 seconds and compiled the changed runtime/tests with bytecode redirected to the task-scoped cache.
+- The complete helper suite passed 265 tests in 350.733 seconds. The complete README module matrix passed 986 tests in 479.824 seconds, and its omitted public-release workflow module passed 38 tests in 0.460 seconds.
+- Current-Python compilation, repository-wide Ruff fatal-error lint (`E9,F63,F7,F82`), changed-file Ruff format, helper `--help`, skill validation, project-journal validation, sync-manifest validation from `6443af48ca61079d731399b59681952e21d7bab3`, and `git diff --check` passed for the source-only parser follow-up.
+- Private attribute/object-binding follow-up base:
+  `dd82b481f285ed64639685fce4a29be9d0e1ebc5`.
+- Three focused captured-index ABA, `info/attributes` ABA, and same-size
+  `.gitmodules` substitution regressions passed; an independent read-only
+  patch audit reported no findings.
+- After the follow-up implementation and before the final formatting pass,
+  the complete README module matrix passed `988` tests in `584.715s`.
+- After final Ruff formatting, the complete submodule helper suite passed
+  `267` tests in `442.559s`.
+- System Python `3.9.6` passed the three new captured-index ABA,
+  `info/attributes` ABA, and `.gitmodules` object-binding regressions in
+  `3.958s`.
+- Ruff check/format, helper `--help`, isolated PyYAML skill validation,
+  project-journal validation, sync-manifest validation against current
+  `origin/master`, and `git diff --check` passed for this follow-up.
+- Final checkout-control follow-up: the complete helper suite passed `273`
+  tests in `782.100s`; the complete README module matrix passed `994` tests
+  in `666.086s`, and its omitted public-release workflow module passed `38`
+  tests in `0.444s`.
+- Xcode Python `3.9.6` compiled the changed runtime/tests and passed all six
+  SHA-1/SHA-256 `.gitmodules`, private-tree path-selection, admin-index
+  absence, and registry-parent policy regressions in `5.267s`.
+- Current-Python compilation, repository-wide Ruff fatal-error lint
+  (`E9,F63,F7,F82`), changed-file Ruff format, helper `--help`, skill
+  validation, project-journal validation, sync-manifest validation from
+  `6443af48ca61079d731399b59681952e21d7bab3`, and `git diff --check` passed
+  for the checkout-control follow-up.
