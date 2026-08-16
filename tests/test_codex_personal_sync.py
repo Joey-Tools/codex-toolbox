@@ -7053,6 +7053,534 @@ while True:
         finally:
             os.close(file_descriptor)
 
+    def test_release_identity_policy_accepts_one_safe_metadata_churn(
+        self,
+    ) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        release_file.chmod(0o700)
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            baseline = os.fstat(file_descriptor)
+            changed = MetadataOverride(
+                baseline,
+                st_mode=stat.S_IFMT(baseline.st_mode) | 0o755,
+                st_ctime_ns=baseline.st_ctime_ns + 1,
+            )
+            terminal = MetadataOverride(
+                baseline,
+                st_mode=changed.st_mode,
+                st_ctime_ns=changed.st_ctime_ns,
+            )
+            acl_api = object()
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE.os,
+                    "fstat",
+                    side_effect=(baseline, changed, changed, terminal),
+                ) as fstat_call,
+                mock.patch.object(
+                    MODULE,
+                    "_load_darwin_extended_acl_api",
+                    return_value=acl_api,
+                ) as load_api,
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_extended_acl_entries",
+                    return_value=(),
+                ) as read_acl,
+            ):
+                metadata = MODULE._require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    release_file,
+                    baseline.st_uid,
+                )
+
+            self.assertIs(metadata, terminal)
+            self.assertEqual(fstat_call.call_count, 4)
+            load_api.assert_called_once_with(release_file)
+            self.assertEqual(read_acl.call_count, 2)
+        finally:
+            os.close(file_descriptor)
+
+    def test_release_identity_policy_accepts_one_safe_mode_only_drift(
+        self,
+    ) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        release_file.chmod(0o700)
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            baseline = os.fstat(file_descriptor)
+            changed = MetadataOverride(
+                baseline,
+                st_mode=stat.S_IFMT(baseline.st_mode) | 0o755,
+            )
+            terminal = MetadataOverride(
+                baseline,
+                st_mode=changed.st_mode,
+            )
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE.os,
+                    "fstat",
+                    side_effect=(baseline, changed, changed, terminal),
+                ) as fstat_call,
+                mock.patch.object(
+                    MODULE,
+                    "_load_darwin_extended_acl_api",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_extended_acl_entries",
+                    return_value=(),
+                ) as read_acl,
+            ):
+                metadata = MODULE._require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    release_file,
+                    baseline.st_uid,
+                )
+
+            self.assertIs(metadata, terminal)
+            self.assertEqual(fstat_call.call_count, 4)
+            self.assertEqual(read_acl.call_count, 2)
+        finally:
+            os.close(file_descriptor)
+
+    def test_release_identity_policy_rejects_unsafe_post_mode_drift(
+        self,
+    ) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        release_file.chmod(0o600)
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            baseline = os.fstat(file_descriptor)
+            unsafe = MetadataOverride(
+                baseline,
+                st_mode=stat.S_IFMT(baseline.st_mode) | 0o620,
+                st_ctime_ns=baseline.st_ctime_ns + 1,
+            )
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE.os,
+                    "fstat",
+                    side_effect=(baseline, unsafe),
+                ) as fstat_call,
+                mock.patch.object(
+                    MODULE,
+                    "_load_darwin_extended_acl_api",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_extended_acl_entries",
+                    return_value=(),
+                ) as read_acl,
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "grants group or world write authority",
+                ) as raised,
+            ):
+                MODULE._require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    release_file,
+                    baseline.st_uid,
+                )
+
+            self.assertIn("mismatch", str(raised.exception))
+            self.assertEqual(
+                raised.exception.code,
+                "current-release-unverifiable",
+            )
+            self.assertEqual(fstat_call.call_count, 2)
+            read_acl.assert_called_once()
+        finally:
+            os.close(file_descriptor)
+
+    def test_release_identity_policy_rejects_post_owner_drift(self) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            baseline = os.fstat(file_descriptor)
+            wrong_owner = MetadataOverride(
+                baseline,
+                st_uid=baseline.st_uid + 1,
+                st_ctime_ns=baseline.st_ctime_ns + 1,
+            )
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE.os,
+                    "fstat",
+                    side_effect=(baseline, wrong_owner),
+                ) as fstat_call,
+                mock.patch.object(
+                    MODULE,
+                    "_load_darwin_extended_acl_api",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_extended_acl_entries",
+                    return_value=(),
+                ) as read_acl,
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "owner UID .* != expected UID",
+                ) as raised,
+            ):
+                MODULE._require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    release_file,
+                    baseline.st_uid,
+                )
+
+            self.assertIn("mismatch", str(raised.exception))
+            self.assertEqual(
+                raised.exception.code,
+                "current-release-unverifiable",
+            )
+            self.assertEqual(fstat_call.call_count, 2)
+            read_acl.assert_called_once()
+        finally:
+            os.close(file_descriptor)
+
+    def test_release_identity_policy_rejects_post_object_drift(self) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            baseline = os.fstat(file_descriptor)
+            for label, overrides in (
+                ("device", {"st_dev": baseline.st_dev + 1}),
+                ("inode", {"st_ino": baseline.st_ino + 1}),
+                (
+                    "type",
+                    {
+                        "st_mode": stat.S_IFDIR
+                        | stat.S_IMODE(baseline.st_mode),
+                    },
+                ),
+            ):
+                replacement = MetadataOverride(
+                    baseline,
+                    st_ctime_ns=baseline.st_ctime_ns + 1,
+                    **overrides,
+                )
+                with (
+                    self.subTest(label=label),
+                    mock.patch.object(MODULE.sys, "platform", "darwin"),
+                    mock.patch.object(
+                        MODULE.os,
+                        "fstat",
+                        side_effect=(baseline, replacement),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_load_darwin_extended_acl_api",
+                        return_value=object(),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_darwin_extended_acl_entries",
+                        return_value=(),
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "bound object identity changed",
+                    ) as raised,
+                ):
+                    MODULE._require_release_identity_fd_access_policy(
+                        file_descriptor,
+                        release_file,
+                        baseline.st_uid,
+                    )
+
+                self.assertIn("mismatch", str(raised.exception))
+                self.assertEqual(
+                    raised.exception.code,
+                    "current-release-unverifiable",
+                )
+        finally:
+            os.close(file_descriptor)
+
+    def test_release_identity_policy_rereads_acl_after_ctime_drift(
+        self,
+    ) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            baseline = os.fstat(file_descriptor)
+            changed = MetadataOverride(
+                baseline,
+                st_ctime_ns=baseline.st_ctime_ns + 1,
+            )
+            owner_uuid = bytes(range(16))
+            non_owner_uuid = bytes(reversed(range(16)))
+            acl_api = object()
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE.os,
+                    "fstat",
+                    side_effect=(baseline, changed, changed),
+                ) as fstat_call,
+                mock.patch.object(
+                    MODULE,
+                    "_load_darwin_extended_acl_api",
+                    return_value=acl_api,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_extended_acl_entries",
+                    side_effect=(
+                        (),
+                        (
+                            (
+                                MODULE._DARWIN_ACL_EXTENDED_ALLOW,
+                                non_owner_uuid,
+                            ),
+                        ),
+                    ),
+                ) as read_acl,
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_owner_uuid",
+                    return_value=owner_uuid,
+                ) as read_owner_uuid,
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "grants ALLOW access to a non-owner qualifier",
+                ) as raised,
+            ):
+                MODULE._require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    release_file,
+                    baseline.st_uid,
+                )
+
+            self.assertEqual(
+                raised.exception.code,
+                "current-release-unverifiable",
+            )
+            self.assertEqual(fstat_call.call_count, 3)
+            self.assertEqual(read_acl.call_count, 2)
+            read_owner_uuid.assert_called_once_with(
+                baseline.st_uid,
+                release_file,
+                acl_api,
+            )
+        finally:
+            os.close(file_descriptor)
+
+    def test_release_identity_policy_rejects_repeated_safe_ctime_drift(
+        self,
+    ) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            baseline = os.fstat(file_descriptor)
+            changed_once = MetadataOverride(
+                baseline,
+                st_ctime_ns=baseline.st_ctime_ns + 1,
+            )
+            changed_twice = MetadataOverride(
+                baseline,
+                st_ctime_ns=baseline.st_ctime_ns + 2,
+            )
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE.os,
+                    "fstat",
+                    side_effect=(
+                        baseline,
+                        changed_once,
+                        changed_once,
+                        changed_twice,
+                    ),
+                ) as fstat_call,
+                mock.patch.object(
+                    MODULE,
+                    "_load_darwin_extended_acl_api",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_extended_acl_entries",
+                    return_value=(),
+                ) as read_acl,
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "access policy did not stabilize",
+                ) as raised,
+            ):
+                MODULE._require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    release_file,
+                    baseline.st_uid,
+                )
+
+            self.assertIn("cannot be verified", str(raised.exception))
+            self.assertEqual(
+                raised.exception.code,
+                "current-release-unverifiable",
+            )
+            self.assertEqual(fstat_call.call_count, 4)
+            self.assertEqual(read_acl.call_count, 2)
+        finally:
+            os.close(file_descriptor)
+
+    def test_release_identity_policy_reports_post_fstat_failure(self) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            baseline = os.fstat(file_descriptor)
+            post_error = OSError(MODULE.errno.EIO, "injected post failure")
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE.os,
+                    "fstat",
+                    side_effect=(baseline, post_error),
+                ) as fstat_call,
+                mock.patch.object(
+                    MODULE,
+                    "_load_darwin_extended_acl_api",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_extended_acl_entries",
+                    return_value=(),
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "post-ACL fstat failed",
+                ) as raised,
+            ):
+                MODULE._require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    release_file,
+                    baseline.st_uid,
+                )
+
+            self.assertIn("cannot be verified", str(raised.exception))
+            self.assertEqual(
+                raised.exception.code,
+                "current-release-unverifiable",
+            )
+            self.assertEqual(fstat_call.call_count, 2)
+        finally:
+            os.close(file_descriptor)
+
+    def test_release_identity_policy_reports_second_pre_fstat_failure(
+        self,
+    ) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            baseline = os.fstat(file_descriptor)
+            changed = MetadataOverride(
+                baseline,
+                st_ctime_ns=baseline.st_ctime_ns + 1,
+            )
+            revalidation_error = OSError(
+                MODULE.errno.EIO,
+                "injected revalidation failure",
+            )
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE.os,
+                    "fstat",
+                    side_effect=(baseline, changed, revalidation_error),
+                ) as fstat_call,
+                mock.patch.object(
+                    MODULE,
+                    "_load_darwin_extended_acl_api",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_extended_acl_entries",
+                    return_value=(),
+                ) as read_acl,
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "revalidation fstat failed",
+                ) as raised,
+            ):
+                MODULE._require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    release_file,
+                    baseline.st_uid,
+                )
+
+            self.assertIn("cannot be verified", str(raised.exception))
+            self.assertEqual(
+                raised.exception.code,
+                "current-release-unverifiable",
+            )
+            self.assertEqual(fstat_call.call_count, 3)
+            read_acl.assert_called_once()
+        finally:
+            os.close(file_descriptor)
+
+    def test_release_identity_policy_preserves_acl_primary_error(self) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            baseline = os.fstat(file_descriptor)
+            primary_error = MODULE.SyncError(
+                "injected ACL cleanup failure",
+                code="current-release-unverifiable",
+            )
+            with (
+                mock.patch.object(MODULE.sys, "platform", "darwin"),
+                mock.patch.object(
+                    MODULE.os,
+                    "fstat",
+                    side_effect=(
+                        baseline,
+                        OSError(MODULE.errno.EIO, "injected post failure"),
+                    ),
+                ) as fstat_call,
+                mock.patch.object(
+                    MODULE,
+                    "_load_darwin_extended_acl_api",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_extended_acl_entries",
+                    side_effect=primary_error,
+                ),
+                self.assertRaises(MODULE.SyncError) as raised,
+            ):
+                MODULE._require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    release_file,
+                    baseline.st_uid,
+                )
+
+            self.assertIs(raised.exception, primary_error)
+            self.assertEqual(fstat_call.call_count, 1)
+        finally:
+            os.close(file_descriptor)
+
     def test_install_release_directory_chains_deduplicate_owned_ancestors(
         self,
     ) -> None:
@@ -8844,6 +9372,73 @@ while True:
         finally:
             os.close(file_descriptor)
 
+        self.assertEqual(stat.S_IMODE(release_file.stat().st_mode), before_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")
+    def test_release_identity_darwin_rereads_acl_after_ctime_drift(
+        self,
+    ) -> None:
+        release_file = self.root / "release-entry"
+        release_file.write_bytes(b"entry")
+        subprocess.run(
+            ["/bin/chmod", "-N", os.fspath(release_file)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        before_mode = stat.S_IMODE(release_file.stat().st_mode)
+        real_read_acl = MODULE._darwin_extended_acl_entries
+        acl_reads = 0
+
+        def capture_then_grant_non_owner_allow(
+            file_descriptor: int,
+            display_path: Path,
+            api: MODULE._DarwinExtendedAclApi,
+        ) -> tuple[tuple[int, bytes | None], ...]:
+            nonlocal acl_reads
+            entries = real_read_acl(file_descriptor, display_path, api)
+            acl_reads += 1
+            if acl_reads == 1:
+                self.assertEqual(entries, ())
+                subprocess.run(
+                    [
+                        "/bin/chmod",
+                        "+a",
+                        "everyone allow write",
+                        os.fspath(release_file),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            return entries
+
+        file_descriptor = os.open(release_file, os.O_RDONLY)
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_darwin_extended_acl_entries",
+                    side_effect=capture_then_grant_non_owner_allow,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "grants ALLOW access to a non-owner qualifier",
+                ) as raised,
+            ):
+                MODULE._require_release_identity_fd_access_policy(
+                    file_descriptor,
+                    release_file,
+                    os.geteuid(),
+                )
+        finally:
+            os.close(file_descriptor)
+
+        self.assertEqual(
+            raised.exception.code,
+            "current-release-unverifiable",
+        )
+        self.assertEqual(acl_reads, 2)
         self.assertEqual(stat.S_IMODE(release_file.stat().st_mode), before_mode)
 
     @unittest.skipUnless(sys.platform == "darwin", "requires Darwin ACLs")

@@ -18656,11 +18656,13 @@ def _require_release_identity_fd_access_policy(
     """Prove the release object is owner-controlled on this exact bound FD.
 
     Raw ACL bytes and entry order are deliberately not evidence. The protected
-    property is the expected UID plus the absence of non-owner write authority
-    from POSIX mode bits or the extended ACL admission policy.
+    property is a stable dev/inode/type, the expected UID, and the absence of
+    non-owner write authority from POSIX mode bits or the extended ACL
+    admission policy. Safe mode or ctime drift triggers one complete semantic
+    reread instead of being treated as mutation evidence by itself.
     """
     try:
-        metadata = os.fstat(file_descriptor)
+        initial_metadata = os.fstat(file_descriptor)
     except OSError as error:
         raise _release_identity_policy_error(
             display_path,
@@ -18668,57 +18670,149 @@ def _require_release_identity_fd_access_policy(
             mismatch=False,
         ) from error
     if sys.platform != "darwin":
-        return metadata
-    if metadata.st_uid != expected_owner_uid:
-        raise _release_identity_policy_error(
-            display_path,
-            f"owner UID {metadata.st_uid} != expected UID {expected_owner_uid}",
-            mismatch=True,
+        return initial_metadata
+
+    expected_identity = (
+        initial_metadata.st_dev,
+        initial_metadata.st_ino,
+        stat.S_IFMT(initial_metadata.st_mode),
+    )
+    api: _DarwinExtendedAclApi | None = None
+    pre_metadata = initial_metadata
+    for sample_index in range(2):
+        if sample_index:
+            try:
+                pre_metadata = os.fstat(file_descriptor)
+            except OSError as error:
+                raise _release_identity_policy_error(
+                    display_path,
+                    f"revalidation fstat failed: {error}",
+                    mismatch=False,
+                ) from error
+
+        pre_identity = (
+            pre_metadata.st_dev,
+            pre_metadata.st_ino,
+            stat.S_IFMT(pre_metadata.st_mode),
         )
-    mode = stat.S_IMODE(metadata.st_mode)
-    if mode & 0o022:
-        raise _release_identity_policy_error(
-            display_path,
-            f"mode {mode:04o} grants group or world write authority",
-            mismatch=True,
+        if pre_identity != expected_identity:
+            raise _release_identity_policy_error(
+                display_path,
+                "bound object identity changed during access-policy validation",
+                mismatch=True,
+            )
+        if pre_metadata.st_uid != expected_owner_uid:
+            raise _release_identity_policy_error(
+                display_path,
+                "owner UID "
+                f"{pre_metadata.st_uid} != expected UID {expected_owner_uid}",
+                mismatch=True,
+            )
+        pre_mode = stat.S_IMODE(pre_metadata.st_mode)
+        if pre_mode & 0o022:
+            raise _release_identity_policy_error(
+                display_path,
+                f"mode {pre_mode:04o} grants group or world write authority",
+                mismatch=True,
+            )
+
+        try:
+            if api is None:
+                api = _load_darwin_extended_acl_api(display_path)
+            entries = _darwin_extended_acl_entries(
+                file_descriptor,
+                display_path,
+                api,
+            )
+        except SyncError:
+            raise
+        except (OSError, TypeError, ValueError, ctypes.ArgumentError) as error:
+            raise _release_identity_policy_error(
+                display_path,
+                f"Darwin extended ACL API failed: {error}",
+                mismatch=False,
+            ) from error
+        if any(
+            tag_type == _DARWIN_ACL_EXTENDED_ALLOW
+            for tag_type, _qualifier in entries
+        ):
+            try:
+                owner_uuid = _darwin_owner_uuid(
+                    pre_metadata.st_uid,
+                    display_path,
+                    api,
+                )
+                _require_darwin_acl_entries_owner_only(
+                    entries,
+                    owner_uuid,
+                    display_path,
+                )
+            except SyncError:
+                raise
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                ctypes.ArgumentError,
+            ) as error:
+                raise _release_identity_policy_error(
+                    display_path,
+                    f"Darwin owner UUID API failed: {error}",
+                    mismatch=False,
+                ) from error
+        else:
+            _require_darwin_acl_entries_owner_only(
+                entries,
+                None,
+                display_path,
+            )
+
+        try:
+            post_metadata = os.fstat(file_descriptor)
+        except OSError as error:
+            raise _release_identity_policy_error(
+                display_path,
+                f"post-ACL fstat failed: {error}",
+                mismatch=False,
+            ) from error
+        post_identity = (
+            post_metadata.st_dev,
+            post_metadata.st_ino,
+            stat.S_IFMT(post_metadata.st_mode),
         )
-    try:
-        api = _load_darwin_extended_acl_api(display_path)
-        entries = _darwin_extended_acl_entries(
-            file_descriptor,
-            display_path,
-            api,
-        )
-    except SyncError:
-        raise
-    except (OSError, TypeError, ValueError, ctypes.ArgumentError) as error:
-        raise _release_identity_policy_error(
-            display_path,
-            f"Darwin extended ACL API failed: {error}",
-            mismatch=False,
-        ) from error
-    if not any(
-        tag_type == _DARWIN_ACL_EXTENDED_ALLOW
-        for tag_type, _qualifier in entries
-    ):
-        _require_darwin_acl_entries_owner_only(entries, None, display_path)
-        return metadata
-    try:
-        owner_uuid = _darwin_owner_uuid(metadata.st_uid, display_path, api)
-        _require_darwin_acl_entries_owner_only(
-            entries,
-            owner_uuid,
-            display_path,
-        )
-    except SyncError:
-        raise
-    except (OSError, TypeError, ValueError, ctypes.ArgumentError) as error:
-        raise _release_identity_policy_error(
-            display_path,
-            f"Darwin owner UUID API failed: {error}",
-            mismatch=False,
-        ) from error
-    return metadata
+        if post_identity != expected_identity:
+            raise _release_identity_policy_error(
+                display_path,
+                "bound object identity changed during access-policy validation",
+                mismatch=True,
+            )
+        if post_metadata.st_uid != expected_owner_uid:
+            raise _release_identity_policy_error(
+                display_path,
+                "owner UID "
+                f"{post_metadata.st_uid} != expected UID {expected_owner_uid}",
+                mismatch=True,
+            )
+        post_mode = stat.S_IMODE(post_metadata.st_mode)
+        if post_mode & 0o022:
+            raise _release_identity_policy_error(
+                display_path,
+                f"mode {post_mode:04o} grants group or world write authority",
+                mismatch=True,
+            )
+        if (
+            pre_mode == post_mode
+            and pre_metadata.st_ctime_ns == post_metadata.st_ctime_ns
+        ):
+            return post_metadata
+        if sample_index:
+            raise _release_identity_policy_error(
+                display_path,
+                "access policy did not stabilize during revalidation",
+                mismatch=False,
+            )
+
+    raise AssertionError("unreachable Darwin access-policy sample state")
 
 
 def _require_release_identity_directory_bindings(
