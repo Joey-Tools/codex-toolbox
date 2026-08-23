@@ -39,7 +39,12 @@ superseded_by:
 - Complete context and reasoning are presented before `request_user_input`,
   which is used only when it can faithfully collect the decision. Structured
   text preserves wider frontiers, option sets, and comparisons with no honest
-  leader. Empty, silent, or timed-out interactions never count as adoption.
+  leader. Text-rendered questions yield control instead of polling, and empty,
+  silent, or timed-out interactions never count as adoption.
+- A sole feasible direction uses proposal mode only for a non-protected,
+  local or reasonably reversible decision. Protected and high-consequence
+  nodes retain their alternatives disclosure unless the user explicitly
+  overrides presentation; the override does not change authorization.
 
 ## Next Steps
 

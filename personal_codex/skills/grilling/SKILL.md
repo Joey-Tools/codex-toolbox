@@ -37,11 +37,12 @@ Choose a presentation independently for each frontier node:
 
 - Use **alternatives mode** when two or more viable, non-dominated directions
   remain and their ordering depends on an unsettled preference.
-- Default to alternatives mode for protected decisions: scope or execution
-  authorization, destructive or hard-to-reverse actions, external publication
-  or spending, permissions or credentials, trust boundaries, security,
-  privacy, compliance, public APIs, compatibility commitments, persistent
-  schemas, migrations, or choices that require external coordination to undo.
+- Default to alternatives mode for protected or high-consequence decisions:
+  scope or execution authorization, destructive or hard-to-reverse actions,
+  external publication or spending, permissions or credentials, trust
+  boundaries, security, privacy, compliance, public APIs, compatibility
+  commitments, persistent schemas, migrations, or choices that require
+  external coordination to undo.
 - Automatically use **proposal mode** only when settled facts, constraints,
   priorities, and prior answers leave one non-dominated direction, and the
   decision is local or reasonably reversible.
@@ -143,8 +144,13 @@ explicitly invite a free-form answer. The picker is a transport convenience,
 not a container for the full reasoning and not a reason to truncate the
 decision space.
 
+Whenever a round or remaining question is rendered in text—including direct
+structured text, a tool fallback, or a partial-response re-presentation—end
+the current turn after presenting it and resume when the user replies. Do not
+poll or keep the turn alive while waiting.
+
 If the tool is unavailable, fails, or returns an empty `answers` object, ask
-the same round in text and wait for explicit input. Do not change modes merely
+the same round in text under this handoff rule. Do not change modes merely
 because the collaboration mode or interaction surface changed.
 
 Never set or describe a timeout, countdown, auto-submit behavior, or

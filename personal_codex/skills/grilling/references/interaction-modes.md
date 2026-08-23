@@ -70,10 +70,14 @@ order:
    decisions that govern the recommendation. Label assumptions separately.
 3. **Recommendation**: make one affirmative, concrete proposal.
 4. **Why it leads**: connect the proposal to the user's settled priorities and
-   explain why it currently leads. If an explicit presentation override is the
-   only reason proposal mode is in use, say that the direction does not
-   dominate, identify the missing preference or labelled assumption behind the
-   recommendation, and do not manufacture certainty.
+   explain why it currently leads. If an explicit presentation override bypasses
+   a lack of dominance, say that the direction does not dominate, identify the
+   missing preference or labelled assumption behind the recommendation, and do
+   not manufacture certainty. If the direction does dominate but the override
+   changes a protected or high-consequence node from its default alternatives
+   presentation, state both facts: explain the dominance and disclose that the
+   protected presentation safeguard was overridden without relaxing protection
+   or authorization.
 5. **Tradeoffs**: state gains, costs, risks, and important non-guarantees. Do not
    hide a real downside in the recommendation rationale.
 6. **Strongest credible alternative**: name it and explain why it is not
@@ -268,12 +272,20 @@ The cognitive-load rules may independently justify splitting a round. A real
 dependency or a natural hierarchy may also justify separate rounds; the picker
 limit alone may not.
 
+Every text-rendered question uses the same handoff, whether text was selected
+directly, used after a tool failure or empty result, or used to re-present the
+valid remainder of a partial response. End the current turn after presenting
+the text and resume only when the user replies. Do not poll or keep the turn
+alive. Conversation silence is the absence of an event, not a trigger to
+re-present the question inside the same turn.
+
 Never set a timeout, countdown, auto-submit behavior, or silence-based default.
 An empty tool result or silence leaves every affected node unanswered. For a
 partial tool or text response, apply all non-empty answers, recompute the entire
 tree, and then re-present only still-reachable, still-valid unanswered nodes.
-Do not replay a question invalidated by an answered sibling, and do not silently
-choose the recommendation.
+Apply the text handoff after that re-presentation. Do not replay a question
+invalidated by an answered sibling, and do not silently choose the
+recommendation.
 
 ## State Transitions
 
@@ -284,8 +296,8 @@ this implementation vocabulary.
 | --- | --- | --- |
 | `blocked-on-fact` | Required accessible evidence is missing | Investigate; leave only dependent nodes blocked. |
 | `blocked-on-fact` | Evidence arrives | Update facts and recompute the entire tree before presenting anything. |
-| `ready` | Router selects `proposal` | Present one proposal and wait. |
-| `ready` | Router selects `alternatives` | Add the node to a cognitively coherent alternatives round and wait. |
+| `ready` | Router selects `proposal` | Present one proposal, leave the node open, and yield control for the user's response. |
+| `ready` | Router selects `alternatives` | Add the node to a cognitively coherent alternatives round, leave it open, and yield control for the user's response. |
 | `proposal-presented` | User adopts exactly as stated or merely repeats an existing proposal condition | Mark settled and recompute the tree. |
 | `proposal-presented` | User adds or changes a condition | Treat as `Revise`; keep open, incorporate the condition, recompute first, and request any still-needed parameter only if the node remains reachable. |
 | `proposal-presented` | User requests revision | Keep open, apply supplied changes, and recompute first; only then obtain missing revision parameters if the node remains reachable. |
@@ -293,7 +305,8 @@ this implementation vocabulary.
 | `alternatives-presented` | User selects a direction | Mark settled, record explicit conditions, and recompute the tree. |
 | `alternatives-presented` | User combines compatible directions | Settle only if the combination is coherent; otherwise split the independent decisions and clarify. |
 | `alternatives-presented` | User rejects all options or changes a constraint | Keep open, revise the viable set, and recompute. |
-| Any presented state | Answer is empty, silent, or ambiguous | Leave open; re-present or ask the minimum narrow clarification. |
+| Any presented state | User sends an empty or ambiguous answer | Leave open; re-present or ask the minimum narrow clarification, then yield control again. |
+| Any presented state | No user reply arrives | Leave open with no state transition; end the current turn and resume only after a later reply. |
 | `settled` | New evidence satisfies its stated reopen condition or invalidates a governing fact | Reopen explicitly, explain why, and recompute affected branches. |
 | Any state | An answer removes, reshapes, or unblocks other nodes | Recompute the full tree; do not use a stale question queue. |
 | All reachable nodes are settled or pruned, with no pending investigation or `blocked-on-fact` state | Ready frontier is empty | Summarize the shared understanding and ask `Confirm and proceed`, `Revise`, or `Pause`. |
@@ -306,9 +319,16 @@ actions outside the user's request.
 
 ## Boundary Cases
 
-1. **One feasible implementation remains.** Use `proposal`; say that there is no
+1. **One feasible implementation remains for a non-protected, local or
+   reasonably reversible decision.** Use `proposal`; say that there is no
    credible live alternative and name the nearest constraint-eliminated
    candidate. Do not invent two inferior implementations to create a picker.
+   If the decision is protected or high-consequence, the protected-decision
+   route remains authoritative: use `alternatives` to disclose the sole viable
+   direction and the constraints that eliminated expected candidates, then ask
+   whether a constraint should be reconsidered. Only an explicit presentation
+   override may render that protected node as a proposal, and it does not relax
+   the protection or authorization boundary.
 2. **Two good implementations optimize different unsettled priorities.** Use
    `alternatives`, even if the agent has a personal favorite.
 3. **Five viable strategies remain.** Render all five in text. Do not omit two,
@@ -346,8 +366,10 @@ actions outside the user's request.
 15. **Options can be combined independently.** Model separate decisions rather
     than pretending they are mutually exclusive; include a combined strategy
     only when it is genuinely a distinct strategy.
-16. **The user does not answer.** Wait indefinitely. Never treat delay, an empty
-    result, or conversation silence as adoption.
+16. **The user does not answer in text mode.** End the current turn after
+    presenting the question and resume when the user replies. Do not poll or
+    keep the turn alive; delay, an empty result, and conversation silence all
+    leave the node unanswered and never count as adoption.
 17. **An older session-wide proposal preference is active and the user rejects
     one proposal.** Apply a newer node-scoped alternatives override for one
     complete comparison. Do not route that same node straight back to proposal.
@@ -378,12 +400,14 @@ Test decisions and transitions, not exact prose or heading names.
 | R8 | User has adopted the last three proposals but stated no preference | Does not infer a session-wide proposal preference. |
 | R9 | User requests a proposal for a protected decision with no settled dominant direction | Treats the override as presentation-only, discloses missing preference or assumption, and does not fabricate dominance or authorization. |
 | R10 | Session proposal preference exists, then the user rejects one proposal | Applies a newer node-scoped alternatives override for one complete comparison instead of re-pushing the proposal. |
+| R11 | A protected or high-consequence decision has only one feasible direction and no explicit proposal override | Keeps the protected `alternatives` route, discloses the sole viable direction and eliminated candidates, and asks whether to reconsider a constraint. |
+| R12 | A protected or high-consequence decision has one dominant direction and an explicit proposal override | Uses proposal presentation, states why the direction dominates, and discloses that the protected presentation safeguard was overridden without relaxing protection or authorization. |
 | P1 | Proposal recommendation is X | Question asks whether to adopt X; `Adopt X` is the recommended disposition with matching polarity. |
 | P2 | User selects `Revise` with one changed parameter | Keeps the node open, applies the change, and recomputes first; asks only for still-needed inputs if the node remains reachable. |
 | P3 | User selects `Reject / compare` | Transitions the same node to a complete alternatives presentation without re-pushing X. |
 | P4 | User repeats a condition already stated in the proposal while adopting | Treats it as exact adoption, settles the node, and recomputes dependent nodes. |
 | P5 | User adds or changes a condition while saying "adopt" | Treats the response as `Revise`, keeps the node open, and requests disposition on the revised proposal. |
-| P6 | Exactly one feasible direction survives | Proposal states `No credible live alternative` and identifies the nearest constraint-eliminated candidate without presenting it as viable. |
+| P6 | Exactly one feasible direction survives for a non-protected, local or reasonably reversible decision | Proposal states `No credible live alternative` and identifies the nearest constraint-eliminated candidate without presenting it as viable. |
 | A1 | Five materially distinct viable options exist | Text rendering includes all five; no truncation, fake grouping, or tournament. |
 | A2 | Only one direction survives hard constraints | Does not invent alternatives; explains eliminations and offers constraint reconsideration. |
 | A3 | Two compatible toggles were drafted as exclusive options | Splits them into independent nodes or models a genuine combined strategy. |
@@ -391,12 +415,13 @@ Test decisions and transitions, not exact prose or heading names.
 | B2 | Two independent but difficult, high-consequence questions are ready | Splits them into focused rounds despite frontier width of two. |
 | B3 | The second ready-looking question can change after the first answer | Treats it as dependent; asks only the first and recomputes. |
 | T1 | Two questions each have three mutually exclusive real options, every question has an honest leader, and the tool is available | Uses `request_user_input`; each recommended real option appears first. |
-| T2 | One question has four viable options | Uses structured text even when the tool is available. |
+| T2 | One question has four viable options | Uses structured text even when the tool is available, then ends the turn and resumes when the user replies. |
 | T3 | Four easy questions form one coherent natural round | Uses structured text instead of splitting solely for the picker limit. |
 | T4 | Tool returns an empty answer object | Leaves nodes unanswered and re-presents the same decisions in text. |
 | T5 | Alternatives have no honest leader because a user preference is missing | States the missing preference and uses structured text; the picker is inapplicable. |
 | T6 | A picker-eligible round has full context and an honest leader | Presents the complete reasoning before the picker; the picker collects only the selection or disposition. |
-| T7 | A multi-question result contains both answered and empty entries | Applies non-empty answers, recomputes the full tree, and re-presents only still-valid unanswered nodes. |
+| T7 | A multi-question result contains both answered and empty entries | Applies non-empty answers, recomputes the full tree, and re-presents only still-valid unanswered nodes; then ends the turn and resumes when the user replies. |
+| T8 | A text-rendered question receives no reply in the current turn | Ends the turn without polling; resumes when the user replies and leaves silence unanswered. |
 | S1 | An answer removes two queued nodes and unblocks a new one | Recomputes the whole tree and asks the new frontier, not the stale queue. |
 | S2 | New verified evidence triggers a recorded reopen condition | Explicitly reopens the affected settled node and recomputes descendants. |
 | F1 | Every reachable node is settled or pruned and no investigation or `blocked-on-fact` node remains | Summarizes decisions and asks confirm, revise, or pause before action. |

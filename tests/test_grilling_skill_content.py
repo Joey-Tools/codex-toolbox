@@ -68,7 +68,7 @@ class GrillingSkillContentTests(unittest.TestCase):
             self.skill_words,
         )
         self.assertIn("When the route is uncertain", self.skill_words)
-        self.assertIn("protected decisions", self.skill_words)
+        self.assertIn("protected or high-consequence decisions", self.skill_words)
 
     def test_blocked_fact_candidates_do_not_enter_the_ready_frontier(self) -> None:
         routing_contract = (
@@ -245,10 +245,62 @@ class GrillingSkillContentTests(unittest.TestCase):
         self.assertIn("No credible live alternative", self.interaction_mode_words)
         self.assertIn("nearest eliminated candidate", self.interaction_mode_words)
         self.assert_matrix_behavior(
-            "Exactly one feasible direction survives",
+            "Exactly one feasible direction survives for a non-protected, local "
+            "or reasonably reversible decision",
             "No credible live alternative",
             "nearest constraint-eliminated candidate",
             "without presenting it as viable",
+        )
+        self.assert_matrix_behavior(
+            "protected or high-consequence decision has only one feasible "
+            "direction and no explicit proposal override",
+            "protected `alternatives` route",
+            "sole viable direction and eliminated candidates",
+            "reconsider a constraint",
+        )
+        self.assert_matrix_behavior(
+            "protected or high-consequence decision has one dominant direction "
+            "and an explicit proposal override",
+            "states why the direction dominates",
+            "protected presentation safeguard was overridden",
+            "without relaxing protection or authorization",
+        )
+        self.assertIn(
+            "If the direction does dominate but the override changes a protected "
+            "or high-consequence node from its default alternatives presentation",
+            self.interaction_mode_words,
+        )
+
+    def test_text_questions_yield_control_without_polling(self) -> None:
+        universal_handoff = (
+            "Whenever a round or remaining question is rendered in text—including "
+            "direct structured text, a tool fallback, or a partial-response "
+            "re-presentation—end the current turn after presenting it and resume "
+            "when the user replies"
+        )
+        self.assertIn(universal_handoff, self.skill_words)
+        self.assertNotIn("wait indefinitely", self.interaction_modes.lower())
+        self.assertNotIn(
+            "Answer is empty, silent, or ambiguous",
+            self.interaction_modes,
+        )
+        self.assert_matrix_behavior(
+            "A text-rendered question receives no reply in the current turn",
+            "Ends the turn without polling",
+            "resumes when the user replies",
+            "leaves silence unanswered",
+        )
+        self.assert_matrix_behavior(
+            "One question has four viable options",
+            "Uses structured text",
+            "ends the turn",
+            "resumes when the user replies",
+        )
+        self.assert_matrix_behavior(
+            "multi-question result contains both answered and empty entries",
+            "re-presents only still-valid unanswered nodes",
+            "then ends the turn",
+            "resumes when the user replies",
         )
 
     def test_conditional_adoption_is_revision(self) -> None:
