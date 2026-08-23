@@ -7,7 +7,9 @@ This skill is adapted from `grilling` by Matt Pocock:
 - Source commit: 1495d014303e041c51c29f9e442485ba06f5878d
 - License: MIT; see LICENSE in this directory.
 
-Local changes require explicit `$grilling` invocation, prefer the
-`request_user_input` tool with three choices and a free-form path, forbid timed
-auto-resolution, and batch large frontiers into at most three questions before
-recomputing the design tree. The upstream `grill-me` wrapper is not included.
+Local changes require explicit `$grilling` invocation, route each frontier node
+between a fully reasoned proposal and a fair alternatives comparison, size
+rounds by reading load and decision difficulty rather than fixed question or
+option counts, treat `request_user_input` limits as transport limits, forbid
+timed auto-resolution, and require explicit final confirmation. The upstream
+`grill-me` wrapper is not included.

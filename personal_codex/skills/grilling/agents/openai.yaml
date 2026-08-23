@@ -1,6 +1,6 @@
 interface:
   display_name: "Grilling"
-  short_description: "Stress-test a plan through explicit design-tree rounds"
+  short_description: "Stress-test decisions with adaptive design-tree rounds"
   default_prompt: "Use $grilling to stress-test this plan before taking action."
 
 policy:
