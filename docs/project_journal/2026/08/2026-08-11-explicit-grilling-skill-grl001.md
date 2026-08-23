@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-11
 updated: 2026-08-23
 branch: wip/adaptive-grilling-modes
-pr:
+pr: https://github.com/Joey-Tools/codex-toolbox/pull/29
 supersedes: []
 superseded_by:
 ---
