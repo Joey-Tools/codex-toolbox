@@ -1863,6 +1863,89 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
             [1, 0],
         )
 
+    def test_release_archive_expanded_budget_supports_max_release_count(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        payload = manifest("keep")
+        tree_digest = "0" * 64
+        expanded_bytes_per_pair = 16 * 1024 * 1024
+        self.assertEqual(
+            MODULE.MAX_RELEASE_EXPANDED_SCAN_TOTAL_BYTES,
+            MODULE.MAX_COMPLETE_RELEASES * expanded_bytes_per_pair,
+        )
+        identities = []
+        for index in range(MODULE.MAX_COMPLETE_RELEASES):
+            identity = MODULE._complete_release_identity(
+                complete_release(
+                    sha,
+                    archive_id=index * 2 + 1,
+                    checksum_id=index * 2 + 2,
+                )
+            )
+            self.assertIsNotNone(identity)
+            assert identity is not None
+            identities.append(identity)
+
+        self.archive_manifest_reader.side_effect = (
+            lambda _repository, _identity, _remaining: (
+                payload,
+                expanded_bytes_per_pair,
+                tree_digest,
+            )
+        )
+        MODULE._verify_release_archive_manifests(
+            "owner/repo",
+            identities,
+            {sha: payload},
+            {sha: tree_digest},
+        )
+
+        self.assertEqual(
+            self.archive_manifest_reader.call_count,
+            MODULE.MAX_COMPLETE_RELEASES,
+        )
+        self.assertEqual(
+            self.archive_manifest_reader.call_args_list[-1].args[2],
+            expanded_bytes_per_pair,
+        )
+
+        self.archive_manifest_reader.reset_mock()
+        pair_index = 0
+
+        def read_over_budget(
+            _repository: str,
+            _identity: object,
+            _remaining: int,
+        ) -> tuple[dict[str, object], int, str]:
+            nonlocal pair_index
+            pair_index += 1
+            expanded_bytes = expanded_bytes_per_pair
+            if pair_index == MODULE.MAX_COMPLETE_RELEASES:
+                expanded_bytes += 1
+            return payload, expanded_bytes, tree_digest
+
+        self.archive_manifest_reader.side_effect = read_over_budget
+        with self.assertRaisesRegex(
+            MODULE.ValidationError,
+            "exceeded its expanded byte budget",
+        ):
+            MODULE._verify_release_archive_manifests(
+                "owner/repo",
+                identities,
+                {sha: payload},
+                {sha: tree_digest},
+            )
+
+        self.assertEqual(
+            self.archive_manifest_reader.call_count,
+            MODULE.MAX_COMPLETE_RELEASES,
+        )
+        self.assertEqual(
+            self.archive_manifest_reader.call_args_list[-1].args[2],
+            expanded_bytes_per_pair,
+        )
+
     def test_runtime_sync_error_is_normalized(self) -> None:
         sha = "a" * 40
         identity = MODULE._complete_release_identity(complete_release(sha))
