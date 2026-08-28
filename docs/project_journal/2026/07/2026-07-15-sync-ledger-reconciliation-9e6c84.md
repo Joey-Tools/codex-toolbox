@@ -3,7 +3,7 @@ id: 20260715-9e6c84
 title: Sync Ledger Reconciliation
 status: completed
 created: 2026-07-15
-updated: 2026-07-18
+updated: 2026-08-28
 branch: codex/sync-ledger-reconciliation
 pr: https://github.com/Joey-Tools/codex-toolbox/pull/15
 supersedes: []
@@ -95,6 +95,7 @@ superseded_by:
 - Public package and manifest validation now reject active removal records whose replacement target is neither present nor explicitly retired, matching the runtime release-set obligation before publication.
 - GitHub release-history validation bounds each response, the page count, the total release count, and batch Git input/output; it normalizes malformed or over-deep JSON without traceback leakage and resolves commit-graph order with a fixed number of Git processes. Every authenticated complete Release manifest is deduplicated and batch-loaded to prove skip-upgrade target hierarchy and WAL capacity, while all declared historical removal targets remain subject to the same checks for legacy and not-yet-released state.
 - Every published personal-Codex Release must retain one complete uploaded archive/checksum pair with valid exact asset IDs, advertised sizes, and lowercase GitHub SHA-256 digests. All known release counts and compressed byte totals are preflighted before download; each distinct pair is API-digest- and checksum-bound to an immutable snapshot, scanned twice without extraction, and required to contain the unique exact package-root manifest. The archive manifest must match its Git commit with type-sensitive JSON equality, and a normalized logical-tree digest binds every selected file's content and mode plus empty and implicit directories to the corresponding historical Git commit. Historical tree construction reads commit objects directly, applies the builder's generated-file exclusions, preserves ordinary parent directories whose only tracked leaves are filtered files plus every ancestor of selected directory and reference-only sources, excludes generated parents such as `__pycache__`, and shares bounded member, blob, and expanded-byte budgets with archive inspection.
+- The cross-release expanded-scan ceiling is 4 GiB across both streaming passes for every unique archive/checksum pair. This plans for the maximum 256 complete Releases at a 16 MiB average per pair while retaining the 256 MiB per-archive and compressed-byte limits and failing closed on the next byte. The prior 2 GiB ceiling was exhausted by the valid 164-Release private history during scheduled sync run `33128766268`; increasing the finite aggregate ceiling preserves complete-history verification without truncating history or introducing a mutable cross-run cache.
 - Complete published Releases must report `immutable: true`. The only compatibility exception is one exact repository-scoped legacy mutable Release identity, pinned by Release ID, tag, commit SHA, and both assets' IDs, sizes, and API digests; any metadata drift fails closed, while the separate incomplete-HEAD repair preflight remains isolated from this trust decision.
 - Historical tree path validation includes the fixed `personal-codex-<sha>/` package-root prefix in the archive byte and depth limits, so a commit cannot describe a tree that the builder or runtime archive validator would reject only after prefixing.
 - Directory-backed Release identity, staging copy, and source revalidation share archive-equivalent member, path, per-file, and total expanded-byte budgets. Limits are enforced before hashing or copying, directory enumeration is bounded, and deep recursion is normalized to a sync-domain error.
@@ -123,6 +124,8 @@ superseded_by:
 - Add a combined public/private manifest capacity gate when the private release job has both exact manifests; the installer already performs this aggregate preflight and fails safely, while repository CI currently proves capacity one owner at a time.
 
 ## Evidence
+- Release-history expanded-scan budget regression — the maximum-count 4 GiB boundary and one-byte-over fail-closed cases passed together with the existing aggregate-budget regression; the complete 64-test Release-baseline module passed in 9.162 seconds.
+- Repository suite after increasing only the finite aggregate expanded-scan ceiling — 1251 tests passed with 2 skips in 164.247 seconds. Changed Python files also passed Ruff, bytecode-free compilation, project journal validation, and `git diff --check`.
 - Manifest field allowlist regression selection — 3 focused tests passed; the five affected runtime, builder, validator, and Release-baseline modules passed 684 tests in 231.916 seconds.
 - Optional-claim runtime, WAL/recovery, and offline capacity regression set — 18 focused tests passed, including public install/rollback, private uninstall, mandatory fail-closed behavior, explicit v4/v5/unknown-version grammar, v5 parser forgery rejection, pre/post-commit races, record-only evidence, and maximum foreign-target projection.
 - Affected runtime and manifest-validation modules — 552 tests passed in 200.093 seconds.
