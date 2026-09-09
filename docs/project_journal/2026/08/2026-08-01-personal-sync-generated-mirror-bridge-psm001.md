@@ -3,7 +3,7 @@ id: 20260801-psm001
 title: Personal Sync Generated Mirror Bridge
 status: completed
 created: 2026-08-01
-updated: 2026-08-16
+updated: 2026-09-10
 branch: codex/personal-sync-generated-mirror-bridge
 pr: 20
 supersedes: []
@@ -176,3 +176,25 @@ superseded_by:
   Python 3.13 compilation, Ruff lint and consumer-owned format checks,
   actionlint, manifest-change validation, project-journal validation, and
   `git diff --check` also passed.
+- Canonical Personal Sync PR #19 squash-landed as
+  `0f05c6c102811cf104de67cf931b7c83f172781c`. Its generated toolbox mirror
+  extends the receipt-bound target set to eleven files. The consumer verifier
+  pins that exact canonical commit and receipt SHA-256
+  `bb3cd618bcb8ee792ad1c556bbc1efba7e4747e441af40b935a9640cd44bc278`,
+  while its fixture reconstructs the same closed eleven-file mapping. The
+  pending-batch projection callers now carry both
+  `terminal_regular_before` and `terminal_regular_after`, and the current
+  payload version is asserted as `10`.
+- The canonical push-triggered `Sync toolbox mirror` run published the exact
+  generated branch and receipt but hit a post-push GitHub PR-head visibility
+  race during its immediate strict PR identity reread. The generated branch,
+  base, marker, and receipt were independently verified before its PR metadata
+  was reconciled to the exact canonical commit; no workflow rerun or dispatch
+  was used because the workflow lacks a separately proved repeat-safe recovery
+  operation and would create a new time-dependent commit.
+- Local target-branch gates for this consumer reconciliation passed 112 focused
+  verifier/manifest tests and the complete 1,672-test discovery with two
+  expected skips. Ruff lint and `git diff --check` passed. Ruff format reports
+  `tests/test_sync_manifest_changes.py` identically at the pre-change base, so
+  the target-branch state deliberately avoids unrelated whole-file formatting
+  churn.

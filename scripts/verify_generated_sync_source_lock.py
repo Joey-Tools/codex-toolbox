@@ -27,9 +27,9 @@ from typing import (
 REPOSITORY_ROOT = Path(os.path.abspath(__file__)).parent.parent
 RECEIPT_PATH = PurePosixPath("generated-sync-source-lock.json")
 EXPECTED_RECEIPT_SHA256 = (
-    "9ea6cd232867fafaa7a72aa46586f8905dbb91ef97de2e5d2baeb75a918efa0a"
+    "bb3cd618bcb8ee792ad1c556bbc1efba7e4747e441af40b935a9640cd44bc278"
 )
-EXPECTED_CANONICAL_COMMIT = "7803eebe63782f5539c22e1b7f0d7a7ec587ac3f"
+EXPECTED_CANONICAL_COMMIT = "0f05c6c102811cf104de67cf931b7c83f172781c"
 EXPECTED_CANONICAL_REPOSITORY = "Joey-Tools/codex-personal-sync"
 EXPECTED_MIRROR = "toolbox"
 EXPECTED_MIRROR_REPOSITORY = "Joey-Tools/codex-toolbox"
@@ -63,9 +63,39 @@ EXPECTED_FILES: Tuple[Mapping[str, str], ...] = (
         "mode": "0644",
     },
     {
+        "source_name": "pending_agent_claim_compatibility_tests",
+        "source_path": "tests/test_pending_agent_claim_compatibility.py",
+        "target_path": "tests/test_pending_agent_claim_compatibility.py",
+        "mode": "0644",
+    },
+    {
+        "source_name": "pending_staging_cleanup_tests",
+        "source_path": "tests/test_pending_staging_cleanup.py",
+        "target_path": "tests/test_pending_staging_cleanup.py",
+        "mode": "0644",
+    },
+    {
+        "source_name": "quarantine_empty_batch_reclaim_tests",
+        "source_path": "tests/test_quarantine_empty_batch_reclaim.py",
+        "target_path": "tests/test_quarantine_empty_batch_reclaim.py",
+        "mode": "0644",
+    },
+    {
         "source_name": "reconciliation_safety_tests",
         "source_path": "tests/test_personal_sync_reconciliation_safety.py",
         "target_path": "tests/test_personal_sync_reconciliation_safety.py",
+        "mode": "0644",
+    },
+    {
+        "source_name": "regular_agent_materialization_tests",
+        "source_path": "tests/test_regular_agent_materialization.py",
+        "target_path": "tests/test_regular_agent_materialization.py",
+        "mode": "0644",
+    },
+    {
+        "source_name": "regular_overlay_uninstall_status_regressions_tests",
+        "source_path": "tests/test_regular_overlay_uninstall_status_regressions.py",
+        "target_path": "tests/test_regular_overlay_uninstall_status_regressions.py",
         "mode": "0644",
     },
     {
@@ -753,7 +783,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "pre-existing current-uid mode-0700 workspace that receives the "
-            "verified receipt and six managed files"
+            "verified receipt and 11 managed files"
         ),
     )
     return parser

@@ -46,9 +46,39 @@ TEST_FILES = (
         "0644",
     ),
     (
+        "pending_agent_claim_compatibility_tests",
+        "tests/test_pending_agent_claim_compatibility.py",
+        "tests/test_pending_agent_claim_compatibility.py",
+        "0644",
+    ),
+    (
+        "pending_staging_cleanup_tests",
+        "tests/test_pending_staging_cleanup.py",
+        "tests/test_pending_staging_cleanup.py",
+        "0644",
+    ),
+    (
+        "quarantine_empty_batch_reclaim_tests",
+        "tests/test_quarantine_empty_batch_reclaim.py",
+        "tests/test_quarantine_empty_batch_reclaim.py",
+        "0644",
+    ),
+    (
         "reconciliation_safety_tests",
         "tests/test_personal_sync_reconciliation_safety.py",
         "tests/test_personal_sync_reconciliation_safety.py",
+        "0644",
+    ),
+    (
+        "regular_agent_materialization_tests",
+        "tests/test_regular_agent_materialization.py",
+        "tests/test_regular_agent_materialization.py",
+        "0644",
+    ),
+    (
+        "regular_overlay_uninstall_status_regressions_tests",
+        "tests/test_regular_overlay_uninstall_status_regressions.py",
+        "tests/test_regular_overlay_uninstall_status_regressions.py",
         "0644",
     ),
     (
@@ -133,7 +163,7 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
             "rules_contract_version": 1,
             "hash_algorithm": "sha256",
             "canonical_repository": "Joey-Tools/codex-personal-sync",
-            "canonical_commit": "7803eebe63782f5539c22e1b7f0d7a7ec587ac3f",
+            "canonical_commit": "0f05c6c102811cf104de67cf931b7c83f172781c",
             "mirror": "toolbox",
             "mirror_repository": "Joey-Tools/codex-toolbox",
             "mapping_digest": "",
@@ -215,7 +245,7 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(
-            "verified and installed generated sync source snapshot (6 files)",
+            "verified and installed generated sync source snapshot (11 files)",
             completed.stdout,
         )
 

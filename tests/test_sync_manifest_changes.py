@@ -367,6 +367,12 @@ class SyncManifestChangeTests(unittest.TestCase):
                 releases_after=runtime._projected_pending_release_payloads(
                     profile.state
                 ),
+                terminal_regular_before=runtime._projected_pending_terminal_regular_payloads(
+                    profile.state
+                ),
+                terminal_regular_after=runtime._projected_pending_terminal_regular_payloads(
+                    profile.state
+                ),
             )
             actual_size = runtime._projected_json_size(
                 payload,
@@ -479,13 +485,19 @@ class SyncManifestChangeTests(unittest.TestCase):
             releases_after=runtime._projected_pending_release_payloads(
                 state_after
             ),
+            terminal_regular_before=runtime._projected_pending_terminal_regular_payloads(
+                profile.state
+            ),
+            terminal_regular_after=runtime._projected_pending_terminal_regular_payloads(
+                state_after
+            ),
         )
         actual_size = runtime._projected_json_size(
             payload,
             trailing_newline=True,
         )
 
-        self.assertEqual(payload["version"], 5)
+        self.assertEqual(payload["version"], 10)
         self.assertEqual(
             len(os.fsencode(runtime._MAX_PENDING_LINK_TARGET)),
             runtime.MAX_RECONCILE_LINK_TARGET_BYTES,
