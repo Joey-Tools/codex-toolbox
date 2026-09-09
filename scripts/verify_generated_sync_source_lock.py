@@ -758,7 +758,7 @@ def verify_generated_mirror(
             # Capture is complete before the first snapshot write. Consumers
             # read these receipt-consistent bytes, never a later pathname lookup
             # in the mutable source checkout. repo_root and snapshot_root may
-            # intentionally name the same private checkout because all seven
+            # intentionally name the same private checkout because all captured
             # payloads are resident in memory before installation begins.
             _install_captured_objects(snapshot_root_fd, captured_objects)
         finally:

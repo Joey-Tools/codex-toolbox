@@ -28,24 +28,24 @@ superseded_by:
   verifier successfully installs its captured snapshot. All later compile,
   test, manifest-validation, package-build, package-verification, and publish
   consumers in that job use that same step-output working directory.
-- The six canonical files and `generated-sync-source-lock.json` bind landed
-  canonical commit `7803eebe63782f5539c22e1b7f0d7a7ec587ac3f`, tree
-  `76b266a41c92b21db9367949edcebf50b7272368`.
+- The eleven canonical files and `generated-sync-source-lock.json` bind landed
+  canonical commit `0f05c6c102811cf104de67cf931b7c83f172781c`, tree
+  `d35345d3b156aa283930f06c33f8aec4ef87a476`.
 - The generated receipt records mapping digest
-  `3e26648dd65526e759089c5acf5a9f429f3df0f5adc8dbe94b3856954b801ece`,
+  `2504ff2345f5bd76b1b965a647dfa424f31849fba228391d9b6f1872ce42f7a6`,
   file-set digest
-  `c280b934568b6bc8df0c993b91d3e2e051970a8395870bf0419fc475556af7ad`,
+  `defbefa4d2b0c016b9ca3cbdeb49ab6c9cf708562039b7f939398ebe2047958d`,
   and tree digest
-  `f98d13ca1e4491659528a777e5a3a035f752a95b9068cf0029d160746fa679dd`.
+  `6a7f5ba3126cd8cf82dda4b69d96a9f61904c54f1a56afc3cfff48ac259b3710`.
 - The consumer verifier pins the complete receipt SHA-256
-  `9ea6cd232867fafaa7a72aa46586f8905dbb91ef97de2e5d2baeb75a918efa0a`
+  `bb3cd618bcb8ee792ad1c556bbc1efba7e4747e441af40b935a9640cd44bc278`
   outside the receipt itself, then checks the exact canonical identity,
-  closed six-file mapping, recomputed digests, target modes, and target bytes
+  closed eleven-file mapping, recomputed digests, target modes, and target bytes
   before any generated-code consumer can proceed.
 - Each receipt or managed file is captured by two equal bounded reads from one
   open regular-file descriptor. Device/inode identity, byte content and size,
   and mode/UID/GID access policy are protected; timestamps and hard-link count
-  are intentionally excluded as benign metadata churn. Only after all seven
+  are intentionally excluded as benign metadata churn. Only after all twelve
   captured objects validate does the verifier install their exact bytes and
   modes through no-follow directory descriptors and exclusive temporary files.
   The snapshot path is canonicalized and every ancestor binding is opened
