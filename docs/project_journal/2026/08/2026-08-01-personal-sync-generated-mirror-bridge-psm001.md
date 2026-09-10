@@ -29,16 +29,16 @@ superseded_by:
   test, manifest-validation, package-build, package-verification, and publish
   consumers in that job use that same step-output working directory.
 - The eleven canonical files and `generated-sync-source-lock.json` bind landed
-  canonical commit `0f05c6c102811cf104de67cf931b7c83f172781c`, tree
-  `d35345d3b156aa283930f06c33f8aec4ef87a476`.
+  canonical commit `b78febccb199c38c48cf9a3bd49f151723524e9d`, tree
+  `8bb5684baeb2d80477b6daab63507ae7771fa4e5`.
 - The generated receipt records mapping digest
   `2504ff2345f5bd76b1b965a647dfa424f31849fba228391d9b6f1872ce42f7a6`,
   file-set digest
   `defbefa4d2b0c016b9ca3cbdeb49ab6c9cf708562039b7f939398ebe2047958d`,
   and tree digest
-  `6a7f5ba3126cd8cf82dda4b69d96a9f61904c54f1a56afc3cfff48ac259b3710`.
+  `9af3a0ffed65a435e06459f95aaed453e734adca8059db333890ae77eccdf5c3`.
 - The consumer verifier pins the complete receipt SHA-256
-  `bb3cd618bcb8ee792ad1c556bbc1efba7e4747e441af40b935a9640cd44bc278`
+  `71ef3e4c86c8daca725432c5e9ea1130f249e47dfdd2f6d5458dea6c1c6a4ecf`
   outside the receipt itself, then checks the exact canonical identity,
   closed eleven-file mapping, recomputed digests, target modes, and target bytes
   before any generated-code consumer can proceed.
@@ -198,3 +198,10 @@ superseded_by:
   `tests/test_sync_manifest_changes.py` identically at the pre-change base, so
   the target-branch state deliberately avoids unrelated whole-file formatting
   churn.
+- Canonical Personal Sync PR #20 squash-landed as
+  `b78febccb199c38c48cf9a3bd49f151723524e9d`. Its generated toolbox receipt
+  binds tree `9af3a0ffed65a435e06459f95aaed453e734adca8059db333890ae77eccdf5c3`
+  and receipt SHA-256
+  `71ef3e4c86c8daca725432c5e9ea1130f249e47dfdd2f6d5458dea6c1c6a4ecf`;
+  the consumer verifier and fixture pin that same canonical identity before
+  generated-code consumers can proceed.

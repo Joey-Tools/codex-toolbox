@@ -255,6 +255,59 @@ class PendingStagingCleanupTests(unittest.TestCase):
             )
         raise AssertionError(f"unknown crash stage: {stage}")
 
+    @contextlib.contextmanager
+    def _recycled_private_inode_identity(self, foreign_private: Path, expected):
+        """Model inode reuse while preserving the foreign payload snapshot."""
+        real_inventory = MODULE._pending_ephemeral_quarantine_private_inventory
+        real_snapshot = MODULE._regular_file_snapshot_at
+        snapshot_names: list[str] = []
+
+        def report_recycled_inventory_identity(
+            quarantine_fd: int,
+            batch_name: str,
+        ) -> tuple[tuple[str, tuple[int, int]], ...]:
+            return tuple(
+                (
+                    name,
+                    expected.file_identity
+                    if name == foreign_private.name
+                    else identity,
+                )
+                for name, identity in real_inventory(quarantine_fd, batch_name)
+            )
+
+        def report_recycled_snapshot_identity(
+            parent_fd: int,
+            name: str,
+            path: Path,
+            *,
+            maximum_bytes: int = MODULE.MAX_ARCHIVE_MEMBER_BYTES,
+        ):
+            snapshot_names.append(name)
+            snapshot = real_snapshot(
+                parent_fd,
+                name,
+                path,
+                maximum_bytes=maximum_bytes,
+            )
+            if path == foreign_private:
+                return replace(snapshot, file_identity=expected.file_identity)
+            return snapshot
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_ephemeral_quarantine_private_inventory",
+                side_effect=report_recycled_inventory_identity,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_regular_file_snapshot_at",
+                side_effect=report_recycled_snapshot_identity,
+            ),
+        ):
+            yield snapshot_names
+
     def _make_v5_empty_ticket(self, home: Path, target: Path):
         expected = MODULE._read_regular_file_snapshot_beneath(
             home,
@@ -3719,6 +3772,296 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     )
                     self.assertEqual(len(evidence), 1)
 
+    def test_v6_private_inode_reuse_before_receipt_is_foreign_evidence(self) -> None:
+        case_home = self.root / "ephemeral-v6-private-inode-reuse-before-receipt"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        ticket = MODULE._publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+            case_home,
+            case_target,
+            expected,
+        )
+        exact_alias = case_target.with_name(
+            MODULE._pending_ephemeral_public_alias_name(ticket.batch_root.name)
+        )
+        case_target.rename(exact_alias)
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        foreign_private = quarantine_root / (
+            MODULE._pending_ephemeral_quarantine_leaf_name(ticket.batch_root.name)
+        )
+        foreign_payload = b"foreign payload with recycled inode identity\n"
+        foreign_private.write_bytes(foreign_payload)
+        foreign_private.chmod(0o600)
+        foreign_metadata = foreign_private.stat()
+        foreign_identity = (foreign_metadata.st_dev, foreign_metadata.st_ino)
+        self.assertNotEqual(
+            hashlib.sha256(foreign_payload).hexdigest(),
+            expected.sha256,
+        )
+
+        with (
+            self._recycled_private_inode_identity(
+                foreign_private,
+                expected,
+            ) as snapshot_names,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "retained replacement as isolated evidence",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertIn(foreign_private.name, snapshot_names)
+        self.assertTrue(ticket.path.is_file())
+        self.assertIsNone(
+            MODULE._read_pending_cleanup_terminal_validation(
+                case_home,
+                ticket,
+                ticket.quarantine_root_identity,
+            )
+        )
+        self.assertEqual(foreign_private.read_bytes(), foreign_payload)
+        self.assertEqual(
+            (foreign_private.stat().st_dev, foreign_private.stat().st_ino),
+            foreign_identity,
+        )
+        retained_foreign = quarantine_root / "preserved-inode-reuse-evidence"
+        foreign_private.rename(retained_foreign)
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(case_home), 1)
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(os.path.lexists(exact_alias))
+        self.assertEqual(retained_foreign.read_bytes(), foreign_payload)
+        self.assertEqual(
+            (retained_foreign.stat().st_dev, retained_foreign.stat().st_ino),
+            foreign_identity,
+        )
+
+    def test_v6_private_inode_reuse_after_receipt_is_foreign_evidence(self) -> None:
+        case_home = self.root / "ephemeral-v6-private-inode-reuse-after-receipt"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        with (
+            self._receiptless_cleanup_crash_patch("private-unlink-before"),
+            self.assertRaisesRegex(SystemExit, "before private unlink"),
+        ):
+            MODULE._delete_exact_regular_publication_without_pending_receipt(
+                case_home,
+                case_target,
+                expected,
+            )
+
+        ticket = self._only_cleanup_ticket_for_home(case_home)
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        private_entries = tuple(
+            quarantine_root.glob(".codex-ephemeral-cleanup-*.delete-*")
+        )
+        self.assertEqual(len(private_entries), 1)
+        foreign_private = private_entries[0]
+        foreign_private.unlink()
+        foreign_payload = b"foreign tombstone with recycled inode identity\n"
+        foreign_private.write_bytes(foreign_payload)
+        foreign_private.chmod(0o600)
+        foreign_metadata = foreign_private.stat()
+        foreign_identity = (foreign_metadata.st_dev, foreign_metadata.st_ino)
+        self.assertNotEqual(
+            hashlib.sha256(foreign_payload).hexdigest(),
+            expected.sha256,
+        )
+
+        with (
+            self._recycled_private_inode_identity(
+                foreign_private,
+                expected,
+            ) as snapshot_names,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "retained replacement as isolated evidence",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        self.assertIn(foreign_private.name, snapshot_names)
+        self.assertTrue(ticket.path.is_file())
+        self.assertIsNotNone(
+            MODULE._read_pending_cleanup_terminal_validation(
+                case_home,
+                ticket,
+                ticket.quarantine_root_identity,
+            )
+        )
+        self.assertEqual(foreign_private.read_bytes(), foreign_payload)
+        self.assertEqual(
+            (foreign_private.stat().st_dev, foreign_private.stat().st_ino),
+            foreign_identity,
+        )
+        retained_foreign = quarantine_root / "preserved-tombstone-reuse-evidence"
+        foreign_private.rename(retained_foreign)
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(case_home), 1)
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(
+            MODULE._pending_cleanup_terminal_validation_path(
+                case_home,
+                ticket.batch_root.name,
+            ).exists()
+        )
+        self.assertEqual(retained_foreign.read_bytes(), foreign_payload)
+        self.assertEqual(
+            (retained_foreign.stat().st_dev, retained_foreign.stat().st_ino),
+            foreign_identity,
+        )
+
+    def test_v6_extra_private_identity_mismatch_skips_snapshot_and_authority(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v6-extra-private-identity-mismatch"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        with (
+            self._receiptless_cleanup_crash_patch("alias-private"),
+            self.assertRaisesRegex(SystemExit, "after private isolation"),
+        ):
+            MODULE._delete_exact_regular_publication_without_pending_receipt(
+                case_home,
+                case_target,
+                expected,
+            )
+
+        ticket = self._only_cleanup_ticket_for_home(case_home)
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        foreign_private = quarantine_root / (
+            MODULE._pending_ephemeral_quarantine_leaf_name(ticket.batch_root.name)
+            + "-retained-extra"
+        )
+        foreign_private.write_bytes(b"foreign extra private evidence\n")
+        foreign_private.chmod(0o600)
+        real_inventory = MODULE._pending_ephemeral_quarantine_private_inventory
+
+        def report_extra_foreign_identity(
+            quarantine_fd: int,
+            batch_name: str,
+        ) -> tuple[tuple[str, tuple[int, int]], ...]:
+            return tuple(
+                (
+                    name,
+                    (identity[0], identity[1] + 1)
+                    if name == foreign_private.name
+                    else identity,
+                )
+                for name, identity in real_inventory(quarantine_fd, batch_name)
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_ephemeral_quarantine_private_inventory",
+                side_effect=report_extra_foreign_identity,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_regular_file_snapshot_at",
+                side_effect=AssertionError("identity prefilter should skip snapshots"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_publish_pending_cleanup_terminal_validation",
+                wraps=MODULE._publish_pending_cleanup_terminal_validation,
+            ) as publish_receipt,
+            mock.patch.object(
+                MODULE,
+                "_delete_pending_cleanup_ticket",
+                wraps=MODULE._delete_pending_cleanup_ticket,
+            ) as delete_ticket,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "retained replacement as isolated evidence while attempting "
+                "private isolation",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(case_home)
+
+        publish_receipt.assert_not_called()
+        delete_ticket.assert_not_called()
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(foreign_private.is_file())
+
+    def test_v6_private_snapshot_verification_failure_is_not_foreign_evidence(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v6-private-snapshot-verification"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        with (
+            self._receiptless_cleanup_crash_patch("private-unlink-before"),
+            self.assertRaisesRegex(SystemExit, "before private unlink"),
+        ):
+            MODULE._delete_exact_regular_publication_without_pending_receipt(
+                case_home,
+                case_target,
+                expected,
+            )
+
+        ticket = self._only_cleanup_ticket_for_home(case_home)
+        for verification_error in (
+            OSError("injected unreadable private payload"),
+            MODULE.SyncError("injected private payload revalidation failure"),
+        ):
+            with self.subTest(error=type(verification_error).__name__):
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_regular_file_snapshot_at",
+                        side_effect=verification_error,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_delete_pending_cleanup_ticket",
+                        wraps=MODULE._delete_pending_cleanup_ticket,
+                    ) as delete_ticket,
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "private snapshot verification failed",
+                    ) as raised,
+                ):
+                    MODULE._cleanup_ready_pending_batches(case_home)
+
+                causes: list[BaseException] = []
+                cause: BaseException | None = raised.exception
+                while cause is not None:
+                    causes.append(cause)
+                    cause = cause.__cause__
+                self.assertIn(verification_error, causes)
+                self.assertNotIn("retained replacement", str(raised.exception))
+                delete_ticket.assert_not_called()
+                self.assertTrue(ticket.path.is_file())
+
     def test_v6_ephemeral_cleanup_with_competing_alias_retires_canonical_first(
         self,
     ) -> None:
@@ -3948,12 +4291,12 @@ class PendingStagingCleanupTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "public alias reappeared after private isolation",
+            "retained replacement as isolated evidence while attempting private isolation",
         ):
             MODULE._cleanup_ready_pending_batches(case_home)
 
         self.assertTrue(ticket.path.is_file())
-        self.assertIsNotNone(
+        self.assertIsNone(
             MODULE._read_pending_cleanup_terminal_validation(
                 case_home,
                 ticket,
@@ -3961,13 +4304,21 @@ class PendingStagingCleanupTests(unittest.TestCase):
             )
         )
         self.assertFalse(os.path.lexists(case_target))
-        for alias_name, (identity, payload) in protected_aliases.items():
+        for alias_name in protected_aliases:
             alias = case_target.with_name(alias_name)
-            self.assertEqual(alias.read_bytes(), payload)
-            self.assertEqual(
-                (alias.stat().st_dev, alias.stat().st_ino),
-                identity,
+            self.assertFalse(os.path.lexists(alias))
+        quarantine_fd = MODULE._open_directory_beneath(case_home, quarantine_root)
+        try:
+            retained_private = MODULE._pending_ephemeral_quarantine_private_inventory(
+                quarantine_fd,
+                ticket.batch_root.name,
             )
+        finally:
+            MODULE._close_fd_quietly(quarantine_fd)
+        retained_by_identity = {identity: name for name, identity in retained_private}
+        for identity, payload in protected_aliases.values():
+            retained = quarantine_root / retained_by_identity[identity]
+            self.assertEqual(retained.read_bytes(), payload)
         for evidence_name, (identity, payload) in protected_private.items():
             evidence = quarantine_root / evidence_name
             self.assertEqual(evidence.read_bytes(), payload)
@@ -3975,6 +4326,16 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 (evidence.stat().st_dev, evidence.stat().st_ino),
                 identity,
             )
+        exact_private = tuple(
+            item for item in retained_private if item[1] == expected.file_identity
+        )
+        self.assertEqual(len(exact_private), 1)
+        self.assertEqual(
+            hashlib.sha256(
+                (quarantine_root / exact_private[0][0]).read_bytes()
+            ).hexdigest(),
+            expected.sha256,
+        )
 
     def test_v6_ephemeral_cleanup_retries_private_evacuation_name_collisions(
         self,

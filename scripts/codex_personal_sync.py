@@ -31157,47 +31157,69 @@ def _remove_pending_ephemeral_quarantine_leaf(
             f"{batch_name}"
         )
 
-    def private_expected_snapshots(
+    def classify_private_snapshots(
         private: tuple[tuple[str, tuple[int, int]], ...],
-    ) -> tuple[tuple[str, RegularFileSnapshot], ...]:
-        snapshots: list[tuple[str, RegularFileSnapshot]] = []
-        for name, identity in private:
-            if identity != expected.file_identity:
-                continue
-            try:
-                current = _regular_file_snapshot_at(
-                    quarantine_fd,
-                    name,
-                    quarantine_root / name,
-                    maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
-                )
-            except (OSError, SyncError) as error:
-                raise SyncError(
-                    "pending ephemeral cleanup private payload cannot be verified: "
-                    f"{batch_name}"
-                ) from error
-            if (
-                current.parent_identity != ticket.quarantine_root_identity
-                or not _regular_snapshot_leaf_matches(current, expected)
-            ):
-                raise SyncError(
-                    f"pending ephemeral cleanup private payload changed: {batch_name}"
-                )
-            snapshots.append((name, current))
-        return tuple(snapshots)
+    ) -> tuple[
+        tuple[tuple[str, RegularFileSnapshot], ...],
+        tuple[str, ...],
+    ]:
+        """Separate complete ticket payloads from retained foreign evidence.
+
+        Receipt or deletion authority is possible only when the related
+        private inventory has exactly one candidate at a recognized evidence
+        or final-tombstone name whose reported identity matches the ticket.
+        Every other inventory shape is foreign evidence and fails closed
+        without an expensive content read.  The identity is only a prefilter:
+        a removed ticket inode can be recycled for foreign content, so the
+        protected payload property remains the complete regular-file snapshot
+        (identity, SHA256, size, mode, UID, policy-relevant GID, and exact
+        link count).  A snapshot verification failure is distinct from foreign
+        evidence and prevents recovery from deciding that a replacement is
+        safe to retain or delete.
+        """
+        if len(private) != 1:
+            return (), tuple(name for name, _identity in private)
+
+        name, identity = private[0]
+        if (
+            name not in evidence_names
+            and _pending_ephemeral_quarantine_final_private_base(batch_name, name)
+            is None
+        ) or identity != expected.file_identity:
+            return (), (name,)
+
+        try:
+            current = _regular_file_snapshot_at(
+                quarantine_fd,
+                name,
+                quarantine_root / name,
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        except (OSError, SyncError) as error:
+            raise SyncError(
+                "pending ephemeral cleanup private snapshot verification failed: "
+                f"{batch_name}: {name}"
+            ) from error
+        if _regular_snapshot_matches(
+            current,
+            ticket.quarantine_root_identity,
+            expected,
+            expected_link_count=expected.link_count,
+        ):
+            return ((name, current),), ()
+        return (), (name,)
 
     def receipt_private_snapshots(
-        private: tuple[tuple[str, tuple[int, int]], ...],
+        exact: tuple[tuple[str, RegularFileSnapshot], ...],
     ) -> tuple[tuple[str, RegularFileSnapshot], ...]:
         return tuple(
             (name, snapshot)
-            for name, snapshot in private_expected_snapshots(private)
+            for name, snapshot in exact
             if (
                 name in evidence_names
                 or _pending_ephemeral_quarantine_final_private_base(batch_name, name)
                 is not None
             )
-            and snapshot.link_count == expected.link_count
         )
 
     def no_public_exact_payload(
@@ -31228,24 +31250,41 @@ def _remove_pending_ephemeral_quarantine_leaf(
             # private descriptor and prove that its inode is absent from every
             # derived public name. Foreign public evidence may remain, but it
             # never supplies ticket authority.
-            receipt_private = (
-                receipt_private_snapshots(private) if phase_receipt is None else ()
-            )
+            if phase_receipt is None:
+                exact_private, foreign_private = classify_private_snapshots(private)
+                receipt_private = receipt_private_snapshots(exact_private)
+            else:
+                receipt_private = ()
             if (
                 phase_receipt is None
                 and len(receipt_private) == 1
+                and len(exact_private) == 1
+                and not foreign_private
+                and len(private) == 1
                 and no_public_exact_payload(canonical_identity, aliases)
             ):
                 _require_pending_cleanup_ticket_unchanged(home, ticket)
                 require_bound_parents()
                 refreshed_private = private_inventory()
-                refreshed_receipt_private = receipt_private_snapshots(refreshed_private)
+                (
+                    refreshed_exact_private,
+                    refreshed_foreign_private,
+                ) = classify_private_snapshots(refreshed_private)
+                refreshed_receipt_private = receipt_private_snapshots(
+                    refreshed_exact_private
+                )
                 refreshed_canonical, refreshed_aliases = public_inventory()
                 _require_pending_cleanup_ticket_unchanged(home, ticket)
                 require_bound_parents()
-                if len(refreshed_receipt_private) == 1 and no_public_exact_payload(
-                    refreshed_canonical,
-                    refreshed_aliases,
+                if (
+                    len(refreshed_receipt_private) == 1
+                    and len(refreshed_exact_private) == 1
+                    and not refreshed_foreign_private
+                    and len(refreshed_private) == 1
+                    and no_public_exact_payload(
+                        refreshed_canonical,
+                        refreshed_aliases,
+                    )
                 ):
                     _publish_pending_cleanup_terminal_validation(
                         home,
@@ -31271,43 +31310,29 @@ def _remove_pending_ephemeral_quarantine_leaf(
                         "private isolation and was retained in place: "
                         f"{target.with_name(aliases[0][0])}"
                     )
-                if len(private) > 1 or (
-                    private
-                    and (
-                        private[0][1] != expected.file_identity
-                        or (
-                            private[0][0] not in evidence_names
-                            and _pending_ephemeral_quarantine_final_private_base(
-                                batch_name,
-                                private[0][0],
-                            )
-                            is None
+                if not private:
+                    break
+
+                exact_private, foreign_private = classify_private_snapshots(private)
+                if (
+                    len(private) != 1
+                    or (
+                        private[0][0] not in evidence_names
+                        and _pending_ephemeral_quarantine_final_private_base(
+                            batch_name,
+                            private[0][0],
                         )
+                        is None
                     )
+                    or len(exact_private) != 1
+                    or foreign_private
                 ):
                     raise SyncError(
                         "pending ephemeral cleanup retained replacement as isolated "
                         f"evidence after private isolation: {batch_name}"
                     )
-                if not private:
-                    break
-
-                quarantine_name, _private_identity = private[0]
+                quarantine_name, current = exact_private[0]
                 quarantine_path = quarantine_root / quarantine_name
-                current = _regular_file_snapshot_at(
-                    quarantine_fd,
-                    quarantine_name,
-                    quarantine_path,
-                    maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
-                )
-                if (
-                    not _regular_snapshot_leaf_matches(current, expected)
-                    or current.link_count != expected.link_count
-                ):
-                    raise SyncError(
-                        f"pending ephemeral cleanup private payload changed: "
-                        f"{batch_name}"
-                    )
                 final_private_base = _pending_ephemeral_quarantine_final_private_base(
                     batch_name,
                     quarantine_name,
