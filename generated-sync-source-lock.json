@@ -1,11 +1,11 @@
 {
-  "canonical_commit": "0f05c6c102811cf104de67cf931b7c83f172781c",
+  "canonical_commit": "b78febccb199c38c48cf9a3bd49f151723524e9d",
   "canonical_repository": "Joey-Tools/codex-personal-sync",
   "file_set_digest": "defbefa4d2b0c016b9ca3cbdeb49ab6c9cf708562039b7f939398ebe2047958d",
   "files": [
     {
       "mode": "0755",
-      "sha256": "b3fed3dda0c10f656259da3fa3ffbf4971235affeedce270b19ae6278a2594c7",
+      "sha256": "70fd66ff3b631730e67ab1de8fedc189641778e230b48fd8222debd3f11596ac",
       "source_name": "engine",
       "source_path": "scripts/codex_personal_sync.py",
       "target_path": "scripts/codex_personal_sync.py"
@@ -33,7 +33,7 @@
     },
     {
       "mode": "0644",
-      "sha256": "baad6e5d2fe3a55af373c55fa6751613caab80990d0cfea69d2db12ea8e15323",
+      "sha256": "0a2a70b4f54301695087c0a616ee10765ffbea7c0898badab451127939c466ee",
       "source_name": "pending_staging_cleanup_tests",
       "source_path": "tests/test_pending_staging_cleanup.py",
       "target_path": "tests/test_pending_staging_cleanup.py"
@@ -88,5 +88,5 @@
   "mirror_repository": "Joey-Tools/codex-toolbox",
   "receipt_version": 1,
   "rules_contract_version": 1,
-  "tree_digest": "6a7f5ba3126cd8cf82dda4b69d96a9f61904c54f1a56afc3cfff48ac259b3710"
+  "tree_digest": "9af3a0ffed65a435e06459f95aaed453e734adca8059db333890ae77eccdf5c3"
 }
