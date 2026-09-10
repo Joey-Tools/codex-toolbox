@@ -1,4 +1,4 @@
 interface:
   display_name: "Submodule Linked Worktrees"
-  short_description: "Reuse submodule object stores across worktrees"
-  default_prompt: "Use $submodule-linked-worktrees to set up Git submodules with linked worktrees and shared object storage."
+  short_description: "Safely reuse submodule objects across worktrees"
+  default_prompt: "Use $submodule-linked-worktrees to preflight explicit Git submodule paths, then sync them as linked worktrees with shared object storage."
