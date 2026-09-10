@@ -304,6 +304,172 @@ class ReleaseRetentionTests(unittest.TestCase):
             os.path.lexists(MODULE._release_retention_pointer_path(self.home))
         )
 
+    def test_prune_accepts_safe_release_file_mode_without_control_mode(self) -> None:
+        self.install_pair()
+        skill = (
+            self.release_path(SHA_A)
+            / "personal_codex"
+            / "skills"
+            / "retention"
+            / "SKILL.md"
+        )
+        self.assertEqual(stat.S_IMODE(skill.stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(skill.parent.stat().st_mode), 0o755)
+        observed_modes: list[int] = []
+        observed_ledger_directory_modes: list[int] = []
+        observed_recursive_directory_modes: list[int] = []
+        real_policy = MODULE._require_current_user_cleanup_fd_access_policy
+
+        def observe_policy(
+            file_descriptor: int,
+            display_path: Path,
+        ) -> os.stat_result:
+            metadata = real_policy(
+                file_descriptor,
+                display_path,
+            )
+            if stat.S_ISREG(metadata.st_mode) and display_path.name == "SKILL.md":
+                observed_modes.append(stat.S_IMODE(metadata.st_mode))
+            if stat.S_ISDIR(metadata.st_mode):
+                if display_path.name == "retention":
+                    observed_ledger_directory_modes.append(
+                        stat.S_IMODE(metadata.st_mode)
+                    )
+                if display_path.name.startswith("<pending-cleanup-fd:"):
+                    observed_recursive_directory_modes.append(
+                        stat.S_IMODE(metadata.st_mode)
+                    )
+            return metadata
+
+        with mock.patch.object(
+            MODULE,
+            "_require_current_user_cleanup_fd_access_policy",
+            side_effect=observe_policy,
+        ):
+            removed = self.run_quietly(
+                MODULE.prune_releases,
+                self.home,
+                dry_run=False,
+            )
+
+        self.assertEqual(removed, [(MODULE.PUBLIC_OWNER, SHA_A)])
+        self.assertIn(0o644, observed_modes)
+        self.assertIn(0o755, observed_ledger_directory_modes)
+        self.assertIn(0o755, observed_recursive_directory_modes)
+
+    def test_release_cleanup_linux_fd_policy_accepts_ordinary_modes_only(
+        self,
+    ) -> None:
+        cleanup_file = self.root / "release-content.txt"
+        cleanup_file.write_bytes(b"release content\n")
+        cleanup_file.chmod(0o644)
+        cleanup_directory = self.root / "release-content-directory"
+        cleanup_directory.mkdir(mode=0o755)
+        foreign_uid = os.geteuid() + 1
+
+        for path, safe_mode, unsafe_mode, open_flags in (
+            (cleanup_file, 0o644, 0o664, os.O_RDONLY),
+            (
+                cleanup_directory,
+                0o755,
+                0o775,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            ),
+        ):
+            with self.subTest(path=path.name):
+                file_descriptor = os.open(path, open_flags)
+                try:
+                    with mock.patch.object(MODULE.sys, "platform", "linux"):
+                        metadata = (
+                            MODULE._require_current_user_cleanup_fd_access_policy(
+                                file_descriptor,
+                                path,
+                            )
+                        )
+                        self.assertEqual(
+                            stat.S_IMODE(metadata.st_mode),
+                            safe_mode,
+                        )
+                        generic_metadata = (
+                            MODULE._require_release_identity_fd_access_policy(
+                                file_descriptor,
+                                path,
+                                foreign_uid,
+                            )
+                        )
+                        self.assertEqual(generic_metadata.st_uid, os.geteuid())
+                        with (
+                            mock.patch.object(
+                                MODULE.os,
+                                "geteuid",
+                                return_value=foreign_uid,
+                            ),
+                            self.assertRaisesRegex(
+                                MODULE.SyncError,
+                                "owner UID",
+                            ),
+                        ):
+                            MODULE._require_current_user_cleanup_fd_access_policy(
+                                file_descriptor,
+                                path,
+                            )
+                        path.chmod(unsafe_mode)
+                        with self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "grants group or world write authority",
+                        ):
+                            MODULE._require_current_user_cleanup_fd_access_policy(
+                                file_descriptor,
+                                path,
+                            )
+                finally:
+                    os.close(file_descriptor)
+
+    def test_prune_retains_release_file_when_general_access_policy_fails(
+        self,
+    ) -> None:
+        self.install_pair()
+        real_policy = MODULE._require_release_identity_fd_access_policy
+
+        def reject_skill_acl(
+            file_descriptor: int,
+            display_path: Path,
+            expected_owner_uid: int,
+        ) -> os.stat_result:
+            metadata = real_policy(
+                file_descriptor,
+                display_path,
+                expected_owner_uid,
+            )
+            if stat.S_ISREG(metadata.st_mode) and display_path.name == "SKILL.md":
+                raise MODULE.SyncError("injected release content ACL mismatch")
+            return metadata
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_release_identity_fd_access_policy",
+                side_effect=reject_skill_acl,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup regular file changed: SKILL.md",
+            ),
+        ):
+            self.run_quietly(
+                MODULE.prune_releases,
+                self.home,
+                dry_run=False,
+            )
+
+        transaction = MODULE._load_release_retention_transaction(self.home)
+        self.assertIsNotNone(transaction)
+        assert transaction is not None
+        self.assertTrue(transaction.committed)
+        self.assertIsNotNone(
+            MODULE._quarantined_release_path(self.home, transaction)
+        )
+
     def test_current_and_ledger_owner_and_link_references_are_preserved(
         self,
     ) -> None:

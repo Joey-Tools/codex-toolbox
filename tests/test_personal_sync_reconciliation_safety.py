@@ -102,6 +102,38 @@ def write_agent_skill_release(
     return MODULE.load_manifest_data(release_root)
 
 
+def write_reviewer_role_release(
+    release_root: Path,
+    *,
+    payload: str = 'name = "reviewer"\n',
+    owner: str = MODULE.PUBLIC_OWNER,
+) -> MODULE.ManifestData:
+    source = release_root / "personal_codex" / "agents" / "reviewer.toml"
+    source.parent.mkdir(parents=True)
+    source.write_text(payload, encoding="utf-8")
+    manifest_path = release_root / MODULE.MANIFEST_RELATIVE_PATH
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "owner": MODULE.PUBLIC_OWNER,
+                "links": [
+                    {
+                        "source": "personal_codex/agents/reviewer.toml",
+                        "target": "agents/reviewer.toml",
+                        "kind": "file",
+                        "owner": owner,
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return MODULE.load_manifest_data(release_root)
+
+
 def write_removed_links(
     release_root: Path,
     removed_links: list[dict[str, object]],
@@ -1520,6 +1552,570 @@ class ReconciliationOrderingTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def _agent_source(self, sha: str, payload: bytes) -> Path:
+        source = (
+            self.home
+            / "personal-sync"
+            / "releases"
+            / sha
+            / "personal_codex"
+            / "agents"
+            / "reviewer.toml"
+        )
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(payload)
+        return source
+
+    def _agent_entry(self) -> MODULE.LinkEntry:
+        return MODULE.LinkEntry(
+            source=PurePosixPath("personal_codex/agents/reviewer.toml"),
+            target=PurePosixPath("agents/reviewer.toml"),
+            kind="file",
+        )
+
+    def test_creates_agent_toml_as_independent_regular_file(self) -> None:
+        source = self._agent_source(SHA_A, b'name = "reviewer"\n')
+        target = self.home / "agents" / "reviewer.toml"
+        action = planned_reconcile_action(
+            self.home,
+            "create",
+            target,
+            "../personal-sync/current/personal_codex/agents/reviewer.toml",
+            "file",
+            materialization="regular",
+            regular_source=source,
+        )
+
+        MODULE._apply_reconcile_actions(self.home, [action], dry_run=False)
+
+        self.assertTrue(target.is_file())
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        metadata = target.stat()
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+        self.assertEqual(metadata.st_nlink, 1)
+
+    def test_changed_agent_leaf_remains_quarantined(self) -> None:
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir()
+        target.write_bytes(b'role = "reviewer"\n')
+        target.chmod(0o600)
+        target_identity = (target.stat().st_dev, target.stat().st_ino)
+        target_parent_fd = MODULE._open_directory_beneath(self.home, target.parent)
+        real_rename_noreplace = MODULE._rename_noreplace_at
+        mutated = False
+
+        def mutate_after_quarantine(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal mutated
+            real_rename_noreplace(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if source_name == target.name and not mutated:
+                destination_fd = os.open(
+                    destination_name,
+                    os.O_WRONLY | os.O_TRUNC,
+                    dir_fd=destination_parent_fd,
+                )
+                try:
+                    os.write(destination_fd, b"tampered = true\n")
+                finally:
+                    os.close(destination_fd)
+                mutated = True
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_noreplace_at",
+                    side_effect=mutate_after_quarantine,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "retained as isolated evidence",
+                ),
+            ):
+                MODULE._move_regular_leaf_to_unique_quarantine(
+                    self.home,
+                    target.parent,
+                    target_parent_fd,
+                    target.name,
+                    label="agent-test",
+                    expected_identity=target_identity,
+                )
+        finally:
+            MODULE._close_fd_quietly(target_parent_fd)
+
+        self.assertTrue(mutated)
+        self.assertFalse(os.path.lexists(target))
+        quarantined = list(
+            (self.home / "personal-sync" / "quarantine").glob("*/leaf/*")
+        )
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(
+            (quarantined[0].stat().st_dev, quarantined[0].stat().st_ino),
+            target_identity,
+        )
+        self.assertEqual(quarantined[0].read_bytes(), b"tampered = true\n")
+
+    def test_regular_quarantine_revalidates_parent_chain_before_rename(self) -> None:
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir()
+        target.write_bytes(b'role = "reviewer"\n')
+        target.chmod(0o600)
+        target_identity = (target.stat().st_dev, target.stat().st_ino)
+        target_parent_fd = MODULE._open_directory_beneath(self.home, target.parent)
+        real_quarantine_batch_root = MODULE._quarantine_batch_root
+
+        def make_parent_writable(*args: object, **kwargs: object):
+            result = real_quarantine_batch_root(*args, **kwargs)
+            target.parent.chmod(0o775)
+            return result
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_quarantine_batch_root",
+                    side_effect=make_parent_writable,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "managed regular-file parent access policy mismatch",
+                ),
+            ):
+                MODULE._move_regular_leaf_to_unique_quarantine(
+                    self.home,
+                    target.parent,
+                    target_parent_fd,
+                    target.name,
+                    label="agent-test",
+                    expected_identity=target_identity,
+                )
+        finally:
+            MODULE._close_fd_quietly(target_parent_fd)
+
+        self.assertTrue(target.is_file())
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino),
+            target_identity,
+        )
+
+    def test_created_agent_parent_policy_drift_evacuates_canonical_toml(self) -> None:
+        payload = b'name = "reviewer"\n'
+        source = self._agent_source(SHA_A, payload)
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir(mode=0o755)
+        real_snapshot = MODULE._regular_file_snapshot_at
+        created_identity: tuple[int, int] | None = None
+
+        def drift_after_created_snapshot(
+            parent_fd: int,
+            name: str,
+            path: Path,
+            *,
+            maximum_bytes: int = MODULE.MAX_ARCHIVE_MEMBER_BYTES,
+        ) -> MODULE.RegularFileSnapshot:
+            nonlocal created_identity
+            snapshot = real_snapshot(
+                parent_fd,
+                name,
+                path,
+                maximum_bytes=maximum_bytes,
+            )
+            if path == target and created_identity is None:
+                created_identity = snapshot.file_identity
+                target.parent.chmod(0o775)
+            return snapshot
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_regular_file_snapshot_at",
+                side_effect=drift_after_created_snapshot,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "managed regular-file parent access policy mismatch",
+            ),
+        ):
+            MODULE._create_regular_file_beneath(self.home, source, target)
+
+        self.assertIsNotNone(created_identity)
+        self.assertFalse(os.path.lexists(target))
+        quarantined = list(
+            (self.home / "personal-sync" / "quarantine").glob("*/leaf/*")
+        )
+        self.assertEqual(len(quarantined), 1)
+        evidence = quarantined[0]
+        self.assertNotEqual(evidence.suffix, ".toml")
+        self.assertEqual(stat.S_IMODE(evidence.parent.stat().st_mode), 0o700)
+        self.assertEqual(
+            (evidence.stat().st_dev, evidence.stat().st_ino),
+            created_identity,
+        )
+        self.assertEqual(evidence.read_bytes(), payload)
+
+    def test_created_agent_canonical_reappearance_retains_private_evidence(
+        self,
+    ) -> None:
+        payload = b'name = "reviewer"\n'
+        replacement = b'name = "replacement"\n'
+        source = self._agent_source(SHA_A, payload)
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir(mode=0o755)
+        real_snapshot = MODULE._regular_file_snapshot_at
+        real_rename_noreplace = MODULE._rename_noreplace_at
+        created_identity: tuple[int, int] | None = None
+        reappeared = False
+
+        def drift_after_created_snapshot(
+            parent_fd: int,
+            name: str,
+            path: Path,
+            *,
+            maximum_bytes: int = MODULE.MAX_ARCHIVE_MEMBER_BYTES,
+        ) -> MODULE.RegularFileSnapshot:
+            nonlocal created_identity
+            snapshot = real_snapshot(
+                parent_fd,
+                name,
+                path,
+                maximum_bytes=maximum_bytes,
+            )
+            if path == target and created_identity is None:
+                created_identity = snapshot.file_identity
+                target.parent.chmod(0o775)
+            return snapshot
+
+        def reappear_after_private_move(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal reappeared
+            real_rename_noreplace(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if source_name.startswith(".codex-created-leaf-") and not reappeared:
+                replacement_fd = os.open(
+                    target.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=source_parent_fd,
+                )
+                try:
+                    os.write(replacement_fd, replacement)
+                    os.fsync(replacement_fd)
+                finally:
+                    os.close(replacement_fd)
+                reappeared = True
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_regular_file_snapshot_at",
+                side_effect=drift_after_created_snapshot,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_rename_noreplace_at",
+                side_effect=reappear_after_private_move,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "canonical name reappeared",
+            ),
+        ):
+            MODULE._create_regular_file_beneath(self.home, source, target)
+
+        self.assertTrue(reappeared)
+        self.assertEqual(target.read_bytes(), replacement)
+        quarantined = list(
+            (self.home / "personal-sync" / "quarantine").glob("*/leaf/*")
+        )
+        self.assertEqual(len(quarantined), 1)
+        evidence = quarantined[0]
+        self.assertNotEqual(evidence.suffix, ".toml")
+        self.assertEqual(stat.S_IMODE(evidence.parent.stat().st_mode), 0o700)
+        self.assertEqual(
+            (evidence.stat().st_dev, evidence.stat().st_ino),
+            created_identity,
+        )
+        self.assertEqual(evidence.read_bytes(), payload)
+
+    def test_install_release_materializes_reviewer_role_as_regular_file(self) -> None:
+        source_root = self.home / "source-release"
+        expected = b'name = "reviewer"\n'
+        write_reviewer_role_release(source_root, payload=expected.decode())
+        install_home = self.home / "install-home"
+
+        install_quietly(source_root, install_home, SHA_A)
+
+        target = install_home / "agents" / "reviewer.toml"
+        self.assertTrue(target.is_file())
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(target.read_bytes(), expected)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertEqual(target.stat().st_nlink, 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(MODULE.status(install_home))
+
+        original_identity = (target.stat().st_dev, target.stat().st_ino)
+        install_quietly(source_root, install_home, SHA_A)
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino), original_identity
+        )
+        self.assertEqual(target.read_bytes(), expected)
+
+    def test_install_release_removes_managed_reviewer_regular_file(self) -> None:
+        source_root = self.home / "source-release"
+        empty_root = self.home / "empty-release"
+        write_reviewer_role_release(source_root)
+        write_skill_release(
+            empty_root,
+            source_name="replacement",
+            target_name="replacement",
+        )
+        install_home = self.home / "remove-home"
+        install_quietly(source_root, install_home, SHA_A)
+        target = install_home / "agents" / "reviewer.toml"
+        self.assertTrue(target.is_file())
+
+        install_quietly(empty_root, install_home, SHA_B)
+
+        self.assertFalse(os.path.lexists(target))
+        state = MODULE._load_managed_state(install_home)
+        self.assertNotIn(PurePosixPath("agents/reviewer.toml"), state.links)
+
+    def test_install_release_updates_managed_reviewer_regular_file(self) -> None:
+        source_a = self.home / "source-a"
+        source_b = self.home / "source-b"
+        write_reviewer_role_release(source_a, payload='version = "a"\n')
+        write_reviewer_role_release(source_b, payload='version = "b"\n')
+        install_home = self.home / "update-home"
+        install_quietly(source_a, install_home, SHA_A)
+
+        install_quietly(source_b, install_home, SHA_B)
+
+        target = install_home / "agents" / "reviewer.toml"
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), 'version = "b"\n')
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertEqual(target.stat().st_nlink, 1)
+
+    def test_migrates_proven_agent_symlink_to_regular_file(self) -> None:
+        source = self._agent_source(SHA_A, b'name = "reviewer"\n')
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir()
+        legacy_target = "../personal-sync/current/personal_codex/agents/reviewer.toml"
+        target.symlink_to(legacy_target)
+        action = planned_reconcile_action(
+            self.home,
+            "replace",
+            target,
+            legacy_target,
+            "file",
+            expected_link_target=legacy_target,
+            materialization="regular",
+            regular_source=source,
+        )
+
+        MODULE._apply_reconcile_actions(self.home, [action], dry_run=False)
+
+        self.assertTrue(target.is_file())
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+
+    def test_regular_file_rollback_restores_exact_preimage(self) -> None:
+        old_source = self._agent_source(SHA_A, b"old = true\n")
+        new_source = self._agent_source(SHA_B, b"new = true\n")
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir()
+        target.write_bytes(old_source.read_bytes())
+        target.chmod(0o600)
+        original_identity = (target.stat().st_dev, target.stat().st_ino)
+        action = planned_reconcile_action(
+            self.home,
+            "replace",
+            target,
+            "../personal-sync/current/personal_codex/agents/reviewer.toml",
+            "file",
+            expected_link_target="../personal-sync/current/personal_codex/agents/reviewer.toml",
+            materialization="regular",
+            regular_source=new_source,
+        )
+
+        transaction = MODULE._apply_reconcile_actions(
+            self.home, [action], dry_run=False
+        )
+        self.assertEqual(target.read_bytes(), new_source.read_bytes())
+        MODULE._rollback_reconcile_transaction(self.home, transaction)
+
+        self.assertEqual(target.read_bytes(), old_source.read_bytes())
+        self.assertEqual(
+            (target.stat().st_dev, target.stat().st_ino), original_identity
+        )
+
+    def test_regular_rollback_cleanup_retains_final_window_replacement_in_private_quarantine(
+        self,
+    ) -> None:
+        old_source = self._agent_source(SHA_A, b"old = true\n")
+        new_source = self._agent_source(SHA_B, b"new = true\n")
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir()
+        target.write_bytes(old_source.read_bytes())
+        target.chmod(0o600)
+        action = planned_reconcile_action(
+            self.home,
+            "replace",
+            target,
+            "../personal-sync/current/personal_codex/agents/reviewer.toml",
+            "file",
+            expected_link_target="../personal-sync/current/personal_codex/agents/reviewer.toml",
+            materialization="regular",
+            regular_source=new_source,
+        )
+        transaction = MODULE._apply_reconcile_actions(
+            self.home, [action], dry_run=False
+        )
+        assert transaction is not None
+        assert transaction.batch_root is not None
+        backup = transaction.batch_root / "links" / "agents" / "reviewer.toml"
+        created_identity = (target.stat().st_dev, target.stat().st_ino)
+        displaced = target.with_name("reviewer-before-quarantine-race.toml")
+        real_rename_noreplace = MODULE._rename_noreplace_at
+        replacement_identity: tuple[int, int] | None = None
+        replaced = False
+
+        def replace_name_before_quarantine(
+            source_parent_fd: int,
+            source_name: str,
+            destination_parent_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal replaced, replacement_identity
+            if source_name == target.name and not replaced:
+                replaced = True
+                os.rename(
+                    target.name,
+                    displaced.name,
+                    src_dir_fd=source_parent_fd,
+                    dst_dir_fd=source_parent_fd,
+                )
+                replacement_fd = os.open(
+                    target.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=source_parent_fd,
+                )
+                try:
+                    os.write(replacement_fd, b"foreign = true\n")
+                finally:
+                    os.close(replacement_fd)
+                metadata = os.stat(
+                    target.name,
+                    dir_fd=source_parent_fd,
+                    follow_symlinks=False,
+                )
+                replacement_identity = (metadata.st_dev, metadata.st_ino)
+            real_rename_noreplace(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with mock.patch.object(
+            MODULE,
+            "_rename_noreplace_at",
+            side_effect=replace_name_before_quarantine,
+        ):
+            with self.assertRaises(MODULE.SyncError):
+                MODULE._rollback_reconcile_transaction(self.home, transaction)
+
+        self.assertTrue(replaced)
+        self.assertIsNotNone(replacement_identity)
+        self.assertFalse(os.path.lexists(target))
+        retained = list(
+            (self.home / "personal-sync" / "quarantine").glob(
+                ".codex-ephemeral-cleanup-*"
+            )
+        )
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), b"foreign = true\n")
+        self.assertEqual(
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            replacement_identity,
+        )
+        self.assertTrue(displaced.is_file())
+        self.assertEqual(displaced.read_bytes(), new_source.read_bytes())
+        self.assertEqual(
+            (displaced.stat().st_dev, displaced.stat().st_ino),
+            created_identity,
+        )
+        self.assertTrue(backup.is_file())
+        self.assertEqual(backup.read_bytes(), old_source.read_bytes())
+
+    def test_plan_rejects_modified_or_unproven_agent_regular_file(self) -> None:
+        old_source = self._agent_source(SHA_A, b"old = true\n")
+        self._agent_source(SHA_B, b"new = true\n")
+        entry = self._agent_entry()
+        target = self.home / "agents" / "reviewer.toml"
+        target.parent.mkdir()
+        target.write_bytes(b"modified = true\n")
+        target.chmod(0o600)
+        record = MODULE.ManagedLinkRecord(
+            source=entry.source,
+            target=entry.target,
+            kind=entry.kind,
+            owner=entry.owner,
+            link_target=MODULE._desired_link_target(self.home, entry),
+            release_sha=SHA_A,
+        )
+        state = MODULE.ManagedState(
+            owners={MODULE.PUBLIC_OWNER: SHA_A},
+            links={entry.target: record},
+        )
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "modified managed regular file",
+        ):
+            MODULE._plan_reconciliation(
+                self.home,
+                [entry],
+                [entry],
+                [],
+                state,
+                allow_cross_owner=False,
+                owner_shas={MODULE.PUBLIC_OWNER: SHA_B},
+            )
+
+        target.write_bytes(old_source.read_bytes())
+        target.chmod(0o600)
+        with self.assertRaisesRegex(MODULE.SyncError, "unproven regular-file"):
+            MODULE._plan_reconciliation(
+                self.home,
+                [entry],
+                [],
+                [],
+                MODULE.ManagedState(owners={}, links={}),
+                allow_cross_owner=False,
+                owner_shas={MODULE.PUBLIC_OWNER: SHA_B},
+            )
+
     def test_create_failure_preserves_old_link_without_quarantine(self) -> None:
         old_target = self.home / "skills" / "old"
         old_target.parent.mkdir(parents=True)
@@ -2498,6 +3094,41 @@ class InternalPathSafetyTests(unittest.TestCase):
 
 
 class AtomicMoveSafetyTests(unittest.TestCase):
+    def _prepare_failed_move_recovery_state(
+        self,
+        home: Path,
+    ) -> tuple[Path, Path, Path, Path, tuple[int, int]]:
+        source = home / "agents" / "reviewer.toml"
+        source.parent.mkdir(parents=True)
+        destination = home / "quarantine" / "reviewer.toml"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"original\n")
+        destination.chmod(0o600)
+        expected_snapshot = MODULE._capture_reconcile_target_snapshot(
+            home,
+            destination,
+        )
+        expected_regular = MODULE._regular_snapshot_from_reconcile(expected_snapshot)
+        self.assertIsNotNone(expected_regular)
+        assert expected_regular is not None
+        expected_identity = expected_regular.file_identity
+        isolation = MODULE._isolate_failed_move_destination(
+            home,
+            source,
+            destination,
+            expected_source_parent_identity=(
+                source.parent.stat().st_dev,
+                source.parent.stat().st_ino,
+            ),
+            expected_parent_identity=expected_regular.parent_identity,
+            expected_identity=expected_identity,
+            expected_mode_type=stat.S_IFREG,
+            expected_target=None,
+            expected_regular=expected_regular,
+        )
+        receipt_path = isolation.isolation_parent / MODULE.FAILED_MOVE_RECEIPT_NAME
+        return source, destination, isolation.isolated, receipt_path, expected_identity
+
     def test_destination_collision_does_not_overwrite_or_move_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir) / "home"
@@ -2550,6 +3181,744 @@ class AtomicMoveSafetyTests(unittest.TestCase):
             self.assertTrue(source.is_symlink())
             self.assertEqual(os.readlink(source), "original-source")
             self.assertFalse(os.path.lexists(destination))
+
+    def test_failed_move_does_not_write_through_detached_destination_parent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            home = root / "home"
+            source = home / "agents" / "reviewer.toml"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"original\n")
+            source.chmod(0o600)
+            source_snapshot = MODULE._capture_reconcile_target_snapshot(home, source)
+            source_identity = (source.stat().st_dev, source.stat().st_ino)
+            destination = home / "quarantine" / "reviewer.toml"
+            destination.parent.mkdir(parents=True)
+            destination_parent_identity = (
+                destination.parent.stat().st_dev,
+                destination.parent.stat().st_ino,
+            )
+            detached_parent = root / "detached-quarantine"
+            real_bound_directory_matches = MODULE._bound_directory_matches
+            destination_parent_checks = 0
+
+            def detach_destination_parent_after_move(
+                checked_home: Path,
+                directory: Path,
+                directory_fd: int,
+            ) -> bool:
+                nonlocal destination_parent_checks
+                if directory == destination.parent:
+                    destination_parent_checks += 1
+                    if destination_parent_checks == 2:
+                        destination.parent.rename(detached_parent)
+                        destination.parent.mkdir()
+                        return False
+                return real_bound_directory_matches(
+                    checked_home,
+                    directory,
+                    directory_fd,
+                )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=detach_destination_parent_after_move,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "canonical destination parent changed",
+                ),
+            ):
+                MODULE._atomic_move_beneath_home(
+                    home,
+                    source,
+                    destination,
+                    source_snapshot,
+                    destination_parent_identity,
+                )
+
+            self.assertFalse(os.path.lexists(source))
+            self.assertFalse(os.path.lexists(destination))
+            detached_evidence = detached_parent / destination.name
+            self.assertEqual(
+                (detached_evidence.stat().st_dev, detached_evidence.stat().st_ino),
+                source_identity,
+            )
+            self.assertEqual(detached_evidence.read_bytes(), b"original\n")
+
+    def test_failed_move_does_not_restore_through_replaced_source_parent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            source = home / "agents" / "reviewer.toml"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"original\n")
+            source.chmod(0o600)
+            source_snapshot = MODULE._capture_reconcile_target_snapshot(home, source)
+            source_identity = (source.stat().st_dev, source.stat().st_ino)
+            displaced_parent = home / "agents-before-race"
+            destination = home / "quarantine" / "reviewer.toml"
+            destination.parent.mkdir(parents=True)
+            destination_parent_identity = (
+                destination.parent.stat().st_dev,
+                destination.parent.stat().st_ino,
+            )
+            real_bound_directory_matches = MODULE._bound_directory_matches
+            source_parent_checks = 0
+            racer_identity: tuple[int, int] | None = None
+
+            def replace_parent_after_move(
+                root: Path,
+                directory: Path,
+                directory_fd: int,
+            ) -> bool:
+                nonlocal racer_identity, source_parent_checks
+                if directory == source.parent:
+                    source_parent_checks += 1
+                    if source_parent_checks == 4:
+                        source.parent.rename(displaced_parent)
+                        source.parent.mkdir()
+                        source.write_bytes(b"racer\n")
+                        source.chmod(0o600)
+                        racer_identity = (source.stat().st_dev, source.stat().st_ino)
+                        return False
+                return real_bound_directory_matches(root, directory, directory_fd)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=replace_parent_after_move,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "canonical source parent changed",
+                ),
+            ):
+                MODULE._atomic_move_beneath_home(
+                    home,
+                    source,
+                    destination,
+                    source_snapshot,
+                    destination_parent_identity,
+                )
+
+            self.assertIsNotNone(racer_identity)
+            self.assertEqual(
+                (source.stat().st_dev, source.stat().st_ino),
+                racer_identity,
+            )
+            self.assertEqual(source.read_bytes(), b"racer\n")
+            self.assertFalse(os.path.lexists(displaced_parent / source.name))
+            self.assertEqual(
+                (destination.stat().st_dev, destination.stat().st_ino),
+                source_identity,
+            )
+            self.assertEqual(destination.read_bytes(), b"original\n")
+
+    def test_failed_move_isolation_receipt_recovers_crash_before_restore(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            source = home / "agents" / "reviewer.toml"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"original\n")
+            source.chmod(0o600)
+            source_snapshot = MODULE._capture_reconcile_target_snapshot(home, source)
+            source_identity = (source.stat().st_dev, source.stat().st_ino)
+            destination = home / "quarantine" / "reviewer.toml"
+            destination.parent.mkdir(parents=True)
+            destination_parent_identity = (
+                destination.parent.stat().st_dev,
+                destination.parent.stat().st_ino,
+            )
+            real_bound = MODULE._bound_directory_matches
+            real_rename = MODULE._rename_noreplace_at
+            source_parent_checks = 0
+            crashed = False
+
+            def fail_post_move_source_check(
+                root: Path,
+                directory: Path,
+                directory_fd: int,
+            ) -> bool:
+                nonlocal source_parent_checks
+                if directory == source.parent:
+                    source_parent_checks += 1
+                    if source_parent_checks == 4:
+                        return False
+                return real_bound(root, directory, directory_fd)
+
+            def crash_after_durable_isolation(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+            ) -> None:
+                nonlocal crashed
+                real_rename(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                )
+                if (
+                    source_name == destination.name
+                    and destination_name == MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
+                ):
+                    crashed = True
+                    raise MODULE.SyncError("injected crash after failed-move isolation")
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=fail_post_move_source_check,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_rename_noreplace_at",
+                    side_effect=crash_after_durable_isolation,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "injected crash after failed-move isolation",
+                ),
+            ):
+                MODULE._atomic_move_beneath_home(
+                    home,
+                    source,
+                    destination,
+                    source_snapshot,
+                    destination_parent_identity,
+                )
+
+            self.assertTrue(crashed)
+            self.assertFalse(os.path.lexists(source))
+            self.assertFalse(os.path.lexists(destination))
+            isolated = (
+                MODULE._failed_move_isolation_parent(home)
+                / MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
+            )
+            self.assertEqual(
+                (isolated.stat().st_dev, isolated.stat().st_ino),
+                source_identity,
+            )
+            self.assertEqual(MODULE._quarantine_batch_count(home), 0)
+
+            self.assertTrue(MODULE._recover_failed_move_isolation(home))
+
+            self.assertFalse(os.path.lexists(isolated))
+            self.assertEqual(
+                (destination.stat().st_dev, destination.stat().st_ino),
+                source_identity,
+            )
+            self.assertFalse(
+                (
+                    MODULE._failed_move_isolation_parent(home)
+                    / MODULE.FAILED_MOVE_RECEIPT_NAME
+                ).exists()
+            )
+            self.assertEqual(MODULE._quarantine_batch_count(home), 0)
+
+            MODULE._atomic_move_beneath_home(
+                home,
+                destination,
+                source,
+                expected_destination_parent_identity=(
+                    source.parent.stat().st_dev,
+                    source.parent.stat().st_ino,
+                ),
+                expected_entry_identity=source_identity,
+            )
+            self.assertEqual(source.read_bytes(), b"original\n")
+            self.assertFalse(os.path.lexists(destination))
+
+    def test_failed_move_recovery_revalidates_rebound_parent_before_restore(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            source, destination, isolated, receipt_path, expected_identity = (
+                self._prepare_failed_move_recovery_state(home)
+            )
+            displaced_parent = home / "quarantine-before-recovery-race"
+            real_rebind = MODULE._rebind_failed_move_recovery_parent_fds
+            real_bound = MODULE._bound_directory_matches
+            injected = False
+            rebind_active = False
+            destination_binding_checks = 0
+
+            def observe_rebind(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[int, int]:
+                nonlocal rebind_active
+                rebind_active = True
+                try:
+                    return real_rebind(*args, **kwargs)
+                finally:
+                    rebind_active = False
+
+            def replace_destination_after_reopen(
+                checked_home: Path,
+                directory: Path,
+                directory_fd: int,
+            ) -> bool:
+                nonlocal destination_binding_checks, injected
+                if rebind_active and directory == destination.parent:
+                    destination_binding_checks += 1
+                    if destination_binding_checks == 2:
+                        destination.parent.rename(displaced_parent)
+                        destination.parent.mkdir()
+                        injected = True
+                return real_bound(checked_home, directory, directory_fd)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rebind_failed_move_recovery_parent_fds",
+                    side_effect=observe_rebind,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=replace_destination_after_reopen,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "parent changed before restore",
+                ),
+            ):
+                MODULE._recover_failed_move_isolation(home)
+
+            self.assertTrue(injected)
+            self.assertFalse(os.path.lexists(source))
+            self.assertFalse(os.path.lexists(destination))
+            self.assertFalse(os.path.lexists(displaced_parent / destination.name))
+            self.assertEqual(
+                (isolated.stat().st_dev, isolated.stat().st_ino),
+                expected_identity,
+            )
+            self.assertTrue(receipt_path.is_file())
+
+    def test_failed_move_recovery_retains_receipt_after_alias_cleanup_race(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            source, destination, isolated, receipt_path, expected_identity = (
+                self._prepare_failed_move_recovery_state(home)
+            )
+            real_clear = MODULE._clear_failed_move_recovery_receipt
+            racer_identity: tuple[int, int] | None = None
+
+            def race_aliases_before_cleanup(
+                checked_home: Path,
+                snapshot: MODULE.ManagedStateFileSnapshot,
+                *,
+                receipt: MODULE.FailedMoveRecoveryReceipt | None = None,
+            ) -> None:
+                nonlocal racer_identity
+                self.assertIsNotNone(receipt)
+                destination.rename(isolated)
+                destination.write_bytes(b"racer\n")
+                destination.chmod(0o600)
+                racer_identity = (
+                    destination.stat().st_dev,
+                    destination.stat().st_ino,
+                )
+                real_clear(
+                    checked_home,
+                    snapshot,
+                    receipt=receipt,
+                )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_clear_failed_move_recovery_receipt",
+                    side_effect=race_aliases_before_cleanup,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "aliases changed before cleanup",
+                ),
+            ):
+                MODULE._recover_failed_move_isolation(home)
+
+            self.assertIsNotNone(racer_identity)
+            self.assertFalse(os.path.lexists(source))
+            self.assertEqual(
+                (isolated.stat().st_dev, isolated.stat().st_ino),
+                expected_identity,
+            )
+            self.assertEqual(
+                (destination.stat().st_dev, destination.stat().st_ino),
+                racer_identity,
+            )
+            self.assertEqual(destination.read_bytes(), b"racer\n")
+            self.assertTrue(receipt_path.is_file())
+
+    def test_failed_move_destination_racer_stays_outside_active_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            source = home / "agents" / "reviewer.toml"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"original\n")
+            source.chmod(0o600)
+            source_snapshot = MODULE._capture_reconcile_target_snapshot(home, source)
+            source_identity = (source.stat().st_dev, source.stat().st_ino)
+            destination = home / "quarantine" / "reviewer.toml"
+            displaced = destination.with_name("reviewer-original.toml")
+            destination.parent.mkdir(parents=True)
+            destination_parent_identity = (
+                destination.parent.stat().st_dev,
+                destination.parent.stat().st_ino,
+            )
+            real_bound_directory_matches = MODULE._bound_directory_matches
+            real_rename_noreplace = MODULE._rename_noreplace_at
+            source_parent_checks = 0
+            racer_identity: tuple[int, int] | None = None
+
+            def fail_post_move_source_parent_check(
+                root: Path,
+                directory: Path,
+                directory_fd: int,
+            ) -> bool:
+                nonlocal source_parent_checks
+                if directory == source.parent:
+                    source_parent_checks += 1
+                    if source_parent_checks == 4:
+                        return False
+                return real_bound_directory_matches(root, directory, directory_fd)
+
+            def replace_destination_before_isolation(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+            ) -> None:
+                nonlocal racer_identity
+                if (
+                    source_name == destination.name
+                    and destination_name == MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
+                ):
+                    os.rename(
+                        source_name,
+                        displaced.name,
+                        src_dir_fd=source_parent_fd,
+                        dst_dir_fd=source_parent_fd,
+                    )
+                    racer_fd = os.open(
+                        source_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=source_parent_fd,
+                    )
+                    try:
+                        os.write(racer_fd, b"racer\n")
+                    finally:
+                        os.close(racer_fd)
+                    racer_metadata = os.stat(
+                        source_name,
+                        dir_fd=source_parent_fd,
+                        follow_symlinks=False,
+                    )
+                    racer_identity = (
+                        racer_metadata.st_dev,
+                        racer_metadata.st_ino,
+                    )
+                real_rename_noreplace(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=fail_post_move_source_parent_check,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_rename_noreplace_at",
+                    side_effect=replace_destination_before_isolation,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "destination racer was retained outside the active source",
+                ),
+            ):
+                MODULE._atomic_move_beneath_home(
+                    home,
+                    source,
+                    destination,
+                    source_snapshot,
+                    destination_parent_identity,
+                )
+
+            self.assertIsNotNone(racer_identity)
+            self.assertFalse(os.path.lexists(source))
+            self.assertEqual(
+                (displaced.stat().st_dev, displaced.stat().st_ino),
+                source_identity,
+            )
+            self.assertEqual(displaced.read_bytes(), b"original\n")
+            self.assertFalse(os.path.lexists(destination))
+            retained_racer = (
+                MODULE._failed_move_isolation_parent(home)
+                / MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
+            )
+            self.assertEqual(
+                (retained_racer.stat().st_dev, retained_racer.stat().st_ino),
+                racer_identity,
+            )
+            self.assertTrue(
+                (
+                    MODULE._failed_move_isolation_parent(home)
+                    / MODULE.FAILED_MOVE_RECEIPT_NAME
+                ).is_file()
+            )
+
+    def test_failed_move_private_isolation_racer_is_removed_from_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            source = home / "agents" / "reviewer.toml"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"original\n")
+            source.chmod(0o600)
+            source_snapshot = MODULE._capture_reconcile_target_snapshot(home, source)
+            source_identity = (source.stat().st_dev, source.stat().st_ino)
+            destination = home / "quarantine" / "reviewer.toml"
+            destination.parent.mkdir(parents=True)
+            destination_parent_identity = (
+                destination.parent.stat().st_dev,
+                destination.parent.stat().st_ino,
+            )
+            real_bound_directory_matches = MODULE._bound_directory_matches
+            real_rename_noreplace = MODULE._rename_noreplace_at
+            source_parent_checks = 0
+            racer_identity: tuple[int, int] | None = None
+
+            def fail_post_move_source_parent_check(
+                root: Path,
+                directory: Path,
+                directory_fd: int,
+            ) -> bool:
+                nonlocal source_parent_checks
+                if directory == source.parent:
+                    source_parent_checks += 1
+                    if source_parent_checks == 4:
+                        return False
+                return real_bound_directory_matches(root, directory, directory_fd)
+
+            def race_private_restore_rename(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+            ) -> None:
+                nonlocal racer_identity
+                if (
+                    source_name == MODULE.FAILED_MOVE_ISOLATION_ENTRY_NAME
+                    and destination_name == source.name
+                ):
+                    displaced_name = f"{source_name}.original"
+                    os.rename(
+                        source_name,
+                        displaced_name,
+                        src_dir_fd=source_parent_fd,
+                        dst_dir_fd=source_parent_fd,
+                    )
+                    racer_fd = os.open(
+                        source_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=source_parent_fd,
+                    )
+                    try:
+                        os.write(racer_fd, b"racer\n")
+                    finally:
+                        os.close(racer_fd)
+                    racer_metadata = os.stat(
+                        source_name,
+                        dir_fd=source_parent_fd,
+                        follow_symlinks=False,
+                    )
+                    racer_identity = (
+                        racer_metadata.st_dev,
+                        racer_metadata.st_ino,
+                    )
+                real_rename_noreplace(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=fail_post_move_source_parent_check,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_rename_noreplace_at",
+                    side_effect=race_private_restore_rename,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "racer was retained outside the active path",
+                ),
+            ):
+                MODULE._atomic_move_beneath_home(
+                    home,
+                    source,
+                    destination,
+                    source_snapshot,
+                    destination_parent_identity,
+                )
+
+            self.assertIsNotNone(racer_identity)
+            self.assertFalse(os.path.lexists(source))
+            self.assertEqual(
+                (destination.stat().st_dev, destination.stat().st_ino),
+                racer_identity,
+            )
+            retained_files = list(
+                MODULE._failed_move_isolation_parent(home).glob("entry*")
+            )
+            retained_identities = {
+                (path.stat().st_dev, path.stat().st_ino) for path in retained_files
+            }
+            self.assertIn(source_identity, retained_identities)
+            self.assertNotIn(racer_identity, retained_identities)
+
+    def test_failed_regular_move_retains_restore_window_mutation(self) -> None:
+        for mutation in ("content", "mode", "link-count"):
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                home = Path(temp_dir) / "home"
+                source = home / "agents" / "reviewer.toml"
+                source.parent.mkdir(parents=True)
+                source.write_bytes(b"original\n")
+                source.chmod(0o600)
+                source_snapshot = MODULE._capture_reconcile_target_snapshot(
+                    home,
+                    source,
+                )
+                source_identity = (source.stat().st_dev, source.stat().st_ino)
+                destination = home / "quarantine" / "reviewer.toml"
+                destination.parent.mkdir(parents=True)
+                destination_parent_identity = (
+                    destination.parent.stat().st_dev,
+                    destination.parent.stat().st_ino,
+                )
+                alias = source.with_name("reviewer-alias.toml")
+                real_bound_directory_matches = MODULE._bound_directory_matches
+                real_regular_snapshot = MODULE._regular_file_snapshot_at
+                source_parent_checks = 0
+                source_snapshot_calls = 0
+                mutation_applied = False
+
+                def fail_post_move_source_parent_check(
+                    root: Path,
+                    directory: Path,
+                    directory_fd: int,
+                ) -> bool:
+                    nonlocal source_parent_checks
+                    if directory == source.parent:
+                        source_parent_checks += 1
+                        if source_parent_checks == 4:
+                            return False
+                    return real_bound_directory_matches(root, directory, directory_fd)
+
+                def mutate_during_restored_snapshot(
+                    parent_fd: int,
+                    name: str,
+                    path: Path,
+                    *,
+                    maximum_bytes: int = MODULE.MAX_ARCHIVE_MEMBER_BYTES,
+                ) -> MODULE.RegularFileSnapshot:
+                    nonlocal mutation_applied, source_snapshot_calls
+                    if path == source:
+                        source_snapshot_calls += 1
+                    if path == source and source_snapshot_calls == 2:
+                        identity_before = (
+                            source.stat().st_dev,
+                            source.stat().st_ino,
+                        )
+                        if mutation == "content":
+                            source.write_bytes(b"tampered\n")
+                        elif mutation == "mode":
+                            source.chmod(0o666)
+                        else:
+                            os.link(source, alias, follow_symlinks=False)
+                        self.assertEqual(
+                            (source.stat().st_dev, source.stat().st_ino),
+                            identity_before,
+                        )
+                        mutation_applied = True
+                    return real_regular_snapshot(
+                        parent_fd,
+                        name,
+                        path,
+                        maximum_bytes=maximum_bytes,
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_bound_directory_matches",
+                        side_effect=fail_post_move_source_parent_check,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_regular_file_snapshot_at",
+                        side_effect=mutate_during_restored_snapshot,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "retained outside the active path",
+                    ),
+                ):
+                    MODULE._atomic_move_beneath_home(
+                        home,
+                        source,
+                        destination,
+                        source_snapshot,
+                        destination_parent_identity,
+                    )
+
+                self.assertTrue(mutation_applied)
+                self.assertFalse(os.path.lexists(source))
+                self.assertEqual(
+                    (destination.stat().st_dev, destination.stat().st_ino),
+                    source_identity,
+                )
+                retained = destination
+                if mutation == "content":
+                    self.assertEqual(retained.read_bytes(), b"tampered\n")
+                elif mutation == "mode":
+                    self.assertEqual(stat.S_IMODE(retained.stat().st_mode), 0o666)
+                else:
+                    self.assertEqual(retained.stat().st_nlink, 2)
+                    self.assertEqual(
+                        (alias.stat().st_dev, alias.stat().st_ino),
+                        source_identity,
+                    )
 
     def test_create_cleanup_restores_same_target_inode_racer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5454,6 +6823,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             dry_run: bool,
             allow_cross_owner: bool,
             preflight_only: bool = False,
+            cleanup_budget: MODULE.PendingCleanupActionBudget | None = None,
         ) -> None:
             nonlocal injected
             if not dry_run and not injected:
@@ -5471,6 +6841,7 @@ class InstallTransactionSafetyTests(unittest.TestCase):
                 dry_run=dry_run,
                 allow_cross_owner=allow_cross_owner,
                 preflight_only=preflight_only,
+                cleanup_budget=cleanup_budget,
             )
 
         with mock.patch.object(
@@ -5964,9 +7335,15 @@ class InstallTransactionSafetyTests(unittest.TestCase):
         def verify_then_enter_mapping_phase(
             home: Path,
             desired_entries: list[MODULE.LinkEntry],
+            *,
+            pending_batch: MODULE.PendingLinkBatch | None = None,
         ) -> None:
             nonlocal mapping_phase
-            real_verify_desired(home, desired_entries)
+            real_verify_desired(
+                home,
+                desired_entries,
+                pending_batch=pending_batch,
+            )
             mapping_phase = True
 
         def current_sha_with_aba(
@@ -6158,6 +7535,10 @@ class InstallTransactionSafetyTests(unittest.TestCase):
             *,
             allow_cross_owner: bool,
             allow_unledgered_removed_links: bool = False,
+            owner_shas: dict[str, str] | None = None,
+            incoming_regular_sources: (
+                dict[tuple[str, PurePosixPath], Path] | None
+            ) = None,
         ) -> list[MODULE.ReconcileAction]:
             nonlocal injected, plan_calls, raced_snapshot
             actions = real_plan(
@@ -6168,6 +7549,8 @@ class InstallTransactionSafetyTests(unittest.TestCase):
                 state,
                 allow_cross_owner=allow_cross_owner,
                 allow_unledgered_removed_links=(allow_unledgered_removed_links),
+                owner_shas=owner_shas,
+                incoming_regular_sources=incoming_regular_sources,
             )
             plan_calls += 1
             if not injected and plan_calls == 2:
@@ -9105,12 +10488,19 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
 
         self.assertIsNotNone(parsed)
         assert parsed is not None
-        self.assertEqual(metadata["version"], 5)
+        self.assertEqual(
+            metadata["version"],
+            MODULE.PENDING_LINK_METADATA_VERSION,
+        )
         self.assertIn(
             MODULE.PENDING_RELINQUISH_FOREIGN_ACTION,
             MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION[5],
         )
-        with mock.patch.object(MODULE, "PENDING_LINK_METADATA_VERSION", 6):
+        with mock.patch.object(
+            MODULE,
+            "PENDING_LINK_METADATA_VERSION",
+            MODULE.PENDING_LINK_METADATA_VERSION,
+        ):
             self.assertIsNotNone(MODULE._load_pending_link_batch(self.home))
         record = next(
             record
@@ -9148,6 +10538,97 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
         )
         self.assertFalse(os.path.lexists(batch.batch_root / "links" / "AGENTS.md"))
         self.assertEqual(foreign_leaf_snapshot(self.agents), self.foreign_before)
+
+    def test_optional_foreign_regular_relinquishment_binds_identity_without_reading(
+        self,
+    ) -> None:
+        self.agents.unlink()
+        self.agents.write_text("foreign regular\n", encoding="utf-8")
+        foreign_identity = (
+            self.agents.stat().st_dev,
+            self.agents.stat().st_ino,
+        )
+        state = MODULE._load_managed_state(self.home)
+        current_manifest = MODULE._current_manifest_data(
+            self.home,
+            MODULE.PUBLIC_OWNER,
+        )
+
+        for error in (
+            PermissionError("simulated unreadable foreign file"),
+            MODULE.SyncError("managed regular file exceeds the size limit"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(
+                    MODULE,
+                    "_regular_file_snapshot_at",
+                    side_effect=error,
+                ) as read_regular:
+                    actions = MODULE._plan_reconciliation(
+                        self.home,
+                        self.manifest_b.entries,
+                        current_manifest.entries,
+                        [],
+                        state,
+                        allow_cross_owner=False,
+                    )
+
+                self.assertEqual(read_regular.call_count, 0)
+                self.assertEqual(
+                    [action.action for action in actions],
+                    [MODULE.PENDING_RELINQUISH_FOREIGN_ACTION],
+                )
+                snapshot = actions[0].planned_snapshot
+                assert snapshot is not None
+                self.assertEqual(snapshot.link_identity, foreign_identity)
+                self.assertIsNone(snapshot.link_target)
+                self.assertIsNone(snapshot.regular_sha256)
+                record = MODULE._pending_link_record_for_action(
+                    self.home,
+                    "managed",
+                    actions[0],
+                    {entry.target: entry for entry in self.manifest_b.entries},
+                    {MODULE.PUBLIC_OWNER: SHA_B},
+                    state,
+                    0,
+                )
+                self.assertEqual(
+                    record.planned_snapshot.link_identity,
+                    foreign_identity,
+                )
+                with mock.patch.object(
+                    MODULE,
+                    "_regular_file_snapshot_at",
+                    side_effect=error,
+                ) as verify_read_regular:
+                    MODULE._verify_managed_state_link_claims(
+                        self.home,
+                        state,
+                        actions,
+                    )
+                self.assertEqual(verify_read_regular.call_count, 0)
+
+        legacy_snapshot = MODULE._capture_reconcile_target_snapshot(
+            self.home,
+            self.agents,
+            capture_regular_content=True,
+        )
+        self.assertIsNotNone(legacy_snapshot.regular_sha256)
+        legacy_action = dataclasses.replace(
+            actions[0],
+            planned_snapshot=legacy_snapshot,
+        )
+        with mock.patch.object(
+            MODULE,
+            "_regular_file_snapshot_at",
+            wraps=MODULE._regular_file_snapshot_at,
+        ) as legacy_read_regular:
+            MODULE._verify_managed_state_link_claims(
+                self.home,
+                state,
+                [legacy_action],
+            )
+        self.assertEqual(legacy_read_regular.call_count, 1)
 
     def test_uncommitted_recovery_requires_exact_foreign_snapshot(self) -> None:
         _batch, state, state_snapshot = self._stage_batch()
@@ -9247,10 +10728,46 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
             MODULE.PENDING_RELINQUISH_FOREIGN_ACTION,
             MODULE.PENDING_LINK_ACTIONS_BY_METADATA_VERSION[4],
         )
-        self._rewrite_metadata_and_republish(
-            batch,
-            lambda payload: payload.__setitem__("version", 4),
-        )
+
+        def downgrade_to_v4(payload: dict[str, object]) -> None:
+            payload["version"] = 4
+            for field in ("state_before", "state_after", "commit_evidence"):
+                evidence = payload[field]
+                assert isinstance(evidence, dict)
+                evidence.pop("uid")
+                evidence.pop("gid")
+            payload.pop("terminal_regular_before")
+            payload.pop("terminal_regular_after")
+            records = payload["records"]
+            assert isinstance(records, list)
+            for record in records:
+                assert isinstance(record, dict)
+                record.pop("before_materialization")
+                record.pop("removed_link")
+                record.pop("publication_cleanup")
+                for field in (
+                    "materialization",
+                    "regular_sha256",
+                    "regular_size",
+                    "regular_mode",
+                    "regular_uid",
+                    "regular_gid",
+                    "regular_link_count",
+                ):
+                    record.pop(field)
+                planned_before = record["planned_before"]
+                assert isinstance(planned_before, dict)
+                for field in (
+                    "regular_sha256",
+                    "regular_size",
+                    "regular_mode",
+                    "regular_uid",
+                    "regular_gid",
+                    "regular_link_count",
+                ):
+                    planned_before.pop(field)
+
+        self._rewrite_metadata_and_republish(batch, downgrade_to_v4)
 
         with self.assertRaisesRegex(MODULE.SyncError, "invalid role"):
             MODULE._load_pending_link_batch(self.home)
@@ -9263,7 +10780,10 @@ class OptionalClaimRelinquishmentSafetyTests(unittest.TestCase):
         )
         self._rewrite_metadata_and_republish(
             batch,
-            lambda payload: payload.__setitem__("version", 6),
+            lambda payload: payload.__setitem__(
+                "version",
+                max(MODULE.SUPPORTED_PENDING_LINK_METADATA_VERSIONS) + 1,
+            ),
         )
 
         with self.assertRaisesRegex(
@@ -10344,20 +11864,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         outside.mkdir()
         sentinel = outside / "sentinel"
         sentinel.write_text("keep\n", encoding="utf-8")
-        shutil.rmtree(batch_root / "pending")
-        (batch_root / "pending").symlink_to(outside, target_is_directory=True)
-        deep_root = (
-            batch_root
-            / "deep"
-            / Path(
-                *(
-                    f"level-{index:02d}"
-                    for index in range(MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)
-                )
-            )
-        )
-        deep_root.mkdir(parents=True)
-        (deep_root / "leaf").write_text("cleanup\n", encoding="utf-8")
+        pending = batch_root / "pending"
+        shutil.rmtree(pending)
+        pending.symlink_to(outside, target_is_directory=True)
 
         install_quietly(self.release_b, self.home, SHA_B)
 
@@ -10384,7 +11893,8 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
     def test_cleanup_rejects_special_nodes_and_resumes_after_repair(self) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        fifo = batch_root / "unsupported-fifo"
+        fifo = batch_root / "metadata.json"
+        fifo.unlink()
         os.mkfifo(fifo, mode=0o600)
 
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -10400,8 +11910,8 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
     def test_cleanup_file_racer_is_retained_across_retries(self) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        victim = batch_root / "cleanup-race-file"
-        expected = batch_root / "cleanup-race-file-expected"
+        victim = batch_root / "metadata.json"
+        expected = self.root / "cleanup-race-file-expected"
         victim.write_text("expected\n", encoding="utf-8")
         expected_identity = (victim.stat().st_dev, victim.stat().st_ino)
         foreign_identity: tuple[int, int] | None = None
@@ -10466,10 +11976,8 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
     def test_cleanup_directory_racer_is_retained_across_retries(self) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        victim = batch_root / "cleanup-race-directory"
-        expected = batch_root / "cleanup-race-directory-expected"
-        victim.mkdir()
-        (victim / "sentinel").write_text("expected\n", encoding="utf-8")
+        victim = batch_root / "pending"
+        expected = self.root / "cleanup-race-directory-expected"
         expected_identity = (victim.stat().st_dev, victim.stat().st_ino)
         foreign_identity: tuple[int, int] | None = None
         real_rename = MODULE._rename_noreplace_at
@@ -10490,7 +11998,6 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             ):
                 victim.rename(expected)
                 victim.mkdir()
-                (victim / "sentinel").write_text("foreign\n", encoding="utf-8")
                 foreign_identity = (victim.stat().st_dev, victim.stat().st_ino)
             real_rename(
                 source_parent_fd,
@@ -10515,17 +12022,10 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         )
         self.assertEqual(len(retained), 1)
         self.assertEqual(
-            (retained[0] / "sentinel").read_text(encoding="utf-8"),
-            "foreign\n",
-        )
-        self.assertEqual(
             (retained[0].stat().st_dev, retained[0].stat().st_ino),
             foreign_identity,
         )
-        self.assertEqual(
-            (expected / "sentinel").read_text(encoding="utf-8"),
-            "expected\n",
-        )
+        self.assertTrue(expected.is_dir())
         self.assertEqual(
             (expected.stat().st_dev, expected.stat().st_ino),
             expected_identity,
@@ -10536,15 +12036,15 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         self.assertIn("requires manual cleanup", retry_stdout.getvalue())
         self.assertTrue(ticket_path.is_file())
         self.assertEqual(
-            (retained[0] / "sentinel").read_text(encoding="utf-8"),
-            "foreign\n",
+            (retained[0].stat().st_dev, retained[0].stat().st_ino),
+            foreign_identity,
         )
 
     def test_cleanup_resumes_after_active_entry_isolation_interruption(
         self,
     ) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        victim = batch_root / "cleanup-interrupted-file"
+        victim = batch_root / "metadata.json"
         victim.write_text("cleanup\n", encoding="utf-8")
         real_rename = MODULE._rename_noreplace_at
         interrupted = False
@@ -10594,7 +12094,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
     def test_cleanup_retry_reisolates_active_entry_before_deletion(self) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        victim = batch_root / "cleanup-retry-file"
+        victim = batch_root / "metadata.json"
         victim.write_text("expected\n", encoding="utf-8")
         expected_identity = (victim.stat().st_dev, victim.stat().st_ino)
         real_rename = MODULE._rename_noreplace_at
@@ -10695,7 +12195,7 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
     def test_cleanup_resumes_mismatched_active_entry_as_retained(self) -> None:
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
-        victim = batch_root / "cleanup-mismatched-active-file"
+        victim = batch_root / "metadata.json"
         expected = self.root / "cleanup-mismatched-active-file-expected"
         victim.write_text("expected\n", encoding="utf-8")
         expected_identity = (victim.stat().st_dev, victim.stat().st_ino)
@@ -11271,6 +12771,8 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         cleanup_root = self.root / "cleanup-mount-root"
         child = cleanup_root / "child"
         child.mkdir(parents=True)
+        cleanup_root.chmod(0o700)
+        child.chmod(0o700)
         sentinel = child / "sentinel"
         sentinel.write_text("keep\n", encoding="utf-8")
         root_fd = os.open(
@@ -11673,6 +13175,34 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         payload["version"] = 4
+        for field in ("state_before", "state_after", "commit_evidence"):
+            payload[field].pop("uid")
+            payload[field].pop("gid")
+        payload.pop("terminal_regular_before")
+        payload.pop("terminal_regular_after")
+        for record in payload["records"]:
+            record.pop("before_materialization")
+            record.pop("removed_link")
+            record.pop("publication_cleanup")
+            for field in (
+                "materialization",
+                "regular_sha256",
+                "regular_size",
+                "regular_mode",
+                "regular_uid",
+                "regular_gid",
+                "regular_link_count",
+            ):
+                record.pop(field)
+            for field in (
+                "regular_sha256",
+                "regular_size",
+                "regular_mode",
+                "regular_uid",
+                "regular_gid",
+                "regular_link_count",
+            ):
+                record["planned_before"].pop(field)
         metadata_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
         batch.pointer_snapshot = None
         MODULE._publish_pending_link_pointer(self.home, batch)
@@ -13159,6 +14689,7 @@ class ManifestPathEncodingSafetyTests(unittest.TestCase):
                         payload=b"{}",
                         file_identity=(3, 4),
                     ),
+                    metadata_version=MODULE.PENDING_LINK_METADATA_VERSION,
                 )
 
             with tempfile.TemporaryDirectory(prefix="schema-version.") as tmpdir:

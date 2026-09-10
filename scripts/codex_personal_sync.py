@@ -67,6 +67,8 @@ MAX_ARCHIVE_CHECKSUM_BYTES = 64 * 1024
 MAX_ARCHIVE_MEMBERS = 10_000
 MAX_ARCHIVE_MEMBER_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_EXPANDED_BYTES = 256 * 1024 * 1024
+MAX_PENDING_REGULAR_MATERIALIZATION_BYTES = MAX_ARCHIVE_EXPANDED_BYTES
+MAX_PENDING_REGULAR_EVIDENCE_READ_BYTES = MAX_ARCHIVE_EXPANDED_BYTES
 MAX_ARCHIVE_MEMBER_PATH_BYTES = 4096
 MAX_ARCHIVE_MEMBER_COMPONENT_BYTES = 255
 MAX_ARCHIVE_MEMBER_PATH_DEPTH = 64
@@ -183,9 +185,12 @@ MAX_RECONCILE_LINK_TARGET_BYTES = 4096
 STATE_RELATIVE_PATH = Path("state/managed-links.json")
 MAX_MANAGED_STATE_BYTES = 16 * 1024 * 1024
 QUARANTINE_RELATIVE_PATH = Path("quarantine")
+FAILED_MOVE_RECEIPT_NAME = "failed-move-recovery.json"
+FAILED_MOVE_ISOLATION_DIRECTORY_NAME = "failed-move"
+FAILED_MOVE_ISOLATION_ENTRY_NAME = "entry"
 PENDING_LINK_POINTER_NAME = ".personal-sync-pending-transaction.json"
 PENDING_LINK_METADATA_NAME = "pending-transaction.json"
-PENDING_LINK_METADATA_VERSION = 5
+PENDING_LINK_METADATA_VERSION = 10
 PENDING_RELINQUISH_FOREIGN_ACTION = "relinquish-foreign"
 PENDING_LINK_V4_ACTIONS = frozenset(
     {
@@ -200,6 +205,11 @@ PENDING_LINK_V4_ACTIONS = frozenset(
 PENDING_LINK_ACTIONS_BY_METADATA_VERSION = {
     4: PENDING_LINK_V4_ACTIONS,
     5: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
+    6: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
+    7: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
+    8: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
+    9: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
+    10: PENDING_LINK_V4_ACTIONS | {PENDING_RELINQUISH_FOREIGN_ACTION},
 }
 SUPPORTED_PENDING_LINK_METADATA_VERSIONS = frozenset(
     PENDING_LINK_ACTIONS_BY_METADATA_VERSION
@@ -208,20 +218,36 @@ PENDING_STATE_BEFORE_EVIDENCE = PurePosixPath("pending", "state", "before")
 PENDING_STATE_AFTER_EVIDENCE = PurePosixPath("pending", "state", "after")
 PENDING_STATE_COMMIT_EVIDENCE = PurePosixPath("pending", "state", "commit-evidence")
 PENDING_STATE_COMMIT_MARKER = PurePosixPath("pending", "state", "committed")
+PENDING_STATE_ROLLBACK_MARKER = PurePosixPath("pending", "state", "rolled-back")
+PENDING_STATE_STAGING_MARKER = PurePosixPath(
+    "pending", "state", "staging-cleanup-ready"
+)
 PENDING_CLEANUP_INDEX_RELATIVE_PATH = Path("pending-cleanup")
 PENDING_CLEANUP_TICKET_SUFFIX = ".json"
+PENDING_CLEANUP_TICKET_TEMP_SUFFIX = ".json.tmp"
+PENDING_QUARANTINE_ALLOCATION_SUFFIX = ".allocation.json"
+PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX = ".allocation.json.tmp"
+PENDING_QUARANTINE_METADATA_STAGE_SUFFIX = ".allocation-metadata.tmp"
+PENDING_CLEANUP_EMPTY_PROOF_SUFFIX = ".empty-proof"
+PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX = ".terminal-validation"
+PENDING_PRIVATE_USE_RETIREMENT_SUFFIX = ".private-use-retirement"
+PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX = ".publish-tmp"
 PENDING_CLEANUP_CURSOR_NAME = ".scan-cursor"
 PENDING_CLEANUP_CURSOR_TEMP_NAME = ".scan-cursor.tmp"
 PENDING_CLEANUP_RETAINED_PREFIX = ".retained-cleanup-"
 PENDING_CLEANUP_ISOLATED_BATCH_PREFIX = ".cleanup-ready-"
 PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX = ".cleanup-active-entry-"
+PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX = ".cleanup-active-links-entry-"
 PENDING_CLEANUP_RETAINED_ENTRY_PREFIX = ".cleanup-retained-entry-"
+PENDING_CLEANUP_TERMINAL_ALIAS_PREFIX = ".terminal-recovery-alias-"
+PENDING_REGULAR_PUBLICATION_RETAINED_CODE = "pending-regular-publication-retained"
 PENDING_CLEANUP_ENTRY_TOKEN_RE = re.compile(
     r"^([0-9a-f]{1,16})-([0-9a-f]{1,16})-"
     r"([0-9a-f]{1,16})-([0-9a-f]{1,16})-"
     r"([0-9a-f]{1,8})-([0-9a-f]{16})$"
 )
 MAX_PENDING_CLEANUP_TICKET_BYTES = 4096
+MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES = MAX_MANAGED_STATE_BYTES
 PENDING_LINK_BATCH_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$")
 MAX_PENDING_LINK_BATCH_NAME_BYTES = 128
 MAX_PENDING_LINK_RECORDS = 10_000
@@ -229,6 +255,7 @@ MAX_PENDING_LINK_CLAIMS = 20_000
 MAX_PENDING_RELEASES = 10_000
 MAX_PENDING_CLEANUP_BATCH_SCAN = 10_000
 MAX_PENDING_CLEANUP_BATCHES_PER_RUN = 8
+MAX_PENDING_CLEANUP_CONTROL_ENTRIES = MAX_PENDING_CLEANUP_BATCH_SCAN * 4 + 8
 MAX_RETAINED_QUARANTINE_BATCHES = 8
 MAX_PENDING_CLEANUP_DEPTH = MAX_MANIFEST_TARGET_PATH_DEPTH + 8
 MAX_PENDING_CLEANUP_ENTRIES = (
@@ -542,6 +569,10 @@ class SyncError(RuntimeError):
         self.code = code
 
 
+class _PendingCleanupAccessPolicyError(SyncError):
+    pass
+
+
 class _PrivateControlRecoveryInitialAbsence(SyncError):
     pass
 
@@ -722,10 +753,7 @@ def _pc_recovery_close_bindings(
     )
     if not retained:
         return
-    if (
-        _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
-        or _PC_RECOVERY_RETAINED_CLOSE_FENCE
-    ):
+    if _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY or _PC_RECOVERY_RETAINED_CLOSE_FENCE:
         _pc_recovery_retain_close_fence(retained)
         _pc_recovery_require_no_close_fence()
     _pc_recovery_retain_close_fence(retained)
@@ -780,14 +808,10 @@ def _pc_recovery_release_pending_descriptor(
 ) -> None:
     global _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
     if custody.fd < 0 or custody.state != "open":
-        raise SyncError(
-            f"pending {custody.label} descriptor cannot be handed off"
-        )
+        raise SyncError(f"pending {custody.label} descriptor cannot be handed off")
     custody.state = "handed-off"
     _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = tuple(
-        item
-        for item in _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
-        if item is not custody
+        item for item in _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY if item is not custody
     )
 
 
@@ -841,9 +865,7 @@ def _pc_recovery_close_pending_descriptor(
         raise
     custody.state = "closed"
     _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY = tuple(
-        item
-        for item in _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
-        if item is not custody
+        item for item in _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY if item is not custody
     )
 
 
@@ -874,10 +896,7 @@ def _pc_recovery_release_close_fence(
 
 
 def _pc_recovery_require_no_close_fence() -> None:
-    if (
-        _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
-        or _PC_RECOVERY_RETAINED_CLOSE_FENCE
-    ):
+    if _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY or _PC_RECOVERY_RETAINED_CLOSE_FENCE:
         raise SyncError(
             "recovery descriptor close remains uncertain; "
             "restart the process before another recovery attempt"
@@ -1937,8 +1956,7 @@ def _pc_recovery_validate_plan_document(
         or not isinstance(tree_digests, dict)
         or set(tree_digests) != {"quarantine", "tool_root"}
         or any(
-            not isinstance(value, str)
-            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
             for value in tree_digests.values()
         )
     ):
@@ -2665,8 +2683,7 @@ def _pc_recovery_remove_superseded_pending_publications(
                 pass
             except OSError as error:
                 raise SyncError(
-                    f"cannot verify superseded pending {label} removal {name}: "
-                    f"{error}"
+                    f"cannot verify superseded pending {label} removal {name}: {error}"
                 ) from error
             else:
                 raise SyncError(
@@ -2743,8 +2760,7 @@ def _pc_recovery_remove_empty_staged_primary_parent(
         pass
     except OSError as error:
         raise SyncError(
-            "cannot verify staged primary private-control parent removal: "
-            f"{error}"
+            f"cannot verify staged primary private-control parent removal: {error}"
         ) from error
     else:
         raise SyncError(
@@ -2754,8 +2770,7 @@ def _pc_recovery_remove_empty_staged_primary_parent(
         descriptor_metadata = os.fstat(temporary.fd)
     except OSError as error:
         raise SyncError(
-            "cannot revalidate removed staged primary private-control parent: "
-            f"{error}"
+            f"cannot revalidate removed staged primary private-control parent: {error}"
         ) from error
     if (
         _pc_recovery_identity(descriptor_metadata) != temporary.identity
@@ -3429,10 +3444,7 @@ def _pc_recovery_publish_document(
                         pretty=True,
                     )
                 assert payload is not None
-                if (
-                    len(payload)
-                    > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES
-                ):
+                if len(payload) > MIRROR_PRIVATE_CONTROL_RECOVERY_MAX_RECEIPT_BYTES:
                     raise SyncError(f"{label} exceeds its byte cap")
                 if reusable is not None:
                     os.ftruncate(file_fd, 0)
@@ -3695,9 +3707,7 @@ def _pc_recovery_primary_receipt_document(
             )
         )
     ):
-        raise SyncError(
-            "primary recovery receipt late-bound identity is unsupported"
-        )
+        raise SyncError("primary recovery receipt late-bound identity is unsupported")
     return {
         "contract": MIRROR_PRIVATE_CONTROL_RECOVERY_CONTRACT,
         "disposition": MIRROR_PRIVATE_CONTROL_RECOVERY_DISPOSITION,
@@ -3953,8 +3963,7 @@ def _pc_recovery_validate_marker(
         or set(roots[1]["inventory"])
         != {"digest", "entry_count", "logical_bytes", "path_bytes"}
         or not isinstance(roots[1]["inventory"].get("digest"), str)
-        or re.fullmatch(r"[0-9a-f]{64}", roots[1]["inventory"]["digest"])
-        is None
+        or re.fullmatch(r"[0-9a-f]{64}", roots[1]["inventory"]["digest"]) is None
         or any(
             type(roots[1]["inventory"].get(field)) is not int
             or roots[1]["inventory"][field] < 0
@@ -4252,15 +4261,12 @@ def execute_private_control_recovery(
                     quarantine,
                     expected_plan_digest=str(plan["plan_digest"]),
                 )
-                if (
-                    not _pc_recovery_canonical_documents_equal(
-                        verification,
-                        first_verification,
-                    )
-                    or not _pc_recovery_canonical_documents_equal(
-                        verification["marker"],
-                        existing_marker_record,
-                    )
+                if not _pc_recovery_canonical_documents_equal(
+                    verification,
+                    first_verification,
+                ) or not _pc_recovery_canonical_documents_equal(
+                    verification["marker"],
+                    existing_marker_record,
                 ):
                     raise SyncError(
                         "private-control cutover state changed during durability retry"
@@ -4389,10 +4395,7 @@ def execute_private_control_recovery(
             for binding in bindings
             if binding is not None
         )
-        if (
-            _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY
-            or _PC_RECOVERY_RETAINED_CLOSE_FENCE
-        ):
+        if _PC_RECOVERY_PENDING_DESCRIPTOR_CUSTODY or _PC_RECOVERY_RETAINED_CLOSE_FENCE:
             _pc_recovery_retain_close_fence(cleanup_bindings)
         elif cleanup_bindings:
             try:
@@ -4636,6 +4639,8 @@ class LinkAction:
     target: Path
     link_target: str
     kind: str
+    materialization: str = "symlink"
+    regular_source: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -4666,6 +4671,15 @@ class PendingLinkRecord:
     owner: str | None
     link_target: str | None
     release_sha: str | None
+    before_materialization: str | None
+    materialization: str
+    removed_link_key: str | None
+    regular_sha256: str | None
+    regular_size: int | None
+    regular_mode: int | None
+    regular_uid: int | None
+    regular_gid: int | None
+    regular_link_count: int | None
     before_evidence: PurePosixPath | None
     before_evidence_identity: tuple[int, int] | None
     backup: PurePosixPath | None
@@ -4673,6 +4687,16 @@ class PendingLinkRecord:
     stage_identity: tuple[int, int] | None
     evidence: PurePosixPath | None
     evidence_identity: tuple[int, int] | None
+    publication_cleanup: PurePosixPath | None
+
+    def is_regular(self) -> bool:
+        return self.materialization == "regular"
+
+    def before_is_regular(self) -> bool:
+        return self.before_materialization == "regular"
+
+    def has_regular_authority(self) -> bool:
+        return self.is_regular() or self.before_is_regular()
 
     def managed_record(self) -> ManagedLinkRecord:
         if (
@@ -4712,6 +4736,53 @@ class PendingLinkClaim:
 
 
 @dataclass(frozen=True)
+class _PendingRegularAliasAuthority:
+    authorized_paths: frozenset[Path]
+    required_paths: frozenset[Path]
+
+
+@dataclass(frozen=True)
+class _PendingRegularAliasAuthorityIndex:
+    batch_root: Path
+    batch_root_identity: tuple[int, int]
+    by_identity: dict[tuple[int, int], _PendingRegularAliasAuthority]
+
+
+@dataclass
+class _LegacyPendingRegularPublicationActiveEntryIndex:
+    names_by_parent_plan: dict[
+        tuple[Path, tuple[int, int], tuple[int, int, int]], set[str]
+    ]
+
+    def names(
+        self,
+        parent: Path,
+        parent_identity: tuple[int, int],
+        planned: tuple[int, int, int],
+    ) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                self.names_by_parent_plan.get((parent, parent_identity, planned), ())
+            )
+        )
+
+    def consume(
+        self,
+        parent: Path,
+        parent_identity: tuple[int, int],
+        planned: tuple[int, int, int],
+        name: str,
+    ) -> None:
+        key = (parent, parent_identity, planned)
+        names = self.names_by_parent_plan.get(key)
+        if names is None or name not in names:
+            raise SyncError("pending legacy regular publication active entry changed")
+        names.remove(name)
+        if not names:
+            self.names_by_parent_plan.pop(key)
+
+
+@dataclass(frozen=True)
 class PendingReleaseExpectation:
     owner: str
     sha: str
@@ -4721,6 +4792,7 @@ class PendingReleaseExpectation:
 
 @dataclass
 class PendingLinkBatch:
+    metadata_version: int
     batch_root: Path
     batch_root_identity: tuple[int, int]
     records: tuple[PendingLinkRecord, ...]
@@ -4734,22 +4806,158 @@ class PendingLinkBatch:
     state_after_value: ManagedState
     releases_before: tuple[PendingReleaseExpectation, ...]
     releases_after: tuple[PendingReleaseExpectation, ...]
+    terminal_regular_before: tuple[PendingRegularTargetExpectation, ...]
+    terminal_regular_after: tuple[PendingRegularTargetExpectation, ...]
     commit_evidence: ManagedStateFileSnapshot
     commit_evidence_path: PurePosixPath
     commit_marker_path: PurePosixPath
     pointer_snapshot: ManagedStateFileSnapshot | None = None
+    regular_alias_authority_index: _PendingRegularAliasAuthorityIndex | None = (
+        dataclass_field(default=None, compare=False, repr=False)
+    )
+
+
+@dataclass(frozen=True)
+class PendingRegularTargetExpectation:
+    target: PurePosixPath
+    parent_identity: tuple[int, int]
+    file_identity: tuple[int, int]
+    sha256: str
+    size: int
+    mode: int
+    uid: int
 
 
 @dataclass(frozen=True)
 class PendingBatchCleanupTicket:
+    version: int
+    phase: str
     path: Path
     snapshot: ManagedStateFileSnapshot
     batch_root: Path
     batch_root_identity: tuple[int, int]
-    marker_parent_identity: tuple[int, int]
-    marker_file_identity: tuple[int, int]
-    marker_mode: int
-    marker_sha256: str
+    marker_path: PurePosixPath | None
+    marker_parent_identity: tuple[int, int] | None
+    marker_file_identity: tuple[int, int] | None
+    marker_mode: int | None
+    marker_sha256: str | None
+    terminal_regular_targets: tuple[PendingRegularTargetExpectation, ...] = ()
+    kind: str | None = None
+    quarantine_root_identity: tuple[int, int] | None = None
+    isolated_name: str | None = None
+    leaf_identity: tuple[int, int] | None = None
+    metadata_file_identity: tuple[int, int] | None = None
+    metadata_mode: int | None = None
+    metadata_sha256: str | None = None
+    metadata_size: int | None = None
+    public_target: PurePosixPath | None = None
+    public_parent_identity: tuple[int, int] | None = None
+    payload_file_identity: tuple[int, int] | None = None
+    payload_sha256: str | None = None
+    payload_size: int | None = None
+    payload_mode: int | None = None
+    payload_uid: int | None = None
+    payload_gid: int | None = None
+    payload_link_count: int | None = None
+
+
+@dataclass(frozen=True)
+class PendingQuarantineAllocationTicket:
+    """Durable reservation/fence; never deletion authority for a batch."""
+
+    path: Path
+    snapshot: ManagedStateFileSnapshot
+    batch_root: Path
+    quarantine_root_identity: tuple[int, int]
+    isolated_name: str
+    batch_mode: int
+    metadata_sha256: str
+    metadata_size: int
+    metadata_mode: int
+    leaf_mode: int
+
+
+@dataclass(frozen=True)
+class PendingPrivateUseControlEvidence:
+    name: str
+    file_identity: tuple[int, int]
+    sha256: str
+    size: int
+    mode: int
+    uid: int
+    gid: int
+
+
+@dataclass(frozen=True)
+class PendingPrivateUseDirectoryEvidence:
+    identity: tuple[int, int]
+    mode: int
+    uid: int
+    gid: int
+
+
+@dataclass(frozen=True)
+class PendingPrivateUseRetirementReceipt:
+    path: Path
+    snapshot: ManagedStateFileSnapshot
+    batch_root: Path
+    canonical_name: str
+    isolated_name: str
+    cleanup_control: PendingPrivateUseControlEvidence
+    allocation_control: PendingPrivateUseControlEvidence
+    cleanup_index: PendingPrivateUseDirectoryEvidence
+    quarantine_root: PendingPrivateUseDirectoryEvidence
+    batch: PendingPrivateUseDirectoryEvidence
+    leaf: PendingPrivateUseDirectoryEvidence
+    metadata_file_identity: tuple[int, int]
+    metadata_sha256: str
+    metadata_size: int
+    metadata_mode: int
+    metadata_uid: int
+    metadata_gid: int
+    private_member_name: str
+    private_member: RegularFileSnapshot
+
+
+@dataclass
+class PendingCleanupActionBudget:
+    limit: int
+    consumed: int = 0
+    charged_batches: set[str] = dataclass_field(default_factory=set)
+    completed_batches: set[str] = dataclass_field(default_factory=set)
+    completed_control_actions: int = 0
+
+    def __post_init__(self) -> None:
+        if self.limit < 0:
+            raise SyncError("pending cleanup action budget is invalid")
+
+    @property
+    def remaining(self) -> int:
+        return self.limit - self.consumed
+
+    def charge_batch(self, batch_name: str) -> bool:
+        if batch_name in self.charged_batches:
+            return True
+        if self.remaining <= 0:
+            return False
+        self.charged_batches.add(batch_name)
+        self.consumed += 1
+        return True
+
+    def consume_control_actions(self, count: int) -> None:
+        if count < 0 or count > self.remaining:
+            raise SyncError("pending cleanup control action budget is invalid")
+        self.consumed += count
+        self.completed_control_actions += count
+
+    def mark_batch_completed(self, batch_name: str) -> None:
+        if batch_name not in self.charged_batches:
+            raise SyncError("pending cleanup completed an uncharged batch")
+        self.completed_batches.add(batch_name)
+
+    @property
+    def completed(self) -> int:
+        return len(self.completed_batches) + self.completed_control_actions
 
 
 @dataclass(frozen=True)
@@ -4761,6 +4969,75 @@ class ReconcileAction:
     expected_link_target: str | None = None
     removed_link_key: str | None = None
     planned_snapshot: ReconcileTargetSnapshot | None = None
+    materialization: str = "symlink"
+    regular_source: Path | None = None
+    regular_size: int | None = None
+
+
+@dataclass
+class _RegularPlanningSourceBudget:
+    payloads: dict[Path, bytes] = dataclass_field(default_factory=dict)
+    sizes: dict[Path, int] = dataclass_field(default_factory=dict)
+    digests: dict[Path, str] = dataclass_field(default_factory=dict)
+    evidence_read_bytes: int = 0
+    materialization_bytes: int = 0
+
+    def source_size(self, source: Path) -> int:
+        cached = self.sizes.get(source)
+        if cached is not None:
+            return cached
+        parent_fd, file_fd, metadata = _open_bounded_regular_file(
+            source,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            description="managed regular-file source",
+        )
+        try:
+            size = metadata.st_size
+        finally:
+            _close_fd_quietly(file_fd)
+            _close_fd_quietly(parent_fd)
+        self.sizes[source] = size
+        return size
+
+    def payload(self, home: Path, source: Path) -> bytes:
+        cached = self.payloads.get(source)
+        if cached is not None:
+            return cached
+        size = self.source_size(source)
+        if size > MAX_PENDING_REGULAR_EVIDENCE_READ_BYTES - self.evidence_read_bytes:
+            raise SyncError(
+                "pending regular-file evidence reads exceed the aggregate "
+                f"size limit: {source}"
+            )
+        payload = _read_regular_source_payload(home, source)
+        if len(payload) != size:
+            raise SyncError(
+                f"managed regular-file source changed during planning: {source}"
+            )
+        self.evidence_read_bytes += size
+        self.payloads[source] = payload
+        return payload
+
+    def digest(self, home: Path, source: Path) -> str:
+        cached = self.digests.get(source)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256(self.payload(home, source)).hexdigest()
+        self.digests[source] = digest
+        return digest
+
+    def reserve_materialization(self, source: Path, target: Path) -> int:
+        size = self.source_size(source)
+        if (
+            size
+            > MAX_PENDING_REGULAR_MATERIALIZATION_BYTES - self.materialization_bytes
+        ):
+            raise SyncError(
+                "pending regular-file materialization exceeds the aggregate "
+                f"size limit: {target}"
+            )
+        self.materialization_bytes += size
+        return size
 
 
 @dataclass(frozen=True)
@@ -4782,6 +5059,8 @@ class ManifestTransitionCapacityProfile:
     after_claim_count: int
     release_size_sum: int
     release_count: int
+    terminal_regular_size_sum: int
+    terminal_regular_count: int
     current_record_size: int
     create_record_sizes: dict[PurePosixPath, int]
     remove_record_sizes: dict[PurePosixPath, int]
@@ -4804,18 +5083,52 @@ class SymlinkSnapshot:
 
 
 @dataclass(frozen=True)
+class RegularFileSnapshot:
+    parent_identity: tuple[int, int]
+    file_identity: tuple[int, int]
+    sha256: str
+    size: int
+    mode: int
+    uid: int
+    gid: int
+    link_count: int
+
+
+@dataclass(frozen=True)
 class ReconcileTargetSnapshot:
     parent_identity: tuple[int, int] | None
     link_identity: tuple[int, int] | None = None
     link_target: str | None = None
     ancestor_identity: tuple[int, int] | None = None
     missing_parent_parts: tuple[str, ...] = ()
+    regular_sha256: str | None = None
+    regular_size: int | None = None
+    regular_mode: int | None = None
+    regular_uid: int | None = None
+    regular_gid: int | None = None
+    regular_link_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.parent_identity is None and self.link_identity is not None:
             raise ValueError("a missing reconcile parent cannot contain a link")
         if self.link_identity is None and self.link_target is not None:
             raise ValueError("an absent reconcile leaf cannot contain a link target")
+        regular_fields = (
+            self.regular_sha256,
+            self.regular_size,
+            self.regular_mode,
+            self.regular_uid,
+            self.regular_gid,
+            self.regular_link_count,
+        )
+        if any(value is not None for value in regular_fields) and not all(
+            value is not None for value in regular_fields
+        ):
+            raise ValueError("regular-file reconcile evidence must be complete")
+        if self.regular_sha256 is not None and self.link_target is not None:
+            raise ValueError("a reconcile leaf cannot be both regular and a symlink")
+        if self.regular_sha256 is not None and self.link_identity is None:
+            raise ValueError("regular-file reconcile evidence requires an identity")
         if self.parent_identity is None:
             if self.ancestor_identity is None or not self.missing_parent_parts:
                 raise ValueError(
@@ -4825,17 +5138,139 @@ class ReconcileTargetSnapshot:
             raise ValueError("an existing reconcile parent cannot have missing parts")
 
 
+_REGULAR_FILE_GID_SENSITIVE_MODE_MASK = stat.S_IRWXG | stat.S_IRWXO | stat.S_ISGID
+
+
+def _gid_matches_regular_file_access_policy(
+    actual_gid: int | None,
+    expected_gid: int | None,
+    expected_mode: int | None,
+) -> bool:
+    if actual_gid is None or expected_gid is None or expected_mode is None:
+        return False
+    # GID cannot affect an owner-only regular file without setgid. Any group or
+    # other permission can make GID select a different effective access class,
+    # while setgid can make GID part of the file's execution behavior.
+    return (
+        not bool(expected_mode & _REGULAR_FILE_GID_SENSITIVE_MODE_MASK)
+        or actual_gid == expected_gid
+    )
+
+
+def _reconcile_target_snapshot_matches(
+    actual: ReconcileTargetSnapshot,
+    expected: ReconcileTargetSnapshot,
+) -> bool:
+    if (
+        actual.parent_identity != expected.parent_identity
+        or actual.link_identity != expected.link_identity
+        or actual.link_target != expected.link_target
+        or actual.ancestor_identity != expected.ancestor_identity
+        or actual.missing_parent_parts != expected.missing_parent_parts
+        or actual.regular_sha256 != expected.regular_sha256
+        or actual.regular_size != expected.regular_size
+        or actual.regular_mode != expected.regular_mode
+        or actual.regular_uid != expected.regular_uid
+        or actual.regular_link_count != expected.regular_link_count
+    ):
+        return False
+    if expected.regular_sha256 is None:
+        return actual.regular_gid is None and expected.regular_gid is None
+    return _gid_matches_regular_file_access_policy(
+        actual.regular_gid,
+        expected.regular_gid,
+        expected.regular_mode,
+    )
+
+
+def _regular_stat_metadata_matches(
+    actual: os.stat_result,
+    expected: os.stat_result,
+) -> bool:
+    expected_mode = stat.S_IMODE(expected.st_mode)
+    return (
+        actual.st_dev == expected.st_dev
+        and actual.st_ino == expected.st_ino
+        and stat.S_IFMT(actual.st_mode) == stat.S_IFMT(expected.st_mode)
+        and stat.S_IMODE(actual.st_mode) == expected_mode
+        and actual.st_uid == expected.st_uid
+        and _gid_matches_regular_file_access_policy(
+            actual.st_gid,
+            expected.st_gid,
+            expected_mode,
+        )
+        and actual.st_size == expected.st_size
+        and actual.st_nlink == expected.st_nlink
+    )
+
+
+def _regular_stat_matches_managed_state_file_snapshot(
+    actual: os.stat_result,
+    expected: ManagedStateFileSnapshot,
+) -> bool:
+    if not _managed_state_snapshot_has_complete_file_evidence(expected):
+        return False
+    assert expected.file_identity is not None
+    return (
+        (actual.st_dev, actual.st_ino) == expected.file_identity
+        and stat.S_IFMT(actual.st_mode) == expected.file_type
+        and stat.S_IMODE(actual.st_mode) == expected.mode
+        and actual.st_uid == expected.uid
+        and _gid_matches_regular_file_access_policy(
+            actual.st_gid,
+            expected.gid,
+            expected.mode,
+        )
+        and actual.st_size == expected.size
+    )
+
+
 @dataclass
 class ReconcileMutation:
     action: ReconcileAction
     backup: Path | None = None
-    created_snapshot: SymlinkSnapshot | None = None
+    created_snapshot: SymlinkSnapshot | RegularFileSnapshot | None = None
 
 
 @dataclass
 class ReconcileTransaction:
     batch_root: Path | None
     mutations: list[ReconcileMutation]
+
+
+@dataclass(frozen=True)
+class FailedMoveIsolation:
+    isolation_parent: Path
+    isolation_parent_identity: tuple[int, int]
+    isolated: Path
+    receipt: ManagedStateFileSnapshot
+
+
+@dataclass(frozen=True)
+class FailedMoveRecoveryReceipt:
+    source: Path
+    source_parent_identity: tuple[int, int]
+    destination: Path
+    destination_parent_identity: tuple[int, int]
+    isolated: Path
+    isolation_parent_identity: tuple[int, int]
+    expected_identity: tuple[int, int]
+    expected_mode_type: int
+    expected_target: str | None
+    expected_regular: RegularFileSnapshot | None
+
+
+@dataclass(frozen=True)
+class EphemeralQuarantineBatchBinding:
+    """Exact authority retained solely to reclaim one operation's empty batch."""
+
+    batch_root: Path
+    quarantine_root_identity: tuple[int, int]
+    batch_identity: tuple[int, int]
+    leaf_identity: tuple[int, int] | None
+    metadata: ManagedStateFileSnapshot
+    allocation_ticket: PendingQuarantineAllocationTicket | None = None
+    cleanup_ticket: PendingBatchCleanupTicket | None = None
 
 
 @dataclass(frozen=True)
@@ -4849,6 +5284,181 @@ class ManagedStateFileSnapshot:
     size: int | None = None
     uid: int | None = None
     gid: int | None = None
+
+
+@dataclass
+class EphemeralQuarantineBatchAllocation:
+    """Own one fully bound empty-scaffold allocation until private use begins.
+
+    The resource is constructed inside the allocator, with duplicated root,
+    batch, and metadata descriptors, before control returns to a caller.  This
+    closes the otherwise unguarded return/unpack/binding window: abandoning the
+    temporary object closes every descriptor and attempts the same
+    identity-bound durable reclaim used by explicit error handling.  A created
+    leaf grants no reclaim authority until its identity is pinned by the owned
+    leaf descriptor.  Reclaim authority is irrevocably dropped before the first
+    private rename, because an exception from rename may arrive after the
+    destination was created.
+    """
+
+    home: Path
+    quarantine_root: Path
+    quarantine_fd: int
+    batch_fd: int
+    metadata_fd: int
+    binding: EphemeralQuarantineBatchBinding
+    leaf_fd: int = -1
+    reclaim_authorized: bool = True
+
+    @property
+    def batch_root(self) -> Path:
+        return self.binding.batch_root
+
+    def create_leaf(self) -> int:
+        if self.leaf_fd >= 0:
+            raise SyncError("ephemeral quarantine leaf is already bound")
+        _create_ephemeral_quarantine_leaf_at(self)
+        return self.leaf_fd
+
+    def revoke_reclaim(self) -> None:
+        self.reclaim_authorized = False
+
+    def retire_allocation_fence_after_private_use(
+        self,
+        *,
+        private_member_name: str,
+        private_member: RegularFileSnapshot,
+    ) -> None:
+        allocation_ticket = self.binding.allocation_ticket
+        cleanup_ticket = self.binding.cleanup_ticket
+        if allocation_ticket is None:
+            raise SyncError("ephemeral quarantine allocation fence is missing")
+        if cleanup_ticket is None or cleanup_ticket.version != 5:
+            raise SyncError("ephemeral quarantine cleanup authority is missing")
+
+        expected_leaf_members = (private_member_name,)
+
+        # Two fsync/verification passes separate the private rename from
+        # receipt publication. The immutable receipt binds the caller-captured
+        # payload snapshot before either control is retired, so a crash after
+        # v5 deletion cannot strand an otherwise unverifiable v8 fence.
+        def require_cleanup_retirement_boundary() -> None:
+            _require_ephemeral_quarantine_private_boundary(
+                self,
+                expected_leaf_members=expected_leaf_members,
+            )
+            _require_pending_quarantine_allocation_ticket_unchanged(
+                self.home,
+                allocation_ticket,
+            )
+
+        for _pass in range(2):
+            os.fsync(self.leaf_fd)
+            os.fsync(self.batch_fd)
+            os.fsync(self.quarantine_fd)
+            require_cleanup_retirement_boundary()
+        receipt = _publish_pending_private_use_retirement_receipt(
+            self,
+            private_member_name,
+            private_member,
+        )
+        _retire_pending_private_use_controls(self.home, receipt)
+
+    def close(self) -> None:
+        leaf_fd = self.leaf_fd
+        metadata_fd = self.metadata_fd
+        batch_fd = self.batch_fd
+        quarantine_fd = self.quarantine_fd
+        self.leaf_fd = -1
+        self.metadata_fd = -1
+        self.batch_fd = -1
+        self.quarantine_fd = -1
+        first_error: BaseException | None = None
+        for file_descriptor in (
+            leaf_fd,
+            metadata_fd,
+            batch_fd,
+            quarantine_fd,
+        ):
+            try:
+                _close_fd_quietly(file_descriptor)
+            except BaseException as error:
+                # Detach every owned number before closing any of them.  A
+                # close wrapper can report an asynchronous failure after the
+                # kernel already released the descriptor; retaining that
+                # number would let a later close/finalizer hit an unrelated
+                # object that reused it.
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def reclaim_empty(self) -> None:
+        if not self.reclaim_authorized:
+            self.close()
+            return
+        # Revoke before entering cleanup.  A cleanup exception can itself be
+        # post-mutation; the durable ticket published by the cleanup protocol,
+        # rather than a second in-process attempt, is then the only authority.
+        self.reclaim_authorized = False
+        try:
+            leaf_identity = self.binding.leaf_identity
+            if (
+                self.quarantine_fd < 0
+                or self.batch_fd < 0
+                or self.metadata_fd < 0
+                or (leaf_identity is None and self.leaf_fd >= 0)
+                or (leaf_identity is not None and self.leaf_fd < 0)
+            ):
+                raise SyncError(
+                    "ephemeral quarantine allocation descriptor state is incomplete"
+                )
+            if (
+                _directory_identity(self.quarantine_fd)
+                != self.binding.quarantine_root_identity
+                or _directory_identity(self.batch_fd) != self.binding.batch_identity
+                or (
+                    leaf_identity is not None
+                    and _directory_identity(self.leaf_fd) != leaf_identity
+                )
+            ):
+                raise SyncError(
+                    "ephemeral quarantine allocation descriptor identity changed"
+                )
+            current_metadata = _snapshot_ephemeral_quarantine_metadata_fd(
+                self.home,
+                self.batch_root,
+                self.batch_fd,
+                self.metadata_fd,
+            )
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                current_metadata,
+                self.binding.metadata,
+            ):
+                raise SyncError(
+                    f"ephemeral quarantine metadata changed: {self.batch_root}"
+                )
+            # Keep the allocation-owned root, batch, and leaf descriptors live
+            # plus the metadata descriptor through ticket publication and
+            # cleanup completion.  Besides preserving the bound objects as
+            # evidence, the retained handles prevent their identities from
+            # being recycled into an ABA match while the cleanup protocol
+            # rebinds the namespace by name.
+            _discard_empty_ephemeral_quarantine_batch(self.home, self.binding)
+        finally:
+            self.close()
+
+    def __del__(self) -> None:
+        try:
+            if self.reclaim_authorized:
+                self.reclaim_empty()
+            else:
+                self.close()
+        except BaseException:
+            # Finalizers cannot report cleanup failures.  Destructive cleanup
+            # publishes durable authority first; pre-publication uncertainty
+            # intentionally retains the complete scaffold as evidence.
+            self.close()
 
 
 @dataclass
@@ -8722,6 +9332,819 @@ def _rename_exchange_at(
         )
 
 
+def _failed_move_isolation_parent(home: Path) -> Path:
+    return _personal_sync_root(home) / FAILED_MOVE_ISOLATION_DIRECTORY_NAME
+
+
+def _failed_move_receipt_payload(
+    home: Path,
+    source: Path,
+    source_parent_identity: tuple[int, int],
+    destination: Path,
+    destination_parent_identity: tuple[int, int],
+    isolated: Path,
+    isolation_parent_identity: tuple[int, int],
+    expected_identity: tuple[int, int],
+    expected_mode_type: int,
+    expected_target: str | None,
+    expected_regular: RegularFileSnapshot | None,
+) -> bytes:
+    try:
+        source_relative = PurePosixPath(*source.relative_to(home).parts)
+        destination_relative = PurePosixPath(*destination.relative_to(home).parts)
+        isolated_relative = PurePosixPath(*isolated.relative_to(home).parts)
+    except ValueError as error:
+        raise SyncError("failed-move recovery path escaped the sync home") from error
+    regular_payload = None
+    if expected_regular is not None:
+        regular_payload = {
+            "sha256": expected_regular.sha256,
+            "size": expected_regular.size,
+            "mode": expected_regular.mode,
+            "uid": expected_regular.uid,
+            "gid": expected_regular.gid,
+            "link_count": expected_regular.link_count,
+        }
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "source": source_relative.as_posix(),
+            "source_parent_identity": _identity_payload(source_parent_identity),
+            "destination": destination_relative.as_posix(),
+            "destination_parent_identity": _identity_payload(
+                destination_parent_identity
+            ),
+            "isolated": isolated_relative.as_posix(),
+            "isolation_parent_identity": _identity_payload(isolation_parent_identity),
+            "expected_identity": _identity_payload(expected_identity),
+            "expected_mode_type": expected_mode_type,
+            "expected_target": expected_target,
+            "expected_regular": regular_payload,
+        },
+        max_bytes=4096,
+        overflow_error="failed-move recovery receipt exceeds the size limit",
+    )
+
+
+def _read_failed_move_recovery_receipt(
+    home: Path,
+) -> tuple[ManagedStateFileSnapshot, FailedMoveRecoveryReceipt] | None:
+    isolation_parent = _failed_move_isolation_parent(home)
+    receipt_path = isolation_parent / FAILED_MOVE_RECEIPT_NAME
+    try:
+        parent_fd = _open_directory_beneath(home, isolation_parent)
+    except FileNotFoundError:
+        return None
+    try:
+        parent_identity = _directory_identity(parent_fd)
+        metadata = os.fstat(parent_fd)
+        if (
+            stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.geteuid()
+            or not _bound_directory_matches(home, isolation_parent, parent_fd)
+        ):
+            raise SyncError("failed-move recovery directory access policy changed")
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            receipt_path,
+            parent_fd,
+            maximum_bytes=4096,
+        )
+    finally:
+        _close_fd_quietly(parent_fd)
+    if not snapshot.exists:
+        return None
+    if (
+        not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+        or snapshot.file_type != stat.S_IFREG
+        or snapshot.mode != 0o600
+        or snapshot.uid != os.geteuid()
+    ):
+        raise SyncError("failed-move recovery receipt changed")
+    data = _decode_managed_state_json(snapshot.payload, receipt_path)
+    if (
+        set(data)
+        != {
+            "version",
+            "source",
+            "source_parent_identity",
+            "destination",
+            "destination_parent_identity",
+            "isolated",
+            "isolation_parent_identity",
+            "expected_identity",
+            "expected_mode_type",
+            "expected_target",
+            "expected_regular",
+        }
+        or data.get("version") != 1
+    ):
+        raise SyncError("failed-move recovery receipt changed")
+    source_relative = _validate_relative_path(
+        data.get("source"), "failed-move recovery source"
+    )
+    destination_relative = _validate_relative_path(
+        data.get("destination"), "failed-move recovery destination"
+    )
+    isolated_relative = _validate_relative_path(
+        data.get("isolated"), "failed-move recovery isolated path"
+    )
+    source_parent_identity = _parse_pending_identity(
+        data.get("source_parent_identity"),
+        "failed-move recovery source parent identity",
+    )
+    destination_parent_identity = _parse_pending_identity(
+        data.get("destination_parent_identity"),
+        "failed-move recovery destination parent identity",
+    )
+    isolation_parent_identity = _parse_pending_identity(
+        data.get("isolation_parent_identity"),
+        "failed-move recovery isolation parent identity",
+    )
+    expected_identity = _parse_pending_identity(
+        data.get("expected_identity"),
+        "failed-move recovery entry identity",
+    )
+    expected_mode_type = data.get("expected_mode_type")
+    expected_target = data.get("expected_target")
+    if (
+        source_parent_identity is None
+        or destination_parent_identity is None
+        or isolation_parent_identity is None
+        or expected_identity is None
+        or not isinstance(expected_mode_type, int)
+        or isinstance(expected_mode_type, bool)
+        or expected_mode_type not in {stat.S_IFREG, stat.S_IFLNK, stat.S_IFDIR}
+        or (expected_target is not None and not isinstance(expected_target, str))
+    ):
+        raise SyncError("failed-move recovery receipt changed")
+    expected_regular = None
+    raw_regular = data.get("expected_regular")
+    if raw_regular is not None:
+        if not isinstance(raw_regular, dict) or set(raw_regular) != {
+            "sha256",
+            "size",
+            "mode",
+            "uid",
+            "gid",
+            "link_count",
+        }:
+            raise SyncError("failed-move recovery receipt changed")
+        integer_fields = ("size", "mode", "uid", "gid", "link_count")
+        if (
+            expected_mode_type != stat.S_IFREG
+            or not isinstance(raw_regular.get("sha256"), str)
+            or len(raw_regular["sha256"]) != 64
+            or any(
+                not isinstance(raw_regular.get(field), int)
+                or isinstance(raw_regular.get(field), bool)
+                for field in integer_fields
+            )
+        ):
+            raise SyncError("failed-move recovery receipt changed")
+        expected_regular = RegularFileSnapshot(
+            parent_identity=source_parent_identity,
+            file_identity=expected_identity,
+            sha256=raw_regular["sha256"],
+            size=raw_regular["size"],
+            mode=raw_regular["mode"],
+            uid=raw_regular["uid"],
+            gid=raw_regular["gid"],
+            link_count=raw_regular["link_count"],
+        )
+    elif expected_mode_type == stat.S_IFREG:
+        raise SyncError("failed-move regular recovery receipt is incomplete")
+    if (expected_mode_type == stat.S_IFLNK and expected_target is None) or (
+        expected_mode_type != stat.S_IFLNK and expected_target is not None
+    ):
+        raise SyncError("failed-move recovery receipt changed")
+    source = home / Path(*source_relative.parts)
+    destination = home / Path(*destination_relative.parts)
+    isolated = home / Path(*isolated_relative.parts)
+    if (
+        isolated.parent != isolation_parent
+        or isolated.name != FAILED_MOVE_ISOLATION_ENTRY_NAME
+        or isolation_parent_identity != parent_identity
+        or source == destination
+        or source == isolated
+        or destination == isolated
+        or _failed_move_receipt_payload(
+            home,
+            source,
+            source_parent_identity,
+            destination,
+            destination_parent_identity,
+            isolated,
+            isolation_parent_identity,
+            expected_identity,
+            expected_mode_type,
+            expected_target,
+            expected_regular,
+        )
+        != snapshot.payload
+    ):
+        raise SyncError("failed-move recovery receipt changed")
+    return snapshot, FailedMoveRecoveryReceipt(
+        source=source,
+        source_parent_identity=source_parent_identity,
+        destination=destination,
+        destination_parent_identity=destination_parent_identity,
+        isolated=isolated,
+        isolation_parent_identity=isolation_parent_identity,
+        expected_identity=expected_identity,
+        expected_mode_type=expected_mode_type,
+        expected_target=expected_target,
+        expected_regular=expected_regular,
+    )
+
+
+def _failed_move_recovery_leaf_state(
+    home: Path,
+    path: Path,
+    parent_identity: tuple[int, int],
+    receipt: FailedMoveRecoveryReceipt,
+) -> str:
+    parent_fd = _open_directory_beneath(home, path.parent)
+    try:
+        if _directory_identity(
+            parent_fd
+        ) != parent_identity or not _bound_directory_matches(
+            home, path.parent, parent_fd
+        ):
+            raise SyncError(f"failed-move recovery parent changed: {path.parent}")
+        try:
+            metadata = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return "missing"
+        if receipt.expected_regular is not None:
+            candidate = _regular_file_snapshot_at(parent_fd, path.name, path)
+            matches = (
+                _regular_snapshot_leaf_matches(candidate, receipt.expected_regular)
+                and candidate.link_count == receipt.expected_regular.link_count
+            )
+        elif receipt.expected_mode_type == stat.S_IFLNK:
+            identity, target = _symlink_snapshot_at(parent_fd, path.name)
+            matches = (
+                identity == receipt.expected_identity
+                and target == receipt.expected_target
+            )
+        else:
+            matches = (
+                metadata.st_dev,
+                metadata.st_ino,
+            ) == receipt.expected_identity and stat.S_IFMT(
+                metadata.st_mode
+            ) == receipt.expected_mode_type
+        return "expected" if matches else "mismatch"
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _failed_move_recovery_alias_states(
+    home: Path,
+    receipt: FailedMoveRecoveryReceipt,
+) -> tuple[str, str, str]:
+    return (
+        _failed_move_recovery_leaf_state(
+            home,
+            receipt.source,
+            receipt.source_parent_identity,
+            receipt,
+        ),
+        _failed_move_recovery_leaf_state(
+            home,
+            receipt.destination,
+            receipt.destination_parent_identity,
+            receipt,
+        ),
+        _failed_move_recovery_leaf_state(
+            home,
+            receipt.isolated,
+            receipt.isolation_parent_identity,
+            receipt,
+        ),
+    )
+
+
+def _failed_move_recovery_aliases_are_terminal(
+    states: tuple[str, str, str],
+) -> bool:
+    """Require one active expected leaf and no retained or foreign alias."""
+    source_state, destination_state, isolated_state = states
+    return (
+        isolated_state == "missing"
+        and "mismatch" not in states
+        and (source_state, destination_state).count("expected") == 1
+        and (source_state, destination_state).count("missing") == 1
+    )
+
+
+def _rebind_failed_move_recovery_parent_fds(
+    home: Path,
+    source_parent: Path,
+    source_parent_identity: tuple[int, int],
+    source_parent_fd: int,
+    destination_parent: Path,
+    destination_parent_identity: tuple[int, int],
+    destination_parent_fd: int,
+) -> tuple[int, int]:
+    """Reopen mutation FDs from canonical paths after checking old bindings.
+
+    The protected property is directory object identity. Child-entry churn does
+    not change that property, so ctime and directory link count are not compared.
+    """
+    if (
+        _directory_identity(source_parent_fd) != source_parent_identity
+        or not _bound_directory_matches(home, source_parent, source_parent_fd)
+        or _directory_identity(destination_parent_fd) != destination_parent_identity
+        or not _bound_directory_matches(
+            home,
+            destination_parent,
+            destination_parent_fd,
+        )
+    ):
+        raise SyncError("failed-move recovery parent changed before restore")
+
+    rebound_source_parent_fd = -1
+    rebound_destination_parent_fd = -1
+    try:
+        rebound_source_parent_fd = _open_directory_beneath(home, source_parent)
+        rebound_destination_parent_fd = _open_directory_beneath(
+            home,
+            destination_parent,
+        )
+        if (
+            _directory_identity(rebound_source_parent_fd) != source_parent_identity
+            or _directory_identity(rebound_destination_parent_fd)
+            != destination_parent_identity
+            or not _bound_directory_matches(
+                home,
+                source_parent,
+                rebound_source_parent_fd,
+            )
+            or not _bound_directory_matches(
+                home,
+                destination_parent,
+                rebound_destination_parent_fd,
+            )
+        ):
+            raise SyncError("failed-move recovery parent changed before restore")
+        result = (rebound_source_parent_fd, rebound_destination_parent_fd)
+        rebound_source_parent_fd = -1
+        rebound_destination_parent_fd = -1
+        return result
+    finally:
+        _close_fd_quietly(rebound_destination_parent_fd)
+        _close_fd_quietly(rebound_source_parent_fd)
+
+
+def _clear_failed_move_recovery_receipt(
+    home: Path,
+    snapshot: ManagedStateFileSnapshot,
+    *,
+    receipt: FailedMoveRecoveryReceipt | None = None,
+) -> None:
+    isolation_parent = _failed_move_isolation_parent(home)
+    parent_fd = _open_directory_beneath(home, isolation_parent)
+    try:
+        current = _read_managed_state_file_snapshot(
+            home,
+            isolation_parent / FAILED_MOVE_RECEIPT_NAME,
+            parent_fd,
+            maximum_bytes=4096,
+        )
+        if not _managed_state_snapshot_exact(current, snapshot):
+            raise SyncError("failed-move recovery receipt changed before cleanup")
+        if receipt is not None:
+            states = _failed_move_recovery_alias_states(home, receipt)
+            if not _failed_move_recovery_aliases_are_terminal(states):
+                raise SyncError(
+                    "failed-move recovery aliases changed before cleanup; "
+                    "exact evidence was retained"
+                )
+            if not _bound_directory_matches(home, isolation_parent, parent_fd):
+                raise SyncError("failed-move recovery directory changed before cleanup")
+        os.unlink(FAILED_MOVE_RECEIPT_NAME, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        if _named_entry_identity(parent_fd, FAILED_MOVE_RECEIPT_NAME) is not None:
+            raise SyncError("failed-move recovery receipt reappeared")
+        if not _bound_directory_matches(home, isolation_parent, parent_fd):
+            raise SyncError("failed-move recovery directory changed during cleanup")
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _recover_failed_move_isolation(home: Path, *, dry_run: bool = False) -> bool:
+    loaded = _read_failed_move_recovery_receipt(home)
+    if loaded is None:
+        return False
+    snapshot, receipt = loaded
+    states = _failed_move_recovery_alias_states(home, receipt)
+    _, _, isolated_state = states
+    if "mismatch" in states or states.count("expected") != 1:
+        raise SyncError(
+            "failed-move recovery aliases are ambiguous; exact evidence was retained"
+        )
+    if dry_run:
+        return True
+    if isolated_state == "expected":
+        destination_parent_fd = _open_directory_beneath(
+            home, receipt.destination.parent
+        )
+        isolation_parent_fd = _open_directory_beneath(home, receipt.isolated.parent)
+        try:
+            rebound_isolation_parent_fd, rebound_destination_parent_fd = (
+                _rebind_failed_move_recovery_parent_fds(
+                    home,
+                    receipt.isolated.parent,
+                    receipt.isolation_parent_identity,
+                    isolation_parent_fd,
+                    receipt.destination.parent,
+                    receipt.destination_parent_identity,
+                    destination_parent_fd,
+                )
+            )
+            _close_fd_quietly(isolation_parent_fd)
+            isolation_parent_fd = rebound_isolation_parent_fd
+            _close_fd_quietly(destination_parent_fd)
+            destination_parent_fd = rebound_destination_parent_fd
+            _rename_noreplace_at(
+                isolation_parent_fd,
+                receipt.isolated.name,
+                destination_parent_fd,
+                receipt.destination.name,
+            )
+            os.fsync(destination_parent_fd)
+            os.fsync(isolation_parent_fd)
+        finally:
+            _close_fd_quietly(isolation_parent_fd)
+            _close_fd_quietly(destination_parent_fd)
+    _clear_failed_move_recovery_receipt(home, snapshot, receipt=receipt)
+    return True
+
+
+def _isolate_failed_move_destination(
+    home: Path,
+    source: Path,
+    destination: Path,
+    expected_source_parent_identity: tuple[int, int],
+    expected_parent_identity: tuple[int, int],
+    expected_identity: tuple[int, int],
+    expected_mode_type: int,
+    expected_target: str | None,
+    expected_regular: RegularFileSnapshot | None,
+) -> FailedMoveIsolation:
+    if _recover_failed_move_isolation(home):
+        raise SyncError("recovered an earlier failed-move isolation; retry the move")
+    isolation_parent = _failed_move_isolation_parent(home)
+    isolation_parent_fd = _open_or_create_directory_beneath(
+        home,
+        isolation_parent,
+        mode=0o700,
+    )
+    destination_parent_fd = -1
+    try:
+        isolation_metadata = os.fstat(isolation_parent_fd)
+        isolation_parent_identity = _directory_identity(isolation_parent_fd)
+        if (
+            stat.S_IMODE(isolation_metadata.st_mode) != 0o700
+            or isolation_metadata.st_uid != os.geteuid()
+            or not _bound_directory_matches(home, isolation_parent, isolation_parent_fd)
+        ):
+            raise SyncError("failed-move isolation parent access policy mismatch")
+        if (
+            _named_entry_identity(isolation_parent_fd, FAILED_MOVE_ISOLATION_ENTRY_NAME)
+            is not None
+        ):
+            raise SyncError("failed-move isolation entry is already occupied")
+        destination_parent_fd = _open_directory_beneath(home, destination.parent)
+        if _directory_identity(
+            destination_parent_fd
+        ) != expected_parent_identity or not _bound_directory_matches(
+            home, destination.parent, destination_parent_fd
+        ):
+            raise SyncError(
+                "canonical destination parent changed before failed-move isolation; "
+                f"evidence was left in place: {destination}"
+            )
+        isolated = isolation_parent / FAILED_MOVE_ISOLATION_ENTRY_NAME
+        expected_receipt_payload = _failed_move_receipt_payload(
+            home,
+            source,
+            expected_source_parent_identity,
+            destination,
+            expected_parent_identity,
+            isolated,
+            isolation_parent_identity,
+            expected_identity,
+            expected_mode_type,
+            expected_target,
+            expected_regular,
+        )
+        receipt_path = isolation_parent / FAILED_MOVE_RECEIPT_NAME
+        _publish_atomic_exclusive_internal_file(
+            home,
+            receipt_path,
+            expected_receipt_payload,
+        )
+        loaded = _read_failed_move_recovery_receipt(home)
+        if loaded is None or loaded[0].payload != expected_receipt_payload:
+            raise SyncError("failed-move recovery receipt was not durable")
+        receipt_snapshot = loaded[0]
+        _rename_noreplace_at(
+            destination_parent_fd,
+            destination.name,
+            isolation_parent_fd,
+            isolated.name,
+        )
+        os.fsync(destination_parent_fd)
+        os.fsync(isolation_parent_fd)
+        if (
+            _failed_move_recovery_leaf_state(
+                home,
+                isolated,
+                isolation_parent_identity,
+                loaded[1],
+            )
+            != "expected"
+        ):
+            raise SyncError(
+                "destination racer was retained outside the active source after "
+                f"failed-move isolation: {isolated}"
+            )
+        return FailedMoveIsolation(
+            isolation_parent=isolation_parent,
+            isolation_parent_identity=isolation_parent_identity,
+            isolated=isolated,
+            receipt=receipt_snapshot,
+        )
+    finally:
+        _close_fd_quietly(destination_parent_fd)
+        _close_fd_quietly(isolation_parent_fd)
+
+
+def _retain_failed_restore_leaf(
+    home: Path,
+    destination: Path,
+    expected_parent_identity: tuple[int, int],
+    expected_identity: tuple[int, int],
+    expected_mode_type: int,
+    expected_target: str | None,
+    expected_regular: RegularFileSnapshot | None,
+) -> Path:
+    batch_root = _quarantine_batch_root(home, [])
+    isolation_parent = batch_root / "failed-move"
+    isolation_parent_fd = _open_or_create_directory_beneath(
+        home,
+        isolation_parent,
+        mode=0o700,
+    )
+    isolation_parent_metadata = os.fstat(isolation_parent_fd)
+    if (
+        stat.S_IMODE(isolation_parent_metadata.st_mode) != 0o700
+        or isolation_parent_metadata.st_uid != os.geteuid()
+    ):
+        _close_fd_quietly(isolation_parent_fd)
+        raise SyncError(
+            f"failed-move isolation parent access policy mismatch: {isolation_parent}"
+        )
+    destination_parent_fd = -1
+    isolated: Path | None = None
+    try:
+        for attempt in range(100):
+            _close_fd_quietly(destination_parent_fd)
+            destination_parent_fd = _open_directory_beneath(
+                home,
+                destination.parent,
+            )
+            if _directory_identity(
+                destination_parent_fd
+            ) != expected_parent_identity or not _bound_directory_matches(
+                home,
+                destination.parent,
+                destination_parent_fd,
+            ):
+                raise SyncError(
+                    "canonical destination parent changed before failed-move "
+                    f"isolation; evidence was left in place: {destination}"
+                )
+            if not _bound_directory_matches(
+                home,
+                isolation_parent,
+                isolation_parent_fd,
+            ):
+                raise SyncError(
+                    "failed-move isolation parent changed before evidence "
+                    f"retention: {isolation_parent}"
+                )
+            if expected_regular is not None:
+                candidate = _regular_file_snapshot_at(
+                    destination_parent_fd,
+                    destination.name,
+                    destination,
+                )
+                if not _regular_snapshot_matches(
+                    candidate,
+                    expected_parent_identity,
+                    expected_regular,
+                    expected_link_count=expected_regular.link_count,
+                ):
+                    raise SyncError(
+                        "moved regular file changed before failed-move isolation "
+                        f"and was left in place: {destination}"
+                    )
+            elif stat.S_ISLNK(expected_mode_type):
+                candidate_identity, candidate_target = _symlink_snapshot_at(
+                    destination_parent_fd,
+                    destination.name,
+                )
+                if (
+                    candidate_identity != expected_identity
+                    or candidate_target != expected_target
+                ):
+                    raise SyncError(
+                        "moved symlink changed before failed-move isolation and "
+                        f"was left in place: {destination}"
+                    )
+            else:
+                candidate_metadata = os.stat(
+                    destination.name,
+                    dir_fd=destination_parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    candidate_metadata.st_dev,
+                    candidate_metadata.st_ino,
+                ) != expected_identity or stat.S_IFMT(
+                    candidate_metadata.st_mode
+                ) != expected_mode_type:
+                    raise SyncError(
+                        "moved entry changed before failed-move isolation and "
+                        f"was left in place: {destination}"
+                    )
+            candidate_name = f"restore-{os.getpid()}-{time.time_ns()}-{attempt}"
+            try:
+                _rename_noreplace_at(
+                    destination_parent_fd,
+                    destination.name,
+                    isolation_parent_fd,
+                    candidate_name,
+                )
+            except FileExistsError:
+                continue
+            isolated = isolation_parent / candidate_name
+            os.fsync(destination_parent_fd)
+            os.fsync(isolation_parent_fd)
+            break
+        if isolated is None:
+            raise SyncError(
+                f"could not allocate private failed-move isolation for {destination}"
+            )
+        if expected_regular is not None:
+            isolated_regular = _regular_file_snapshot_at(
+                isolation_parent_fd,
+                isolated.name,
+                isolated,
+            )
+            if (
+                not _regular_snapshot_leaf_matches(
+                    isolated_regular,
+                    expected_regular,
+                )
+                or isolated_regular.link_count != expected_regular.link_count
+            ):
+                raise SyncError(
+                    "destination racer was retained outside the active source "
+                    f"after failed-move isolation: {isolated}"
+                )
+        elif stat.S_ISLNK(expected_mode_type):
+            isolated_identity, isolated_target = _symlink_snapshot_at(
+                isolation_parent_fd,
+                isolated.name,
+            )
+            if (
+                isolated_identity != expected_identity
+                or isolated_target != expected_target
+            ):
+                raise SyncError(
+                    "destination racer was retained outside the active source "
+                    f"after failed-move isolation: {isolated}"
+                )
+        else:
+            isolated_metadata = os.stat(
+                isolated.name,
+                dir_fd=isolation_parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                isolated_metadata.st_dev,
+                isolated_metadata.st_ino,
+            ) != expected_identity or stat.S_IFMT(
+                isolated_metadata.st_mode
+            ) != expected_mode_type:
+                raise SyncError(
+                    "destination racer was retained outside the active source "
+                    f"after failed-move isolation: {isolated}"
+                )
+        if not _bound_directory_matches(
+            home,
+            isolation_parent,
+            isolation_parent_fd,
+        ):
+            raise SyncError(
+                "failed-move isolation parent changed after evidence retention: "
+                f"{isolated}"
+            )
+        return isolated
+    finally:
+        _close_fd_quietly(destination_parent_fd)
+        _close_fd_quietly(isolation_parent_fd)
+
+
+def _isolate_current_failed_restore_leaf(
+    home: Path,
+    source: Path,
+    expected_parent_identity: tuple[int, int],
+    source_parent_fd: int,
+) -> Path:
+    metadata = os.stat(
+        source.name,
+        dir_fd=source_parent_fd,
+        follow_symlinks=False,
+    )
+    identity = (metadata.st_dev, metadata.st_ino)
+    mode_type = stat.S_IFMT(metadata.st_mode)
+    link_target = None
+    regular = None
+    if stat.S_ISREG(metadata.st_mode):
+        try:
+            regular = _regular_file_snapshot_at(
+                source_parent_fd,
+                source.name,
+                source,
+            )
+        except (OSError, SyncError):
+            pass
+    elif stat.S_ISLNK(metadata.st_mode):
+        identity, link_target = _symlink_snapshot_at(
+            source_parent_fd,
+            source.name,
+        )
+    return _retain_failed_restore_leaf(
+        home,
+        source,
+        expected_parent_identity,
+        identity,
+        mode_type,
+        link_target,
+        regular,
+    )
+
+
+def _return_failed_restore_mismatch_to_destination(
+    home: Path,
+    source: Path,
+    destination: Path,
+    source_parent_fd: int,
+    expected_source_parent_identity: tuple[int, int],
+    expected_destination_parent_identity: tuple[int, int],
+) -> Path:
+    destination_parent_fd = _open_directory_beneath(home, destination.parent)
+    try:
+        if (
+            _directory_identity(source_parent_fd) != expected_source_parent_identity
+            or not _bound_directory_matches(home, source.parent, source_parent_fd)
+            or _directory_identity(destination_parent_fd)
+            != expected_destination_parent_identity
+            or not _bound_directory_matches(
+                home, destination.parent, destination_parent_fd
+            )
+        ):
+            raise SyncError(
+                "failed-move mismatch parent changed; active evidence was retained"
+            )
+        _rename_noreplace_at(
+            source_parent_fd,
+            source.name,
+            destination_parent_fd,
+            destination.name,
+        )
+        os.fsync(source_parent_fd)
+        if destination_parent_fd != source_parent_fd:
+            os.fsync(destination_parent_fd)
+        if _named_entry_identity(source_parent_fd, source.name) is not None:
+            raise SyncError(
+                "failed-move mismatch remained exposed at the active source"
+            )
+        return destination
+    finally:
+        _close_fd_quietly(destination_parent_fd)
+
+
 def _atomic_move_beneath_home(
     home: Path,
     source: Path,
@@ -8741,56 +10164,88 @@ def _atomic_move_beneath_home(
         raise
     moved = False
     moved_identity_for_restore: tuple[int, int] | None = None
+    moved_mode_type_for_restore: int | None = None
     moved_target_for_restore: str | None = None
+    source_regular_for_restore: RegularFileSnapshot | None = None
+    source_parent_identity_for_restore: tuple[int, int] | None = None
+    destination_parent_identity_for_restore: tuple[int, int] | None = None
+    rollback_source_parent_fd = -1
+    rollback_destination_parent_fd = -1
+    isolated_parent_fd = -1
     try:
-        if (
-            expected_destination_parent_identity is not None
-            and _directory_identity(destination_parent_fd)
-            != expected_destination_parent_identity
-        ):
-            raise SyncError(
-                f"destination parent changed after planning: {destination.parent}"
-            )
+        source_parent_identity_for_restore = _directory_identity(source_parent_fd)
+        destination_parent_identity_for_restore = _directory_identity(
+            destination_parent_fd
+        )
+        if expected_destination_parent_identity is not None:
+            if (
+                destination_parent_identity_for_restore
+                != expected_destination_parent_identity
+            ):
+                raise SyncError(
+                    f"destination parent changed after planning: {destination.parent}"
+                )
         source_metadata = os.stat(
             source.name,
             dir_fd=source_parent_fd,
             follow_symlinks=False,
         )
         source_identity = (source_metadata.st_dev, source_metadata.st_ino)
+        moved_mode_type_for_restore = stat.S_IFMT(source_metadata.st_mode)
         if (
             expected_entry_identity is not None
             and source_identity != expected_entry_identity
         ):
             raise SyncError(f"source object changed after planning: {source}")
+        if stat.S_ISREG(source_metadata.st_mode):
+            source_regular_for_restore = _regular_file_snapshot_at(
+                source_parent_fd,
+                source.name,
+                source,
+            )
+            if source_regular_for_restore.file_identity != source_identity:
+                raise SyncError(f"source object changed after planning: {source}")
         if expected_snapshot is not None:
             if (
                 expected_snapshot.parent_identity is None
                 or expected_snapshot.link_identity is None
-                or expected_snapshot.link_target is None
             ):
                 raise SyncError(
-                    f"destructive move has no planned symlink snapshot: {source}"
+                    f"destructive move has no planned target snapshot: {source}"
                 )
-            actual_parent_identity = _directory_identity(source_parent_fd)
-            if actual_parent_identity != expected_snapshot.parent_identity:
+            if source_parent_identity_for_restore != expected_snapshot.parent_identity:
                 raise SyncError(
                     f"source parent changed after planning: {source.parent}"
                 )
-            if not stat.S_ISLNK(source_metadata.st_mode):
-                raise SyncError(f"source changed after planning: {source}")
-            actual_target = os.readlink(source.name, dir_fd=source_parent_fd)
-            source_metadata_after = os.stat(
-                source.name,
-                dir_fd=source_parent_fd,
-                follow_symlinks=False,
-            )
-            if (
-                (source_metadata_after.st_dev, source_metadata_after.st_ino)
-                != source_identity
-                or source_identity != expected_snapshot.link_identity
-                or actual_target != expected_snapshot.link_target
-            ):
-                raise SyncError(f"source changed after planning: {source}")
+            planned_regular = _regular_snapshot_from_reconcile(expected_snapshot)
+            if planned_regular is not None:
+                if source_regular_for_restore is None:
+                    raise SyncError(f"source changed after planning: {source}")
+                if not _regular_snapshot_matches(
+                    source_regular_for_restore,
+                    planned_regular.parent_identity,
+                    planned_regular,
+                    expected_link_count=planned_regular.link_count,
+                ):
+                    raise SyncError(f"source changed after planning: {source}")
+            else:
+                if expected_snapshot.link_target is None or not stat.S_ISLNK(
+                    source_metadata.st_mode
+                ):
+                    raise SyncError(f"source changed after planning: {source}")
+                actual_target = os.readlink(source.name, dir_fd=source_parent_fd)
+                source_metadata_after = os.stat(
+                    source.name,
+                    dir_fd=source_parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    (source_metadata_after.st_dev, source_metadata_after.st_ino)
+                    != source_identity
+                    or source_identity != expected_snapshot.link_identity
+                    or actual_target != expected_snapshot.link_target
+                ):
+                    raise SyncError(f"source changed after planning: {source}")
         if not _bound_directory_matches(home, source.parent, source_parent_fd):
             raise SyncError(f"source parent changed before move: {source.parent}")
         if not _bound_directory_matches(
@@ -8800,6 +10255,12 @@ def _atomic_move_beneath_home(
         ):
             raise SyncError(
                 f"destination parent changed before move: {destination.parent}"
+            )
+        if source_regular_for_restore is not None:
+            _require_managed_regular_parent_chain_access(
+                home,
+                source.parent,
+                bound_parent_fd=source_parent_fd,
             )
         _rename_noreplace_at(
             source_parent_fd,
@@ -8825,6 +10286,22 @@ def _atomic_move_beneath_home(
                 destination_parent_fd,
                 destination.name,
             )
+        elif source_regular_for_restore is not None:
+            moved_regular = _regular_file_snapshot_at(
+                destination_parent_fd,
+                destination.name,
+                destination,
+            )
+            moved_identity_for_restore = moved_regular.file_identity
+            if not _regular_snapshot_matches(
+                moved_regular,
+                destination_parent_identity_for_restore,
+                source_regular_for_restore,
+                expected_link_count=source_regular_for_restore.link_count,
+            ):
+                raise SyncError(
+                    f"moved regular file changed during reconciliation: {source}"
+                )
         if moved_identity_for_restore != source_identity:
             raise SyncError(f"moved entry changed during reconciliation: {source}")
         if expected_snapshot is not None:
@@ -8856,32 +10333,185 @@ def _atomic_move_beneath_home(
     except BaseException as error:
         if moved:
             restored = False
+            isolated: Path | None = None
             try:
+                assert destination_parent_identity_for_restore is not None
+                assert moved_identity_for_restore is not None
+                assert moved_mode_type_for_restore is not None
+                rollback_source_parent_fd = _open_directory_beneath(
+                    home,
+                    source.parent,
+                )
+                if _directory_identity(
+                    rollback_source_parent_fd
+                ) != source_parent_identity_for_restore or not _bound_directory_matches(
+                    home,
+                    source.parent,
+                    rollback_source_parent_fd,
+                ):
+                    raise SyncError(
+                        "canonical source parent changed before failed-move "
+                        f"restoration; evidence was retained at {destination}"
+                    )
+                try:
+                    rollback_source_metadata = os.stat(
+                        source.name,
+                        dir_fd=rollback_source_parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    rollback_source_identity = (
+                        rollback_source_metadata.st_dev,
+                        rollback_source_metadata.st_ino,
+                    )
+                    raise SyncError(
+                        "canonical source leaf appeared before failed-move "
+                        "restoration and was left in place: "
+                        f"{source} ({rollback_source_identity}); evidence was "
+                        f"retained at {destination}"
+                    )
+                isolation = _isolate_failed_move_destination(
+                    home,
+                    source,
+                    destination,
+                    source_parent_identity_for_restore,
+                    destination_parent_identity_for_restore,
+                    moved_identity_for_restore,
+                    moved_mode_type_for_restore,
+                    moved_target_for_restore,
+                    source_regular_for_restore,
+                )
+                isolated = isolation.isolated
+                if (
+                    not _bound_directory_matches(
+                        home,
+                        source.parent,
+                        rollback_source_parent_fd,
+                    )
+                    or _directory_identity(rollback_source_parent_fd)
+                    != source_parent_identity_for_restore
+                ):
+                    raise SyncError(
+                        "canonical source parent changed after failed-move "
+                        f"isolation; evidence was retained at {isolated}"
+                    )
+                try:
+                    os.stat(
+                        source.name,
+                        dir_fd=rollback_source_parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise SyncError(
+                        "canonical source leaf appeared after failed-move "
+                        f"isolation and was left in place: {source}; evidence "
+                        f"was retained at {isolated}"
+                    )
+                isolated_parent_fd = _open_directory_beneath(
+                    home,
+                    isolated.parent,
+                )
+                if not _bound_directory_matches(
+                    home,
+                    isolated.parent,
+                    isolated_parent_fd,
+                ):
+                    raise SyncError(
+                        "failed-move isolation parent changed before exact "
+                        f"restoration; evidence was retained at {isolated}"
+                    )
+                if source_regular_for_restore is not None:
+                    isolated_regular = _regular_file_snapshot_at(
+                        isolated_parent_fd,
+                        isolated.name,
+                        isolated,
+                    )
+                    if (
+                        not _regular_snapshot_leaf_matches(
+                            isolated_regular,
+                            source_regular_for_restore,
+                        )
+                        or isolated_regular.link_count
+                        != source_regular_for_restore.link_count
+                    ):
+                        raise SyncError(
+                            "failed-move isolated regular evidence changed before "
+                            f"restoration and was retained at {isolated}"
+                        )
+                elif stat.S_ISLNK(moved_mode_type_for_restore):
+                    isolated_identity, isolated_target = _symlink_snapshot_at(
+                        isolated_parent_fd,
+                        isolated.name,
+                    )
+                    if (
+                        isolated_identity != moved_identity_for_restore
+                        or isolated_target != moved_target_for_restore
+                    ):
+                        raise SyncError(
+                            "failed-move isolated symlink evidence changed before "
+                            f"restoration and was retained at {isolated}"
+                        )
+                else:
+                    isolated_metadata = os.stat(
+                        isolated.name,
+                        dir_fd=isolated_parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        isolated_metadata.st_dev,
+                        isolated_metadata.st_ino,
+                    ) != moved_identity_for_restore or stat.S_IFMT(
+                        isolated_metadata.st_mode
+                    ) != moved_mode_type_for_restore:
+                        raise SyncError(
+                            "failed-move isolated evidence changed before exact "
+                            f"restoration and was retained at {isolated}"
+                        )
+                if source_regular_for_restore is not None:
+                    _require_managed_regular_parent_chain_access(
+                        home,
+                        source.parent,
+                        bound_parent_fd=rollback_source_parent_fd,
+                    )
                 _rename_noreplace_at(
-                    destination_parent_fd,
-                    destination.name,
-                    source_parent_fd,
+                    isolated_parent_fd,
+                    isolated.name,
+                    rollback_source_parent_fd,
                     source.name,
                 )
                 restored = True
-                os.fsync(source_parent_fd)
-                if destination_parent_fd != source_parent_fd:
-                    os.fsync(destination_parent_fd)
+                os.fsync(rollback_source_parent_fd)
+                if isolated_parent_fd != rollback_source_parent_fd:
+                    os.fsync(isolated_parent_fd)
                 restored_metadata = os.stat(
                     source.name,
-                    dir_fd=source_parent_fd,
+                    dir_fd=rollback_source_parent_fd,
                     follow_symlinks=False,
                 )
                 if (
                     restored_metadata.st_dev,
                     restored_metadata.st_ino,
                 ) != moved_identity_for_restore:
+                    retained_racer = _return_failed_restore_mismatch_to_destination(
+                        home,
+                        source,
+                        destination,
+                        rollback_source_parent_fd,
+                        source_parent_identity_for_restore,
+                        destination_parent_identity_for_restore,
+                    )
+                    restored = False
                     raise SyncError(
-                        f"restored entry changed after failed move: {source}"
+                        "restored entry changed after failed move and the racer "
+                        f"was retained outside the active path: {retained_racer}"
                     )
                 if moved_target_for_restore is not None:
                     restored_identity, restored_target = _symlink_snapshot_at(
-                        source_parent_fd,
+                        rollback_source_parent_fd,
                         source.name,
                     )
                     if (
@@ -8891,10 +10521,61 @@ def _atomic_move_beneath_home(
                         raise SyncError(
                             f"restored symlink changed after failed move: {source}"
                         )
+                if source_regular_for_restore is not None:
+                    restored_regular = None
+                    restored_regular_error = None
+                    try:
+                        restored_regular = _regular_file_snapshot_at(
+                            rollback_source_parent_fd,
+                            source.name,
+                            source,
+                        )
+                    except BaseException as snapshot_error:
+                        restored_regular_error = snapshot_error
+                    if restored_regular is None or not _regular_snapshot_matches(
+                        restored_regular,
+                        source_regular_for_restore.parent_identity,
+                        source_regular_for_restore,
+                        expected_link_count=source_regular_for_restore.link_count,
+                    ):
+                        retained_path = _return_failed_restore_mismatch_to_destination(
+                            home,
+                            source,
+                            destination,
+                            rollback_source_parent_fd,
+                            source_parent_identity_for_restore,
+                            destination_parent_identity_for_restore,
+                        )
+                        restored = False
+                        semantic_error = SyncError(
+                            "restored regular source changed and was retained "
+                            f"outside the active path: {retained_path}"
+                        )
+                        if restored_regular_error is not None:
+                            raise semantic_error from restored_regular_error
+                        raise semantic_error
+                _clear_failed_move_recovery_receipt(home, isolation.receipt)
+                rollback_destination_parent_fd = _open_directory_beneath(
+                    home,
+                    destination.parent,
+                )
+                if (
+                    _directory_identity(rollback_destination_parent_fd)
+                    != destination_parent_identity_for_restore
+                    or not _bound_directory_matches(
+                        home,
+                        destination.parent,
+                        rollback_destination_parent_fd,
+                    )
+                ):
+                    raise SyncError(
+                        "canonical destination parent changed after exact source "
+                        f"restoration: {destination.parent}"
+                    )
                 try:
                     os.stat(
                         destination.name,
-                        dir_fd=destination_parent_fd,
+                        dir_fd=rollback_destination_parent_fd,
                         follow_symlinks=False,
                     )
                 except FileNotFoundError:
@@ -8906,7 +10587,7 @@ def _atomic_move_beneath_home(
                 if not _bound_directory_matches(
                     home,
                     source.parent,
-                    source_parent_fd,
+                    rollback_source_parent_fd,
                 ):
                     raise SyncError(f"restored source parent changed: {source.parent}")
             except BaseException as rollback_error:
@@ -8915,12 +10596,19 @@ def _atomic_move_beneath_home(
                         "safe move failed after exact source restoration could not "
                         f"be validated: {source}: {rollback_error}"
                     ) from error
+                retained_location = isolated or destination
                 raise SyncError(
-                    "safe move failed and the entry was retained at its destination: "
-                    f"{destination}: {rollback_error}"
+                    "safe move failed and the entry was retained outside the "
+                    f"active source: {retained_location}: {rollback_error}"
                 ) from error
         raise
     finally:
+        if rollback_destination_parent_fd >= 0:
+            _close_fd_quietly(rollback_destination_parent_fd)
+        if isolated_parent_fd >= 0:
+            _close_fd_quietly(isolated_parent_fd)
+        if rollback_source_parent_fd >= 0:
+            _close_fd_quietly(rollback_source_parent_fd)
         _close_fd_quietly(source_parent_fd)
         _close_fd_quietly(destination_parent_fd)
 
@@ -8940,6 +10628,152 @@ def _symlink_snapshot_at(
     return identity, link_target
 
 
+def _regular_file_snapshot_at(
+    parent_fd: int,
+    name: str,
+    path: Path,
+    *,
+    maximum_bytes: int = MAX_ARCHIVE_MEMBER_BYTES,
+) -> RegularFileSnapshot:
+    try:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise SyncError(
+            f"managed regular file is unreadable: {path}: {error}"
+        ) from error
+    if not stat.S_ISREG(named.st_mode):
+        raise SyncError(f"managed target is not a regular file: {path}")
+    if named.st_size > maximum_bytes:
+        raise SyncError(f"managed regular file exceeds {maximum_bytes} bytes: {path}")
+    expected_identity = (named.st_dev, named.st_ino)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    file_fd = -1
+    try:
+        try:
+            file_fd = os.open(name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            raise SyncError(
+                f"managed regular file is unreadable: {path}: {error}"
+            ) from error
+        opened = _require_release_identity_fd_access_policy(
+            file_fd,
+            path,
+            os.geteuid(),
+        )
+        if not _regular_stat_metadata_matches(opened, named):
+            raise SyncError(f"managed regular file changed before read: {path}")
+        payload = _read_managed_state_bytes(file_fd, path, maximum_bytes)
+        os.lseek(file_fd, 0, os.SEEK_SET)
+        if _read_managed_state_bytes(file_fd, path, maximum_bytes) != payload:
+            raise SyncError(f"managed regular file content changed during read: {path}")
+        confirmed = os.fstat(file_fd)
+        if not _regular_stat_metadata_matches(confirmed, named):
+            raise SyncError(f"managed regular file changed during read: {path}")
+        rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _regular_stat_metadata_matches(rebound, named):
+            raise SyncError(f"managed regular file changed during read: {path}")
+        access_revalidated = _require_release_identity_fd_access_policy(
+            file_fd,
+            path,
+            os.geteuid(),
+        )
+        if not _regular_stat_metadata_matches(access_revalidated, named):
+            raise SyncError(
+                f"managed regular file changed during access-policy revalidation: {path}"
+            )
+    finally:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
+    return RegularFileSnapshot(
+        parent_identity=_directory_identity(parent_fd),
+        file_identity=expected_identity,
+        sha256=hashlib.sha256(payload).hexdigest(),
+        size=len(payload),
+        mode=stat.S_IMODE(named.st_mode),
+        uid=named.st_uid,
+        gid=named.st_gid,
+        link_count=named.st_nlink,
+    )
+
+
+def _read_regular_file_snapshot_beneath(
+    home: Path,
+    path: Path,
+    *,
+    require_managed_access: bool,
+) -> RegularFileSnapshot:
+    parent_fd = _open_directory_beneath(home, path.parent)
+    try:
+        _require_managed_regular_parent_chain_access(
+            home,
+            path.parent,
+            bound_parent_fd=parent_fd,
+        )
+        snapshot = _regular_file_snapshot_at(parent_fd, path.name, path)
+        if require_managed_access and (
+            snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.link_count != 1
+        ):
+            raise SyncError(
+                "managed regular file access policy mismatch: "
+                f"{path} (mode={snapshot.mode:o}, uid={snapshot.uid}, "
+                f"links={snapshot.link_count})"
+            )
+        _require_managed_regular_parent_chain_access(
+            home,
+            path.parent,
+            bound_parent_fd=parent_fd,
+        )
+        return snapshot
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _remove_expected_regular_file_beneath(
+    home: Path,
+    target: Path,
+    expected: RegularFileSnapshot,
+) -> None:
+    parent_fd = _open_directory_beneath(home, target.parent)
+    try:
+        quarantine_path, moved = _move_regular_leaf_to_unique_quarantine(
+            home,
+            target.parent,
+            parent_fd,
+            target.name,
+            label="remove",
+            expected=expected,
+        )
+        if (
+            not _regular_snapshot_leaf_matches(
+                moved,
+                expected,
+            )
+            or moved.link_count != expected.link_count
+        ):
+            raise SyncError(
+                "managed regular file changed during removal and was retained "
+                f"in quarantine: {target} -> {quarantine_path}"
+            )
+        try:
+            os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise SyncError(
+                "managed regular file replacement appeared during removal and "
+                f"was left in place: {target}; original retained in quarantine: "
+                f"{quarantine_path}"
+            )
+        if not _bound_directory_matches(home, target.parent, parent_fd):
+            raise SyncError(f"managed target parent changed: {target.parent}")
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
 def _validate_reconcile_link_target(link_target: str, label: str) -> str:
     try:
         encoded = os.fsencode(link_target)
@@ -8955,18 +10789,33 @@ def _validate_reconcile_link_target(link_target: str, label: str) -> str:
 def _capture_reconcile_target_snapshot(
     home: Path,
     target: Path,
+    *,
+    capture_regular_content: bool = True,
+    require_managed_parent_access: bool = False,
 ) -> ReconcileTargetSnapshot:
     parent_parts = _directory_parts_beneath(home, target.parent)
     child_flags = _directory_open_flags(nofollow=True)
     parent_fd = _open_directory_beneath(home, home)
     current_path = home
     try:
+        if require_managed_parent_access:
+            _require_managed_regular_directory_fd_access(
+                home,
+                current_path,
+                parent_fd,
+            )
         for index, part in enumerate(parent_parts):
             try:
                 next_fd = os.open(part, child_flags, dir_fd=parent_fd)
             except FileNotFoundError:
                 ancestor_identity = _directory_identity(parent_fd)
-                if not _bound_directory_matches(home, current_path, parent_fd):
+                if require_managed_parent_access:
+                    _require_managed_regular_directory_fd_access(
+                        home,
+                        current_path,
+                        parent_fd,
+                    )
+                elif not _bound_directory_matches(home, current_path, parent_fd):
                     raise SyncError(f"managed target ancestor changed: {current_path}")
                 return ReconcileTargetSnapshot(
                     parent_identity=None,
@@ -8976,8 +10825,20 @@ def _capture_reconcile_target_snapshot(
             _close_fd_quietly(parent_fd)
             parent_fd = next_fd
             current_path /= part
+            if require_managed_parent_access:
+                _require_managed_regular_directory_fd_access(
+                    home,
+                    current_path,
+                    parent_fd,
+                )
         parent_identity = _directory_identity(parent_fd)
-        if not _bound_directory_matches(home, target.parent, parent_fd):
+        if require_managed_parent_access:
+            _require_managed_regular_directory_fd_access(
+                home,
+                target.parent,
+                parent_fd,
+            )
+        elif not _bound_directory_matches(home, target.parent, parent_fd):
             raise SyncError(f"managed target parent changed: {target.parent}")
         try:
             metadata = os.stat(
@@ -8986,13 +10847,64 @@ def _capture_reconcile_target_snapshot(
                 follow_symlinks=False,
             )
         except FileNotFoundError:
-            if not _bound_directory_matches(home, target.parent, parent_fd):
+            if require_managed_parent_access:
+                _require_managed_regular_directory_fd_access(
+                    home,
+                    target.parent,
+                    parent_fd,
+                )
+            elif not _bound_directory_matches(home, target.parent, parent_fd):
                 raise SyncError(f"managed target parent changed: {target.parent}")
             return ReconcileTargetSnapshot(
                 parent_identity=parent_identity,
                 ancestor_identity=parent_identity,
             )
+        if stat.S_ISREG(metadata.st_mode):
+            if not capture_regular_content:
+                if require_managed_parent_access:
+                    _require_managed_regular_directory_fd_access(
+                        home,
+                        target.parent,
+                        parent_fd,
+                    )
+                elif not _bound_directory_matches(home, target.parent, parent_fd):
+                    raise SyncError(f"managed target parent changed: {target.parent}")
+                return ReconcileTargetSnapshot(
+                    parent_identity=parent_identity,
+                    link_identity=(metadata.st_dev, metadata.st_ino),
+                    ancestor_identity=parent_identity,
+                )
+            regular = _regular_file_snapshot_at(
+                parent_fd,
+                target.name,
+                target,
+            )
+            if require_managed_parent_access:
+                _require_managed_regular_directory_fd_access(
+                    home,
+                    target.parent,
+                    parent_fd,
+                )
+            elif not _bound_directory_matches(home, target.parent, parent_fd):
+                raise SyncError(f"managed target parent changed: {target.parent}")
+            return ReconcileTargetSnapshot(
+                parent_identity=parent_identity,
+                link_identity=regular.file_identity,
+                ancestor_identity=parent_identity,
+                regular_sha256=regular.sha256,
+                regular_size=regular.size,
+                regular_mode=regular.mode,
+                regular_uid=regular.uid,
+                regular_gid=regular.gid,
+                regular_link_count=regular.link_count,
+            )
         if not stat.S_ISLNK(metadata.st_mode):
+            if require_managed_parent_access:
+                _require_managed_regular_directory_fd_access(
+                    home,
+                    target.parent,
+                    parent_fd,
+                )
             return ReconcileTargetSnapshot(
                 parent_identity=parent_identity,
                 link_identity=(metadata.st_dev, metadata.st_ino),
@@ -9003,7 +10915,13 @@ def _capture_reconcile_target_snapshot(
             link_target,
             f"managed target symlink value for {target}",
         )
-        if not _bound_directory_matches(home, target.parent, parent_fd):
+        if require_managed_parent_access:
+            _require_managed_regular_directory_fd_access(
+                home,
+                target.parent,
+                parent_fd,
+            )
+        elif not _bound_directory_matches(home, target.parent, parent_fd):
             raise SyncError(f"managed target parent changed: {target.parent}")
         return ReconcileTargetSnapshot(
             parent_identity=parent_identity,
@@ -9019,12 +10937,18 @@ def _require_reconcile_target_snapshot(
     home: Path,
     target: Path,
     expected_snapshot: ReconcileTargetSnapshot,
+    *,
+    require_managed_parent_access: bool = False,
 ) -> None:
     try:
-        actual_snapshot = _capture_reconcile_target_snapshot(home, target)
+        actual_snapshot = _capture_reconcile_target_snapshot(
+            home,
+            target,
+            require_managed_parent_access=require_managed_parent_access,
+        )
     except (OSError, SyncError) as error:
         raise SyncError(f"managed target changed after planning: {target}") from error
-    if actual_snapshot != expected_snapshot:
+    if not _reconcile_target_snapshot_matches(actual_snapshot, expected_snapshot):
         raise SyncError(f"managed target changed after planning: {target}")
 
 
@@ -9132,6 +11056,168 @@ def _move_symlink_leaf_to_unique_quarantine(
         _close_fd_quietly(quarantine_parent_fd)
 
 
+def _move_regular_leaf_to_unique_quarantine(
+    home: Path,
+    source_parent: Path,
+    source_parent_fd: int,
+    source_name: str,
+    *,
+    label: str,
+    expected: RegularFileSnapshot | None = None,
+    expected_identity: tuple[int, int] | None = None,
+    retain_batch_binding: bool = False,
+) -> (
+    tuple[Path, RegularFileSnapshot]
+    | tuple[Path, RegularFileSnapshot, EphemeralQuarantineBatchBinding]
+):
+    source_path = Path(source_name)
+    source_snapshot = _regular_file_snapshot_at(
+        source_parent_fd,
+        source_name,
+        source_path,
+    )
+    if expected is not None and not _regular_snapshot_matches(
+        source_snapshot,
+        expected.parent_identity,
+        expected,
+        expected_link_count=expected.link_count,
+    ):
+        raise SyncError(f"regular file changed before quarantine: {source_name}")
+    if (
+        expected_identity is not None
+        and source_snapshot.file_identity != expected_identity
+    ):
+        raise SyncError(f"regular file changed before quarantine: {source_name}")
+    allocation: EphemeralQuarantineBatchAllocation | None = None
+    quarantine_parent: Path | None = None
+    destination: Path | None = None
+    try:
+        allocated = _quarantine_batch_root(
+            home,
+            [],
+            retain_binding=True,
+            retain_scaffold_binding=True,
+        )
+        assert isinstance(allocated, EphemeralQuarantineBatchAllocation)
+        allocation = allocated
+        batch_root = allocation.batch_root
+        metadata = allocation.binding.metadata
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(metadata)
+            or metadata.file_type != stat.S_IFREG
+            or metadata.mode != 0o600
+            or metadata.uid != os.geteuid()
+        ):
+            raise SyncError(f"ephemeral quarantine metadata is unsafe: {batch_root}")
+        current_metadata = _read_managed_state_file_snapshot(
+            home,
+            batch_root / "metadata.json",
+            allocation.batch_fd,
+            expected_identity=metadata.file_identity,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_metadata,
+            metadata,
+        ):
+            raise SyncError(f"ephemeral quarantine metadata changed: {batch_root}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            batch_root / "metadata.json",
+            allocation.batch_fd,
+            current_metadata,
+        )
+        quarantine_parent = batch_root / "leaf"
+        allocation.create_leaf()
+        for attempt in range(100):
+            destination_name = f"{label}-{os.getpid()}-{time.time_ns()}-{attempt}"
+            try:
+                _require_managed_regular_parent_chain_access(
+                    home,
+                    source_parent,
+                    bound_parent_fd=source_parent_fd,
+                )
+                _require_ephemeral_quarantine_private_boundary(allocation)
+                # rename(2) may commit and then surface a BaseException through
+                # a wrapper or signal.  Empty-scaffold authority is therefore
+                # revoked before the first attempt, not after apparent success.
+                allocation.revoke_reclaim()
+                _rename_noreplace_at(
+                    source_parent_fd,
+                    source_name,
+                    allocation.leaf_fd,
+                    destination_name,
+                )
+            except FileExistsError:
+                continue
+            destination = quarantine_parent / destination_name
+            break
+        if destination is None:
+            raise SyncError(
+                f"could not allocate a unique quarantine path for {source_name}"
+            )
+        try:
+            os.fsync(source_parent_fd)
+            os.fsync(allocation.leaf_fd)
+            moved = _regular_file_snapshot_at(
+                allocation.leaf_fd,
+                destination.name,
+                destination,
+            )
+            _require_ephemeral_quarantine_private_boundary(
+                allocation,
+                expected_leaf_members=(destination.name,),
+            )
+        except BaseException as error:
+            raise SyncError(
+                "moved regular-file leaf was retained in quarantine after "
+                f"validation failed: {destination}: {error}"
+            ) from error
+        moved_matches = (
+            _regular_snapshot_leaf_matches(
+                moved,
+                source_snapshot,
+            )
+            and moved.link_count == source_snapshot.link_count
+        )
+        if not moved_matches:
+            raise SyncError(
+                "regular file changed during quarantine and was retained as "
+                f"isolated evidence at {destination}"
+            )
+        allocation.retire_allocation_fence_after_private_use(
+            private_member_name=destination.name,
+            private_member=moved,
+        )
+        if not retain_batch_binding:
+            return destination, moved
+        return (
+            destination,
+            moved,
+            allocation.binding,
+        )
+    except BaseException as original_error:
+        if allocation is not None and allocation.reclaim_authorized:
+            try:
+                allocation.reclaim_empty()
+            except (OSError, SyncError) as cleanup_error:
+                cleanup_note = (
+                    "fallback quarantine setup failed and its empty scaffold could "
+                    f"not be safely reclaimed: {cleanup_error}"
+                )
+                add_note = getattr(original_error, "add_note", None)
+                if callable(add_note):
+                    add_note(cleanup_note)
+                else:
+                    raise SyncError(
+                        f"{cleanup_note}; original setup failure: {original_error}"
+                    ) from cleanup_error
+        raise
+    finally:
+        if allocation is not None:
+            allocation.close()
+
+
 def _publish_reconcile_directory_noreplace(
     parent_fd: int,
     name: str,
@@ -9204,16 +11290,29 @@ def _open_reconcile_parent_for_create(
     target: Path,
     expected_snapshot: ReconcileTargetSnapshot,
     created_parent_identities: dict[Path, tuple[int, int]],
+    *,
+    require_managed_parent_access: bool = False,
 ) -> int:
     if expected_snapshot.link_identity is not None:
         raise SyncError(f"create target was not absent when planned: {target}")
     if expected_snapshot.parent_identity is not None:
-        _require_reconcile_target_snapshot(home, target, expected_snapshot)
+        _require_reconcile_target_snapshot(
+            home,
+            target,
+            expected_snapshot,
+            require_managed_parent_access=require_managed_parent_access,
+        )
         parent_fd = _open_directory_beneath(home, target.parent)
         if _directory_identity(parent_fd) != expected_snapshot.parent_identity:
             _close_fd_quietly(parent_fd)
             raise SyncError(
                 f"managed target parent changed after planning: {target.parent}"
+            )
+        if require_managed_parent_access:
+            _require_managed_regular_parent_chain_access(
+                home,
+                target.parent,
+                bound_parent_fd=parent_fd,
             )
         return parent_fd
 
@@ -9236,6 +11335,12 @@ def _open_reconcile_parent_for_create(
         ):
             raise SyncError(
                 f"managed target ancestor changed after planning: {ancestor_path}"
+            )
+        if require_managed_parent_access:
+            _require_managed_regular_parent_chain_access(
+                home,
+                ancestor_path,
+                bound_parent_fd=parent_fd,
             )
         current_path = ancestor_path
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -9266,13 +11371,25 @@ def _open_reconcile_parent_for_create(
             _close_fd_quietly(parent_fd)
             parent_fd = next_fd
             current_path = next_path
-            if not _bound_directory_matches(home, current_path, parent_fd):
+            if require_managed_parent_access:
+                _require_managed_regular_directory_fd_access(
+                    home,
+                    current_path,
+                    parent_fd,
+                )
+            elif not _bound_directory_matches(home, current_path, parent_fd):
                 raise SyncError(
                     f"transaction-created managed parent changed: {current_path}"
                 )
         try:
             os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
+            if require_managed_parent_access:
+                _require_managed_regular_parent_chain_access(
+                    home,
+                    target.parent,
+                    bound_parent_fd=parent_fd,
+                )
             return parent_fd
         raise SyncError(f"managed target appeared after planning: {target}")
     except BaseException:
@@ -9377,6 +11494,396 @@ def _create_symlink_beneath(
             ) from error
         raise
     finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _read_regular_source_payload(home: Path, source: Path) -> bytes:
+    try:
+        source.relative_to(home)
+    except ValueError:
+        try:
+            named = os.lstat(source)
+        except OSError as error:
+            raise SyncError(
+                f"managed regular-file source is unreadable: {source}: {error}"
+            ) from error
+        if not stat.S_ISREG(named.st_mode):
+            raise SyncError(f"managed regular-file source is not regular: {source}")
+        if named.st_size > MAX_ARCHIVE_MEMBER_BYTES:
+            raise SyncError(
+                f"managed regular-file source exceeds the size limit: {source}"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        file_fd = -1
+        try:
+            file_fd = os.open(source, flags)
+            if not _regular_stat_metadata_matches(os.fstat(file_fd), named):
+                raise SyncError(
+                    f"managed regular-file source changed before read: {source}"
+                )
+            payload = _read_managed_state_bytes(
+                file_fd,
+                source,
+                MAX_ARCHIVE_MEMBER_BYTES,
+            )
+            os.lseek(file_fd, 0, os.SEEK_SET)
+            confirmed = _read_managed_state_bytes(
+                file_fd,
+                source,
+                MAX_ARCHIVE_MEMBER_BYTES,
+            )
+            if confirmed != payload or (
+                not _regular_stat_metadata_matches(os.fstat(file_fd), named)
+            ):
+                raise SyncError(
+                    f"managed regular-file source changed during read: {source}"
+                )
+            if not _regular_stat_metadata_matches(os.lstat(source), named):
+                raise SyncError(
+                    f"managed regular-file source changed during read: {source}"
+                )
+            return payload
+        finally:
+            if file_fd >= 0:
+                _close_fd_quietly(file_fd)
+    parent_fd = _open_directory_beneath(home, source.parent)
+    try:
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            source,
+            parent_fd,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+        if not snapshot.exists or snapshot.payload is None:
+            raise SyncError(f"managed regular-file source is missing: {source}")
+        if snapshot.file_type != stat.S_IFREG:
+            raise SyncError(f"managed regular-file source is not regular: {source}")
+        return snapshot.payload
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _evacuate_created_regular_leaf_after_failure(
+    home: Path,
+    target: Path,
+    parent_fd: int,
+    parent_identity: tuple[int, int],
+    created_identity: tuple[int, int] | None,
+    payload: bytes,
+) -> tuple[Path, RegularFileSnapshot]:
+    """Retain a failed create outside its canonical TOML pathname.
+
+    The protected properties are the observed leaf's content stability and
+    access policy, the identity of the already-bound parent, and the created
+    leaf's object identity when the initial descriptor stat succeeded. A
+    descriptor-stat failure cannot authorize leaving a loadable
+    ``agents/*.toml`` behind, so the first operation is an identity-agnostic,
+    no-replace rename to a high-entropy non-TOML alias in that bound parent.
+    Identity/content/access validation happens only after the observed leaf is
+    moved into a mode-0700 private quarantine. Parent timestamps and link-count
+    churn are not mutation signals; parent object replacement, an unreadable or
+    changed leaf, alias reappearance, or canonical-name reappearance all retain
+    evidence and fail closed. An unbound replacement can therefore be retained,
+    but is never deleted as though it were the created object. Before the first
+    private move, an allocation-time binding over the batch, metadata and leaf
+    authorizes reclamation only while that scaffold remains exact and empty.
+    """
+    active_name: str | None = None
+    for _attempt in range(128):
+        candidate = (
+            f".codex-created-leaf-{os.getpid()}-{secrets.token_hex(16)}.evidence"
+        )
+        try:
+            _rename_noreplace_at(
+                parent_fd,
+                target.name,
+                parent_fd,
+                candidate,
+            )
+        except FileExistsError:
+            continue
+        except FileNotFoundError as error:
+            raise SyncError(
+                f"created managed regular file disappeared before evacuation: {target}"
+            ) from error
+        active_name = candidate
+        break
+    if active_name is None:
+        raise SyncError(
+            f"could not allocate a non-loadable created-leaf alias: {target}"
+        )
+    active_path = target.with_name(active_name)
+    try:
+        os.fsync(parent_fd)
+    except BaseException as error:
+        raise SyncError(
+            "created managed regular file was retained under a non-loadable "
+            f"alias after evacuation sync failed: {active_path}: {error}"
+        ) from error
+
+    allocation: EphemeralQuarantineBatchAllocation | None = None
+    destination: Path | None = None
+    quarantine_setup_complete = False
+    try:
+        try:
+            allocated = _quarantine_batch_root(
+                home,
+                [],
+                retain_binding=True,
+                retain_scaffold_binding=True,
+            )
+            assert isinstance(allocated, EphemeralQuarantineBatchAllocation)
+            allocation = allocated
+            batch_root = allocation.batch_root
+            metadata = allocation.binding.metadata
+            if (
+                not _managed_state_snapshot_has_complete_file_evidence(metadata)
+                or metadata.file_type != stat.S_IFREG
+                or metadata.mode != 0o600
+                or metadata.uid != os.geteuid()
+            ):
+                raise SyncError(
+                    f"ephemeral quarantine metadata is unsafe: {batch_root}"
+                )
+            current_metadata = _read_managed_state_file_snapshot(
+                home,
+                batch_root / "metadata.json",
+                allocation.batch_fd,
+                expected_identity=metadata.file_identity,
+                maximum_bytes=MAX_MANAGED_STATE_BYTES,
+            )
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                current_metadata,
+                metadata,
+            ):
+                raise SyncError(f"ephemeral quarantine metadata changed: {batch_root}")
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                batch_root / "metadata.json",
+                allocation.batch_fd,
+                current_metadata,
+            )
+            quarantine_parent = batch_root / "leaf"
+            allocation.create_leaf()
+            quarantine_setup_complete = True
+        except BaseException as error:
+            raise SyncError(
+                "created managed regular file was retained under a non-loadable "
+                "alias because private quarantine setup failed: "
+                f"{active_path}: {error}"
+            ) from error
+
+        assert allocation is not None
+        _require_ephemeral_quarantine_private_boundary(allocation)
+        if _directory_identity(parent_fd) != parent_identity:
+            raise SyncError(
+                f"created managed regular-file parent binding changed: {target.parent}"
+            )
+        for _attempt in range(128):
+            destination_name = (
+                f"created-leaf-{os.getpid()}-{time.time_ns()}-"
+                f"{secrets.token_hex(16)}.evidence"
+            )
+            try:
+                _require_ephemeral_quarantine_private_boundary(allocation)
+                allocation.revoke_reclaim()
+                _rename_noreplace_at(
+                    parent_fd,
+                    active_name,
+                    allocation.leaf_fd,
+                    destination_name,
+                )
+            except FileExistsError:
+                continue
+            except FileNotFoundError as error:
+                raise SyncError(
+                    "created managed regular-file non-loadable alias disappeared "
+                    f"before private isolation: {active_path}"
+                ) from error
+            destination = quarantine_parent / destination_name
+            break
+        if destination is None:
+            raise SyncError(
+                f"could not allocate private created-leaf evidence for {active_path}"
+            )
+        try:
+            os.fsync(parent_fd)
+            os.fsync(allocation.leaf_fd)
+            moved = _regular_file_snapshot_at(
+                allocation.leaf_fd,
+                destination.name,
+                destination,
+            )
+            _require_ephemeral_quarantine_private_boundary(
+                allocation,
+                expected_leaf_members=(destination.name,),
+            )
+        except BaseException as error:
+            raise SyncError(
+                "created managed regular-file evidence was retained in private "
+                f"quarantine after validation failed: {destination}: {error}"
+            ) from error
+
+        if (
+            (created_identity is not None and moved.file_identity != created_identity)
+            or moved.sha256 != hashlib.sha256(payload).hexdigest()
+            or moved.size != len(payload)
+            or moved.mode != 0o600
+            or moved.uid != os.geteuid()
+            or moved.link_count != 1
+        ):
+            raise SyncError(
+                "created managed regular file changed during evacuation and was "
+                f"retained as private evidence: {target} -> {destination}"
+            )
+        try:
+            canonical_identity = _named_entry_identity(parent_fd, target.name)
+            active_identity = _named_entry_identity(parent_fd, active_name)
+        except OSError as error:
+            raise SyncError(
+                "created managed regular-file public names became unreadable; "
+                f"private evidence was retained: {destination}"
+            ) from error
+        if canonical_identity is not None:
+            raise SyncError(
+                "created managed regular-file canonical name reappeared; private "
+                f"evidence was retained: {target} -> {destination}"
+            )
+        if active_identity is not None:
+            raise SyncError(
+                "created managed regular-file evacuation alias reappeared; private "
+                f"evidence was retained: {active_path} -> {destination}"
+            )
+        if _directory_identity(
+            parent_fd
+        ) != parent_identity or not _bound_directory_matches(
+            home, target.parent, parent_fd
+        ):
+            raise SyncError(
+                "created managed regular-file parent changed during evacuation; "
+                f"private evidence was retained: {destination}"
+            )
+        allocation.retire_allocation_fence_after_private_use(
+            private_member_name=destination.name,
+            private_member=moved,
+        )
+        return destination, moved
+    except BaseException as original_error:
+        if allocation is not None and allocation.reclaim_authorized:
+            try:
+                allocation.reclaim_empty()
+            except (OSError, SyncError) as cleanup_error:
+                cleanup_note = (
+                    "created-leaf quarantine setup failed and its empty scaffold "
+                    f"could not be safely reclaimed: {cleanup_error}"
+                )
+                add_note = getattr(original_error, "add_note", None)
+                if callable(add_note):
+                    add_note(cleanup_note)
+                else:
+                    raise SyncError(
+                        f"{cleanup_note}; original setup failure: {original_error}"
+                    ) from cleanup_error
+        if quarantine_setup_complete and destination is None:
+            raise SyncError(
+                "created managed regular file remained under its non-loadable "
+                "alias after private isolation failed: "
+                f"{active_path}: {original_error}"
+            ) from original_error
+        raise
+    finally:
+        if allocation is not None:
+            allocation.close()
+
+
+def _create_regular_file_beneath(
+    home: Path,
+    source: Path,
+    target: Path,
+    expected_snapshot: ReconcileTargetSnapshot | None = None,
+    created_parent_identities: dict[Path, tuple[int, int]] | None = None,
+) -> RegularFileSnapshot:
+    payload = _read_regular_source_payload(home, source)
+    _ensure_safe_target_parent(home, target)
+    if expected_snapshot is not None:
+        if created_parent_identities is None:
+            created_parent_identities = {}
+        parent_fd = _open_reconcile_parent_for_create(
+            home,
+            target,
+            expected_snapshot,
+            created_parent_identities,
+            require_managed_parent_access=True,
+        )
+    else:
+        parent_fd = _open_or_create_directory_beneath(home, target.parent)
+    file_fd = -1
+    parent_identity: tuple[int, int] | None = None
+    created = False
+    created_identity: tuple[int, int] | None = None
+    try:
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
+        parent_identity = _directory_identity(parent_fd)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        file_fd = os.open(target.name, flags, 0o600, dir_fd=parent_fd)
+        created = True
+        opened = os.fstat(file_fd)
+        created_identity = (opened.st_dev, opened.st_ino)
+        os.fchmod(file_fd, 0o600)
+        with os.fdopen(file_fd, "wb", closefd=True) as file:
+            file_fd = -1
+            file.write(payload)
+            file.flush()
+            os.fsync(file.fileno())
+        os.fsync(parent_fd)
+        snapshot = _regular_file_snapshot_at(parent_fd, target.name, target)
+        if (
+            snapshot.parent_identity != parent_identity
+            or snapshot.file_identity != created_identity
+            or snapshot.sha256 != hashlib.sha256(payload).hexdigest()
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.link_count != 1
+        ):
+            raise SyncError(f"created managed regular file changed: {target}")
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
+        return snapshot
+    except BaseException as error:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
+            file_fd = -1
+        if created:
+            assert parent_identity is not None
+            try:
+                _evacuate_created_regular_leaf_after_failure(
+                    home,
+                    target,
+                    parent_fd,
+                    parent_identity,
+                    created_identity,
+                    payload,
+                )
+            except (OSError, SyncError) as cleanup_error:
+                raise SyncError(
+                    "managed regular-file creation failed and exact cleanup "
+                    f"could not be verified: {target}: {cleanup_error}"
+                ) from error
+        raise
+    finally:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
         _close_fd_quietly(parent_fd)
 
 
@@ -9695,8 +12202,409 @@ def _managed_state_snapshot_matches_file_evidence(
         and actual.file_type == expected.file_type
         and actual.size == expected.size
         and actual.uid == expected.uid
-        and actual.gid == expected.gid
+        and _gid_matches_regular_file_access_policy(
+            actual.gid,
+            expected.gid,
+            expected.mode,
+        )
     )
+
+
+def _managed_state_snapshot_matches_bound_file_evidence(
+    actual: ManagedStateFileSnapshot,
+    expected: ManagedStateFileSnapshot,
+) -> bool:
+    return (
+        actual.parent_identity == expected.parent_identity
+        and _managed_state_snapshot_matches_file_evidence(actual, expected)
+    )
+
+
+def _pending_cleanup_ticket_matches(
+    actual: PendingBatchCleanupTicket,
+    expected: PendingBatchCleanupTicket,
+) -> bool:
+    return (
+        actual.version == expected.version
+        and actual.phase == expected.phase
+        and actual.path == expected.path
+        and _managed_state_snapshot_matches_bound_file_evidence(
+            actual.snapshot,
+            expected.snapshot,
+        )
+        and actual.batch_root == expected.batch_root
+        and actual.batch_root_identity == expected.batch_root_identity
+        and actual.marker_path == expected.marker_path
+        and actual.marker_parent_identity == expected.marker_parent_identity
+        and actual.marker_file_identity == expected.marker_file_identity
+        and actual.marker_mode == expected.marker_mode
+        and actual.marker_sha256 == expected.marker_sha256
+        and actual.terminal_regular_targets == expected.terminal_regular_targets
+        and actual.kind == expected.kind
+        and actual.quarantine_root_identity == expected.quarantine_root_identity
+        and actual.isolated_name == expected.isolated_name
+        and actual.leaf_identity == expected.leaf_identity
+        and actual.metadata_file_identity == expected.metadata_file_identity
+        and actual.metadata_mode == expected.metadata_mode
+        and actual.metadata_sha256 == expected.metadata_sha256
+        and actual.metadata_size == expected.metadata_size
+        and actual.public_target == expected.public_target
+        and actual.public_parent_identity == expected.public_parent_identity
+        and actual.payload_file_identity == expected.payload_file_identity
+        and actual.payload_sha256 == expected.payload_sha256
+        and actual.payload_size == expected.payload_size
+        and actual.payload_mode == expected.payload_mode
+        and actual.payload_uid == expected.payload_uid
+        and actual.payload_gid == expected.payload_gid
+        and actual.payload_link_count == expected.payload_link_count
+    )
+
+
+def _require_pending_cleanup_fd_access_policy(
+    file_descriptor: int,
+    display_path: Path,
+    *,
+    expected_mode: int,
+) -> os.stat_result:
+    """Prove owner-only access on the exact pending-control object.
+
+    Object identity and type are stable signals and are revalidated by the
+    generic exact-FD ACL admission. POSIX mode and Darwin ACL semantics are the
+    protected access policy. ctime and directory link count are deliberately
+    only resampling signals; neither is treated as mutation by itself.
+    """
+    expected_owner_uid = os.geteuid()
+    try:
+        metadata = _require_release_identity_fd_access_policy(
+            file_descriptor,
+            display_path,
+            expected_owner_uid,
+        )
+    except SyncError as error:
+        raise _PendingCleanupAccessPolicyError(str(error)) from error
+    if metadata.st_uid != expected_owner_uid:
+        raise _PendingCleanupAccessPolicyError(
+            "pending cleanup access policy mismatch: "
+            f"{display_path}: owner UID {metadata.st_uid} "
+            f"!= expected UID {expected_owner_uid}"
+        )
+    if stat.S_IMODE(metadata.st_mode) != expected_mode:
+        raise _PendingCleanupAccessPolicyError(
+            "pending cleanup access policy mismatch: "
+            f"{display_path}: mode {stat.S_IMODE(metadata.st_mode):04o} "
+            f"!= {expected_mode:04o}"
+        )
+    return metadata
+
+
+def _rmdir_bound_empty_pending_cleanup_directory(
+    home: Path,
+    parent_path: Path,
+    parent_fd: int,
+    expected_parent_identity: tuple[int, int],
+    member_name: str,
+    member_path: Path,
+    member_fd: int,
+    expected_member_identity: tuple[int, int],
+    *,
+    changed_message: str,
+    mutation_revalidator: Callable[[], None],
+) -> None:
+    """Privately isolate and remove only the bound empty directory.
+
+    The protected properties are the parent/member object identities, the
+    member's empty contents, and owner-only access policy on both directories.
+    Directory ctime and link count are intentionally not compared: child-entry
+    churn can change both without replacing either protected object.  Portable
+    Unix has no inode-conditional ``rmdir``, so atomically rename the current
+    source to an identity-encoded, high-entropy private name first.  A source
+    replacement observed before the final rebind is moved but retained as
+    evidence; within the cooperative same-UID threat model, the expected object
+    is then reopened with ``O_NOFOLLOW`` and removed.  This does not cover an
+    excluded non-cooperating same-UID process actively replacing the
+    high-entropy tombstone after that rebind.  No external mutation authority
+    callback runs after isolation; the exact bound parent/member policies and
+    pathname binding are revalidated before removal.
+    """
+    planned = (
+        expected_member_identity[0],
+        expected_member_identity[1],
+        stat.S_IFDIR,
+    )
+
+    def require_parent_access_boundary() -> None:
+        if _directory_identity(
+            parent_fd
+        ) != expected_parent_identity or not _bound_directory_matches(
+            home, parent_path, parent_fd
+        ):
+            raise SyncError(changed_message)
+        _require_pending_cleanup_fd_access_policy(
+            parent_fd,
+            parent_path,
+            expected_mode=0o700,
+        )
+
+    boundary_fd = -1
+    try:
+        require_parent_access_boundary()
+        if (
+            _directory_identity(member_fd) != expected_member_identity
+            or not _bound_directory_matches(home, member_path, member_fd)
+            or _directory_member_names(member_fd, maximum_entries=1) != ()
+        ):
+            raise SyncError(changed_message)
+        _require_pending_cleanup_fd_access_policy(
+            member_fd,
+            member_path,
+            expected_mode=0o700,
+        )
+
+        private_name: str | None = None
+        isolation_error: BaseException | None = None
+        for _attempt in range(128):
+            mutation_revalidator()
+            # The callback may inspect mutable external authority. Reprove the
+            # exact parent's binding and owner-only access policy after it
+            # returns, before relying on this namespace for private isolation.
+            require_parent_access_boundary()
+            candidate = _pending_cleanup_entry_name(
+                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                expected_parent_identity,
+                planned,
+            )
+            try:
+                _rename_noreplace_at(
+                    parent_fd,
+                    member_name,
+                    parent_fd,
+                    candidate,
+                )
+            except FileExistsError:
+                continue
+            except BaseException as error:
+                source_identity = _named_entry_identity(parent_fd, member_name)
+                candidate_identity = _named_entry_identity(parent_fd, candidate)
+                if source_identity is None and candidate_identity is not None:
+                    private_name = candidate
+                    isolation_error = error
+                    break
+                if source_identity is None:
+                    raise SyncError(
+                        f"{changed_message}; directory disappeared during isolation"
+                    ) from error
+                raise SyncError(
+                    f"{changed_message}; directory could not be privately isolated"
+                ) from error
+            private_name = candidate
+            break
+        if private_name is None:
+            raise SyncError(
+                f"{changed_message}; could not allocate a private isolation name"
+            )
+        os.fsync(parent_fd)
+
+        private_path = parent_path / private_name
+        try:
+            boundary_fd = os.open(
+                private_name,
+                _directory_open_flags(nofollow=True),
+                dir_fd=parent_fd,
+            )
+        except OSError:
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                private_name,
+                expected_parent_identity,
+                planned,
+                label=f"{changed_message}; private evidence became unreadable",
+            )
+        if (
+            _directory_identity(boundary_fd) != expected_member_identity
+            or _directory_identity(member_fd) != expected_member_identity
+            or _directory_identity(parent_fd) != expected_parent_identity
+            or not _bound_directory_matches(home, parent_path, parent_fd)
+            or not _bound_directory_matches(home, private_path, boundary_fd)
+        ):
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                private_name,
+                expected_parent_identity,
+                planned,
+                label=f"{changed_message}; private evidence changed identity",
+            )
+        # Reopening the private name rebinds the pathname to the expected
+        # member descriptor, but identity alone does not preserve the parent's
+        # owner-only namespace policy.
+        require_parent_access_boundary()
+        try:
+            _require_pending_cleanup_fd_access_policy(
+                boundary_fd,
+                private_path,
+                expected_mode=0o700,
+            )
+        except SyncError:
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                private_name,
+                expected_parent_identity,
+                planned,
+                label=f"{changed_message}; private evidence changed access policy",
+            )
+        if (
+            _directory_member_names(boundary_fd, maximum_entries=1) != ()
+            or _named_entry_identity(parent_fd, private_name)
+            != expected_member_identity
+        ):
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                private_name,
+                expected_parent_identity,
+                planned,
+                label=f"{changed_message}; private evidence changed contents",
+            )
+        if isolation_error is not None:
+            raise isolation_error
+        # Close the final pathname boundary in policy-before-binding order:
+        # first prove that no non-owner can mutate the namespace, then rebind
+        # the private name and contents to the still-open expected directory.
+        require_parent_access_boundary()
+        if (
+            _directory_identity(boundary_fd) != expected_member_identity
+            or _directory_identity(member_fd) != expected_member_identity
+            or not _bound_directory_matches(home, private_path, boundary_fd)
+            or _directory_member_names(boundary_fd, maximum_entries=1) != ()
+            or _named_entry_identity(parent_fd, private_name)
+            != expected_member_identity
+        ):
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                private_name,
+                expected_parent_identity,
+                planned,
+                label=f"{changed_message}; private evidence changed before removal",
+            )
+        # The verified private name is fresh, high entropy, and exists only in
+        # this mode-0700 namespace.  Keep its exact descriptor live across the
+        # only pathname-based destructive syscall available on portable Unix.
+        os.rmdir(private_name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        if _named_entry_identity(parent_fd, private_name) is not None:
+            raise SyncError(f"{changed_message}; private name reappeared")
+    except OSError as error:
+        raise SyncError(changed_message) from error
+    finally:
+        _close_fd_quietly(boundary_fd)
+
+
+def _require_current_user_cleanup_fd_access_policy(
+    file_descriptor: int,
+    display_path: Path,
+) -> os.stat_result:
+    """Prove a cleanup object has no non-owner write authority.
+
+    The exact bound object, current-euid ownership, and absence of group/world
+    POSIX write authority are protected on every platform. The generic policy
+    additionally proves Darwin extended-ACL semantics without changing its
+    intentionally metadata-only non-Darwin contract.
+    """
+    expected_owner_uid = os.geteuid()
+    metadata = _require_release_identity_fd_access_policy(
+        file_descriptor,
+        display_path,
+        expected_owner_uid,
+    )
+    if metadata.st_uid != expected_owner_uid:
+        raise _release_identity_policy_error(
+            display_path,
+            f"owner UID {metadata.st_uid} != expected UID {expected_owner_uid}",
+            mismatch=True,
+        )
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode & 0o022:
+        raise _release_identity_policy_error(
+            display_path,
+            f"mode {mode:04o} grants group or world write authority",
+            mismatch=True,
+        )
+    return metadata
+
+
+def _require_pending_cleanup_file_snapshot_access_policy(
+    home: Path,
+    path: Path,
+    parent_fd: int,
+    snapshot: ManagedStateFileSnapshot,
+) -> None:
+    if not snapshot.exists or snapshot.file_identity is None:
+        raise SyncError(f"pending cleanup authority is missing: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    file_fd = -1
+    try:
+        file_fd = os.open(path.name, flags, dir_fd=parent_fd)
+        before = _require_pending_cleanup_fd_access_policy(
+            file_fd,
+            path,
+            expected_mode=0o600,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != snapshot.file_identity
+            or before.st_uid != snapshot.uid
+            or before.st_size != snapshot.size
+        ):
+            raise SyncError(f"pending cleanup authority changed: {path}")
+        rebound = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            (rebound.st_dev, rebound.st_ino) != snapshot.file_identity
+            or stat.S_IFMT(rebound.st_mode) != stat.S_IFREG
+            or not _bound_directory_matches(home, path.parent, parent_fd)
+        ):
+            raise SyncError(f"pending cleanup authority rebound: {path}")
+        after = _require_pending_cleanup_fd_access_policy(
+            file_fd,
+            path,
+            expected_mode=0o600,
+        )
+        if (after.st_dev, after.st_ino, after.st_size) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+        ):
+            raise SyncError(f"pending cleanup authority changed: {path}")
+    finally:
+        if file_fd >= 0:
+            _close_fd_quietly(file_fd)
+
+
+def _require_pending_cleanup_file_snapshot_unchanged(
+    home: Path,
+    path: Path,
+    parent_fd: int,
+    expected: ManagedStateFileSnapshot,
+    *,
+    label: str,
+    maximum_bytes: int = MAX_MANAGED_STATE_BYTES,
+) -> ManagedStateFileSnapshot:
+    """Rebind one exact control file's identity, bytes, and access policy."""
+    current = _read_managed_state_file_snapshot(
+        home,
+        path,
+        parent_fd,
+        expected_identity=expected.file_identity,
+        maximum_bytes=maximum_bytes,
+    )
+    if not _managed_state_snapshot_matches_bound_file_evidence(current, expected):
+        raise SyncError(f"{label} changed")
+    _require_pending_cleanup_file_snapshot_access_policy(
+        home,
+        path,
+        parent_fd,
+        current,
+    )
+    return current
 
 
 def _read_managed_state_bytes(
@@ -9765,7 +12673,6 @@ def _read_managed_state_file_snapshot(
         raise SyncError(f"Failed to read {path}: {error}") from error
     if not stat.S_ISREG(named_metadata.st_mode):
         raise SyncError(f"refusing non-file sync state: {path}")
-    expected_snapshot = _managed_state_metadata_snapshot(named_metadata)
     if (
         expected_identity is not None
         and (named_metadata.st_dev, named_metadata.st_ino) != expected_identity
@@ -9788,7 +12695,7 @@ def _read_managed_state_file_snapshot(
         opened_metadata = os.fstat(file_fd)
         if not stat.S_ISREG(opened_metadata.st_mode):
             raise SyncError(f"refusing non-file sync state: {path}")
-        if _managed_state_metadata_snapshot(opened_metadata) != expected_snapshot:
+        if not _regular_stat_metadata_matches(opened_metadata, named_metadata):
             raise SyncError(f"managed sync state changed before read: {path}")
         if (
             expected_identity is not None
@@ -9814,7 +12721,7 @@ def _read_managed_state_file_snapshot(
         )
         if confirmed_payload != payload:
             raise SyncError(f"managed sync state content changed during read: {path}")
-        if _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected_snapshot:
+        if not _regular_stat_metadata_matches(os.fstat(file_fd), named_metadata):
             raise SyncError(f"managed sync state changed during read: {path}")
         try:
             current_metadata = os.stat(
@@ -9826,7 +12733,7 @@ def _read_managed_state_file_snapshot(
             raise SyncError(
                 f"managed sync state changed during read: {path}"
             ) from error
-        if _managed_state_metadata_snapshot(current_metadata) != expected_snapshot:
+        if not _regular_stat_metadata_matches(current_metadata, named_metadata):
             raise SyncError(f"managed sync state changed during read: {path}")
         if not _bound_directory_matches(home, path.parent, parent_fd):
             raise SyncError(f"managed sync state parent changed during read: {path}")
@@ -10118,7 +13025,14 @@ def _managed_state_file_matches(
         and (snapshot.file_type is None or current.file_type == snapshot.file_type)
         and (snapshot.size is None or current.size == snapshot.size)
         and (snapshot.uid is None or current.uid == snapshot.uid)
-        and (snapshot.gid is None or current.gid == snapshot.gid)
+        and (
+            snapshot.gid is None
+            or _gid_matches_regular_file_access_policy(
+                current.gid,
+                snapshot.gid,
+                snapshot.mode,
+            )
+        )
         and (effective_identity is None or current.file_identity == effective_identity)
     )
 
@@ -10995,10 +13909,169 @@ def _verify_managed_state_current_owner_claims(
             )
 
 
+def _regular_alias_identity_beneath(
+    home: Path,
+    path: Path,
+) -> tuple[int, int] | None:
+    try:
+        parent_fd = _open_directory_beneath(home, path.parent)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            metadata = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        if not _bound_directory_matches(home, path.parent, parent_fd):
+            raise SyncError(f"pending regular-file alias parent changed: {path.parent}")
+        return metadata.st_dev, metadata.st_ino
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _verify_pending_regular_alias_batch_root(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> None:
+    batch_fd = _open_directory_beneath(home, batch.batch_root)
+    try:
+        if _directory_identity(
+            batch_fd
+        ) != batch.batch_root_identity or not _bound_directory_matches(
+            home, batch.batch_root, batch_fd
+        ):
+            raise SyncError(
+                f"pending regular-file batch root changed: {batch.batch_root}"
+            )
+    finally:
+        _close_fd_quietly(batch_fd)
+
+
+def _build_pending_regular_alias_authority_index(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> _PendingRegularAliasAuthorityIndex:
+    _verify_pending_regular_alias_batch_root(home, batch)
+    mutable_authorities: dict[tuple[int, int], tuple[set[Path], set[Path]]] = {}
+
+    def authority_for(
+        identity: tuple[int, int],
+    ) -> tuple[set[Path], set[Path]]:
+        return mutable_authorities.setdefault(identity, (set(), set()))
+
+    for record in batch.records:
+        if not record.has_regular_authority():
+            continue
+        target = home / Path(*record.target.parts)
+        if record.is_regular() and record.evidence_identity is not None:
+            if record.stage is None or record.evidence is None:
+                raise SyncError(
+                    f"pending regular-file alias authority is incomplete: {record.target}"
+                )
+            authorized_paths, required_paths = authority_for(record.evidence_identity)
+            stage = batch.batch_root / Path(*record.stage.parts)
+            evidence = batch.batch_root / Path(*record.evidence.parts)
+            authorized_paths.update((stage, evidence, target))
+            required_paths.update((stage, evidence))
+        if record.before_is_regular() and record.before_evidence_identity is not None:
+            if record.before_evidence is None:
+                raise SyncError(
+                    f"pending regular-file preimage authority is incomplete: {record.target}"
+                )
+            authorized_paths, required_paths = authority_for(
+                record.before_evidence_identity
+            )
+            before = batch.batch_root / Path(*record.before_evidence.parts)
+            authorized_paths.update((before, target))
+            required_paths.add(before)
+            if record.backup is not None:
+                authorized_paths.add(batch.batch_root / Path(*record.backup.parts))
+
+    return _PendingRegularAliasAuthorityIndex(
+        batch_root=batch.batch_root,
+        batch_root_identity=batch.batch_root_identity,
+        by_identity={
+            identity: _PendingRegularAliasAuthority(
+                authorized_paths=frozenset(authorized_paths),
+                required_paths=frozenset(required_paths),
+            )
+            for identity, (
+                authorized_paths,
+                required_paths,
+            ) in mutable_authorities.items()
+        },
+    )
+
+
+def _pending_regular_alias_authority_index(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> _PendingRegularAliasAuthorityIndex:
+    index = batch.regular_alias_authority_index
+    if index is None:
+        index = _build_pending_regular_alias_authority_index(home, batch)
+        batch.regular_alias_authority_index = index
+    elif (
+        index.batch_root != batch.batch_root
+        or index.batch_root_identity != batch.batch_root_identity
+    ):
+        raise SyncError("pending regular-file alias authority index is invalid")
+    _verify_pending_regular_alias_batch_root(home, batch)
+    return index
+
+
+def _verify_pending_regular_aliases(
+    home: Path,
+    batch: PendingLinkBatch | None,
+    observed_path: Path,
+    snapshot: RegularFileSnapshot,
+) -> None:
+    if batch is None:
+        if snapshot.link_count != 1:
+            raise SyncError(
+                f"managed regular file has an unauthorized hard link: {observed_path}"
+            )
+        return
+
+    identity = snapshot.file_identity
+    authority = _pending_regular_alias_authority_index(home, batch).by_identity.get(
+        identity
+    )
+    if authority is None:
+        if snapshot.link_count != 1:
+            raise SyncError(
+                "managed regular file has no transaction record authorizing its "
+                f"hard links: {observed_path}"
+            )
+        return
+
+    observed_aliases: set[Path] = set()
+    for path in authority.authorized_paths | {observed_path}:
+        alias_identity = _regular_alias_identity_beneath(home, path)
+        if path in authority.required_paths and alias_identity != identity:
+            raise SyncError(f"pending regular-file authority changed: {path}")
+        if alias_identity == identity:
+            observed_aliases.add(path)
+    if observed_path not in observed_aliases:
+        raise SyncError(f"pending regular-file observed alias changed: {observed_path}")
+    if snapshot.link_count != len(observed_aliases):
+        raise SyncError(
+            "pending regular file has an unauthorized hard-link alias: "
+            f"{observed_path} (links={snapshot.link_count}, "
+            f"authorized={len(observed_aliases)})"
+        )
+
+
 def _verify_managed_state_link_claims(
     home: Path,
     state: ManagedState,
     planned_actions: list[ReconcileAction] | None = None,
+    *,
+    pending_batch: PendingLinkBatch | None = None,
 ) -> None:
     relinquishments: dict[PurePosixPath, ReconcileAction] = {}
     for action in planned_actions or []:
@@ -11016,18 +14089,38 @@ def _verify_managed_state_link_claims(
 
     matched_relinquishments: set[PurePosixPath] = set()
     for target, record in state.links.items():
+        relinquishment = relinquishments.get(target)
         actual_snapshot = _capture_reconcile_target_snapshot(
             home,
             home / Path(*target.parts),
+            capture_regular_content=(
+                relinquishment is None
+                or relinquishment.planned_snapshot.regular_sha256 is not None
+            ),
         )
         if actual_snapshot.link_identity is None:
             continue
+        actual_regular = _regular_snapshot_from_reconcile(actual_snapshot)
+        if _record_materializes_regular_file(record) and actual_regular is not None:
+            _verify_pending_regular_aliases(
+                home,
+                pending_batch,
+                home / Path(*target.parts),
+                actual_regular,
+            )
+            if actual_regular.mode != 0o600 or actual_regular.uid != os.geteuid():
+                raise SyncError(
+                    f"managed regular file access policy mismatch: {target}"
+                )
+            expected_source = _record_regular_source_path(home, record)
+            if actual_regular.sha256 == _regular_source_sha256(home, expected_source):
+                continue
+            raise SyncError(f"managed state/regular-file content mismatch for {target}")
         if actual_snapshot.link_target == record.link_target:
             continue
-        relinquishment = relinquishments.get(target)
-        if (
-            relinquishment is not None
-            and relinquishment.planned_snapshot == actual_snapshot
+        if relinquishment is not None and _reconcile_target_snapshot_matches(
+            actual_snapshot,
+            relinquishment.planned_snapshot,
         ):
             matched_relinquishments.add(target)
             continue
@@ -11249,6 +14342,91 @@ def _desired_link_target(home: Path, entry: LinkEntry) -> str:
     )
 
 
+def _entry_materializes_regular_file(entry: LinkEntry) -> bool:
+    """Keep Codex custom-agent TOML files independent from release symlinks."""
+    portable_parts = _portable_target_key(entry.target)
+    return (
+        entry.kind == "file"
+        and len(portable_parts) == 2
+        and portable_parts[0] == "agents"
+        and portable_parts[1].endswith(".toml")
+    )
+
+
+def _record_materializes_regular_file(record: ManagedLinkRecord) -> bool:
+    return _entry_materializes_regular_file(
+        LinkEntry(
+            source=record.source,
+            target=record.target,
+            kind=record.kind,
+            owner=record.owner,
+        )
+    )
+
+
+def _entry_regular_source_path(
+    home: Path,
+    entry: LinkEntry,
+    owner_shas: dict[str, str] | None = None,
+) -> Path:
+    if not _entry_materializes_regular_file(entry):
+        raise SyncError(f"entry is not a managed regular file: {entry.target}")
+    sha = (owner_shas or {}).get(entry.owner)
+    if sha is None:
+        sha = _current_sha(home, entry.owner)
+    if sha is None:
+        raise SyncError(
+            f"managed regular file has no installed release: {entry.target}"
+        )
+    sha = _validate_release_sha(sha)
+    _ensure_safe_release_directory(home, entry.owner, sha, allow_missing=False)
+    return _releases_root(home, entry.owner) / sha / Path(*entry.source.parts)
+
+
+def _record_regular_source_path(home: Path, record: ManagedLinkRecord) -> Path:
+    if not _record_materializes_regular_file(record):
+        raise SyncError(f"record is not a managed regular file: {record.target}")
+    sha = _validate_release_sha(record.release_sha)
+    _ensure_safe_release_directory(home, record.owner, sha, allow_missing=False)
+    return _releases_root(home, record.owner) / sha / Path(*record.source.parts)
+
+
+def _regular_source_sha256(home: Path, source: Path) -> str:
+    return hashlib.sha256(_read_regular_source_payload(home, source)).hexdigest()
+
+
+def _regular_snapshot_has_managed_access(snapshot: RegularFileSnapshot) -> bool:
+    return (
+        snapshot.mode == 0o600
+        and snapshot.uid == os.geteuid()
+        and snapshot.link_count == 1
+    )
+
+
+def _regular_snapshot_from_reconcile(
+    snapshot: ReconcileTargetSnapshot,
+) -> RegularFileSnapshot | None:
+    if snapshot.regular_sha256 is None:
+        return None
+    assert snapshot.parent_identity is not None
+    assert snapshot.link_identity is not None
+    assert snapshot.regular_size is not None
+    assert snapshot.regular_mode is not None
+    assert snapshot.regular_uid is not None
+    assert snapshot.regular_gid is not None
+    assert snapshot.regular_link_count is not None
+    return RegularFileSnapshot(
+        parent_identity=snapshot.parent_identity,
+        file_identity=snapshot.link_identity,
+        sha256=snapshot.regular_sha256,
+        size=snapshot.regular_size,
+        mode=snapshot.regular_mode,
+        uid=snapshot.regular_uid,
+        gid=snapshot.regular_gid,
+        link_count=snapshot.regular_link_count,
+    )
+
+
 def _path_exists_or_is_link(path: Path) -> bool:
     return os.path.lexists(path)
 
@@ -11265,6 +14443,98 @@ def _ensure_safe_target_parent(home: Path, target: Path) -> None:
             raise SyncError(f"refusing managed target below symlink parent: {current}")
         if _path_exists_or_is_link(current) and not current.is_dir():
             raise SyncError(f"link parent exists but is not a directory: {current}")
+
+
+def _require_managed_regular_directory_fd_access(
+    home: Path,
+    directory: Path,
+    directory_fd: int,
+) -> os.stat_result:
+    """Prove an exact directory FD remains owner-controlled and path-bound.
+
+    The protected properties are directory object identity and access policy.
+    Child-entry churn is intentionally absent from the evidence: directory
+    link counts and timestamps are not compared.
+    """
+    try:
+        metadata = _require_release_identity_fd_access_policy(
+            directory_fd,
+            directory,
+            os.geteuid(),
+        )
+    except SyncError as error:
+        classification = (
+            "mismatch"
+            if " access policy mismatch:" in str(error)
+            else "cannot be verified"
+        )
+        raise SyncError(
+            f"managed regular-file parent access policy {classification}: "
+            f"{directory}: {error}"
+        ) from error
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or mode & 0o022
+    ):
+        raise SyncError(
+            "managed regular-file parent access policy mismatch: "
+            f"{directory} (mode={mode:04o}, uid={metadata.st_uid})"
+        )
+    if not _bound_directory_matches(home, directory, directory_fd):
+        raise SyncError(f"managed regular-file parent changed: {directory}")
+    return metadata
+
+
+def _require_managed_regular_parent_chain_access(
+    home: Path,
+    directory: Path,
+    *,
+    bound_parent_fd: int | None = None,
+) -> None:
+    parts = _directory_parts_beneath(home, directory)
+    current_fd = _bound_sync_home_anchor(home, None)
+    current_path = home
+    try:
+        metadata = _require_managed_regular_directory_fd_access(
+            home,
+            current_path,
+            current_fd,
+        )
+        for part in parts:
+            try:
+                next_fd = os.open(
+                    part,
+                    _directory_open_flags(nofollow=True),
+                    dir_fd=current_fd,
+                )
+            except OSError as error:
+                raise SyncError(
+                    f"managed regular-file parent chain is unreadable: {directory}"
+                ) from error
+            _close_fd_quietly(current_fd)
+            current_fd = next_fd
+            current_path /= part
+            metadata = _require_managed_regular_directory_fd_access(
+                home,
+                current_path,
+                current_fd,
+            )
+        if bound_parent_fd is None:
+            return
+        bound_metadata = _require_managed_regular_directory_fd_access(
+            home,
+            directory,
+            bound_parent_fd,
+        )
+        if (bound_metadata.st_dev, bound_metadata.st_ino) != (
+            metadata.st_dev,
+            metadata.st_ino,
+        ):
+            raise SyncError(f"managed regular-file parent changed: {directory}")
+    finally:
+        _close_fd_quietly(current_fd)
 
 
 def _known_owners(home: Path, extra_owners: set[str] | None = None) -> set[str]:
@@ -11317,6 +14587,617 @@ def _removed_link_target(home: Path, removed: RemovedLink) -> str:
         owner=removed.owner,
     )
     return _desired_link_target(home, entry)
+
+
+def _removed_link_exactly_matches_managed_record(
+    removed: RemovedLink,
+    record: ManagedLinkRecord,
+) -> bool:
+    return (
+        removed.source == record.source
+        and removed.target == record.target
+        and removed.kind == record.kind
+        and removed.owner == record.owner
+    )
+
+
+def _same_target_regular_to_symlink_removal(
+    removed_links: list[RemovedLink] | tuple[RemovedLink, ...],
+    record: ManagedLinkRecord,
+    desired_entry: LinkEntry,
+    *,
+    removed_link_key: str | None = None,
+) -> RemovedLink | None:
+    if (
+        not _record_materializes_regular_file(record)
+        or _entry_materializes_regular_file(desired_entry)
+        or desired_entry.kind not in {"directory", "skill"}
+        or desired_entry.target != record.target
+    ):
+        return None
+    matches = [
+        removed
+        for removed in removed_links
+        if _removed_link_exactly_matches_managed_record(removed, record)
+        and removed.replacement_target == desired_entry.target
+        and (removed_link_key is None or _removed_link_key(removed) == removed_link_key)
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _regular_to_symlink_reconcile_action_is_typed(
+    action: ReconcileAction,
+) -> bool:
+    return (
+        action.action == "quarantine-replace"
+        and action.materialization == "symlink"
+        and action.kind in {"directory", "skill"}
+        and action.regular_source is None
+        and action.regular_size is None
+        and action.expected_link_target is not None
+        and action.removed_link_key is not None
+        and bool(action.link_target)
+        and action.planned_snapshot is not None
+        and _regular_snapshot_from_reconcile(action.planned_snapshot) is not None
+    )
+
+
+def _pending_release_removal_authority(
+    home: Path,
+    expectation: PendingReleaseExpectation,
+) -> dict[str, RemovedLink]:
+    """Return removal authority from one exact receipt-bound release snapshot."""
+    identity, directory_identity = _installed_release_identity_and_directory_identity(
+        home,
+        expectation.owner,
+        expectation.sha,
+    )
+    if (
+        directory_identity != expectation.directory_identity
+        or identity[2] != expectation.tree_sha256
+    ):
+        raise SyncError(
+            "pending removal-authority release tree changed: "
+            f"{expectation.owner}@{expectation.sha}"
+        )
+    removal_by_key: dict[str, RemovedLink] = {}
+    for removed in identity[1].removed_links:
+        key = _removed_link_key(removed)
+        if key in removal_by_key:
+            raise SyncError(f"pending release has duplicate removal authority: {key}")
+        removal_by_key[key] = removed
+    return removal_by_key
+
+
+@dataclass(frozen=True)
+class _PendingRegularSourceEvidence:
+    sha256: str
+    size: int
+    source_receipt: tuple[int, int, int, int, int, int, int, int, int]
+    release_receipt: _PendingRegularReleaseReceipt
+
+
+@dataclass(frozen=True)
+class _PendingRegularReleaseReceipt:
+    source_snapshots: dict[PurePosixPath, _ReleaseSourceSnapshot]
+    source_members: dict[PurePosixPath, tuple[str, ...]]
+    expected_owner_uid: int | None
+
+
+def _pending_regular_source_receipt(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    """Capture the signals that keep cached content evidence usable.
+
+    Device/inode protect object identity; mode/owner/group/link count protect
+    access and alias policy; size plus mtime/ctime keep the prior content digest
+    current. A mismatch invalidates the cached proof without claiming that every
+    metadata transition was itself a content mutation. The bound source and
+    release-directory FDs separately prove pathname and release-root identity;
+    directory timestamps and child-entry churn are intentionally not compared.
+    """
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_pending_regular_source_payload(
+    file_fd: int,
+    source: Path,
+    size: int,
+) -> bytes:
+    payload = bytearray()
+    remaining = size
+    try:
+        while remaining:
+            chunk = os.read(file_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SyncError(
+                    f"pending regular-file source ended early while reading: {source}"
+                )
+            payload.extend(chunk)
+            remaining -= len(chunk)
+    except OSError as error:
+        raise SyncError(
+            f"pending regular-file source is unreadable: {source}: {error}"
+        ) from error
+    return bytes(payload)
+
+
+def _require_pending_regular_source_receipt(
+    file_fd: int,
+    source: Path,
+    expected: tuple[int, int, int, int, int, int, int, int, int],
+) -> None:
+    try:
+        actual = _pending_regular_source_receipt(os.fstat(file_fd))
+    except OSError as error:
+        raise SyncError(
+            "pending regular-file source evidence receipt cannot be revalidated: "
+            f"{source}: {error}"
+        ) from error
+    if actual != expected:
+        raise SyncError(
+            f"pending regular-file source evidence receipt no longer matches: {source}"
+        )
+
+
+def _require_pending_regular_cached_source_evidence(
+    home: Path,
+    source: Path,
+    parent_fd: int,
+    file_fd: int,
+    metadata: os.stat_result,
+    evidence: _PendingRegularSourceEvidence,
+) -> None:
+    _require_pending_regular_source_receipt(
+        file_fd,
+        source,
+        evidence.source_receipt,
+    )
+    _require_bounded_regular_file_unchanged(
+        source,
+        parent_fd,
+        file_fd,
+        metadata,
+        "pending regular-file source evidence",
+    )
+    _require_managed_regular_parent_chain_access(
+        home,
+        source.parent,
+        bound_parent_fd=parent_fd,
+    )
+    _require_pending_regular_source_receipt(
+        file_fd,
+        source,
+        evidence.source_receipt,
+    )
+
+
+def _capture_pending_regular_release_receipt(
+    release_fd: int,
+    release_root: Path,
+    expectation: PendingReleaseExpectation,
+) -> _PendingRegularReleaseReceipt:
+    expected_owner_uid = _effective_release_identity_owner_uid(None)
+    with _release_identity_owner_uid_scope(expected_owner_uid):
+        (
+            manifest_payload,
+            tree_digest,
+            path_kinds,
+            source_snapshots,
+            source_members,
+            _captured_files,
+        ) = _release_tree_snapshot_from_directory_fd(
+            release_fd,
+            release_root,
+            require_sanitized_modes=True,
+            expected_owner_uid=expected_owner_uid,
+            capture_limits={},
+        )
+    manifest_data = _decode_manifest_payload(
+        manifest_payload,
+        release_root / MANIFEST_RELATIVE_PATH,
+    )
+    manifest = _parse_manifest_data(manifest_data, path_kinds.get)
+    if manifest.owner != expectation.owner or tree_digest != expectation.tree_sha256:
+        raise SyncError(
+            "pending regular-file source release tree changed: "
+            f"{expectation.owner}@{expectation.sha}"
+        )
+    _verify_release_source_snapshot(
+        release_fd,
+        release_root,
+        source_snapshots,
+        source_members,
+        operation="pending regular-file source evidence validation",
+        expected_owner_uid=expected_owner_uid,
+    )
+    return _PendingRegularReleaseReceipt(
+        source_snapshots=source_snapshots,
+        source_members=source_members,
+        expected_owner_uid=expected_owner_uid,
+    )
+
+
+def _require_pending_regular_release_receipt(
+    release_fd: int,
+    release_root: Path,
+    receipt: _PendingRegularReleaseReceipt,
+) -> None:
+    _verify_release_source_snapshot(
+        release_fd,
+        release_root,
+        receipt.source_snapshots,
+        receipt.source_members,
+        operation="pending regular-file source evidence cache revalidation",
+        expected_owner_uid=receipt.expected_owner_uid,
+    )
+
+
+@dataclass
+class _PendingRegularSourceEvidenceBudget:
+    evidence_by_source: dict[
+        tuple[str, str, PurePosixPath, tuple[int, int], str],
+        _PendingRegularSourceEvidence,
+    ] = dataclass_field(default_factory=dict)
+    release_receipt_by_authority: dict[
+        tuple[str, str, tuple[int, int], str],
+        _PendingRegularReleaseReceipt,
+    ] = dataclass_field(default_factory=dict)
+    evidence_read_bytes: int = 0
+    sealed: bool = False
+
+    def evidence(
+        self,
+        home: Path,
+        record: ManagedLinkRecord,
+        expectation: PendingReleaseExpectation,
+    ) -> _PendingRegularSourceEvidence:
+        if self.sealed:
+            raise SyncError("pending regular-file source evidence budget is sealed")
+        if expectation.owner != record.owner or expectation.sha != record.release_sha:
+            raise SyncError(
+                "pending regular-file source release binding changed: "
+                f"{record.owner}@{record.release_sha}:{record.source}"
+            )
+        source = _record_regular_source_path(home, record)
+        release_root = _releases_root(home, expectation.owner) / expectation.sha
+        cache_key = (
+            record.owner,
+            record.release_sha,
+            record.source,
+            expectation.directory_identity,
+            expectation.tree_sha256,
+        )
+        release_cache_key = (
+            expectation.owner,
+            expectation.sha,
+            expectation.directory_identity,
+            expectation.tree_sha256,
+        )
+        release_receipt = self.release_receipt_by_authority.get(release_cache_key)
+        release_fd = _open_installed_release_directory_fd(
+            home,
+            expectation.owner,
+            expectation.sha,
+        )
+        parent_fd = -1
+        file_fd = -1
+        try:
+            if _directory_identity(release_fd) != expectation.directory_identity:
+                raise SyncError(
+                    "pending regular-file source release directory changed: "
+                    f"{expectation.owner}@{expectation.sha}"
+                )
+            parent_fd, file_fd, metadata = _open_bounded_regular_file(
+                source,
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                description="pending regular-file source evidence",
+            )
+            cached = self.evidence_by_source.get(cache_key)
+            if cached is not None:
+                if release_receipt is not cached.release_receipt:
+                    raise SyncError(
+                        "pending regular-file source evidence cache is incomplete"
+                    )
+                _require_pending_regular_cached_source_evidence(
+                    home,
+                    source,
+                    parent_fd,
+                    file_fd,
+                    metadata,
+                    cached,
+                )
+                if _directory_identity(
+                    release_fd
+                ) != expectation.directory_identity or not _bound_directory_matches(
+                    home, release_root, release_fd
+                ):
+                    raise SyncError(
+                        "pending regular-file source release directory changed: "
+                        f"{expectation.owner}@{expectation.sha}"
+                    )
+                return cached
+
+            size = metadata.st_size
+            if (
+                size
+                > MAX_PENDING_REGULAR_EVIDENCE_READ_BYTES - self.evidence_read_bytes
+            ):
+                raise SyncError(
+                    "pending regular-file source evidence reads exceed the aggregate "
+                    f"size limit: {source}"
+                )
+            payload = _read_pending_regular_source_payload(file_fd, source, size)
+            _require_bounded_regular_file_unchanged(
+                source,
+                parent_fd,
+                file_fd,
+                metadata,
+                "pending regular-file source evidence",
+            )
+            if release_receipt is None:
+                release_receipt = _capture_pending_regular_release_receipt(
+                    release_fd,
+                    release_root,
+                    expectation,
+                )
+            _require_bounded_regular_file_unchanged(
+                source,
+                parent_fd,
+                file_fd,
+                metadata,
+                "pending regular-file source evidence",
+            )
+            _require_managed_regular_parent_chain_access(
+                home,
+                source.parent,
+                bound_parent_fd=parent_fd,
+            )
+            source_receipt = _pending_regular_source_receipt(metadata)
+            _require_pending_regular_source_receipt(
+                file_fd,
+                source,
+                source_receipt,
+            )
+            if _directory_identity(
+                release_fd
+            ) != expectation.directory_identity or not _bound_directory_matches(
+                home, release_root, release_fd
+            ):
+                raise SyncError(
+                    "pending regular-file source release directory changed: "
+                    f"{expectation.owner}@{expectation.sha}"
+                )
+        finally:
+            _close_fd_quietly(file_fd)
+            _close_fd_quietly(parent_fd)
+            _close_fd_quietly(release_fd)
+        if release_receipt is None:
+            raise SyncError("pending regular-file source evidence cache is incomplete")
+        evidence = _PendingRegularSourceEvidence(
+            sha256=hashlib.sha256(payload).hexdigest(),
+            size=len(payload),
+            source_receipt=source_receipt,
+            release_receipt=release_receipt,
+        )
+        self.evidence_read_bytes += len(payload)
+        self.release_receipt_by_authority.setdefault(
+            release_cache_key,
+            release_receipt,
+        )
+        self.evidence_by_source[cache_key] = evidence
+        return evidence
+
+    def finalize(self, home: Path) -> None:
+        if self.sealed:
+            raise SyncError("pending regular-file source evidence budget is sealed")
+        try:
+            for (
+                owner,
+                sha,
+                source_relative,
+                directory_identity,
+                tree_sha256,
+            ), evidence in self.evidence_by_source.items():
+                release_cache_key = (
+                    owner,
+                    sha,
+                    directory_identity,
+                    tree_sha256,
+                )
+                if (
+                    self.release_receipt_by_authority.get(release_cache_key)
+                    is not evidence.release_receipt
+                ):
+                    raise SyncError(
+                        "pending regular-file source evidence cache is incomplete"
+                    )
+                release_root = _releases_root(home, owner) / sha
+                source = release_root / Path(*source_relative.parts)
+                release_fd = _open_installed_release_directory_fd(home, owner, sha)
+                parent_fd = -1
+                file_fd = -1
+                try:
+                    if _directory_identity(release_fd) != directory_identity:
+                        raise SyncError(
+                            "pending regular-file source release directory changed: "
+                            f"{owner}@{sha}"
+                        )
+                    parent_fd, file_fd, metadata = _open_bounded_regular_file(
+                        source,
+                        maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                        description="pending regular-file source evidence",
+                    )
+                    _require_pending_regular_cached_source_evidence(
+                        home,
+                        source,
+                        parent_fd,
+                        file_fd,
+                        metadata,
+                        evidence,
+                    )
+                    if _directory_identity(
+                        release_fd
+                    ) != directory_identity or not _bound_directory_matches(
+                        home, release_root, release_fd
+                    ):
+                        raise SyncError(
+                            "pending regular-file source release directory changed: "
+                            f"{owner}@{sha}"
+                        )
+                finally:
+                    _close_fd_quietly(file_fd)
+                    _close_fd_quietly(parent_fd)
+                    _close_fd_quietly(release_fd)
+            for (
+                owner,
+                sha,
+                directory_identity,
+                _tree_sha256,
+            ), receipt in self.release_receipt_by_authority.items():
+                release_root = _releases_root(home, owner) / sha
+                release_fd = _open_installed_release_directory_fd(home, owner, sha)
+                try:
+                    if _directory_identity(
+                        release_fd
+                    ) != directory_identity or not _bound_directory_matches(
+                        home, release_root, release_fd
+                    ):
+                        raise SyncError(
+                            "pending regular-file source release directory changed: "
+                            f"{owner}@{sha}"
+                        )
+                    _require_pending_regular_release_receipt(
+                        release_fd,
+                        release_root,
+                        receipt,
+                    )
+                    if _directory_identity(
+                        release_fd
+                    ) != directory_identity or not _bound_directory_matches(
+                        home, release_root, release_fd
+                    ):
+                        raise SyncError(
+                            "pending regular-file source release directory changed: "
+                            f"{owner}@{sha}"
+                        )
+                finally:
+                    _close_fd_quietly(release_fd)
+        finally:
+            self.sealed = True
+
+
+def _pending_regular_to_symlink_transition_is_authorized(
+    home: Path,
+    record: PendingLinkRecord,
+    state_before: ManagedState,
+    state_after: ManagedState,
+    before_expectations_by_owner: dict[str, PendingReleaseExpectation],
+    after_expectations_by_owner: dict[str, PendingReleaseExpectation],
+    removal_authority_by_release: dict[tuple[str, str], dict[str, RemovedLink]],
+    regular_source_evidence: _PendingRegularSourceEvidenceBudget,
+) -> bool:
+    if (
+        record.scope != "managed"
+        or record.action != "quarantine-replace"
+        or record.before_materialization != "regular"
+        or record.materialization != "symlink"
+        or record.kind not in {"directory", "skill"}
+        or record.removed_link_key is None
+        or record.link_target is None
+        or any(
+            value is not None
+            for value in (
+                record.regular_sha256,
+                record.regular_size,
+                record.regular_mode,
+                record.regular_uid,
+                record.regular_gid,
+                record.regular_link_count,
+            )
+        )
+    ):
+        return False
+    before_record = state_before.links.get(record.target)
+    after_record = state_after.links.get(record.target)
+    planned = _regular_snapshot_from_reconcile(record.planned_snapshot)
+    if (
+        before_record is None
+        or after_record is None
+        or planned is None
+        or not _record_materializes_regular_file(before_record)
+        or _record_materializes_regular_file(after_record)
+        or after_record.kind != record.kind
+        or after_record.source != record.source
+        or after_record.owner != record.owner
+        or after_record.release_sha != record.release_sha
+        or after_record.link_target != record.link_target
+        or planned.mode != 0o600
+        or planned.uid != os.geteuid()
+        or planned.link_count != 2
+    ):
+        return False
+    removal_owner, _removed_id = record.removed_link_key.split(":", 1)
+    if (
+        removal_owner != before_record.owner
+        or state_before.owners.get(removal_owner) != before_record.release_sha
+    ):
+        return False
+    removal_expectation = (
+        after_expectations_by_owner.get(removal_owner)
+        if removal_owner in state_after.owners
+        else before_expectations_by_owner.get(removal_owner)
+    )
+    source_expectation = before_expectations_by_owner.get(before_record.owner)
+    if removal_expectation is None or source_expectation is None:
+        return False
+    try:
+        if (
+            planned.sha256
+            != regular_source_evidence.evidence(
+                home,
+                before_record,
+                source_expectation,
+            ).sha256
+        ):
+            return False
+        desired_entry = LinkEntry(
+            source=after_record.source,
+            target=after_record.target,
+            kind=after_record.kind,
+            owner=after_record.owner,
+        )
+        cache_key = (removal_expectation.owner, removal_expectation.sha)
+        removal_by_key = removal_authority_by_release.get(cache_key)
+        if removal_by_key is None:
+            removal_by_key = _pending_release_removal_authority(
+                home,
+                removal_expectation,
+            )
+            removal_authority_by_release[cache_key] = removal_by_key
+    except OSError as error:
+        raise SyncError(
+            "cannot revalidate pending regular-to-symlink removal authority: "
+            f"{record.target}: {error}"
+        ) from error
+    removed = removal_by_key.get(record.removed_link_key)
+    return (
+        removed is not None
+        and _removed_link_exactly_matches_managed_record(removed, before_record)
+        and removed.replacement_target == desired_entry.target
+    )
 
 
 def _combine_entries(
@@ -11513,13 +15394,19 @@ def _plan_reconciliation(
     *,
     allow_cross_owner: bool,
     allow_unledgered_removed_links: bool = False,
+    owner_shas: dict[str, str] | None = None,
+    incoming_regular_sources: dict[tuple[str, PurePosixPath], Path] | None = None,
 ) -> list[ReconcileAction]:
+    regular_budget = _RegularPlanningSourceBudget()
     desired_by_target = _entries_by_target(desired_entries)
     previous_targets: dict[PurePosixPath, set[str]] = {}
+    previous_regular_entries: dict[PurePosixPath, list[LinkEntry]] = {}
     for entry in previous_entries:
         previous_targets.setdefault(entry.target, set()).add(
             _desired_link_target(home, entry)
         )
+        if _entry_materializes_regular_file(entry):
+            previous_regular_entries.setdefault(entry.target, []).append(entry)
     removed_by_target: dict[PurePosixPath, list[RemovedLink]] = {}
     for removed in removed_links:
         removed_by_target.setdefault(removed.target, []).append(removed)
@@ -11539,12 +15426,33 @@ def _plan_reconciliation(
         ):
             continue
         _ensure_safe_target_parent(home, target)
+        record = state.links.get(relative_target)
+        require_managed_parent_access = bool(
+            (
+                desired_entry is not None
+                and _entry_materializes_regular_file(desired_entry)
+            )
+            or (record is not None and _record_materializes_regular_file(record))
+            or previous_regular_entries.get(relative_target)
+        )
+        capture_regular_content = not (
+            record is not None
+            and not _record_materializes_regular_file(record)
+            and _allows_optional_claim_relinquishment(
+                relative_target,
+                desired_entry,
+            )
+        )
         planned_snapshot = (
-            _capture_reconcile_target_snapshot(home, target)
+            _capture_reconcile_target_snapshot(
+                home,
+                target,
+                capture_regular_content=capture_regular_content,
+                require_managed_parent_access=require_managed_parent_access,
+            )
             if home.is_dir() and not home.is_symlink()
             else None
         )
-        record = state.links.get(relative_target)
         removed_candidates = (
             removed_by_target.get(relative_target, [])
             if allow_unledgered_removed_links
@@ -11554,6 +15462,10 @@ def _plan_reconciliation(
             record is not None
             and planned_snapshot is not None
             and planned_snapshot.link_identity is not None
+            and (
+                not _record_materializes_regular_file(record)
+                or planned_snapshot.regular_sha256 is None
+            )
             and planned_snapshot.link_target != record.link_target
         ):
             if _allows_optional_claim_relinquishment(
@@ -11577,6 +15489,34 @@ def _plan_reconciliation(
             )
         if desired_entry is not None:
             desired = _desired_link_target(home, desired_entry)
+            regular_source = (
+                (incoming_regular_sources or {}).get(
+                    (desired_entry.owner, desired_entry.target)
+                )
+                or _entry_regular_source_path(home, desired_entry, owner_shas)
+                if _entry_materializes_regular_file(desired_entry)
+                else None
+            )
+            materialization = "regular" if regular_source is not None else "symlink"
+            obvious_regular_create = regular_source is not None and (
+                planned_snapshot is None or planned_snapshot.link_identity is None
+            )
+            if obvious_regular_create:
+                desired_regular_size = regular_budget.reserve_materialization(
+                    regular_source,
+                    target,
+                )
+            else:
+                desired_regular_size = (
+                    regular_budget.source_size(regular_source)
+                    if regular_source is not None
+                    else None
+                )
+            desired_regular_sha256 = (
+                regular_budget.digest(home, regular_source)
+                if regular_source is not None
+                else None
+            )
             if planned_snapshot is None or planned_snapshot.link_identity is None:
                 actions.append(
                     ReconcileAction(
@@ -11585,6 +15525,140 @@ def _plan_reconciliation(
                         desired,
                         desired_entry.kind,
                         planned_snapshot=planned_snapshot,
+                        materialization=materialization,
+                        regular_source=regular_source,
+                        regular_size=desired_regular_size,
+                    )
+                )
+                continue
+            planned_regular = _regular_snapshot_from_reconcile(planned_snapshot)
+            legacy_managed_symlink_to_regular = (
+                regular_source is not None
+                and planned_snapshot.link_target is not None
+                and record is not None
+                and planned_snapshot.link_target == record.link_target
+            )
+            if (
+                record is not None
+                and _record_materializes_regular_file(record)
+                and planned_regular is None
+                and not legacy_managed_symlink_to_regular
+            ):
+                raise SyncError(
+                    f"managed state target type mismatch for regular file: {target}"
+                )
+            if regular_source is not None and planned_regular is not None:
+                if record is None:
+                    raise SyncError(
+                        f"refusing to adopt unproven regular-file target: {target}"
+                    )
+                if not _record_materializes_regular_file(record):
+                    raise SyncError(
+                        f"managed state target type mismatch for regular file: {target}"
+                    )
+                if not _regular_snapshot_has_managed_access(planned_regular):
+                    raise SyncError(
+                        f"managed regular file access policy mismatch: {target}"
+                    )
+                assert desired_regular_sha256 is not None
+                if planned_regular.sha256 == desired_regular_sha256:
+                    continue
+                assert regular_source is not None
+                regular_budget.reserve_materialization(regular_source, target)
+                prior_source = _record_regular_source_path(home, record)
+                if planned_regular.sha256 != regular_budget.digest(home, prior_source):
+                    raise SyncError(
+                        f"refusing to replace modified managed regular file: {target}"
+                    )
+                actions.append(
+                    ReconcileAction(
+                        "replace",
+                        target,
+                        desired,
+                        desired_entry.kind,
+                        expected_link_target=record.link_target,
+                        planned_snapshot=planned_snapshot,
+                        materialization="regular",
+                        regular_source=regular_source,
+                        regular_size=desired_regular_size,
+                    )
+                )
+                continue
+            if regular_source is None and planned_regular is not None:
+                if record is None:
+                    if _allows_optional_claim_relinquishment(
+                        relative_target,
+                        desired_entry,
+                    ):
+                        continue
+                    raise SyncError(
+                        "refusing to migrate unproven regular-file non-symlink "
+                        f"target: {target}"
+                    )
+                if not _record_materializes_regular_file(record):
+                    raise SyncError(
+                        f"managed state target type mismatch for regular file: {target}"
+                    )
+                if not _regular_snapshot_has_managed_access(planned_regular):
+                    raise SyncError(
+                        f"managed regular file access policy mismatch: {target}"
+                    )
+                prior_source = _record_regular_source_path(home, record)
+                if planned_regular.sha256 != regular_budget.digest(home, prior_source):
+                    raise SyncError(
+                        f"refusing to replace modified managed regular file: {target}"
+                    )
+                removed_match = _same_target_regular_to_symlink_removal(
+                    removed_by_target.get(relative_target, []),
+                    record,
+                    desired_entry,
+                )
+                if removed_match is None:
+                    raise SyncError(
+                        "refusing to migrate managed regular file without an exact "
+                        f"same-target removal: {target}"
+                    )
+                if removed_match.owner != desired_entry.owner and not allow_cross_owner:
+                    raise SyncError(
+                        f"cross-owner migration requires install-private: {target}"
+                    )
+                actions.append(
+                    ReconcileAction(
+                        "quarantine-replace",
+                        target,
+                        desired,
+                        desired_entry.kind,
+                        expected_link_target=record.link_target,
+                        removed_link_key=_removed_link_key(removed_match),
+                        planned_snapshot=planned_snapshot,
+                        materialization="symlink",
+                    )
+                )
+                continue
+            if regular_source is not None and planned_snapshot.link_target is not None:
+                existing = planned_snapshot.link_target
+                proven = record is not None and record.link_target == existing
+                if not proven:
+                    existing_owner = _link_managed_owner(home, target)
+                    proven = (
+                        existing_owner == desired_entry.owner and existing == desired
+                    )
+                if not proven:
+                    raise SyncError(
+                        f"refusing to migrate unproven symlink target: {target}"
+                    )
+                regular_budget.reserve_materialization(regular_source, target)
+                actions.append(
+                    ReconcileAction(
+                        "replace",
+                        target,
+                        desired,
+                        desired_entry.kind,
+                        expected_link_target=existing,
+                        planned_snapshot=planned_snapshot,
+                        materialization="regular",
+                        regular_source=regular_source,
+                        regular_size=desired_regular_size,
                     )
                 )
                 continue
@@ -11645,10 +15719,49 @@ def _plan_reconciliation(
                 continue
             raise SyncError(f"refusing to replace unproven symlink target: {target}")
 
-        if planned_snapshot is None or (
-            planned_snapshot.link_identity is None
-            or planned_snapshot.link_target is None
-        ):
+        if planned_snapshot is None or planned_snapshot.link_identity is None:
+            continue
+        planned_regular = _regular_snapshot_from_reconcile(planned_snapshot)
+        if planned_regular is not None:
+            if record is None:
+                previous_regular = previous_regular_entries.get(relative_target, [])
+                if previous_regular:
+                    claim_kind = (
+                        "overlay"
+                        if any(
+                            entry.owner != PUBLIC_OWNER for entry in previous_regular
+                        )
+                        else "managed"
+                    )
+                    raise SyncError(
+                        f"missing {claim_kind} regular claim for existing target: "
+                        f"{target}"
+                    )
+                continue
+            if not _record_materializes_regular_file(record):
+                continue
+            if not _regular_snapshot_has_managed_access(planned_regular):
+                raise SyncError(
+                    f"managed regular file access policy mismatch: {target}"
+                )
+            prior_source = _record_regular_source_path(home, record)
+            if planned_regular.sha256 != regular_budget.digest(home, prior_source):
+                raise SyncError(
+                    f"refusing to remove modified managed regular file: {target}"
+                )
+            actions.append(
+                ReconcileAction(
+                    "remove",
+                    target,
+                    "",
+                    record.kind,
+                    expected_link_target=record.link_target,
+                    planned_snapshot=planned_snapshot,
+                    materialization="regular",
+                )
+            )
+            continue
+        if planned_snapshot.link_target is None:
             continue
         assert planned_snapshot.link_target is not None
         existing = planned_snapshot.link_target
@@ -11687,7 +15800,86 @@ def _plan_reconciliation(
     return actions
 
 
-def _quarantine_batch_root(home: Path, actions: list[ReconcileAction]) -> Path:
+def _snapshot_ephemeral_quarantine_metadata_fd(
+    home: Path,
+    batch_root: Path,
+    batch_fd: int,
+    metadata_fd: int,
+) -> ManagedStateFileSnapshot:
+    """Capture stable cleanup evidence from the allocator's retained file FD."""
+    metadata_path = batch_root / "metadata.json"
+    original_offset = 0
+    try:
+        original_offset = os.lseek(metadata_fd, 0, os.SEEK_CUR)
+        before = _require_pending_cleanup_fd_access_policy(
+            metadata_fd,
+            metadata_path,
+            expected_mode=0o600,
+        )
+        os.lseek(metadata_fd, 0, os.SEEK_SET)
+        payload = _read_managed_state_bytes(
+            metadata_fd,
+            metadata_path,
+            MAX_MANAGED_STATE_BYTES,
+        )
+        os.lseek(metadata_fd, 0, os.SEEK_SET)
+        confirmed_payload = _read_managed_state_bytes(
+            metadata_fd,
+            metadata_path,
+            MAX_MANAGED_STATE_BYTES,
+        )
+        after = _require_pending_cleanup_fd_access_policy(
+            metadata_fd,
+            metadata_path,
+            expected_mode=0o600,
+        )
+        named = os.stat(
+            "metadata.json",
+            dir_fd=batch_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not _regular_stat_metadata_matches(after, before)
+            or not _regular_stat_metadata_matches(named, before)
+            or payload != confirmed_payload
+            or after.st_size != len(payload)
+            or not _bound_directory_matches(home, batch_root, batch_fd)
+        ):
+            raise SyncError(
+                f"ephemeral quarantine metadata changed while binding: {batch_root}"
+            )
+        return ManagedStateFileSnapshot(
+            exists=True,
+            payload=payload,
+            mode=stat.S_IMODE(after.st_mode),
+            parent_identity=_directory_identity(batch_fd),
+            file_identity=(after.st_dev, after.st_ino),
+            file_type=stat.S_IFMT(after.st_mode),
+            size=after.st_size,
+            uid=after.st_uid,
+            gid=after.st_gid,
+        )
+    except (OSError, SyncError) as error:
+        raise SyncError(
+            f"ephemeral quarantine metadata is unreadable while binding: {batch_root}"
+        ) from error
+    finally:
+        try:
+            os.lseek(metadata_fd, original_offset, os.SEEK_SET)
+        except OSError:
+            pass
+
+
+def _quarantine_batch_root(
+    home: Path,
+    actions: list[ReconcileAction],
+    *,
+    retain_binding: bool = False,
+    retain_scaffold_binding: bool = False,
+) -> Path | tuple[Path, int, tuple[int, int]] | EphemeralQuarantineBatchAllocation:
+    if retain_scaffold_binding and not retain_binding:
+        raise ValueError("scaffold binding requires a retained batch binding")
     quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     batch_name = f"{stamp}-{os.getpid()}-{time.time_ns()}"
@@ -11708,6 +15900,9 @@ def _quarantine_batch_root(home: Path, actions: list[ReconcileAction]) -> Path:
             for action in actions
         ],
     }
+    metadata_payload = (json.dumps(metadata, indent=2, sort_keys=False) + "\n").encode(
+        "utf-8"
+    )
     quarantine_fd = _open_or_create_directory_beneath(
         home,
         quarantine_root,
@@ -11716,15 +15911,102 @@ def _quarantine_batch_root(home: Path, actions: list[ReconcileAction]) -> Path:
     batch_fd = -1
     metadata_fd = -1
     created_batch = False
+    batch_identity: tuple[int, int] | None = None
+    metadata_snapshot: ManagedStateFileSnapshot | None = None
+    metadata_cleanup_snapshot: ManagedStateFileSnapshot | None = None
+    metadata_stage_path: Path | None = None
+    metadata_stage_snapshot: ManagedStateFileSnapshot | None = None
+    metadata_stage_parent_fd = -1
+    quarantine_root_identity: tuple[int, int] | None = None
+    allocation_ticket: PendingQuarantineAllocationTicket | None = None
+    scaffold_allocation: EphemeralQuarantineBatchAllocation | None = None
     try:
+        quarantine_root_identity = _directory_identity(quarantine_fd)
         if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
             raise SyncError(f"quarantine root changed: {quarantine_root}")
-        retained_batches = _quarantine_batch_count_from_fd(quarantine_fd)
+        retained_batches = _quarantine_capacity_batch_count(home, quarantine_fd)
         if retained_batches >= MAX_RETAINED_QUARANTINE_BATCHES:
             raise SyncError(
                 "quarantine retains too many transaction batches: "
                 f"{retained_batches} >= {MAX_RETAINED_QUARANTINE_BATCHES}",
                 code="quarantine-saturated",
+            )
+        if retain_scaffold_binding:
+            index_root = _pending_cleanup_index_path(home)
+            index_fd = _open_or_create_directory_beneath(home, index_root, mode=0o700)
+            _close_fd_quietly(index_fd)
+            metadata_stage_parent_fd = _open_directory_beneath(home, index_root)
+            metadata_stage_path = _pending_quarantine_metadata_stage_path(
+                home,
+                batch_name,
+            )
+            metadata_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            metadata_flags |= getattr(os, "O_CLOEXEC", 0)
+            metadata_flags |= getattr(os, "O_NOFOLLOW", 0)
+            metadata_fd = os.open(
+                metadata_stage_path.name,
+                metadata_flags,
+                0o600,
+                dir_fd=metadata_stage_parent_fd,
+            )
+            try:
+                os.fchmod(metadata_fd, 0o600)
+                _require_pending_cleanup_fd_access_policy(
+                    metadata_fd,
+                    metadata_stage_path,
+                    expected_mode=0o600,
+                )
+                written = 0
+                while written < len(metadata_payload):
+                    count = os.write(metadata_fd, metadata_payload[written:])
+                    if count <= 0:
+                        raise OSError(
+                            "quarantine metadata stage write made no progress"
+                        )
+                    written += count
+                os.fsync(metadata_fd)
+                os.fsync(metadata_stage_parent_fd)
+                metadata_fd_stat = os.fstat(metadata_fd)
+                metadata_stage_snapshot = _read_managed_state_file_snapshot(
+                    home,
+                    metadata_stage_path,
+                    metadata_stage_parent_fd,
+                    expected_identity=(
+                        metadata_fd_stat.st_dev,
+                        metadata_fd_stat.st_ino,
+                    ),
+                    maximum_bytes=MAX_MANAGED_STATE_BYTES,
+                )
+                if (
+                    metadata_stage_snapshot.payload != metadata_payload
+                    or metadata_stage_snapshot.mode != 0o600
+                    or metadata_stage_snapshot.uid != os.geteuid()
+                ):
+                    raise SyncError(
+                        f"quarantine metadata stage write was incomplete: {batch_root}"
+                    )
+            except BaseException:
+                try:
+                    metadata_fd_stat = os.fstat(metadata_fd)
+                    metadata_stage_snapshot = _read_managed_state_file_snapshot(
+                        home,
+                        metadata_stage_path,
+                        metadata_stage_parent_fd,
+                        expected_identity=(
+                            metadata_fd_stat.st_dev,
+                            metadata_fd_stat.st_ino,
+                        ),
+                        maximum_bytes=MAX_MANAGED_STATE_BYTES,
+                    )
+                except (OSError, SyncError):
+                    metadata_stage_snapshot = None
+                raise
+            allocation_ticket = _publish_pending_quarantine_allocation_ticket(
+                home,
+                quarantine_root,
+                quarantine_fd,
+                batch_name,
+                metadata_payload,
             )
         os.mkdir(batch_root.name, mode=0o700, dir_fd=quarantine_fd)
         created_batch = True
@@ -11733,44 +16015,330 @@ def _quarantine_batch_root(home: Path, actions: list[ReconcileAction]) -> Path:
         directory_flags |= getattr(os, "O_CLOEXEC", 0)
         directory_flags |= getattr(os, "O_NOFOLLOW", 0)
         batch_fd = os.open(batch_root.name, directory_flags, dir_fd=quarantine_fd)
-        metadata_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        metadata_flags |= getattr(os, "O_CLOEXEC", 0)
-        metadata_flags |= getattr(os, "O_NOFOLLOW", 0)
-        metadata_fd = os.open(
-            "metadata.json",
-            metadata_flags,
-            0o600,
-            dir_fd=batch_fd,
+        batch_identity = _directory_identity(batch_fd)
+        if retain_scaffold_binding:
+            assert metadata_stage_path is not None
+            assert metadata_stage_snapshot is not None
+            assert allocation_ticket is not None
+            current_stage = _require_pending_cleanup_file_snapshot_unchanged(
+                home,
+                metadata_stage_path,
+                metadata_stage_parent_fd,
+                metadata_stage_snapshot,
+                label=f"quarantine metadata stage {batch_name}",
+            )
+            _require_pending_quarantine_allocation_ticket_unchanged(
+                home,
+                allocation_ticket,
+            )
+            if (
+                _directory_identity(batch_fd) != batch_identity
+                or not _bound_directory_matches(home, batch_root, batch_fd)
+                or _directory_member_names(batch_fd, maximum_entries=1) != ()
+            ):
+                raise SyncError(
+                    f"quarantine batch changed before metadata: {batch_root}"
+                )
+            _rename_noreplace_at(
+                metadata_stage_parent_fd,
+                metadata_stage_path.name,
+                batch_fd,
+                "metadata.json",
+            )
+            metadata_stage_path = None
+            metadata_stage_snapshot = None
+            os.fsync(batch_fd)
+            os.fsync(metadata_stage_parent_fd)
+            named_metadata = os.stat(
+                "metadata.json",
+                dir_fd=batch_fd,
+                follow_symlinks=False,
+            )
+            if current_stage.file_identity != (
+                named_metadata.st_dev,
+                named_metadata.st_ino,
+            ) or _directory_member_names(batch_fd, maximum_entries=2) != (
+                "metadata.json",
+            ):
+                raise SyncError(
+                    f"quarantine metadata changed during publication: {batch_root}"
+                )
+        else:
+            metadata_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            metadata_flags |= getattr(os, "O_CLOEXEC", 0)
+            metadata_flags |= getattr(os, "O_NOFOLLOW", 0)
+            metadata_fd = os.open(
+                "metadata.json",
+                metadata_flags,
+                0o600,
+                dir_fd=batch_fd,
+            )
+            os.fchmod(metadata_fd, 0o600)
+            written = 0
+            while written < len(metadata_payload):
+                count = os.write(metadata_fd, metadata_payload[written:])
+                if count <= 0:
+                    raise OSError("quarantine metadata write made no progress")
+                written += count
+            os.fsync(metadata_fd)
+        metadata_snapshot = _snapshot_ephemeral_quarantine_metadata_fd(
+            home,
+            batch_root,
+            batch_fd,
+            metadata_fd,
         )
-        with os.fdopen(metadata_fd, "w", encoding="utf-8", closefd=True) as file:
-            metadata_fd = -1
-            json.dump(metadata, file, indent=2, sort_keys=False)
-            file.write("\n")
-            file.flush()
-            os.fsync(file.fileno())
+        if metadata_snapshot.payload != metadata_payload:
+            raise SyncError(f"quarantine metadata write was incomplete: {batch_root}")
+        metadata_cleanup_snapshot = metadata_snapshot
         os.fsync(batch_fd)
         if not _bound_directory_matches(home, batch_root, batch_fd):
             raise SyncError(f"quarantine batch changed: {batch_root}")
-    except BaseException:
-        if metadata_fd >= 0:
-            _close_fd_quietly(metadata_fd)
-        if batch_fd >= 0:
+        if retain_scaffold_binding:
+            assert metadata_snapshot is not None
+            assert allocation_ticket is not None
+            current_metadata = _read_managed_state_file_snapshot(
+                home,
+                batch_root / "metadata.json",
+                batch_fd,
+                expected_identity=metadata_snapshot.file_identity,
+                maximum_bytes=MAX_MANAGED_STATE_BYTES,
+            )
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                current_metadata,
+                metadata_snapshot,
+            ):
+                raise SyncError(
+                    f"quarantine metadata changed before binding: {batch_root}"
+                )
+            _require_pending_quarantine_allocation_ticket_unchanged(
+                home,
+                allocation_ticket,
+            )
+            assert quarantine_root_identity is not None
+            retained_quarantine_fd = os.dup(quarantine_fd)
+            retained_batch_fd = -1
+            retained_metadata_fd = -1
             try:
-                os.unlink("metadata.json", dir_fd=batch_fd)
-            except OSError:
-                pass
-        if created_batch:
+                retained_batch_fd = os.dup(batch_fd)
+                retained_metadata_fd = os.dup(metadata_fd)
+                scaffold_allocation = EphemeralQuarantineBatchAllocation(
+                    home=home,
+                    quarantine_root=quarantine_root,
+                    quarantine_fd=retained_quarantine_fd,
+                    batch_fd=retained_batch_fd,
+                    metadata_fd=retained_metadata_fd,
+                    binding=EphemeralQuarantineBatchBinding(
+                        batch_root=batch_root,
+                        quarantine_root_identity=quarantine_root_identity,
+                        batch_identity=batch_identity,
+                        leaf_identity=None,
+                        metadata=metadata_snapshot,
+                        allocation_ticket=allocation_ticket,
+                    ),
+                )
+            except BaseException:
+                _close_fd_quietly(retained_metadata_fd)
+                _close_fd_quietly(retained_batch_fd)
+                _close_fd_quietly(retained_quarantine_fd)
+                raise
+    except BaseException as original_error:
+        if metadata_stage_path is not None:
             try:
-                os.rmdir(batch_root.name, dir_fd=quarantine_fd)
-                os.fsync(quarantine_fd)
-            except OSError:
-                pass
+                if metadata_stage_snapshot is None:
+                    raise SyncError(
+                        "quarantine metadata stage could not be rebound for cleanup: "
+                        f"{batch_name}"
+                    )
+                _discard_incomplete_pending_cleanup_ticket(
+                    home,
+                    metadata_stage_path,
+                    expected_snapshot=metadata_stage_snapshot,
+                )
+                metadata_stage_path = None
+                metadata_stage_snapshot = None
+            except (OSError, SyncError) as cleanup_error:
+                cleanup_note = (
+                    "quarantine metadata staging failed and its exact temporary "
+                    f"file was retained: {cleanup_error}"
+                )
+                add_note = getattr(original_error, "add_note", None)
+                if callable(add_note):
+                    add_note(cleanup_note)
+                else:
+                    raise SyncError(
+                        f"{cleanup_note}; original allocation failure: {original_error}"
+                    ) from cleanup_error
+        cleanup_binding: EphemeralQuarantineBatchBinding | None = None
+        if (
+            created_batch
+            and batch_fd >= 0
+            and quarantine_root_identity is not None
+            and batch_identity is not None
+            and metadata_cleanup_snapshot is not None
+            and _managed_state_snapshot_has_complete_file_evidence(
+                metadata_cleanup_snapshot
+            )
+            and metadata_cleanup_snapshot.parent_identity == batch_identity
+            and metadata_cleanup_snapshot.file_type == stat.S_IFREG
+            and metadata_cleanup_snapshot.mode == 0o600
+            and metadata_cleanup_snapshot.uid == os.geteuid()
+        ):
+            cleanup_binding = EphemeralQuarantineBatchBinding(
+                batch_root=batch_root,
+                quarantine_root_identity=quarantine_root_identity,
+                batch_identity=batch_identity,
+                leaf_identity=None,
+                metadata=metadata_cleanup_snapshot,
+                allocation_ticket=allocation_ticket,
+            )
+        try:
+            if scaffold_allocation is not None:
+                try:
+                    scaffold_allocation.reclaim_empty()
+                except (OSError, SyncError) as cleanup_error:
+                    cleanup_note = (
+                        "quarantine allocation handoff failed and its bound empty "
+                        f"scaffold was retained: {cleanup_error}"
+                    )
+                    add_note = getattr(original_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(cleanup_note)
+                    else:
+                        raise SyncError(
+                            f"{cleanup_note}; original allocation failure: "
+                            f"{original_error}"
+                        ) from cleanup_error
+                cleanup_binding = None
+            if cleanup_binding is not None:
+                try:
+                    # Keep the allocator's original batch and metadata
+                    # descriptors live through the direct cleanup's durable
+                    # ticket publication and final removal, preventing identity
+                    # reuse while the cleanup helper independently rebinds.
+                    _discard_empty_ephemeral_quarantine_batch(home, cleanup_binding)
+                except (OSError, SyncError) as cleanup_error:
+                    cleanup_note = (
+                        "quarantine allocation failed and its bound empty scaffold "
+                        f"was retained: {cleanup_error}"
+                    )
+                    add_note = getattr(original_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(cleanup_note)
+                    else:
+                        raise SyncError(
+                            f"{cleanup_note}; original allocation failure: "
+                            f"{original_error}"
+                        ) from cleanup_error
+        finally:
+            if metadata_fd >= 0:
+                _close_fd_quietly(metadata_fd)
+                metadata_fd = -1
+            if batch_fd >= 0:
+                _close_fd_quietly(batch_fd)
+                batch_fd = -1
         raise
     finally:
-        if batch_fd >= 0:
+        _close_fd_quietly(metadata_fd)
+        _close_fd_quietly(metadata_stage_parent_fd)
+        if batch_fd >= 0 and (not retain_binding or retain_scaffold_binding):
             _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)
+    if retain_binding:
+        assert batch_fd >= 0
+        assert batch_identity is not None
+        if retain_scaffold_binding:
+            assert scaffold_allocation is not None
+            return scaffold_allocation
+        return batch_root, batch_fd, batch_identity
     return batch_root
+
+
+def _create_quarantine_batch_directory_at(
+    batch_root_fd: int,
+    relative_parts: tuple[str, ...],
+) -> int:
+    directory_fd = os.dup(batch_root_fd)
+    child_flags = _directory_open_flags(nofollow=True)
+    try:
+        for part in relative_parts:
+            created = False
+            next_fd = -1
+            try:
+                try:
+                    next_fd = os.open(part, child_flags, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    try:
+                        os.mkdir(part, mode=0o700, dir_fd=directory_fd)
+                        created = True
+                    except FileExistsError:
+                        pass
+                    next_fd = os.open(part, child_flags, dir_fd=directory_fd)
+                if created:
+                    os.fsync(next_fd)
+                    os.fsync(directory_fd)
+            except BaseException:
+                if next_fd >= 0:
+                    _close_fd_quietly(next_fd)
+                raise
+            _close_fd_quietly(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except BaseException:
+        _close_fd_quietly(directory_fd)
+        raise
+
+
+def _create_ephemeral_quarantine_leaf_at(
+    allocation: EphemeralQuarantineBatchAllocation,
+) -> None:
+    """Exclusively create and transfer the fallback leaf to its owner.
+
+    ``mkdir`` cannot return a directory descriptor.  Capture the new named
+    directory's identity and store it in the allocation before the first fsync
+    or open that can raise.  Once the descriptor exists, transfer it to the
+    allocation before validating it.  Before returning, publish durable v5
+    authority over the exact batch, metadata, and leaf identities.  Thus a
+    crash after successful publication is recoverable without promoting a v8
+    reservation into deletion authority.  A physical crash before publication
+    intentionally leaves the present entity fail-closed.
+    """
+    batch_fd = allocation.batch_fd
+    if _directory_member_names(batch_fd, maximum_entries=2) != ("metadata.json",):
+        raise SyncError("ephemeral quarantine batch changed before leaf creation")
+    os.mkdir("leaf", mode=0o700, dir_fd=batch_fd)
+    leaf_stat = os.stat("leaf", dir_fd=batch_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(leaf_stat.st_mode):
+        raise SyncError("ephemeral quarantine leaf changed during creation")
+    leaf_identity = (leaf_stat.st_dev, leaf_stat.st_ino)
+    allocation.binding = replace(allocation.binding, leaf_identity=leaf_identity)
+    os.fsync(batch_fd)
+    leaf_fd = os.open(
+        "leaf",
+        _directory_open_flags(nofollow=True),
+        dir_fd=batch_fd,
+    )
+    # Transfer descriptor ownership before validation/fsync.  The allocation's
+    # error path, rather than this helper, then has the complete v5 authority.
+    allocation.leaf_fd = leaf_fd
+    if (
+        _directory_identity(leaf_fd) != leaf_identity
+        or _named_entry_identity(batch_fd, "leaf") != leaf_identity
+        or _directory_member_names(batch_fd, maximum_entries=3)
+        != ("leaf", "metadata.json")
+    ):
+        raise SyncError("ephemeral quarantine leaf changed during creation")
+    os.fsync(leaf_fd)
+    os.fsync(batch_fd)
+    cleanup_ticket = _publish_pending_ephemeral_quarantine_cleanup_ticket(
+        allocation.home,
+        allocation.binding,
+    )
+    allocation.binding = replace(
+        allocation.binding,
+        cleanup_ticket=cleanup_ticket,
+    )
+    _require_ephemeral_quarantine_private_boundary(allocation)
+    _require_pending_cleanup_ticket_unchanged(allocation.home, cleanup_ticket)
 
 
 def _snapshot_payload_digest(snapshot: ManagedStateFileSnapshot) -> str | None:
@@ -11791,6 +16359,12 @@ def _planned_snapshot_payload(snapshot: ReconcileTargetSnapshot) -> dict[str, An
         "link_target": snapshot.link_target,
         "ancestor_identity": _identity_payload(snapshot.ancestor_identity),
         "missing_parent_parts": list(snapshot.missing_parent_parts),
+        "regular_sha256": snapshot.regular_sha256,
+        "regular_size": snapshot.regular_size,
+        "regular_mode": snapshot.regular_mode,
+        "regular_uid": snapshot.regular_uid,
+        "regular_gid": snapshot.regular_gid,
+        "regular_link_count": snapshot.regular_link_count,
     }
 
 
@@ -11803,6 +16377,8 @@ def _state_evidence_payload(
         "mode": snapshot.mode if snapshot.exists else None,
         "sha256": _snapshot_payload_digest(snapshot),
         "identity": _identity_payload(snapshot.file_identity),
+        "uid": snapshot.uid if snapshot.exists else None,
+        "gid": snapshot.gid if snapshot.exists else None,
         "evidence": evidence.as_posix() if evidence is not None else None,
     }
 
@@ -11834,6 +16410,296 @@ def _pending_release_payload(
     }
 
 
+def _pending_regular_target_expectation_payload(
+    expectation: PendingRegularTargetExpectation,
+) -> dict[str, Any]:
+    return {
+        "target": expectation.target.as_posix(),
+        "parent_identity": _identity_payload(expectation.parent_identity),
+        "file_identity": _identity_payload(expectation.file_identity),
+        "sha256": expectation.sha256,
+        "size": expectation.size,
+        "mode": expectation.mode,
+        "uid": expectation.uid,
+    }
+
+
+def _terminal_regular_state_items(
+    state: ManagedState,
+    records: tuple[PendingLinkRecord, ...],
+    *,
+    phase: str,
+) -> tuple[tuple[PurePosixPath, ManagedLinkRecord, PendingLinkRecord | None], ...]:
+    if phase not in {"before", "after"}:
+        raise SyncError("pending terminal regular phase is invalid")
+    records_by_target = {
+        record.target: record for record in records if record.scope == "managed"
+    }
+    items: list[tuple[PurePosixPath, ManagedLinkRecord, PendingLinkRecord | None]] = []
+    for target, state_record in sorted(
+        state.links.items(),
+        key=lambda item: item[0].as_posix(),
+    ):
+        if not _record_materializes_regular_file(state_record):
+            continue
+        pending_record = records_by_target.get(target)
+        if phase == "before" and pending_record is not None:
+            if (
+                pending_record.action
+                not in {
+                    "replace",
+                    "quarantine-replace",
+                    "remove",
+                    "quarantine-remove",
+                }
+                or _regular_snapshot_from_reconcile(pending_record.planned_snapshot)
+                is None
+            ):
+                continue
+        items.append((target, state_record, pending_record))
+    return tuple(items)
+
+
+def _require_pending_terminal_regular_group_size_budget(
+    sizes: tuple[int | None, ...],
+    *,
+    phase: str,
+) -> None:
+    total = 0
+    for size in sizes:
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise SyncError(
+                f"pending terminal regular {phase} group has incomplete size evidence"
+            )
+        if size > MAX_PENDING_REGULAR_MATERIALIZATION_BYTES - total:
+            raise SyncError(
+                f"pending terminal regular {phase} group exceeds the aggregate "
+                "size limit"
+            )
+        total += size
+
+
+def _stable_regular_source_size_evidence(source: Path) -> int:
+    parent_fd, file_fd, metadata = _open_bounded_regular_file(
+        source,
+        maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        description="managed regular-file source",
+    )
+    try:
+        _require_bounded_regular_file_unchanged(
+            source,
+            parent_fd,
+            file_fd,
+            metadata,
+            "managed regular-file source",
+        )
+        return metadata.st_size
+    finally:
+        _close_fd_quietly(file_fd)
+        _close_fd_quietly(parent_fd)
+
+
+def _stable_managed_regular_target_size_evidence(
+    home: Path,
+    target: Path,
+) -> int:
+    parent_fd = _open_directory_beneath(home, target.parent)
+    file_fd = -1
+    try:
+        if not _bound_directory_matches(home, target.parent, parent_fd):
+            raise SyncError(f"managed regular-file parent changed: {target.parent}")
+        try:
+            named = os.stat(
+                target.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise SyncError(
+                f"managed regular file is unreadable: {target}: {error}"
+            ) from error
+        if not stat.S_ISREG(named.st_mode):
+            raise SyncError(f"managed target is not a regular file: {target}")
+        if named.st_size > MAX_ARCHIVE_MEMBER_BYTES:
+            raise SyncError(
+                f"managed regular file exceeds {MAX_ARCHIVE_MEMBER_BYTES} bytes: "
+                f"{target}"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        try:
+            file_fd = os.open(target.name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            raise SyncError(
+                f"managed regular file is unreadable: {target}: {error}"
+            ) from error
+        opened = os.fstat(file_fd)
+        rebound = os.stat(
+            target.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not _regular_stat_metadata_matches(opened, named)
+            or not _regular_stat_metadata_matches(rebound, named)
+            or not _bound_directory_matches(home, target.parent, parent_fd)
+        ):
+            raise SyncError(f"managed regular file changed before read: {target}")
+        if (
+            stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+        ):
+            raise SyncError(
+                "managed regular file access policy mismatch: "
+                f"{target} (mode={stat.S_IMODE(opened.st_mode):o}, "
+                f"uid={opened.st_uid}, links={opened.st_nlink})"
+            )
+        return opened.st_size
+    finally:
+        _close_fd_quietly(file_fd)
+        _close_fd_quietly(parent_fd)
+
+
+def _pending_terminal_regular_group_size_evidence(
+    home: Path,
+    state_items: tuple[
+        tuple[PurePosixPath, ManagedLinkRecord, PendingLinkRecord | None], ...
+    ],
+    *,
+    phase: str,
+) -> tuple[int | None, ...]:
+    sizes: list[int | None] = []
+    for target, state_record, pending_record in state_items:
+        if (
+            phase == "after"
+            and pending_record is not None
+            and pending_record.action in {"create", "replace", "quarantine-replace"}
+        ):
+            size = pending_record.regular_size
+        elif (
+            phase == "before"
+            and pending_record is not None
+            and pending_record.action
+            in {"replace", "quarantine-replace", "remove", "quarantine-remove"}
+        ):
+            planned = _regular_snapshot_from_reconcile(pending_record.planned_snapshot)
+            size = planned.size if planned is not None else None
+        else:
+            source_size = _stable_regular_source_size_evidence(
+                _record_regular_source_path(home, state_record)
+            )
+            target_size = _stable_managed_regular_target_size_evidence(
+                home,
+                home / Path(*target.parts),
+            )
+            if target_size != source_size:
+                raise SyncError(
+                    f"pending terminal regular target size changed: {target}"
+                )
+            size = source_size
+        sizes.append(size)
+    return tuple(sizes)
+
+
+def _stage_pending_terminal_regular_targets(
+    home: Path,
+    state: ManagedState,
+    records: tuple[PendingLinkRecord, ...],
+    *,
+    phase: str,
+) -> tuple[PendingRegularTargetExpectation, ...]:
+    state_items = _terminal_regular_state_items(
+        state,
+        records,
+        phase=phase,
+    )
+    _require_pending_terminal_regular_group_size_budget(
+        _pending_terminal_regular_group_size_evidence(
+            home,
+            state_items,
+            phase=phase,
+        ),
+        phase=phase,
+    )
+    expectations: list[PendingRegularTargetExpectation] = []
+    for target, state_record, pending_record in state_items:
+        snapshot: RegularFileSnapshot | None = None
+        if (
+            phase == "after"
+            and pending_record is not None
+            and pending_record.action in {"create", "replace", "quarantine-replace"}
+        ):
+            parent_identity = pending_record.planned_snapshot.parent_identity
+            file_identity = pending_record.evidence_identity
+            digest = pending_record.regular_sha256
+            size = pending_record.regular_size
+            mode = pending_record.regular_mode
+            uid = pending_record.regular_uid
+        elif (
+            phase == "before"
+            and pending_record is not None
+            and pending_record.action
+            in {"replace", "quarantine-replace", "remove", "quarantine-remove"}
+        ):
+            snapshot = _regular_snapshot_from_reconcile(pending_record.planned_snapshot)
+            if snapshot is None:
+                raise SyncError(
+                    f"pending terminal regular preimage is missing: {target}"
+                )
+            parent_identity = snapshot.parent_identity
+            file_identity = snapshot.file_identity
+            digest = snapshot.sha256
+            size = snapshot.size
+            mode = snapshot.mode
+            uid = snapshot.uid
+        else:
+            snapshot = _read_regular_file_snapshot_beneath(
+                home,
+                home / Path(*target.parts),
+                require_managed_access=True,
+            )
+            expected_digest = _regular_source_sha256(
+                home,
+                _record_regular_source_path(home, state_record),
+            )
+            if snapshot.sha256 != expected_digest:
+                raise SyncError(
+                    f"pending terminal regular target content changed: {target}"
+                )
+            parent_identity = snapshot.parent_identity
+            file_identity = snapshot.file_identity
+            digest = snapshot.sha256
+            size = snapshot.size
+            mode = snapshot.mode
+            uid = snapshot.uid
+        if (
+            parent_identity is None
+            or file_identity is None
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or mode != 0o600
+            or uid != os.geteuid()
+        ):
+            raise SyncError(f"pending terminal regular target is incomplete: {target}")
+        expectations.append(
+            PendingRegularTargetExpectation(
+                target=target,
+                parent_identity=parent_identity,
+                file_identity=file_identity,
+                sha256=digest,
+                size=size,
+                mode=mode,
+                uid=uid,
+            )
+        )
+    return tuple(expectations)
+
+
 def _pending_commit_evidence_payload(
     batch_root: Path,
     state_after: ManagedStateFileSnapshot,
@@ -11852,6 +16718,26 @@ def _pending_commit_evidence_payload(
         "state_after_sha256": hashlib.sha256(state_after.payload).hexdigest(),
     }
     return (json.dumps(payload, indent=2, sort_keys=False) + "\n").encode("utf-8")
+
+
+def _pending_rollback_marker_payload(batch: PendingLinkBatch) -> bytes:
+    state_before = batch.state_before
+    if state_before.parent_identity is None:
+        raise SyncError("pending state-before parent is not fully bound")
+    payload = {
+        "version": 1,
+        "batch": batch.batch_root.name,
+        "phase": "before",
+        "state_parent_identity": _identity_payload(state_before.parent_identity),
+        "state_before_exists": state_before.exists,
+        "state_before_identity": _identity_payload(state_before.file_identity),
+        "state_before_sha256": _snapshot_payload_digest(state_before),
+    }
+    return _bounded_json_document(
+        payload,
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending rollback marker exceeds the size limit",
+    )
 
 
 def _bounded_json_document(
@@ -11887,6 +16773,8 @@ def _pending_link_metadata_payload(
     state_after_evidence: PurePosixPath,
     releases_before: tuple[PendingReleaseExpectation, ...],
     releases_after: tuple[PendingReleaseExpectation, ...],
+    terminal_regular_before: tuple[PendingRegularTargetExpectation, ...],
+    terminal_regular_after: tuple[PendingRegularTargetExpectation, ...],
     commit_evidence: ManagedStateFileSnapshot,
 ) -> bytes:
     payload = {
@@ -11903,6 +16791,14 @@ def _pending_link_metadata_payload(
         ],
         "releases_after": [
             _pending_release_payload(expectation) for expectation in releases_after
+        ],
+        "terminal_regular_before": [
+            _pending_regular_target_expectation_payload(expectation)
+            for expectation in terminal_regular_before
+        ],
+        "terminal_regular_after": [
+            _pending_regular_target_expectation_payload(expectation)
+            for expectation in terminal_regular_after
         ],
         "commit_evidence": _state_evidence_payload(
             commit_evidence,
@@ -11925,6 +16821,15 @@ def _pending_link_metadata_payload(
                 "owner": record.owner,
                 "link_target": record.link_target,
                 "release_sha": record.release_sha,
+                "before_materialization": record.before_materialization,
+                "materialization": record.materialization,
+                "removed_link": record.removed_link_key,
+                "regular_sha256": record.regular_sha256,
+                "regular_size": record.regular_size,
+                "regular_mode": record.regular_mode,
+                "regular_uid": record.regular_uid,
+                "regular_gid": record.regular_gid,
+                "regular_link_count": record.regular_link_count,
                 "before_evidence": (
                     record.before_evidence.as_posix()
                     if record.before_evidence is not None
@@ -11942,6 +16847,11 @@ def _pending_link_metadata_payload(
                     record.evidence.as_posix() if record.evidence is not None else None
                 ),
                 "evidence_identity": _identity_payload(record.evidence_identity),
+                "publication_cleanup": (
+                    record.publication_cleanup.as_posix()
+                    if record.publication_cleanup is not None
+                    else None
+                ),
             }
             for record in records
         ],
@@ -11960,21 +16870,185 @@ def _write_exclusive_internal_file(
 ) -> ManagedStateFileSnapshot:
     parent_fd = _open_directory_beneath(home, path.parent)
     file_fd = -1
+    parent_identity: tuple[int, int] | None = None
+    created_identity: tuple[int, int, int] | None = None
     try:
+        parent_identity = _directory_identity(parent_fd)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         file_fd = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
-        with os.fdopen(file_fd, "wb", closefd=True) as file:
-            file_fd = -1
+        created = os.fstat(file_fd)
+        created_identity = _exclusive_internal_object_identity(created)
+        if created_identity[2] != stat.S_IFREG:
+            raise SyncError(f"exclusive internal authority is not regular: {path}")
+        os.fchmod(file_fd, 0o600)
+        _require_pending_cleanup_fd_access_policy(
+            file_fd,
+            path,
+            expected_mode=0o600,
+        )
+        with os.fdopen(file_fd, "wb", closefd=False) as file:
             file.write(payload)
             file.flush()
             os.fsync(file.fileno())
+            _require_pending_cleanup_fd_access_policy(
+                file.fileno(),
+                path,
+                expected_mode=0o600,
+            )
         os.fsync(parent_fd)
         return _read_managed_state_file_snapshot(home, path, parent_fd)
+    except BaseException as original_error:
+        if (
+            file_fd >= 0
+            and parent_identity is not None
+            and created_identity is not None
+        ):
+            try:
+                _cleanup_created_exclusive_internal_file(
+                    home,
+                    path,
+                    parent_fd,
+                    file_fd,
+                    parent_identity,
+                    created_identity,
+                    label="exclusive internal authority",
+                )
+            except (OSError, SyncError) as cleanup_error:
+                cleanup_note = (
+                    "exclusive internal authority creation failed and its "
+                    "final name could not be safely cleared: "
+                    f"{cleanup_error}"
+                )
+                add_note = getattr(original_error, "add_note", None)
+                if callable(add_note):
+                    add_note(cleanup_note)
+                else:
+                    raise SyncError(
+                        f"{cleanup_note}; original creation failure: {original_error}"
+                    ) from cleanup_error
+        raise
     finally:
         if file_fd >= 0:
             _close_fd_quietly(file_fd)
+        _close_fd_quietly(parent_fd)
+
+
+def _publish_atomic_exclusive_internal_file(
+    home: Path,
+    path: Path,
+    payload: bytes,
+) -> ManagedStateFileSnapshot:
+    parent_fd = _open_directory_beneath(home, path.parent)
+    try:
+        existing = _read_managed_state_file_snapshot(
+            home,
+            path,
+            parent_fd,
+        )
+        if existing.exists:
+            if (
+                existing.file_type != stat.S_IFREG
+                or existing.mode != 0o600
+                or existing.uid != os.geteuid()
+                or existing.payload != payload
+                or not _managed_state_snapshot_has_complete_file_evidence(existing)
+            ):
+                raise SyncError(
+                    f"atomic internal authority is incomplete or changed: {path}"
+                )
+            os.fsync(parent_fd)
+            return existing
+    finally:
+        _close_fd_quietly(parent_fd)
+
+    temp_path = path.with_name(path.name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX)
+    _discard_incomplete_pending_cleanup_ticket(home, temp_path)
+    if _pending_cleanup_temp_residue_is_observed(home, temp_path):
+        raise SyncError(
+            f"atomic internal authority temp backlog was retained: {temp_path}"
+        )
+    try:
+        staged = _write_exclusive_internal_file(home, temp_path, payload)
+    except _PendingCleanupAccessPolicyError as error:
+        raise SyncError(
+            f"atomic internal authority appeared with changed content: {path}"
+        ) from error
+    parent_fd = _open_directory_beneath(home, path.parent)
+    try:
+        current_temp = _read_managed_state_file_snapshot(
+            home,
+            temp_path,
+            parent_fd,
+            expected_identity=staged.file_identity,
+        )
+        if (
+            not _managed_state_snapshot_matches_bound_file_evidence(
+                current_temp,
+                staged,
+            )
+            or current_temp.payload != payload
+        ):
+            raise SyncError(f"atomic internal authority temp changed: {temp_path}")
+        try:
+            _rename_noreplace_at(
+                parent_fd,
+                temp_path.name,
+                parent_fd,
+                path.name,
+            )
+        except FileExistsError:
+            existing = _read_managed_state_file_snapshot(home, path, parent_fd)
+            if (
+                not existing.exists
+                or existing.file_type != stat.S_IFREG
+                or existing.mode != 0o600
+                or existing.uid != os.geteuid()
+                or existing.payload != payload
+            ):
+                raise SyncError(
+                    f"atomic internal authority appeared with changed content: {path}"
+                )
+            current_temp = _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                parent_fd,
+                expected_identity=staged.file_identity,
+            )
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                current_temp,
+                staged,
+            ):
+                raise SyncError(
+                    f"atomic internal authority temp changed after race: {temp_path}"
+                )
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                temp_path,
+                parent_fd,
+                staged,
+                label="atomic internal authority temp",
+            )
+            os.fsync(parent_fd)
+            return existing
+        os.fsync(parent_fd)
+        published = _read_managed_state_file_snapshot(
+            home,
+            path,
+            parent_fd,
+            expected_identity=staged.file_identity,
+        )
+        if (
+            published.payload != payload
+            or published.mode != 0o600
+            or published.uid != os.geteuid()
+        ):
+            raise SyncError(
+                f"atomic internal authority changed during publication: {path}"
+            )
+        return published
+    finally:
         _close_fd_quietly(parent_fd)
 
 
@@ -11983,40 +17057,91 @@ def _publish_regular_hardlink_beneath(
     source: Path,
     destination: Path,
     expected_source: ManagedStateFileSnapshot,
+    *,
+    maximum_bytes: int | None = None,
 ) -> ManagedStateFileSnapshot:
+    if maximum_bytes is None:
+        pending_parent = destination.parent
+        maximum_bytes = (
+            MAX_ARCHIVE_MEMBER_BYTES
+            if pending_parent.name in {"before", "evidence"}
+            and pending_parent.parent.name == "pending"
+            else MAX_MANAGED_STATE_BYTES
+        )
     if not expected_source.exists or expected_source.file_identity is None:
         raise SyncError(f"regular-file evidence has no source identity: {source}")
     source_parent_fd = _open_directory_beneath(home, source.parent)
     destination_parent_fd = _open_directory_beneath(home, destination.parent)
     published = False
     try:
-        source_snapshot = _read_managed_state_file_snapshot(
+        try:
+            source_snapshot = _read_managed_state_file_snapshot(
+                home,
+                source,
+                source_parent_fd,
+                expected_identity=expected_source.file_identity,
+                maximum_bytes=maximum_bytes,
+            )
+        except (OSError, SyncError) as error:
+            raise SyncError(
+                f"regular-file evidence source changed: {source}: {error}",
+                code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+            ) from error
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            source_snapshot,
+            expected_source,
+        ):
+            raise SyncError(
+                f"regular-file evidence source changed: {source}",
+                code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+            )
+        try:
+            os.link(
+                source.name,
+                destination.name,
+                src_dir_fd=source_parent_fd,
+                dst_dir_fd=destination_parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise SyncError(
+                "regular-file evidence namespace changed before publication; "
+                f"the batch was retained without deletion: {destination}",
+                code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+            ) from error
+        published = True
+        rebound_source = _read_managed_state_file_snapshot(
             home,
             source,
             source_parent_fd,
             expected_identity=expected_source.file_identity,
+            maximum_bytes=maximum_bytes,
         )
-        if source_snapshot != expected_source:
-            raise SyncError(f"regular-file evidence source changed: {source}")
-        os.link(
-            source.name,
-            destination.name,
-            src_dir_fd=source_parent_fd,
-            dst_dir_fd=destination_parent_fd,
-            follow_symlinks=False,
-        )
-        published = True
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            rebound_source,
+            expected_source,
+        ):
+            raise SyncError(
+                "regular-file evidence source changed after publication; the "
+                "source and destination leaves were retained without deletion: "
+                f"{source}, {destination}",
+                code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+            )
         destination_snapshot = _read_managed_state_file_snapshot(
             home,
             destination,
             destination_parent_fd,
             expected_identity=expected_source.file_identity,
+            maximum_bytes=maximum_bytes,
         )
         if not _managed_state_snapshot_matches_file_evidence(
             destination_snapshot,
             expected_source,
         ):
-            raise SyncError(f"regular-file evidence changed: {destination}")
+            raise SyncError(
+                f"regular-file evidence changed: {destination}",
+                code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+            )
         os.fsync(destination_parent_fd)
         if not _bound_directory_matches(
             home, source.parent, source_parent_fd
@@ -12029,14 +17154,3727 @@ def _publish_regular_hardlink_beneath(
         return destination_snapshot
     except BaseException as error:
         if published:
+            if (
+                isinstance(error, SyncError)
+                and error.code == PENDING_REGULAR_PUBLICATION_RETAINED_CODE
+            ):
+                raise
+            # Once link(2) succeeds, the destination may already be the last
+            # exact alias. A pathname revalidation of source cannot authorize a
+            # later destination unlink because source can be replaced between
+            # those operations. Retain every post-publication destination;
+            # batch recovery can classify it without risking evidence loss.
             raise SyncError(
-                "regular-file evidence publication failed after publication; "
-                f"the unreferenced evidence was retained: {destination}"
+                "regular-file evidence publication failed after link creation; "
+                "the destination leaf was retained without deletion: "
+                f"{destination}",
+                code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
             ) from error
         raise
     finally:
         _close_fd_quietly(destination_parent_fd)
         _close_fd_quietly(source_parent_fd)
+
+
+def _publish_regular_reconcile_hardlink_beneath(
+    home: Path,
+    source: Path,
+    target: Path,
+    source_snapshot: RegularFileSnapshot,
+    expected_target_snapshot: ReconcileTargetSnapshot,
+    created_parent_identities: dict[Path, tuple[int, int]],
+    *,
+    pending_batch: PendingLinkBatch | None = None,
+    pending_record: PendingLinkRecord | None = None,
+    cleanup_phase: str = "produced",
+) -> RegularFileSnapshot:
+    source_parent_fd = _open_directory_beneath(home, source.parent)
+    try:
+        target_parent_fd = _open_reconcile_parent_for_create(
+            home,
+            target,
+            expected_target_snapshot,
+            created_parent_identities,
+            require_managed_parent_access=True,
+        )
+    except BaseException:
+        _close_fd_quietly(source_parent_fd)
+        raise
+    published = False
+    published_snapshot: RegularFileSnapshot | None = None
+    expected_publication: RegularFileSnapshot | None = None
+    try:
+        actual_source = _regular_file_snapshot_at(
+            source_parent_fd,
+            source.name,
+            source,
+        )
+        if not _regular_snapshot_matches(
+            actual_source,
+            source_snapshot.parent_identity,
+            source_snapshot,
+            expected_link_count=source_snapshot.link_count,
+        ) or not _bound_directory_matches(home, source.parent, source_parent_fd):
+            raise SyncError(f"pending regular-file stage changed: {source}")
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=target_parent_fd,
+        )
+        os.link(
+            source.name,
+            target.name,
+            src_dir_fd=source_parent_fd,
+            dst_dir_fd=target_parent_fd,
+            follow_symlinks=False,
+        )
+        published = True
+        expected_publication = RegularFileSnapshot(
+            parent_identity=_directory_identity(target_parent_fd),
+            file_identity=source_snapshot.file_identity,
+            sha256=source_snapshot.sha256,
+            size=source_snapshot.size,
+            mode=source_snapshot.mode,
+            uid=source_snapshot.uid,
+            gid=source_snapshot.gid,
+            link_count=source_snapshot.link_count + 1,
+        )
+        published_snapshot = _regular_file_snapshot_at(
+            target_parent_fd,
+            target.name,
+            target,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+        if not _regular_snapshot_leaf_matches(
+            published_snapshot,
+            source_snapshot,
+        ) or (published_snapshot.link_count != source_snapshot.link_count + 1):
+            raise SyncError(f"published managed regular file changed: {target}")
+        os.fsync(target_parent_fd)
+        rebound_source = _regular_file_snapshot_at(
+            source_parent_fd,
+            source.name,
+            source,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+        if (
+            not _regular_snapshot_leaf_matches(
+                rebound_source,
+                source_snapshot,
+            )
+            or rebound_source.link_count != source_snapshot.link_count + 1
+        ):
+            raise SyncError(f"pending regular-file stage changed: {source}")
+        if not _bound_directory_matches(home, source.parent, source_parent_fd):
+            raise SyncError(f"managed regular-file parent changed: {target}")
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=target_parent_fd,
+        )
+        return published_snapshot
+    except BaseException as error:
+        if published:
+            assert expected_publication is not None
+            try:
+                if pending_batch is None or pending_record is None:
+                    _delete_exact_regular_publication_beneath(
+                        home,
+                        target,
+                        expected_publication,
+                    )
+                else:
+                    _delete_pending_regular_publication_beneath(
+                        home,
+                        pending_batch,
+                        pending_record,
+                        target,
+                        expected_publication,
+                        phase=cleanup_phase,
+                    )
+            except BaseException as cleanup_error:
+                raise SyncError(
+                    "managed regular-file publication failed and exact cleanup "
+                    f"could not be verified: {target}: {cleanup_error}",
+                    code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+                ) from error
+        raise
+    finally:
+        _close_fd_quietly(target_parent_fd)
+        _close_fd_quietly(source_parent_fd)
+
+
+def _delete_exact_regular_publication_beneath(
+    home: Path,
+    target: Path,
+    expected: RegularFileSnapshot,
+    *,
+    pending_batch: PendingLinkBatch | None = None,
+    pending_record: PendingLinkRecord | None = None,
+    cleanup_phase: str | None = None,
+) -> None:
+    if pending_batch is None:
+        _delete_exact_regular_publication_without_pending_receipt(
+            home,
+            target,
+            expected,
+        )
+        return
+    if pending_record is None or cleanup_phase is None:
+        raise SyncError("pending regular publication cleanup authority is incomplete")
+    parent_fd = _open_directory_beneath(home, target.parent)
+    try:
+        planned = (
+            expected.file_identity[0],
+            expected.file_identity[1],
+            stat.S_IFREG,
+        )
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
+        active_name, isolated = _isolate_pending_cleanup_entry(
+            parent_fd,
+            target.name,
+            expected.parent_identity,
+            planned,
+        )
+        try:
+            isolated_snapshot = _regular_file_snapshot_at(
+                parent_fd,
+                active_name,
+                target.with_name(active_name),
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        except BaseException:
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                active_name,
+                expected.parent_identity,
+                planned,
+                label=(
+                    "published regular-file destination became unreadable after "
+                    f"isolation: {target}"
+                ),
+            )
+        if (
+            not _regular_snapshot_matches(
+                isolated_snapshot,
+                expected.parent_identity,
+                expected,
+                expected_link_count=expected.link_count,
+            )
+            or _pending_cleanup_entry_plan(isolated) != planned
+        ):
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                active_name,
+                expected.parent_identity,
+                planned,
+                label=(
+                    "published regular-file destination changed during cleanup; "
+                    f"the isolated replacement was retained: {target}"
+                ),
+            )
+        _isolate_and_delete_pending_regular_publication_candidate(
+            home,
+            pending_batch,
+            pending_record,
+            cleanup_phase,
+            target.parent,
+            parent_fd,
+            active_name,
+            expected,
+            expected_link_count=expected.link_count,
+            label="published regular-file destination",
+        )
+        if _named_entry_identity(parent_fd, active_name) is not None:
+            raise SyncError(f"published regular-file cleanup name reappeared: {target}")
+        if not _bound_directory_matches(home, target.parent, parent_fd):
+            raise SyncError(f"managed target parent changed: {target.parent}")
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _pending_ephemeral_public_alias_name(batch_name: str) -> str:
+    return f".codex-publication-cleanup-{batch_name}"
+
+
+def _pending_ephemeral_public_alias_names(batch_name: str) -> tuple[str, ...]:
+    primary = _pending_ephemeral_public_alias_name(batch_name)
+    return (primary,) + tuple(f"{primary}-retained-{index}" for index in range(8))
+
+
+def _pending_ephemeral_quarantine_leaf_name(batch_name: str) -> str:
+    return f".codex-ephemeral-cleanup-{batch_name}"
+
+
+def _pending_ephemeral_quarantine_evidence_names(
+    batch_name: str,
+) -> tuple[str, ...]:
+    primary = _pending_ephemeral_quarantine_leaf_name(batch_name)
+    return (primary,) + tuple(f"{primary}-retained-{index}" for index in range(8))
+
+
+def _pending_ephemeral_quarantine_retained_private_name(batch_name: str) -> str:
+    """Return a collision-resistant private evidence name for foreign data."""
+    primary = _pending_ephemeral_quarantine_leaf_name(batch_name)
+    return f"{primary}-retained-{os.urandom(16).hex()}"
+
+
+def _pending_ephemeral_quarantine_final_private_name(private_name: str) -> str:
+    return f"{private_name}.delete-{os.urandom(16).hex()}"
+
+
+def _pending_ephemeral_quarantine_final_private_base(
+    batch_name: str,
+    name: str,
+) -> str | None:
+    for private_name in _pending_ephemeral_quarantine_evidence_names(batch_name):
+        prefix = f"{private_name}.delete-"
+        if not name.startswith(prefix):
+            continue
+        token = name[len(prefix) :]
+        if len(token) == 32 and re.fullmatch(r"[0-9a-f]{32}", token) is not None:
+            return private_name
+    return None
+
+
+def _pending_ephemeral_quarantine_private_name_is_related(
+    batch_name: str,
+    name: str,
+) -> bool:
+    """Recognize the v6 private namespace without granting deletion authority.
+
+    Exact evidence slots and exact tombstones are authorized elsewhere. Their
+    malformed or suffixed descendants remain related evidence, while unrelated
+    quarantine-root child churn remains outside this batch's inventory.
+    """
+    primary = _pending_ephemeral_quarantine_leaf_name(batch_name)
+    return (
+        name == primary
+        or name.startswith(f"{primary}-retained-")
+        or name.startswith(f"{primary}.delete-")
+    )
+
+
+def _pending_ephemeral_quarantine_private_inventory(
+    quarantine_fd: int,
+    batch_name: str,
+) -> tuple[tuple[str, tuple[int, int]], ...]:
+    names = _directory_member_names(
+        quarantine_fd,
+        maximum_entries=MAX_PENDING_CLEANUP_BATCH_SCAN,
+        overflow_message="ephemeral quarantine evidence scan exceeds the limit",
+    )
+    private: list[tuple[str, tuple[int, int]]] = []
+    for name in names:
+        if not _pending_ephemeral_quarantine_private_name_is_related(
+            batch_name,
+            name,
+        ):
+            continue
+        identity = _named_entry_identity(quarantine_fd, name)
+        if identity is not None:
+            private.append((name, identity))
+    return tuple(private)
+
+
+def _require_pending_ephemeral_terminal_names_absent(
+    home: Path,
+    target: Path,
+    public_parent_fd: int,
+    public_parent_identity: tuple[int, int],
+    quarantine_root: Path,
+    quarantine_fd: int,
+    quarantine_root_identity: tuple[int, int],
+    batch_name: str,
+) -> None:
+    """Reprove the exact parent policy and derived-name absence boundary.
+
+    The protected directory property is identity plus owner-only access policy;
+    ordinary child-entry churn is allowed.  Every public alias, deterministic
+    private evidence name, and high-entropy final-private tombstone derived from
+    this batch must remain absent before its terminal receipt can disappear.
+    """
+    _require_managed_regular_parent_chain_access(
+        home,
+        target.parent,
+        bound_parent_fd=public_parent_fd,
+    )
+    if _directory_identity(
+        public_parent_fd
+    ) != public_parent_identity or not _bound_directory_matches(
+        home,
+        target.parent,
+        public_parent_fd,
+    ):
+        raise SyncError(
+            f"pending ephemeral cleanup public parent changed: {target.parent}"
+        )
+    _require_pending_cleanup_fd_access_policy(
+        quarantine_fd,
+        quarantine_root,
+        expected_mode=0o700,
+    )
+    if _directory_identity(
+        quarantine_fd
+    ) != quarantine_root_identity or not _bound_directory_matches(
+        home,
+        quarantine_root,
+        quarantine_fd,
+    ):
+        raise SyncError("pending cleanup quarantine root changed")
+    public_names = (target.name,) + _pending_ephemeral_public_alias_names(batch_name)
+    if any(
+        _named_entry_identity(public_parent_fd, name) is not None
+        for name in public_names
+    ):
+        raise SyncError(
+            "pending ephemeral cleanup public entry was retained in place: "
+            f"{batch_name}"
+        )
+    if _pending_ephemeral_quarantine_private_inventory(quarantine_fd, batch_name):
+        raise SyncError(
+            f"pending ephemeral cleanup private evidence was retained: {batch_name}"
+        )
+    _require_managed_regular_parent_chain_access(
+        home,
+        target.parent,
+        bound_parent_fd=public_parent_fd,
+    )
+    _require_pending_cleanup_fd_access_policy(
+        quarantine_fd,
+        quarantine_root,
+        expected_mode=0o700,
+    )
+    if (
+        _directory_identity(public_parent_fd) != public_parent_identity
+        or not _bound_directory_matches(home, target.parent, public_parent_fd)
+        or _directory_identity(quarantine_fd) != quarantine_root_identity
+        or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+    ):
+        raise SyncError("pending ephemeral cleanup parent changed during name audit")
+
+
+def _require_pending_ephemeral_ticket_representations_absent(
+    home: Path,
+    index_root: Path,
+    index_fd: int,
+    batch_name: str,
+) -> None:
+    """Reject every recoverable representation of one cleanup ticket."""
+    _require_pending_cleanup_fd_access_policy(
+        index_fd,
+        index_root,
+        expected_mode=0o700,
+    )
+    if not _bound_directory_matches(home, index_root, index_fd):
+        raise SyncError("pending ephemeral cleanup index changed")
+    names = _directory_member_names(
+        index_fd,
+        maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+        overflow_message="pending cleanup control scan exceeds the size limit",
+    )
+    for name in names:
+        if _pending_cleanup_ticket_representation_batch_name(name) == batch_name:
+            raise SyncError(
+                "pending ephemeral cleanup ticket representation remained before "
+                f"terminal receipt deletion: {batch_name}: {name}"
+            )
+    _require_pending_cleanup_fd_access_policy(
+        index_fd,
+        index_root,
+        expected_mode=0o700,
+    )
+    if not _bound_directory_matches(home, index_root, index_fd):
+        raise SyncError("pending ephemeral cleanup index changed")
+
+
+def _new_pending_ephemeral_cleanup_batch_name() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    batch_name = f"{stamp}-{os.getpid()}-{time.time_ns()}"
+    if len(batch_name.encode("utf-8")) > MAX_PENDING_LINK_BATCH_NAME_BYTES:
+        raise SyncError("ephemeral cleanup batch name exceeds the size limit")
+    return batch_name
+
+
+def _publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+    home: Path,
+    target: Path,
+    expected: RegularFileSnapshot,
+) -> PendingBatchCleanupTicket:
+    quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+    quarantine_fd = _open_or_create_directory_beneath(
+        home,
+        quarantine_root,
+        mode=0o700,
+    )
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
+            raise SyncError(f"ephemeral quarantine root changed: {quarantine_root}")
+        quarantine_root_identity = _directory_identity(quarantine_fd)
+        for _attempt in range(128):
+            batch_name = _new_pending_ephemeral_cleanup_batch_name()
+            alias_names = _pending_ephemeral_public_alias_names(batch_name)
+            evidence_names = _pending_ephemeral_quarantine_evidence_names(batch_name)
+            if any(
+                _named_entry_identity(quarantine_fd, name) is not None
+                for name in evidence_names
+            ):
+                continue
+            ticket_path = _pending_cleanup_ticket_path(home, batch_name)
+            temp_path = ticket_path.with_name(ticket_path.name + ".tmp")
+            if ticket_path.exists() or temp_path.exists():
+                continue
+            break
+        else:
+            raise SyncError("could not allocate an ephemeral cleanup ticket name")
+    finally:
+        _close_fd_quietly(quarantine_fd)
+
+    parent_fd = _open_directory_beneath(home, target.parent)
+    try:
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
+        if _directory_identity(
+            parent_fd
+        ) != expected.parent_identity or not _bound_directory_matches(
+            home, target.parent, parent_fd
+        ):
+            raise SyncError(f"published regular-file parent changed: {target.parent}")
+        if any(
+            _named_entry_identity(parent_fd, name) is not None for name in alias_names
+        ):
+            raise SyncError(f"published regular-file cleanup alias exists: {target}")
+    finally:
+        _close_fd_quietly(parent_fd)
+
+    payload = _pending_ephemeral_quarantine_leaf_cleanup_ticket_payload(
+        home,
+        batch_name,
+        quarantine_root_identity,
+        target,
+        expected,
+    )
+    pseudo_batch_root = quarantine_root / batch_name
+    _publish_pending_batch_cleanup_ticket_for_root(
+        home,
+        pseudo_batch_root,
+        payload,
+    )
+    ticket = _read_pending_cleanup_ticket(
+        home,
+        _pending_cleanup_ticket_path(home, batch_name),
+    )
+    if ticket is None or ticket.snapshot.payload != payload:
+        raise SyncError(f"ephemeral cleanup ticket changed: {batch_name}")
+    return ticket
+
+
+def _delete_exact_regular_publication_without_pending_receipt(
+    home: Path,
+    target: Path,
+    expected: RegularFileSnapshot,
+) -> None:
+    """Delete an exact publication under durable v6 cleanup authority.
+
+    The ticket is durable before either the public canonical name or the
+    private quarantine name is mutated. Recovery can therefore resume the
+    exact inode through canonical, non-loadable alias, and private states.
+    Foreign or replaced entries are never cleanup authority.
+    """
+    ticket = _publish_pending_ephemeral_quarantine_leaf_cleanup_ticket(
+        home,
+        target,
+        expected,
+    )
+    if not _remove_pending_ephemeral_quarantine_leaf(home, ticket):
+        raise SyncError(
+            f"ephemeral quarantine leaf cleanup was not completed: "
+            f"{ticket.batch_root.name}"
+        )
+
+
+def _publish_pending_ephemeral_quarantine_cleanup_ticket(
+    home: Path,
+    binding: EphemeralQuarantineBatchBinding,
+) -> PendingBatchCleanupTicket:
+    _require_quarantine_allocation_matches_binding(home, binding)
+    if binding.leaf_identity is None:
+        raise SyncError("ephemeral quarantine cleanup leaf identity is missing")
+    batch_root = binding.batch_root
+    quarantine_root = batch_root.parent
+    leaf_path = batch_root / "leaf"
+    batch_name = batch_root.name
+    directory_flags = _directory_open_flags(nofollow=True)
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    batch_fd = -1
+    leaf_fd = -1
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        if _directory_identity(
+            quarantine_fd
+        ) != binding.quarantine_root_identity or not _bound_directory_matches(
+            home, quarantine_root, quarantine_fd
+        ):
+            raise SyncError(f"ephemeral quarantine root changed: {quarantine_root}")
+        batch_fd = os.open(batch_name, directory_flags, dir_fd=quarantine_fd)
+        if _directory_identity(
+            batch_fd
+        ) != binding.batch_identity or not _bound_directory_matches(
+            home, batch_root, batch_fd
+        ):
+            raise SyncError(f"ephemeral quarantine batch changed: {batch_root}")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            batch_root,
+            expected_mode=0o700,
+        )
+        if _directory_member_names(
+            batch_fd,
+            maximum_entries=3,
+            overflow_message="ephemeral quarantine batch has too many entries",
+        ) != ("leaf", "metadata.json"):
+            raise SyncError(f"ephemeral quarantine batch changed: {batch_root}")
+        current_metadata = _read_managed_state_file_snapshot(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            expected_identity=binding.metadata.file_identity,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_metadata,
+            binding.metadata,
+        ):
+            raise SyncError(f"ephemeral quarantine metadata changed: {batch_root}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            current_metadata,
+        )
+        leaf_fd = os.open("leaf", directory_flags, dir_fd=batch_fd)
+        if _directory_identity(
+            leaf_fd
+        ) != binding.leaf_identity or not _bound_directory_matches(
+            home, leaf_path, leaf_fd
+        ):
+            raise SyncError(f"ephemeral quarantine leaf changed: {leaf_path}")
+        _require_pending_cleanup_fd_access_policy(
+            leaf_fd,
+            leaf_path,
+            expected_mode=0o700,
+        )
+        payload = _pending_ephemeral_quarantine_cleanup_ticket_payload(
+            replace(binding, metadata=current_metadata),
+            binding.quarantine_root_identity,
+        )
+        _publish_pending_batch_cleanup_ticket_for_root(
+            home,
+            batch_root,
+            payload,
+        )
+        ticket = _read_pending_cleanup_ticket(
+            home,
+            _pending_cleanup_ticket_path(home, batch_name),
+        )
+        if ticket is None or ticket.snapshot.payload != payload:
+            raise SyncError(
+                f"ephemeral quarantine cleanup ticket changed: {batch_name}"
+            )
+        return ticket
+    finally:
+        _close_fd_quietly(leaf_fd)
+        _close_fd_quietly(batch_fd)
+        _close_fd_quietly(quarantine_fd)
+
+
+def _pending_private_use_control_evidence(
+    name: str,
+    snapshot: ManagedStateFileSnapshot,
+) -> PendingPrivateUseControlEvidence:
+    if (
+        not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+        or snapshot.payload is None
+        or snapshot.file_identity is None
+        or snapshot.file_type != stat.S_IFREG
+        or snapshot.mode != 0o600
+        or snapshot.uid != os.geteuid()
+        or snapshot.gid is None
+        or snapshot.size is None
+    ):
+        raise SyncError(f"private-use retirement control is incomplete: {name}")
+    return PendingPrivateUseControlEvidence(
+        name=name,
+        file_identity=snapshot.file_identity,
+        sha256=hashlib.sha256(snapshot.payload).hexdigest(),
+        size=snapshot.size,
+        mode=snapshot.mode,
+        uid=snapshot.uid,
+        gid=snapshot.gid,
+    )
+
+
+def _pending_private_use_directory_evidence(
+    descriptor: int,
+    path: Path,
+) -> PendingPrivateUseDirectoryEvidence:
+    metadata = _require_pending_cleanup_fd_access_policy(
+        descriptor, path, expected_mode=0o700
+    )
+    return PendingPrivateUseDirectoryEvidence(
+        identity=_directory_identity(descriptor),
+        mode=stat.S_IMODE(metadata.st_mode),
+        uid=metadata.st_uid,
+        gid=metadata.st_gid,
+    )
+
+
+def _pending_private_use_control_matches(
+    snapshot: ManagedStateFileSnapshot,
+    expected: PendingPrivateUseControlEvidence,
+) -> bool:
+    return (
+        _managed_state_snapshot_has_complete_file_evidence(snapshot)
+        and snapshot.payload is not None
+        and snapshot.file_type == stat.S_IFREG
+        and snapshot.file_identity == expected.file_identity
+        and hashlib.sha256(snapshot.payload).hexdigest() == expected.sha256
+        and snapshot.size == expected.size
+        and snapshot.mode == expected.mode
+        and snapshot.uid == expected.uid
+        and _gid_matches_regular_file_access_policy(
+            snapshot.gid, expected.gid, expected.mode
+        )
+    )
+
+
+def _pending_private_use_retirement_control_state(
+    home: Path,
+    receipt: PendingPrivateUseRetirementReceipt,
+    *,
+    receipt_member: str,
+) -> tuple[PendingBatchCleanupTicket | None, PendingQuarantineAllocationTicket | None]:
+    """Bind the complete same-batch control namespace at a mutation boundary."""
+    index_root = _pending_cleanup_index_path(home)
+    index_fd = _open_directory_beneath(home, index_root)
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            index_fd, index_root, expected_mode=0o700
+        )
+        if _directory_identity(
+            index_fd
+        ) != receipt.cleanup_index.identity or not _bound_directory_matches(
+            home, index_root, index_fd
+        ):
+            raise SyncError("private-use retirement cleanup index changed")
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="private-use retirement control scan exceeds the limit",
+        )
+        batch_name = receipt.batch_root.name
+        expected_receipt_canonical = batch_name + PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+        expected_receipt_temp = (
+            expected_receipt_canonical + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+        )
+        cleanup_representations: list[str] = []
+        allocation_representations: list[str] = []
+        receipt_representations: list[str] = []
+        for name in names:
+            related_batch = _pending_quarantine_allocation_cleanup_control_batch_name(
+                name
+            )
+            receipt_related = _pending_private_use_retirement_representation_batch_name(
+                name
+            )
+            if related_batch != batch_name and receipt_related != batch_name:
+                continue
+            retained_canonical = _pending_cleanup_retained_canonical_name(name)
+            canonical = retained_canonical or name
+            if canonical == receipt.cleanup_control.name:
+                cleanup_representations.append(name)
+            elif canonical == receipt.allocation_control.name:
+                allocation_representations.append(name)
+            elif canonical in {expected_receipt_canonical, expected_receipt_temp}:
+                receipt_representations.append(name)
+            else:
+                raise SyncError(
+                    "private-use retirement has competing control evidence: "
+                    f"{batch_name}: {name}"
+                )
+        if len(cleanup_representations) > 1 or len(allocation_representations) > 1:
+            raise SyncError(
+                f"private-use retirement has overlapping controls: {batch_name}"
+            )
+        if receipt_representations != [receipt_member]:
+            raise SyncError(
+                f"private-use retirement receipt representation changed: {batch_name}"
+            )
+        current_receipt = _read_managed_state_file_snapshot(
+            home,
+            index_root / receipt_member,
+            index_fd,
+            expected_identity=receipt.snapshot.file_identity,
+            maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_receipt, receipt.snapshot
+        ):
+            raise SyncError(f"private-use retirement receipt changed: {batch_name}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, index_root / receipt_member, index_fd, current_receipt
+        )
+
+        cleanup: PendingBatchCleanupTicket | None = None
+        if cleanup_representations:
+            cleanup_name = cleanup_representations[0]
+            cleanup_snapshot = _read_managed_state_file_snapshot(
+                home,
+                index_root / cleanup_name,
+                index_fd,
+                expected_identity=receipt.cleanup_control.file_identity,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
+            if not _pending_private_use_control_matches(
+                cleanup_snapshot, receipt.cleanup_control
+            ):
+                raise SyncError(
+                    f"private-use retirement cleanup control changed: {batch_name}"
+                )
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home, index_root / cleanup_name, index_fd, cleanup_snapshot
+            )
+            if cleanup_name == receipt.cleanup_control.name:
+                cleanup = _read_pending_cleanup_ticket(
+                    home,
+                    index_root / cleanup_name,
+                    expected_ticket_identity=receipt.cleanup_control.file_identity,
+                )
+            else:
+                cleanup = _read_pending_cleanup_ticket(
+                    home,
+                    index_root / (batch_name + PENDING_CLEANUP_TICKET_TEMP_SUFFIX),
+                    expected_ticket_identity=receipt.cleanup_control.file_identity,
+                    allow_temporary=True,
+                    _captured_snapshot=cleanup_snapshot,
+                )
+            if cleanup is None or cleanup.version != 5:
+                raise SyncError(
+                    f"private-use retirement cleanup authority changed: {batch_name}"
+                )
+
+        allocation: PendingQuarantineAllocationTicket | None = None
+        if allocation_representations:
+            allocation_name = allocation_representations[0]
+            allocation_snapshot = _read_managed_state_file_snapshot(
+                home,
+                index_root / allocation_name,
+                index_fd,
+                expected_identity=receipt.allocation_control.file_identity,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
+            if not _pending_private_use_control_matches(
+                allocation_snapshot, receipt.allocation_control
+            ):
+                raise SyncError(
+                    f"private-use retirement allocation control changed: {batch_name}"
+                )
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home, index_root / allocation_name, index_fd, allocation_snapshot
+            )
+            if allocation_name == receipt.allocation_control.name:
+                allocation = _read_pending_quarantine_allocation_ticket(
+                    home,
+                    index_root / allocation_name,
+                    expected_identity=receipt.allocation_control.file_identity,
+                )
+            else:
+                # The immutable receipt binds the exact v8 bytes and inode.  A
+                # retained tombstone is not promoted here because the deletion
+                # helper may be between its rename and unlink boundaries.
+                original = _read_pending_quarantine_allocation_ticket(
+                    home,
+                    index_root / receipt.allocation_control.name,
+                )
+                if original is not None:
+                    raise SyncError(
+                        f"private-use retirement allocation overlaps: {batch_name}"
+                    )
+                allocation = PendingQuarantineAllocationTicket(
+                    path=index_root / receipt.allocation_control.name,
+                    snapshot=allocation_snapshot,
+                    batch_root=receipt.batch_root,
+                    quarantine_root_identity=receipt.quarantine_root.identity,
+                    isolated_name=receipt.isolated_name,
+                    batch_mode=receipt.batch.mode,
+                    metadata_sha256=receipt.metadata_sha256,
+                    metadata_size=receipt.metadata_size,
+                    metadata_mode=receipt.metadata_mode,
+                    leaf_mode=receipt.leaf.mode,
+                )
+        if cleanup is not None:
+            if (
+                cleanup.batch_root != receipt.batch_root
+                or cleanup.quarantine_root_identity != receipt.quarantine_root.identity
+                or cleanup.isolated_name != receipt.isolated_name
+                or cleanup.batch_root_identity != receipt.batch.identity
+                or cleanup.leaf_identity != receipt.leaf.identity
+                or cleanup.metadata_file_identity != receipt.metadata_file_identity
+                or cleanup.metadata_sha256 != receipt.metadata_sha256
+                or cleanup.metadata_mode != receipt.metadata_mode
+            ):
+                raise SyncError(
+                    f"private-use retirement cleanup authority changed: {batch_name}"
+                )
+        if allocation is not None and (
+            allocation.batch_root != receipt.batch_root
+            or allocation.quarantine_root_identity != receipt.quarantine_root.identity
+            or allocation.isolated_name != receipt.isolated_name
+            or allocation.batch_mode != receipt.batch.mode
+            or allocation.metadata_sha256 != receipt.metadata_sha256
+            or allocation.metadata_size != receipt.metadata_size
+            or allocation.metadata_mode != receipt.metadata_mode
+            or allocation.leaf_mode != receipt.leaf.mode
+        ):
+            raise SyncError(
+                f"private-use retirement allocation authority changed: {batch_name}"
+            )
+        _require_pending_cleanup_fd_access_policy(
+            index_fd, index_root, expected_mode=0o700
+        )
+        if _directory_identity(
+            index_fd
+        ) != receipt.cleanup_index.identity or not _bound_directory_matches(
+            home, index_root, index_fd
+        ):
+            raise SyncError("private-use retirement cleanup index changed")
+        return cleanup, allocation
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _require_pending_private_use_retirement_boundary(
+    home: Path,
+    receipt: PendingPrivateUseRetirementReceipt,
+    *,
+    receipt_member: str,
+) -> tuple[PendingBatchCleanupTicket | None, PendingQuarantineAllocationTicket | None]:
+    quarantine_root = receipt.batch_root.parent
+    leaf_path = receipt.batch_root / "leaf"
+    directory_flags = _directory_open_flags(nofollow=True)
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    batch_fd = -1
+    leaf_fd = -1
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd, quarantine_root, expected_mode=receipt.quarantine_root.mode
+        )
+        if (
+            _directory_identity(quarantine_fd) != receipt.quarantine_root.identity
+            or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+            or _named_entry_identity(quarantine_fd, receipt.canonical_name)
+            != receipt.batch.identity
+            or _named_entry_identity(quarantine_fd, receipt.isolated_name) is not None
+        ):
+            raise SyncError("private-use retirement quarantine namespace changed")
+        batch_fd = os.open(
+            receipt.canonical_name, directory_flags, dir_fd=quarantine_fd
+        )
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd, receipt.batch_root, expected_mode=receipt.batch.mode
+        )
+        if (
+            _directory_identity(batch_fd) != receipt.batch.identity
+            or not _bound_directory_matches(home, receipt.batch_root, batch_fd)
+            or _directory_member_names(batch_fd, maximum_entries=3)
+            != ("leaf", "metadata.json")
+            or _named_entry_identity(batch_fd, "leaf") != receipt.leaf.identity
+        ):
+            raise SyncError("private-use retirement batch changed")
+        metadata = _read_managed_state_file_snapshot(
+            home,
+            receipt.batch_root / "metadata.json",
+            batch_fd,
+            expected_identity=receipt.metadata_file_identity,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(metadata)
+            or metadata.payload is None
+            or metadata.file_identity != receipt.metadata_file_identity
+            or hashlib.sha256(metadata.payload).hexdigest() != receipt.metadata_sha256
+            or metadata.size != receipt.metadata_size
+            or metadata.mode != receipt.metadata_mode
+            or metadata.uid != receipt.metadata_uid
+            or not _gid_matches_regular_file_access_policy(
+                metadata.gid, receipt.metadata_gid, receipt.metadata_mode
+            )
+        ):
+            raise SyncError("private-use retirement metadata changed")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, receipt.batch_root / "metadata.json", batch_fd, metadata
+        )
+        leaf_fd = os.open("leaf", directory_flags, dir_fd=batch_fd)
+        _require_pending_cleanup_fd_access_policy(
+            leaf_fd, leaf_path, expected_mode=receipt.leaf.mode
+        )
+        if (
+            _directory_identity(leaf_fd) != receipt.leaf.identity
+            or not _bound_directory_matches(home, leaf_path, leaf_fd)
+            or _directory_member_names(leaf_fd, maximum_entries=2)
+            != (receipt.private_member_name,)
+        ):
+            raise SyncError("private-use retirement leaf changed")
+        private = _regular_file_snapshot_at(
+            leaf_fd,
+            receipt.private_member_name,
+            leaf_path / receipt.private_member_name,
+        )
+        if not _regular_snapshot_matches(
+            private,
+            receipt.leaf.identity,
+            receipt.private_member,
+            expected_link_count=receipt.private_member.link_count,
+        ):
+            raise SyncError("private-use retirement private member changed")
+        controls = _pending_private_use_retirement_control_state(
+            home, receipt, receipt_member=receipt_member
+        )
+        # Repeat the complete private namespace after the index scan.  The
+        # receipt is about to authorize a control mutation, so its protected
+        # object identity, content stability, and access policy must still
+        # hold—not merely the identities of the held directory descriptors.
+        # Benign 0700 gid transitions are not identity or access-policy
+        # changes, while replacement, mode/owner/ACL drift and extra members
+        # remain protected properties.
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd, quarantine_root, expected_mode=receipt.quarantine_root.mode
+        )
+        if (
+            _directory_identity(quarantine_fd) != receipt.quarantine_root.identity
+            or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+            or _named_entry_identity(quarantine_fd, receipt.canonical_name)
+            != receipt.batch.identity
+            or _named_entry_identity(quarantine_fd, receipt.isolated_name) is not None
+        ):
+            raise SyncError("private-use retirement quarantine namespace changed")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd, receipt.batch_root, expected_mode=receipt.batch.mode
+        )
+        if (
+            _directory_identity(batch_fd) != receipt.batch.identity
+            or not _bound_directory_matches(home, receipt.batch_root, batch_fd)
+            or _directory_member_names(batch_fd, maximum_entries=3)
+            != ("leaf", "metadata.json")
+            or _named_entry_identity(batch_fd, "leaf") != receipt.leaf.identity
+        ):
+            raise SyncError("private-use retirement batch changed")
+        metadata_after = _read_managed_state_file_snapshot(
+            home,
+            receipt.batch_root / "metadata.json",
+            batch_fd,
+            expected_identity=receipt.metadata_file_identity,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(metadata_after)
+            or metadata_after.payload is None
+            or metadata_after.file_identity != receipt.metadata_file_identity
+            or hashlib.sha256(metadata_after.payload).hexdigest()
+            != receipt.metadata_sha256
+            or metadata_after.size != receipt.metadata_size
+            or metadata_after.mode != receipt.metadata_mode
+            or metadata_after.uid != receipt.metadata_uid
+            or not _gid_matches_regular_file_access_policy(
+                metadata_after.gid, receipt.metadata_gid, receipt.metadata_mode
+            )
+        ):
+            raise SyncError("private-use retirement metadata changed")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, receipt.batch_root / "metadata.json", batch_fd, metadata_after
+        )
+        _require_pending_cleanup_fd_access_policy(
+            leaf_fd, leaf_path, expected_mode=receipt.leaf.mode
+        )
+        if (
+            _directory_identity(leaf_fd) != receipt.leaf.identity
+            or not _bound_directory_matches(home, leaf_path, leaf_fd)
+            or _directory_member_names(leaf_fd, maximum_entries=2)
+            != (receipt.private_member_name,)
+        ):
+            raise SyncError("private-use retirement leaf changed")
+        private_after = _regular_file_snapshot_at(
+            leaf_fd,
+            receipt.private_member_name,
+            leaf_path / receipt.private_member_name,
+        )
+        if not _regular_snapshot_matches(
+            private_after,
+            receipt.leaf.identity,
+            receipt.private_member,
+            expected_link_count=receipt.private_member.link_count,
+        ):
+            raise SyncError("private-use retirement private member changed")
+        return controls
+    finally:
+        _close_fd_quietly(leaf_fd)
+        _close_fd_quietly(batch_fd)
+        _close_fd_quietly(quarantine_fd)
+
+
+def _publish_pending_private_use_retirement_receipt(
+    allocation: EphemeralQuarantineBatchAllocation,
+    private_member_name: str,
+    private_member: RegularFileSnapshot,
+) -> PendingPrivateUseRetirementReceipt:
+    """Publish control-only retirement authority from caller-captured evidence."""
+    binding = allocation.binding
+    cleanup_ticket = binding.cleanup_ticket
+    allocation_ticket = binding.allocation_ticket
+    if (
+        cleanup_ticket is None
+        or cleanup_ticket.version != 5
+        or allocation_ticket is None
+        or binding.leaf_identity is None
+        or private_member.parent_identity != binding.leaf_identity
+    ):
+        raise SyncError("private-use retirement authority is incomplete")
+    _require_ephemeral_quarantine_private_boundary(
+        allocation, expected_leaf_members=(private_member_name,)
+    )
+    current_cleanup = _read_pending_cleanup_ticket(
+        allocation.home,
+        cleanup_ticket.path,
+        expected_ticket_identity=cleanup_ticket.snapshot.file_identity,
+    )
+    current_allocation = _read_pending_quarantine_allocation_ticket(
+        allocation.home,
+        allocation_ticket.path,
+        expected_identity=allocation_ticket.snapshot.file_identity,
+    )
+    if (
+        current_cleanup is None
+        or current_cleanup.version != 5
+        or not _managed_state_snapshot_matches_bound_file_evidence(
+            current_cleanup.snapshot, cleanup_ticket.snapshot
+        )
+        or current_allocation is None
+        or not _pending_quarantine_allocation_ticket_matches(
+            current_allocation, allocation_ticket
+        )
+        or not _cleanup_ticket_matches_quarantine_allocation(
+            current_cleanup, current_allocation
+        )
+    ):
+        raise SyncError("private-use retirement controls changed before publication")
+    current_private = _regular_file_snapshot_at(
+        allocation.leaf_fd,
+        private_member_name,
+        binding.batch_root / "leaf" / private_member_name,
+    )
+    if not _regular_snapshot_matches(
+        current_private,
+        binding.leaf_identity,
+        private_member,
+        expected_link_count=private_member.link_count,
+    ):
+        raise SyncError("private-use retirement private member changed")
+    current_metadata = _read_managed_state_file_snapshot(
+        allocation.home,
+        binding.batch_root / "metadata.json",
+        allocation.batch_fd,
+        expected_identity=binding.metadata.file_identity,
+        maximum_bytes=MAX_MANAGED_STATE_BYTES,
+    )
+    if (
+        not _managed_state_snapshot_matches_bound_file_evidence(
+            current_metadata, binding.metadata
+        )
+        or current_metadata.payload is None
+        or current_metadata.file_identity is None
+        or current_metadata.size is None
+        or current_metadata.mode is None
+        or current_metadata.uid is None
+        or current_metadata.gid is None
+    ):
+        raise SyncError("private-use retirement metadata changed")
+    index_root = _pending_cleanup_index_path(allocation.home)
+    index_fd = _open_directory_beneath(allocation.home, index_root)
+    try:
+        cleanup_index = _pending_private_use_directory_evidence(index_fd, index_root)
+        if (
+            cleanup_ticket.snapshot.parent_identity != cleanup_index.identity
+            or allocation_ticket.snapshot.parent_identity != cleanup_index.identity
+        ):
+            raise SyncError("private-use retirement cleanup index changed")
+    finally:
+        _close_fd_quietly(index_fd)
+    prototype = PendingPrivateUseRetirementReceipt(
+        path=_pending_private_use_retirement_path(
+            allocation.home, binding.batch_root.name
+        ),
+        snapshot=ManagedStateFileSnapshot(exists=False),
+        batch_root=binding.batch_root,
+        canonical_name=binding.batch_root.name,
+        isolated_name=_pending_cleanup_isolated_batch_name(binding.batch_root.name),
+        cleanup_control=_pending_private_use_control_evidence(
+            cleanup_ticket.path.name, cleanup_ticket.snapshot
+        ),
+        allocation_control=_pending_private_use_control_evidence(
+            allocation_ticket.path.name, allocation_ticket.snapshot
+        ),
+        cleanup_index=cleanup_index,
+        quarantine_root=_pending_private_use_directory_evidence(
+            allocation.quarantine_fd, allocation.quarantine_root
+        ),
+        batch=_pending_private_use_directory_evidence(
+            allocation.batch_fd, binding.batch_root
+        ),
+        leaf=_pending_private_use_directory_evidence(
+            allocation.leaf_fd, binding.batch_root / "leaf"
+        ),
+        metadata_file_identity=current_metadata.file_identity,
+        metadata_sha256=hashlib.sha256(current_metadata.payload).hexdigest(),
+        metadata_size=current_metadata.size,
+        metadata_mode=current_metadata.mode,
+        metadata_uid=current_metadata.uid,
+        metadata_gid=current_metadata.gid,
+        private_member_name=private_member_name,
+        # This must remain the caller's pre-publication snapshot.  The current
+        # read above is only a comparison and never becomes recovery authority.
+        private_member=private_member,
+    )
+    payload = _pending_private_use_retirement_receipt_payload(prototype)
+    _require_ephemeral_quarantine_private_boundary(
+        allocation, expected_leaf_members=(private_member_name,)
+    )
+    published = _publish_atomic_exclusive_internal_file(
+        allocation.home, prototype.path, payload
+    )
+    receipt = _read_pending_private_use_retirement_receipt(
+        allocation.home,
+        prototype.path,
+        expected_identity=published.file_identity,
+    )
+    if receipt is None or receipt.snapshot.payload != payload:
+        raise SyncError("private-use retirement receipt changed during publication")
+    _require_pending_private_use_retirement_boundary(
+        allocation.home, receipt, receipt_member=receipt.path.name
+    )
+    return receipt
+
+
+def _publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+    home: Path,
+    binding: EphemeralQuarantineBatchBinding,
+) -> PendingBatchCleanupTicket:
+    """Durably bind an allocation whose ``leaf`` member is proven absent."""
+    _require_quarantine_allocation_matches_binding(home, binding)
+    if binding.leaf_identity is not None:
+        raise SyncError("ephemeral quarantine scaffold leaf must be absent")
+    batch_root = binding.batch_root
+    quarantine_root = batch_root.parent
+    batch_name = batch_root.name
+    directory_flags = _directory_open_flags(nofollow=True)
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    batch_fd = -1
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        if (
+            _directory_identity(quarantine_fd) != binding.quarantine_root_identity
+            or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+            or _named_entry_identity(quarantine_fd, batch_name)
+            != binding.batch_identity
+        ):
+            raise SyncError(f"ephemeral quarantine root changed: {quarantine_root}")
+        batch_fd = os.open(batch_name, directory_flags, dir_fd=quarantine_fd)
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            batch_root,
+            expected_mode=0o700,
+        )
+        if (
+            _directory_identity(batch_fd) != binding.batch_identity
+            or not _bound_directory_matches(home, batch_root, batch_fd)
+            or _directory_member_names(batch_fd, maximum_entries=2)
+            != ("metadata.json",)
+        ):
+            raise SyncError(f"ephemeral quarantine batch changed: {batch_root}")
+        current_metadata = _read_managed_state_file_snapshot(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            expected_identity=binding.metadata.file_identity,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_metadata,
+            binding.metadata,
+        ):
+            raise SyncError(f"ephemeral quarantine metadata changed: {batch_root}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            current_metadata,
+        )
+        # Repeat root/batch/path/member checks immediately before ticket
+        # publication.  Root or batch replacement is a namespace change, while
+        # ordinary directory timestamps are deliberately not compared.
+        if (
+            _directory_identity(quarantine_fd) != binding.quarantine_root_identity
+            or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+            or _named_entry_identity(quarantine_fd, batch_name)
+            != binding.batch_identity
+            or _directory_identity(batch_fd) != binding.batch_identity
+            or not _bound_directory_matches(home, batch_root, batch_fd)
+            or _directory_member_names(batch_fd, maximum_entries=2)
+            != ("metadata.json",)
+        ):
+            raise SyncError(
+                f"ephemeral quarantine scaffold changed before ticket: {batch_root}"
+            )
+        payload = _pending_ephemeral_quarantine_scaffold_cleanup_ticket_payload(
+            replace(binding, metadata=current_metadata)
+        )
+        _publish_pending_batch_cleanup_ticket_for_root(home, batch_root, payload)
+        ticket = _read_pending_cleanup_ticket(
+            home,
+            _pending_cleanup_ticket_path(home, batch_name),
+        )
+        if ticket is None or ticket.snapshot.payload != payload:
+            raise SyncError(
+                f"ephemeral quarantine scaffold ticket changed: {batch_name}"
+            )
+        return ticket
+    finally:
+        _close_fd_quietly(batch_fd)
+        _close_fd_quietly(quarantine_fd)
+
+
+def _require_ephemeral_quarantine_private_boundary(
+    allocation: EphemeralQuarantineBatchAllocation,
+    *,
+    expected_leaf_members: tuple[str, ...] = (),
+) -> None:
+    """Reprove one exact empty leaf immediately before a private rename.
+
+    Protected properties are root/batch/leaf object identity, canonical path
+    membership, metadata object and byte stability, exact member sets, and
+    current-euid access policy.  Directory timestamp or link-count churn is not
+    compared because it does not change any of those properties.
+    """
+    binding = allocation.binding
+    if binding.leaf_identity is None or allocation.leaf_fd < 0:
+        raise SyncError("ephemeral quarantine private leaf is not bound")
+    batch_root = binding.batch_root
+    quarantine_root = allocation.quarantine_root
+    leaf_path = batch_root / "leaf"
+    # Establish the complete namespace first.  Metadata content and every
+    # access policy are then sampled last, immediately before the caller's
+    # rename.  The old ordering ended on member checks, leaving a final window
+    # in which already-sampled policy/content could become unsafe unnoticed.
+    if (
+        _directory_identity(allocation.quarantine_fd)
+        != binding.quarantine_root_identity
+        or not _bound_directory_matches(
+            allocation.home,
+            quarantine_root,
+            allocation.quarantine_fd,
+        )
+        or _named_entry_identity(allocation.quarantine_fd, batch_root.name)
+        != binding.batch_identity
+        or _directory_identity(allocation.batch_fd) != binding.batch_identity
+        or not _bound_directory_matches(
+            allocation.home,
+            batch_root,
+            allocation.batch_fd,
+        )
+        or _directory_member_names(allocation.batch_fd, maximum_entries=3)
+        != ("leaf", "metadata.json")
+        or _named_entry_identity(allocation.batch_fd, "leaf") != binding.leaf_identity
+        or _directory_identity(allocation.leaf_fd) != binding.leaf_identity
+        or not _bound_directory_matches(
+            allocation.home,
+            leaf_path,
+            allocation.leaf_fd,
+        )
+        or _directory_member_names(
+            allocation.leaf_fd,
+            maximum_entries=len(expected_leaf_members) + 1,
+        )
+        != expected_leaf_members
+    ):
+        raise SyncError(
+            f"ephemeral quarantine namespace changed before private rename: "
+            f"{batch_root}"
+        )
+    current_metadata = _read_managed_state_file_snapshot(
+        allocation.home,
+        batch_root / "metadata.json",
+        allocation.batch_fd,
+        expected_identity=binding.metadata.file_identity,
+        maximum_bytes=MAX_MANAGED_STATE_BYTES,
+    )
+    if not _managed_state_snapshot_matches_bound_file_evidence(
+        current_metadata,
+        binding.metadata,
+    ):
+        raise SyncError(f"ephemeral quarantine metadata changed: {batch_root}")
+    _require_pending_cleanup_file_snapshot_access_policy(
+        allocation.home,
+        batch_root / "metadata.json",
+        allocation.batch_fd,
+        current_metadata,
+    )
+    _require_pending_cleanup_fd_access_policy(
+        allocation.quarantine_fd,
+        quarantine_root,
+        expected_mode=0o700,
+    )
+    _require_pending_cleanup_fd_access_policy(
+        allocation.batch_fd,
+        batch_root,
+        expected_mode=0o700,
+    )
+    _require_pending_cleanup_fd_access_policy(
+        allocation.leaf_fd,
+        leaf_path,
+        expected_mode=0o700,
+    )
+
+
+def _discard_empty_ephemeral_quarantine_batch(
+    home: Path,
+    binding: EphemeralQuarantineBatchBinding,
+) -> None:
+    """Reclaim only the exact empty scaffold allocated for fallback cleanup.
+
+    The quarantine root, batch and leaf directory identities plus the object
+    identity, content stability and access policy of ``metadata.json`` are
+    bound at allocation time and independently rebound before deletion.
+    Child-entry churn is not itself a mutation signal, but any extra entry
+    prevents reclamation and leaves the private batch intact for inspection.
+    Durable v5 (empty leaf) or v7 (leaf proven absent) authority is published
+    before any destructive cleanup, so every later mutation can be resumed by
+    the ordinary pending-cleanup scanner. This is deliberately not an orphan
+    sweep: no batch without an exact ticket or this in-process binding is
+    eligible for removal.
+    """
+    batch_root = binding.batch_root
+    leaf_path = batch_root / "leaf"
+    quarantine_root = batch_root.parent
+    batch_name = batch_root.name
+    if _pending_cleanup_batch_name_from_quarantine_entry(batch_name) != batch_name:
+        raise SyncError(f"ephemeral quarantine batch name is invalid: {batch_root}")
+    _require_quarantine_allocation_matches_binding(home, binding)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    batch_fd = -1
+    leaf_fd = -1
+    ticket: PendingBatchCleanupTicket | None = None
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        if _directory_identity(
+            quarantine_fd
+        ) != binding.quarantine_root_identity or not _bound_directory_matches(
+            home, quarantine_root, quarantine_fd
+        ):
+            raise SyncError(f"ephemeral quarantine root changed: {quarantine_root}")
+        batch_fd = os.open(batch_name, directory_flags, dir_fd=quarantine_fd)
+        if _directory_identity(
+            batch_fd
+        ) != binding.batch_identity or not _bound_directory_matches(
+            home, batch_root, batch_fd
+        ):
+            raise SyncError(f"ephemeral quarantine batch changed: {batch_root}")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            batch_root,
+            expected_mode=0o700,
+        )
+        expected_batch_members = (
+            ("metadata.json",)
+            if binding.leaf_identity is None
+            else ("leaf", "metadata.json")
+        )
+        if (
+            _directory_member_names(
+                batch_fd,
+                maximum_entries=3,
+                overflow_message="ephemeral quarantine batch has too many entries",
+            )
+            != expected_batch_members
+        ):
+            raise SyncError(f"ephemeral quarantine batch is not empty: {batch_root}")
+        current_metadata = _read_managed_state_file_snapshot(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            expected_identity=binding.metadata.file_identity,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_metadata,
+            binding.metadata,
+        ):
+            raise SyncError(f"ephemeral quarantine metadata changed: {batch_root}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            current_metadata,
+        )
+        if binding.leaf_identity is not None:
+            leaf_fd = os.open("leaf", directory_flags, dir_fd=batch_fd)
+            if _directory_identity(
+                leaf_fd
+            ) != binding.leaf_identity or not _bound_directory_matches(
+                home, leaf_path, leaf_fd
+            ):
+                raise SyncError(f"ephemeral quarantine leaf changed: {leaf_path}")
+            _require_pending_cleanup_fd_access_policy(
+                leaf_fd,
+                leaf_path,
+                expected_mode=0o700,
+            )
+            if _directory_member_names(leaf_fd, maximum_entries=1) != ():
+                raise SyncError(f"ephemeral quarantine leaf is not empty: {leaf_path}")
+            _close_fd_quietly(leaf_fd)
+            leaf_fd = -1
+            leaf_stat = os.stat("leaf", dir_fd=batch_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(leaf_stat.st_mode)
+                or (leaf_stat.st_dev, leaf_stat.st_ino) != binding.leaf_identity
+                or _directory_member_names(
+                    batch_fd,
+                    maximum_entries=3,
+                    overflow_message="ephemeral quarantine batch has too many entries",
+                )
+                != ("leaf", "metadata.json")
+            ):
+                raise SyncError(
+                    f"ephemeral quarantine leaf changed before cleanup: {leaf_path}"
+                )
+            cleanup_binding = replace(binding, metadata=current_metadata)
+            if binding.cleanup_ticket is None:
+                ticket = _publish_pending_ephemeral_quarantine_cleanup_ticket(
+                    home,
+                    cleanup_binding,
+                )
+            else:
+                ticket = binding.cleanup_ticket
+                if (
+                    ticket.version != 5
+                    or ticket.snapshot.payload
+                    != _pending_ephemeral_quarantine_cleanup_ticket_payload(
+                        cleanup_binding,
+                        binding.quarantine_root_identity,
+                    )
+                ):
+                    raise SyncError(
+                        f"ephemeral quarantine cleanup authority changed: {batch_name}"
+                    )
+                _require_pending_cleanup_ticket_unchanged(home, ticket)
+        else:
+            # Leaf absence is itself a protected property.  Publish v7 durable
+            # authority before metadata isolation, batch isolation, or rmdir so
+            # every post-mutation crash can resume from the ticket/tombstone,
+            # deterministic isolated name, and empty-proof protocol.
+            if (
+                _directory_identity(quarantine_fd) != binding.quarantine_root_identity
+                or not _bound_directory_matches(
+                    home,
+                    quarantine_root,
+                    quarantine_fd,
+                )
+                or _directory_identity(batch_fd) != binding.batch_identity
+                or not _bound_directory_matches(home, batch_root, batch_fd)
+                or _directory_member_names(batch_fd, maximum_entries=2)
+                != ("metadata.json",)
+            ):
+                raise SyncError(
+                    "ephemeral quarantine namespace changed before cleanup: "
+                    f"{batch_root}"
+                )
+            ticket = _publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+                home,
+                replace(binding, metadata=current_metadata),
+            )
+    finally:
+        _close_fd_quietly(leaf_fd)
+        _close_fd_quietly(batch_fd)
+        _close_fd_quietly(quarantine_fd)
+    if ticket is not None and not _remove_cleanup_ready_batch(home, ticket):
+        raise SyncError(f"ephemeral quarantine cleanup was not completed: {batch_name}")
+
+
+def _isolate_and_delete_pending_regular_publication_candidate(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    source_parent: Path,
+    source_parent_fd: int,
+    source_name: str,
+    expected: RegularFileSnapshot,
+    *,
+    public_names: tuple[str, ...] | None = None,
+    expected_link_count: int,
+    label: str,
+) -> None:
+    """Delete an exact regular leaf only after private batch isolation.
+
+    The protected leaf properties are object identity, stable content and
+    access policy. Parent directory timestamps and link counts are deliberately
+    ignored so ordinary child-entry churn remains valid. The public source
+    parent's complete access policy is revalidated after the final leaf
+    snapshot and immediately before the rename. After that atomic boundary,
+    only the mode-0700 batch cleanup namespace is mutated.
+    """
+    cleanup_parent = batch.batch_root / "pending" / "cleanup"
+    if public_names is None:
+        public_names = (source_name,)
+    cleanup_parent_fd = _open_directory_beneath(home, cleanup_parent)
+    planned = (
+        expected.file_identity[0],
+        expected.file_identity[1],
+        stat.S_IFREG,
+    )
+    try:
+        cleanup_parent_identity = _directory_identity(cleanup_parent_fd)
+        _require_pending_cleanup_fd_access_policy(
+            cleanup_parent_fd,
+            cleanup_parent,
+            expected_mode=0o700,
+        )
+        if not _bound_directory_matches(
+            home,
+            cleanup_parent,
+            cleanup_parent_fd,
+        ):
+            raise SyncError("pending regular publication cleanup namespace changed")
+        isolated_name = _pending_regular_publication_private_alias_name(
+            cleanup_parent_identity,
+            planned,
+            record.index,
+            phase,
+        )
+        if _named_entry_identity(cleanup_parent_fd, isolated_name) is not None:
+            raise SyncError(
+                "pending regular publication cleanup has both public and private "
+                "active aliases"
+            )
+        source_snapshot = _regular_file_snapshot_at(
+            source_parent_fd,
+            source_name,
+            source_parent / source_name,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+        if (
+            not _regular_snapshot_matches(
+                source_snapshot,
+                expected.parent_identity,
+                expected,
+                expected_link_count=expected_link_count,
+            )
+            or _pending_cleanup_internal_entry_plan(
+                source_name,
+                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                expected.parent_identity,
+            )
+            != planned
+        ):
+            raise SyncError(f"{label} active entry changed")
+        _require_managed_regular_parent_chain_access(
+            home,
+            source_parent,
+            bound_parent_fd=source_parent_fd,
+        )
+        _require_pending_cleanup_fd_access_policy(
+            cleanup_parent_fd,
+            cleanup_parent,
+            expected_mode=0o700,
+        )
+        _rename_noreplace_at(
+            source_parent_fd,
+            source_name,
+            cleanup_parent_fd,
+            isolated_name,
+        )
+        os.fsync(source_parent_fd)
+        os.fsync(cleanup_parent_fd)
+        if not _pending_regular_publication_uses_receiptless_cleanup(
+            batch,
+            record,
+            phase,
+        ):
+            _advance_pending_regular_publication_private_authority(
+                home,
+                batch,
+                record,
+                phase,
+                expected,
+                source_name,
+                cleanup_parent_fd=cleanup_parent_fd,
+                cleanup_parent_identity=cleanup_parent_identity,
+            )
+        if _named_entry_identity(source_parent_fd, source_name) is not None:
+            raise SyncError(
+                f"{label} public active name reappeared; exact private evidence "
+                "was retained"
+            )
+        try:
+            _delete_pending_regular_publication_private_alias(
+                home,
+                batch,
+                record,
+                phase,
+                cleanup_parent_fd,
+                cleanup_parent_identity,
+                expected,
+                public_parent=source_parent,
+                public_parent_fd=source_parent_fd,
+                public_names=public_names,
+                expected_link_count=expected_link_count,
+                label=label,
+            )
+        except BaseException:
+            # Modern cleanup advances an independent private-authority anchor
+            # and never restores this inode to a public name. Receiptless
+            # legacy cleanup retains its original best-effort restoration.
+            if _named_entry_identity(cleanup_parent_fd, isolated_name) is not None:
+                try:
+                    restored_snapshot = _regular_file_snapshot_at(
+                        cleanup_parent_fd,
+                        isolated_name,
+                        cleanup_parent / isolated_name,
+                        maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                    )
+                except BaseException:
+                    _retain_pending_cleanup_entry(
+                        cleanup_parent_fd,
+                        isolated_name,
+                        cleanup_parent_identity,
+                        planned,
+                        label=f"{label} private evidence became unreadable",
+                    )
+                if (
+                    not _regular_snapshot_leaf_matches(restored_snapshot, expected)
+                    or restored_snapshot.link_count != expected_link_count
+                    or _pending_cleanup_internal_entry_plan(
+                        isolated_name,
+                        PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                        cleanup_parent_identity,
+                    )
+                    != planned
+                ):
+                    _retain_pending_cleanup_entry(
+                        cleanup_parent_fd,
+                        isolated_name,
+                        cleanup_parent_identity,
+                        planned,
+                        label=f"{label} private evidence changed before restoration",
+                    )
+                if not _pending_regular_publication_uses_receiptless_cleanup(
+                    batch,
+                    record,
+                    phase,
+                ):
+                    journal = _read_pending_regular_publication_cleanup(
+                        home,
+                        batch,
+                        record,
+                        phase,
+                    )
+                    if journal is None:
+                        _retain_pending_cleanup_entry(
+                            cleanup_parent_fd,
+                            isolated_name,
+                            cleanup_parent_identity,
+                            planned,
+                            label=f"{label} cleanup journal disappeared",
+                        )
+                    _journal, active_name, _journal_phase, _expected = journal
+                    _advance_pending_regular_publication_private_authority(
+                        home,
+                        batch,
+                        record,
+                        phase,
+                        expected,
+                        active_name,
+                        cleanup_parent_fd=cleanup_parent_fd,
+                        cleanup_parent_identity=cleanup_parent_identity,
+                    )
+                    # The durable anchor makes this private-only authority.
+                    # Moving the same inode back to a public alias would make
+                    # a later retry indistinguishable from hostile replay.
+                    raise
+                if any(
+                    name != source_name
+                    and _named_entry_identity(source_parent_fd, name) is not None
+                    for name in public_names
+                ):
+                    _retain_pending_cleanup_entry(
+                        cleanup_parent_fd,
+                        isolated_name,
+                        cleanup_parent_identity,
+                        planned,
+                        label=(
+                            f"{label} public canonical name reappeared while "
+                            "private evidence was retained"
+                        ),
+                    )
+                try:
+                    _require_managed_regular_parent_chain_access(
+                        home,
+                        source_parent,
+                        bound_parent_fd=source_parent_fd,
+                    )
+                    _rename_noreplace_at(
+                        cleanup_parent_fd,
+                        isolated_name,
+                        source_parent_fd,
+                        source_name,
+                    )
+                    os.fsync(source_parent_fd)
+                    os.fsync(cleanup_parent_fd)
+                except BaseException:
+                    _retain_pending_cleanup_entry(
+                        cleanup_parent_fd,
+                        isolated_name,
+                        cleanup_parent_identity,
+                        planned,
+                        label=f"{label} private evidence could not be restored",
+                    )
+            raise
+    finally:
+        _close_fd_quietly(cleanup_parent_fd)
+
+
+def _pending_regular_publication_private_alias_name(
+    cleanup_parent_identity: tuple[int, int],
+    planned: tuple[int, int, int],
+    record_index: int,
+    phase: str,
+) -> str:
+    if phase not in {"produced", "before"}:
+        raise SyncError("pending regular publication cleanup phase is invalid")
+    token = hashlib.sha256(f"{record_index}:{phase}".encode("ascii")).hexdigest()[:16]
+    return (
+        f"{PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX}"
+        f"{cleanup_parent_identity[0]:x}-{cleanup_parent_identity[1]:x}-"
+        f"{planned[0]:x}-{planned[1]:x}-{planned[2]:x}-{token}"
+    )
+
+
+def _pending_regular_publication_private_deletion_alias_name(
+    private_name: str,
+) -> str:
+    return f"{private_name}.delete-{os.urandom(16).hex()}"
+
+
+def _pending_regular_publication_private_deletion_alias_base(
+    name: str,
+) -> str | None:
+    match = re.fullmatch(r"(.+)\.delete-[0-9a-f]{32}", name)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _pending_regular_publication_private_alias_binding(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    file_identity: tuple[int, int],
+) -> tuple[str, RegularFileSnapshot] | None:
+    """Locate exactly one canonical or final-isolation private alias."""
+    cleanup_parent = batch.batch_root / "pending" / "cleanup"
+    cleanup_parent_fd = _open_directory_beneath(home, cleanup_parent)
+    try:
+        cleanup_parent_identity = _directory_identity(cleanup_parent_fd)
+        _require_pending_cleanup_fd_access_policy(
+            cleanup_parent_fd,
+            cleanup_parent,
+            expected_mode=0o700,
+        )
+        if not _bound_directory_matches(
+            home,
+            cleanup_parent,
+            cleanup_parent_fd,
+        ):
+            raise SyncError("pending regular publication cleanup namespace changed")
+        planned = (file_identity[0], file_identity[1], stat.S_IFREG)
+        canonical_name = _pending_regular_publication_private_alias_name(
+            cleanup_parent_identity,
+            planned,
+            record.index,
+            phase,
+        )
+        deletion_prefix = f"{canonical_name}.delete-"
+        candidates: list[str] = []
+        with os.scandir(cleanup_parent_fd) as entries:
+            for scanned, entry in enumerate(entries, start=1):
+                if scanned > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
+                    raise SyncError(
+                        "pending regular publication private alias scan exceeds "
+                        "the batch limit"
+                    )
+                if entry.name == canonical_name:
+                    candidates.append(entry.name)
+                elif entry.name.startswith(deletion_prefix) and (
+                    _pending_regular_publication_private_deletion_alias_base(entry.name)
+                    == canonical_name
+                ):
+                    candidates.append(entry.name)
+        if not _bound_directory_matches(
+            home,
+            cleanup_parent,
+            cleanup_parent_fd,
+        ):
+            raise SyncError("pending regular publication cleanup namespace changed")
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise SyncError("pending regular publication private cleanup is ambiguous")
+        private_name = candidates[0]
+        return private_name, _regular_file_snapshot_at(
+            cleanup_parent_fd,
+            private_name,
+            cleanup_parent / private_name,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+    finally:
+        _close_fd_quietly(cleanup_parent_fd)
+
+
+def _pending_regular_publication_private_alias_snapshot(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    file_identity: tuple[int, int],
+) -> RegularFileSnapshot | None:
+    binding = _pending_regular_publication_private_alias_binding(
+        home,
+        batch,
+        record,
+        phase,
+        file_identity,
+    )
+    return None if binding is None else binding[1]
+
+
+def _pending_regular_publication_public_name_is_allowed(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    public_parent: Path,
+    public_parent_fd: int,
+    name: str,
+) -> bool:
+    if _named_entry_identity(public_parent_fd, name) is None:
+        return True
+    target = home / Path(*record.target.parts)
+    if (
+        phase != "produced"
+        or record.action not in {"replace", "quarantine-replace"}
+        or not record.before_is_regular()
+        or public_parent != target.parent
+        or name != target.name
+    ):
+        return False
+    before = _pending_record_before_evidence_snapshot(home, batch, record)
+    if not isinstance(before, RegularFileSnapshot):
+        return False
+    target_snapshot = _regular_file_snapshot_at(
+        public_parent_fd,
+        name,
+        target,
+        maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+    )
+    return _regular_snapshot_matches(
+        target_snapshot,
+        record.planned_snapshot.parent_identity,
+        before,
+        expected_link_count=before.link_count,
+    )
+
+
+def _pending_regular_publication_public_names_are_allowed(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    public_parent: Path,
+    public_parent_fd: int,
+    public_names: tuple[str, ...],
+) -> bool:
+    """Validate public absence or the exact produced-phase before preimage.
+
+    The protected properties are canonical object identity, stable content,
+    access policy, parent binding, and the batch-authorized hard-link set.
+    Parent child-entry churn is deliberately allowed.
+    """
+    return all(
+        _pending_regular_publication_public_name_is_allowed(
+            home,
+            batch,
+            record,
+            phase,
+            public_parent,
+            public_parent_fd,
+            name,
+        )
+        for name in public_names
+    )
+
+
+def _delete_pending_regular_publication_private_alias(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    cleanup_parent_fd: int,
+    cleanup_parent_identity: tuple[int, int],
+    expected: RegularFileSnapshot,
+    *,
+    public_parent: Path,
+    public_parent_fd: int,
+    public_names: tuple[str, ...],
+    expected_link_count: int,
+    label: str,
+    private_name: str | None = None,
+) -> None:
+    cleanup_parent = batch.batch_root / "pending" / "cleanup"
+    planned = (
+        expected.file_identity[0],
+        expected.file_identity[1],
+        stat.S_IFREG,
+    )
+    canonical_private_name = _pending_regular_publication_private_alias_name(
+        cleanup_parent_identity,
+        planned,
+        record.index,
+        phase,
+    )
+    isolated_name = private_name or canonical_private_name
+    if (
+        isolated_name != canonical_private_name
+        and _pending_regular_publication_private_deletion_alias_base(isolated_name)
+        != canonical_private_name
+    ):
+        raise SyncError(f"{label} private isolation name is invalid")
+    isolated_path = cleanup_parent / isolated_name
+    try:
+        isolated_snapshot = _regular_file_snapshot_at(
+            cleanup_parent_fd,
+            isolated_name,
+            isolated_path,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+    except BaseException:
+        _retain_pending_cleanup_entry(
+            cleanup_parent_fd,
+            isolated_name,
+            cleanup_parent_identity,
+            planned,
+            label=f"{label} became unreadable after private isolation",
+        )
+    if (
+        not _regular_snapshot_leaf_matches(isolated_snapshot, expected)
+        or isolated_snapshot.link_count != expected_link_count
+        or _pending_cleanup_internal_entry_plan(
+            canonical_private_name,
+            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+            cleanup_parent_identity,
+        )
+        != planned
+    ):
+        _retain_pending_cleanup_entry(
+            cleanup_parent_fd,
+            isolated_name,
+            cleanup_parent_identity,
+            planned,
+            label=f"{label} changed during private isolation",
+        )
+    if not _pending_regular_publication_uses_receiptless_cleanup(
+        batch,
+        record,
+        phase,
+    ):
+        journal = _read_pending_regular_publication_cleanup(
+            home,
+            batch,
+            record,
+            phase,
+        )
+        if journal is None:
+            raise SyncError("pending regular publication cleanup journal is missing")
+        _journal_snapshot, active_name, _journal_phase, _journal_expected = journal
+        _advance_pending_regular_publication_private_authority(
+            home,
+            batch,
+            record,
+            phase,
+            expected,
+            active_name,
+            cleanup_parent_fd=cleanup_parent_fd,
+            cleanup_parent_identity=cleanup_parent_identity,
+        )
+    _require_managed_regular_parent_chain_access(
+        home,
+        public_parent,
+        bound_parent_fd=public_parent_fd,
+    )
+    if not _pending_regular_publication_public_names_are_allowed(
+        home,
+        batch,
+        record,
+        phase,
+        public_parent,
+        public_parent_fd,
+        public_names,
+    ):
+        raise SyncError(
+            f"{label} public name reappeared; exact private evidence was retained"
+        )
+    _require_pending_cleanup_fd_access_policy(
+        cleanup_parent_fd,
+        cleanup_parent,
+        expected_mode=0o700,
+    )
+
+    deletion_name: str | None = None
+    isolation_error: BaseException | None = None
+    for _attempt in range(128):
+        candidate = _pending_regular_publication_private_deletion_alias_name(
+            canonical_private_name
+        )
+        try:
+            _rename_noreplace_at(
+                cleanup_parent_fd,
+                isolated_name,
+                cleanup_parent_fd,
+                candidate,
+            )
+        except FileExistsError:
+            continue
+        except BaseException as error:
+            source_identity = _named_entry_identity(
+                cleanup_parent_fd,
+                isolated_name,
+            )
+            candidate_identity = _named_entry_identity(
+                cleanup_parent_fd,
+                candidate,
+            )
+            if source_identity is None and candidate_identity is not None:
+                deletion_name = candidate
+                isolation_error = error
+                break
+            if source_identity is None:
+                raise SyncError(
+                    f"{label} private evidence disappeared during final isolation"
+                ) from error
+            raise SyncError(
+                f"{label} private evidence could not be finally isolated; "
+                f"retained as {isolated_name}"
+            ) from error
+        deletion_name = candidate
+        break
+    if deletion_name is None:
+        raise SyncError(f"{label} could not allocate a final private isolation name")
+    os.fsync(cleanup_parent_fd)
+
+    deletion_path = cleanup_parent / deletion_name
+    try:
+        deletion_snapshot = _regular_file_snapshot_at(
+            cleanup_parent_fd,
+            deletion_name,
+            deletion_path,
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+    except BaseException:
+        _retain_pending_cleanup_entry(
+            cleanup_parent_fd,
+            deletion_name,
+            cleanup_parent_identity,
+            planned,
+            label=f"{label} became unreadable after final private isolation",
+        )
+    if (
+        not _regular_snapshot_leaf_matches(deletion_snapshot, expected)
+        or deletion_snapshot.link_count != expected_link_count
+        or _pending_regular_publication_private_deletion_alias_base(deletion_name)
+        != canonical_private_name
+        or _directory_identity(cleanup_parent_fd) != cleanup_parent_identity
+        or not _bound_directory_matches(home, cleanup_parent, cleanup_parent_fd)
+    ):
+        _retain_pending_cleanup_entry(
+            cleanup_parent_fd,
+            deletion_name,
+            cleanup_parent_identity,
+            planned,
+            label=f"{label} changed during final private isolation",
+        )
+    if isolation_error is not None:
+        raise isolation_error
+
+    private_fd = -1
+    private_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    private_flags |= getattr(os, "O_NOFOLLOW", 0)
+    private_flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        try:
+            private_fd = os.open(
+                deletion_name,
+                private_flags,
+                dir_fd=cleanup_parent_fd,
+            )
+        except OSError as error:
+            raise SyncError(
+                f"{label} final private evidence became unreadable"
+            ) from error
+
+        def require_open_private_unchanged(stage: str) -> None:
+            try:
+                before = _require_release_identity_fd_access_policy(
+                    private_fd,
+                    deletion_path,
+                    expected.uid,
+                )
+                os.lseek(private_fd, 0, os.SEEK_SET)
+                payload = _read_managed_state_bytes(
+                    private_fd,
+                    deletion_path,
+                    MAX_ARCHIVE_MEMBER_BYTES,
+                )
+                os.lseek(private_fd, 0, os.SEEK_SET)
+                confirmed_payload = _read_managed_state_bytes(
+                    private_fd,
+                    deletion_path,
+                    MAX_ARCHIVE_MEMBER_BYTES,
+                )
+                after = _require_release_identity_fd_access_policy(
+                    private_fd,
+                    deletion_path,
+                    expected.uid,
+                )
+                named = os.stat(
+                    deletion_name,
+                    dir_fd=cleanup_parent_fd,
+                    follow_symlinks=False,
+                )
+            except (OSError, SyncError) as error:
+                raise SyncError(
+                    f"{label} final private evidence changed {stage}"
+                ) from error
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or not _regular_stat_metadata_matches(after, before)
+                or not _regular_stat_metadata_matches(named, before)
+                or (before.st_dev, before.st_ino) != expected.file_identity
+                or stat.S_IMODE(before.st_mode) != expected.mode
+                or before.st_uid != expected.uid
+                or not _gid_matches_regular_file_access_policy(
+                    before.st_gid,
+                    expected.gid,
+                    expected.mode,
+                )
+                or before.st_size != expected.size
+                or before.st_nlink != expected_link_count
+                or hashlib.sha256(payload).hexdigest() != expected.sha256
+                or hashlib.sha256(confirmed_payload).hexdigest() != expected.sha256
+                or _pending_regular_publication_private_deletion_alias_base(
+                    deletion_name
+                )
+                != canonical_private_name
+                or _directory_identity(cleanup_parent_fd) != cleanup_parent_identity
+                or not _bound_directory_matches(
+                    home,
+                    cleanup_parent,
+                    cleanup_parent_fd,
+                )
+            ):
+                raise SyncError(f"{label} final private evidence changed {stage}")
+
+        require_open_private_unchanged("before boundary revalidation")
+        if not _pending_regular_publication_uses_receiptless_cleanup(
+            batch,
+            record,
+            phase,
+        ):
+            journal = _read_pending_regular_publication_cleanup(
+                home,
+                batch,
+                record,
+                phase,
+            )
+            if journal is None:
+                raise SyncError(
+                    f"{label} cleanup journal disappeared after final isolation"
+                )
+            _journal_snapshot, active_name, _journal_phase, _journal_expected = journal
+            _advance_pending_regular_publication_private_authority(
+                home,
+                batch,
+                record,
+                phase,
+                expected,
+                active_name,
+                cleanup_parent_fd=cleanup_parent_fd,
+                cleanup_parent_identity=cleanup_parent_identity,
+            )
+        _require_managed_regular_parent_chain_access(
+            home,
+            public_parent,
+            bound_parent_fd=public_parent_fd,
+        )
+        if not _pending_regular_publication_public_names_are_allowed(
+            home,
+            batch,
+            record,
+            phase,
+            public_parent,
+            public_parent_fd,
+            public_names,
+        ):
+            raise SyncError(
+                f"{label} public name reappeared; exact private evidence was retained"
+            )
+        _require_pending_cleanup_fd_access_policy(
+            cleanup_parent_fd,
+            cleanup_parent,
+            expected_mode=0o700,
+        )
+        # Boundary probes above can race with the final pathname. Rebind the
+        # name to the still-open exact descriptor and repeat identity,
+        # content, access-policy, and link-count validation immediately before
+        # the irreversible unlink.
+        require_open_private_unchanged("after boundary revalidation")
+        os.unlink(deletion_name, dir_fd=cleanup_parent_fd)
+        os.fsync(cleanup_parent_fd)
+        if _named_entry_identity(cleanup_parent_fd, deletion_name) is not None:
+            raise SyncError(f"{label} private name reappeared after deletion")
+    finally:
+        _close_fd_quietly(private_fd)
+    _require_managed_regular_parent_chain_access(
+        home,
+        public_parent,
+        bound_parent_fd=public_parent_fd,
+    )
+    if not _pending_regular_publication_public_names_are_allowed(
+        home,
+        batch,
+        record,
+        phase,
+        public_parent,
+        public_parent_fd,
+        public_names,
+    ):
+        raise SyncError(
+            f"{label} public name reappeared while private cleanup completed"
+        )
+
+
+def _recover_pending_regular_publication_private_alias(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    public_parent: Path,
+    public_parent_fd: int,
+    public_names: tuple[str, ...],
+    expected: RegularFileSnapshot,
+    *,
+    expected_link_count: int,
+    label: str,
+) -> bool:
+    private_binding = _pending_regular_publication_private_alias_binding(
+        home,
+        batch,
+        record,
+        phase,
+        expected.file_identity,
+    )
+    if private_binding is None:
+        return False
+    private_name, private_snapshot = private_binding
+    if (
+        not _regular_snapshot_leaf_matches(private_snapshot, expected)
+        or private_snapshot.link_count != expected_link_count
+    ):
+        raise SyncError(f"{label} private active entry changed")
+    _require_managed_regular_parent_chain_access(
+        home,
+        public_parent,
+        bound_parent_fd=public_parent_fd,
+    )
+    if not _pending_regular_publication_public_names_are_allowed(
+        home,
+        batch,
+        record,
+        phase,
+        public_parent,
+        public_parent_fd,
+        public_names,
+    ):
+        raise SyncError(
+            f"{label} public name reappeared; exact private evidence was retained"
+        )
+    cleanup_parent = batch.batch_root / "pending" / "cleanup"
+    cleanup_parent_fd = _open_directory_beneath(home, cleanup_parent)
+    try:
+        cleanup_parent_identity = _directory_identity(cleanup_parent_fd)
+        if cleanup_parent_identity != private_snapshot.parent_identity:
+            raise SyncError("pending regular publication cleanup namespace changed")
+        _delete_pending_regular_publication_private_alias(
+            home,
+            batch,
+            record,
+            phase,
+            cleanup_parent_fd,
+            cleanup_parent_identity,
+            expected,
+            public_parent=public_parent,
+            public_parent_fd=public_parent_fd,
+            public_names=public_names,
+            expected_link_count=expected_link_count,
+            label=label,
+            private_name=private_name,
+        )
+    finally:
+        _close_fd_quietly(cleanup_parent_fd)
+    return True
+
+
+def _pending_regular_publication_cleanup_payload(
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    expected: RegularFileSnapshot,
+    phase: str,
+    active_name: str,
+    *,
+    version: int = 2,
+    cleanup_parent_identity: tuple[int, int] | None = None,
+) -> bytes:
+    if (
+        batch.metadata_version < 8
+        or record.publication_cleanup is None
+        or record.planned_snapshot.parent_identity is None
+    ):
+        raise SyncError("pending regular publication cleanup authority is incomplete")
+    planned_regular = _regular_snapshot_from_reconcile(record.planned_snapshot)
+    if phase == "produced":
+        if not _pending_regular_publication_snapshot_matches(
+            expected,
+            record,
+            expected_link_count=(record.regular_link_count or 0) + 1,
+        ):
+            raise SyncError("pending regular publication cleanup target changed")
+    elif phase == "before":
+        if (
+            planned_regular is None
+            or not _regular_snapshot_leaf_matches(
+                expected,
+                planned_regular,
+            )
+            or expected.parent_identity != record.planned_snapshot.parent_identity
+            or expected.link_count != planned_regular.link_count + 1
+        ):
+            raise SyncError("pending regular restoration cleanup target changed")
+    else:
+        raise SyncError("pending regular publication cleanup phase is invalid")
+    planned = (
+        expected.file_identity[0],
+        expected.file_identity[1],
+        stat.S_IFREG,
+    )
+    if (
+        _pending_cleanup_internal_entry_plan(
+            active_name,
+            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+            record.planned_snapshot.parent_identity,
+        )
+        != planned
+    ):
+        raise SyncError("pending regular publication cleanup name is invalid")
+    if version not in {1, 2, 3}:
+        raise SyncError(
+            "pending regular publication cleanup journal version is invalid"
+        )
+    if version == 3 and cleanup_parent_identity is None:
+        raise SyncError(
+            "pending regular publication private cleanup authority is incomplete"
+        )
+    private_name = None
+    if cleanup_parent_identity is not None:
+        private_name = _pending_regular_publication_private_alias_name(
+            cleanup_parent_identity,
+            planned,
+            record.index,
+            phase,
+        )
+    payload: dict[str, object] = {
+        "version": version,
+        "record": record.index,
+        "phase": phase,
+        "target": record.target.as_posix(),
+        "parent_identity": _identity_payload(expected.parent_identity),
+        "file_identity": _identity_payload(expected.file_identity),
+        "sha256": expected.sha256,
+        "size": expected.size,
+        "mode": expected.mode,
+        "uid": expected.uid,
+        "link_count": expected.link_count,
+        "active": active_name,
+    }
+    if version >= 2:
+        payload.update(
+            {
+                "batch": batch.batch_root.name,
+                "batch_root_identity": _identity_payload(batch.batch_root_identity),
+                "lifecycle": (
+                    "public-authorized" if version == 2 else "private-authority"
+                ),
+            }
+        )
+    if version == 3:
+        payload.update(
+            {
+                "cleanup_parent_identity": _identity_payload(cleanup_parent_identity),
+                "private": private_name,
+            }
+        )
+    return _bounded_json_document(
+        payload,
+        max_bytes=4096,
+        overflow_error="pending regular publication cleanup journal exceeds the size limit",
+    )
+
+
+def _pending_regular_publication_cleanup_path(
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+) -> Path:
+    if batch.metadata_version < 8 or record.publication_cleanup is None:
+        raise SyncError("pending regular publication cleanup is unavailable")
+    if phase == "produced":
+        relative_path = record.publication_cleanup
+    elif phase == "before":
+        relative_path = record.publication_cleanup.with_name(
+            record.publication_cleanup.stem + ".before.json"
+        )
+    else:
+        raise SyncError("pending regular publication cleanup phase is invalid")
+    return batch.batch_root / Path(*relative_path.parts)
+
+
+def _pending_regular_publication_snapshot_matches(
+    snapshot: RegularFileSnapshot,
+    record: PendingLinkRecord,
+    *,
+    expected_link_count: int,
+) -> bool:
+    return (
+        record.planned_snapshot.parent_identity is not None
+        and record.evidence_identity is not None
+        and snapshot.parent_identity == record.planned_snapshot.parent_identity
+        and snapshot.file_identity == record.evidence_identity
+        and snapshot.sha256 == record.regular_sha256
+        and snapshot.size == record.regular_size
+        and snapshot.mode == record.regular_mode
+        and snapshot.uid == record.regular_uid
+        and snapshot.link_count == expected_link_count
+    )
+
+
+def _read_pending_regular_publication_cleanup(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    requested_phase: str,
+) -> tuple[ManagedStateFileSnapshot, str, str, RegularFileSnapshot] | None:
+    path = _pending_regular_publication_cleanup_path(batch, record, requested_phase)
+    parent_fd = _open_directory_beneath(home, path.parent)
+    try:
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            path,
+            parent_fd,
+            maximum_bytes=4096,
+        )
+    finally:
+        _close_fd_quietly(parent_fd)
+    if not snapshot.exists:
+        return None
+    if (
+        not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+        or snapshot.file_type != stat.S_IFREG
+        or snapshot.mode != 0o600
+        or snapshot.uid != os.geteuid()
+    ):
+        raise SyncError("pending regular publication cleanup journal changed")
+    data = _decode_managed_state_json(snapshot.payload, path)
+    journal_version = data.get("version")
+    if (
+        not isinstance(journal_version, int)
+        or isinstance(journal_version, bool)
+        or journal_version not in {1, 2, 3}
+    ):
+        raise SyncError("pending regular publication cleanup journal changed")
+    expected_fields = {
+        "version",
+        "record",
+        "phase",
+        "target",
+        "parent_identity",
+        "file_identity",
+        "sha256",
+        "size",
+        "mode",
+        "uid",
+        "link_count",
+        "active",
+    }
+    if journal_version in {2, 3}:
+        expected_fields.update({"batch", "batch_root_identity", "lifecycle"})
+    if journal_version == 3:
+        expected_fields.update({"cleanup_parent_identity", "private"})
+    if set(data) != expected_fields:
+        raise SyncError("pending regular publication cleanup journal changed")
+    parent_identity = _parse_pending_identity(
+        data.get("parent_identity"),
+        "pending regular publication cleanup parent identity",
+    )
+    file_identity = _parse_pending_identity(
+        data.get("file_identity"),
+        "pending regular publication cleanup file identity",
+    )
+    journal_phase = data.get("phase")
+    active_name = data.get("active")
+    link_count = data.get("link_count")
+    batch_root_identity = (
+        _parse_pending_identity(
+            data.get("batch_root_identity"),
+            "pending regular publication cleanup batch identity",
+        )
+        if journal_version in {2, 3}
+        else None
+    )
+    cleanup_parent_identity = (
+        _parse_pending_identity(
+            data.get("cleanup_parent_identity"),
+            "pending regular publication cleanup namespace identity",
+        )
+        if journal_version == 3
+        else None
+    )
+    if (
+        parent_identity is None
+        or file_identity is None
+        or not isinstance(journal_phase, str)
+        or journal_phase not in {"produced", "before"}
+        or not isinstance(data.get("sha256"), str)
+        or not isinstance(data.get("size"), int)
+        or isinstance(data.get("size"), bool)
+        or not isinstance(data.get("mode"), int)
+        or isinstance(data.get("mode"), bool)
+        or not isinstance(data.get("uid"), int)
+        or isinstance(data.get("uid"), bool)
+        or not isinstance(link_count, int)
+        or isinstance(link_count, bool)
+    ):
+        raise SyncError("pending regular publication cleanup journal changed")
+    expected = RegularFileSnapshot(
+        parent_identity=parent_identity,
+        file_identity=file_identity,
+        sha256=data["sha256"],
+        size=data["size"],
+        mode=data["mode"],
+        uid=data["uid"],
+        gid=0,
+        link_count=link_count,
+    )
+    if journal_version == 3:
+        if (
+            cleanup_parent_identity is None
+            or cleanup_parent_identity != snapshot.parent_identity
+            or data.get("private")
+            != _pending_regular_publication_private_alias_name(
+                cleanup_parent_identity,
+                (file_identity[0], file_identity[1], stat.S_IFREG),
+                record.index,
+                journal_phase,
+            )
+        ):
+            raise SyncError("pending regular publication cleanup journal changed")
+    if (
+        data.get("record") != record.index
+        or data.get("target") != record.target.as_posix()
+        or journal_phase != requested_phase
+        or not isinstance(active_name, str)
+        or (
+            journal_version in {2, 3}
+            and (
+                data.get("batch") != batch.batch_root.name
+                or batch_root_identity != batch.batch_root_identity
+                or data.get("lifecycle")
+                != (
+                    "public-authorized" if journal_version == 2 else "private-authority"
+                )
+            )
+        )
+        or _pending_regular_publication_cleanup_payload(
+            batch,
+            record,
+            expected,
+            journal_phase,
+            active_name,
+            version=journal_version,
+            cleanup_parent_identity=cleanup_parent_identity,
+        )
+        != snapshot.payload
+    ):
+        raise SyncError("pending regular publication cleanup journal changed")
+    return snapshot, active_name, journal_phase, expected
+
+
+def _pending_regular_publication_cleanup_lifecycle(
+    journal: ManagedStateFileSnapshot,
+) -> str | None:
+    if journal.payload is None:
+        raise SyncError("pending regular publication cleanup journal changed")
+    data = _decode_managed_state_json(
+        journal.payload,
+        Path("pending regular publication cleanup journal"),
+    )
+    version = data.get("version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise SyncError("pending regular publication cleanup journal changed")
+    if version == 1:
+        return None
+    lifecycle = data.get("lifecycle")
+    if version not in {2, 3} or lifecycle not in {
+        "public-authorized",
+        "private-authority",
+    }:
+        raise SyncError("pending regular publication cleanup journal changed")
+    return lifecycle
+
+
+def _pending_regular_publication_private_authority_path(
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+) -> Path:
+    journal_path = _pending_regular_publication_cleanup_path(batch, record, phase)
+    return journal_path.with_name(journal_path.stem + ".private-authority.json")
+
+
+def _read_pending_regular_publication_private_authority(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    expected: RegularFileSnapshot,
+    active_name: str,
+    cleanup_parent_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot | None:
+    path = _pending_regular_publication_private_authority_path(
+        batch,
+        record,
+        phase,
+    )
+    parent_fd = _open_directory_beneath(home, path.parent)
+    try:
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            path,
+            parent_fd,
+            maximum_bytes=4096,
+        )
+        if not snapshot.exists:
+            return None
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.file_type != stat.S_IFREG
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.parent_identity != cleanup_parent_identity
+            or _directory_identity(parent_fd) != cleanup_parent_identity
+            or not _bound_directory_matches(home, path.parent, parent_fd)
+            or snapshot.payload
+            != _pending_regular_publication_cleanup_payload(
+                batch,
+                record,
+                expected,
+                phase,
+                active_name,
+                version=3,
+                cleanup_parent_identity=cleanup_parent_identity,
+            )
+        ):
+            raise SyncError(
+                "pending regular publication private authority anchor changed"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            path,
+            parent_fd,
+            snapshot,
+        )
+        return snapshot
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _publish_pending_regular_publication_private_authority(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    expected: RegularFileSnapshot,
+    active_name: str,
+    cleanup_parent_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot:
+    path = _pending_regular_publication_private_authority_path(
+        batch,
+        record,
+        phase,
+    )
+    published = _publish_atomic_exclusive_internal_file(
+        home,
+        path,
+        _pending_regular_publication_cleanup_payload(
+            batch,
+            record,
+            expected,
+            phase,
+            active_name,
+            version=3,
+            cleanup_parent_identity=cleanup_parent_identity,
+        ),
+    )
+    verified = _read_pending_regular_publication_private_authority(
+        home,
+        batch,
+        record,
+        phase,
+        expected,
+        active_name,
+        cleanup_parent_identity,
+    )
+    if verified is None or not _managed_state_snapshot_matches_bound_file_evidence(
+        verified,
+        published,
+    ):
+        raise SyncError("pending regular publication private authority anchor changed")
+    return verified
+
+
+def _advance_pending_regular_publication_private_authority(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    expected: RegularFileSnapshot,
+    active_name: str,
+    cleanup_parent_fd: int,
+    cleanup_parent_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot:
+    """Durably revoke public cleanup authority before private deletion.
+
+    The protected property is the monotonic cleanup-authority lifecycle for
+    the exact batch, record phase and regular-file inode. The original journal
+    identity and payload prove content stability; the exclusive v3 anchor,
+    bound cleanup-parent identity and access-policy checks prove private-only
+    authority. Ordinary child-entry churn is not compared. Missing or
+    unreadable evidence remains distinct from an identity or payload mismatch,
+    and every such failure occurs before the private inode can be unlinked.
+    """
+    current = _read_pending_regular_publication_cleanup(home, batch, record, phase)
+    if current is None:
+        raise SyncError("pending regular publication cleanup journal is missing")
+    current_snapshot, current_active_name, _journal_phase, current_expected = current
+    if (
+        current_active_name != active_name
+        or not _regular_snapshot_leaf_matches(current_expected, expected)
+        or current_expected.link_count != expected.link_count
+        or current_snapshot.parent_identity != cleanup_parent_identity
+    ):
+        raise SyncError("pending regular publication cleanup journal changed")
+    _publish_pending_regular_publication_private_authority(
+        home,
+        batch,
+        record,
+        phase,
+        expected,
+        active_name,
+        cleanup_parent_identity,
+    )
+    # The exclusive v3 anchor is the durable monotonic revocation record.
+    # Keeping the original journal inode and payload avoids an overwrite race
+    # entirely; recovery already treats either a private lifecycle journal or
+    # this independently validated anchor as private authority.
+    return current_snapshot
+
+
+def _delete_pending_regular_publication_beneath(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    target: Path,
+    expected: RegularFileSnapshot,
+    *,
+    phase: str,
+) -> None:
+    produced_authority = (
+        phase == "produced"
+        and record.is_regular()
+        and record.action in {"create", "replace", "quarantine-replace"}
+    )
+    before_authority = (
+        phase == "before"
+        and record.before_is_regular()
+        and record.action
+        in {"replace", "quarantine-replace", "remove", "quarantine-remove"}
+    )
+    if not (produced_authority or before_authority):
+        raise SyncError("pending regular publication cleanup has an invalid record")
+    if _pending_regular_publication_uses_receiptless_cleanup(
+        batch,
+        record,
+        phase,
+    ):
+        # Metadata v6/v7 predates the durable publication receipt. Preserve its
+        # exact deletion protocol for those versions and for the v8/v9 managed
+        # regular-removal shape whose closed writers emitted a null receipt.
+        _delete_exact_regular_publication_beneath(
+            home,
+            target,
+            expected,
+            pending_batch=batch,
+            pending_record=record,
+            cleanup_phase=phase,
+        )
+        return
+    existing = _read_pending_regular_publication_cleanup(home, batch, record, phase)
+    if existing is not None:
+        _recover_pending_regular_publication_cleanup(
+            home,
+            batch,
+            record,
+            phase,
+        )
+        return
+    parent_fd = _open_directory_beneath(home, target.parent)
+    try:
+        parent_identity = _directory_identity(parent_fd)
+        if parent_identity != expected.parent_identity or not _bound_directory_matches(
+            home, target.parent, parent_fd
+        ):
+            raise SyncError("pending regular publication cleanup parent changed")
+        planned = (expected.file_identity[0], expected.file_identity[1], stat.S_IFREG)
+        active_name = _pending_cleanup_entry_name(
+            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+            parent_identity,
+            planned,
+        )
+        journal_path = _pending_regular_publication_cleanup_path(batch, record, phase)
+        cleanup_parent_fd = _open_directory_beneath(home, journal_path.parent)
+        try:
+            cleanup_parent_identity = _directory_identity(cleanup_parent_fd)
+            _require_pending_cleanup_fd_access_policy(
+                cleanup_parent_fd,
+                journal_path.parent,
+                expected_mode=0o700,
+            )
+            if not _bound_directory_matches(
+                home,
+                journal_path.parent,
+                cleanup_parent_fd,
+            ):
+                raise SyncError("pending regular publication cleanup namespace changed")
+        finally:
+            _close_fd_quietly(cleanup_parent_fd)
+        if (
+            _read_pending_regular_publication_private_authority(
+                home,
+                batch,
+                record,
+                phase,
+                expected,
+                active_name,
+                cleanup_parent_identity,
+            )
+            is not None
+        ):
+            raise SyncError(
+                "pending regular publication public cleanup authority was revoked"
+            )
+        prepared_journal = _publish_atomic_exclusive_internal_file(
+            home,
+            journal_path,
+            _pending_regular_publication_cleanup_payload(
+                batch, record, expected, phase, active_name
+            ),
+        )
+        current_journal = _read_pending_regular_publication_cleanup(
+            home,
+            batch,
+            record,
+            phase,
+        )
+        if (
+            current_journal is None
+            or not _managed_state_snapshot_matches_bound_file_evidence(
+                current_journal[0],
+                prepared_journal,
+            )
+            or _pending_regular_publication_cleanup_lifecycle(current_journal[0])
+            != "public-authorized"
+        ):
+            raise SyncError(
+                "pending regular publication public cleanup authority changed"
+            )
+        # Publish the complete public-authorized phase before removing a
+        # Codex-loadable canonical name. The same receipt is advanced atomically
+        # to private-authority before the private alias can be deleted.
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
+        _rename_noreplace_at(parent_fd, target.name, parent_fd, active_name)
+        os.fsync(parent_fd)
+        try:
+            active = _regular_file_snapshot_at(
+                parent_fd,
+                active_name,
+                target.with_name(active_name),
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        except BaseException:
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                active_name,
+                parent_identity,
+                planned,
+                label=(
+                    "pending regular publication became unreadable after "
+                    f"isolation: {target}"
+                ),
+            )
+        if not _regular_snapshot_matches(
+            active,
+            expected.parent_identity,
+            expected,
+            expected_link_count=expected.link_count,
+        ):
+            _retain_pending_cleanup_entry(
+                parent_fd,
+                active_name,
+                parent_identity,
+                planned,
+                label=f"pending regular publication active entry changed: {target}",
+            )
+        _isolate_and_delete_pending_regular_publication_candidate(
+            home,
+            batch,
+            record,
+            phase,
+            target.parent,
+            parent_fd,
+            active_name,
+            expected,
+            public_names=(target.name, active_name),
+            expected_link_count=expected.link_count,
+            label="pending regular publication",
+        )
+        # Keep this lifecycle receipt until whole-batch finalization.
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _pending_regular_publication_uses_receiptless_cleanup(
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+) -> bool:
+    if batch.metadata_version < 8:
+        return True
+    return (
+        phase == "before"
+        and batch.metadata_version in {8, 9}
+        and record.publication_cleanup is None
+    )
+
+
+def _legacy_pending_regular_publication_phase_authority(
+    record: PendingLinkRecord,
+    phase: str,
+) -> tuple[
+    tuple[int, int],
+    tuple[int, int],
+    PurePosixPath,
+    tuple[PurePosixPath | None, ...],
+    RegularFileSnapshot | None,
+]:
+    parent_identity = record.planned_snapshot.parent_identity
+    planned_regular = _regular_snapshot_from_reconcile(record.planned_snapshot)
+    if phase == "produced":
+        file_identity = record.evidence_identity
+        evidence_path = record.evidence
+        other_alias_paths = (record.stage,)
+    elif phase == "before":
+        file_identity = record.before_evidence_identity
+        evidence_path = record.before_evidence
+        other_alias_paths = (record.backup,)
+    else:
+        raise SyncError("pending legacy regular publication phase is invalid")
+    if (
+        parent_identity is None
+        or file_identity is None
+        or evidence_path is None
+        or (phase == "produced" and record.regular_link_count is None)
+        or (phase == "before" and planned_regular is None)
+    ):
+        raise SyncError("pending legacy regular publication evidence is incomplete")
+    return (
+        parent_identity,
+        file_identity,
+        evidence_path,
+        other_alias_paths,
+        planned_regular,
+    )
+
+
+def _build_legacy_pending_regular_publication_active_entry_index(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> _LegacyPendingRegularPublicationActiveEntryIndex:
+    if batch.metadata_version not in {6, 7, 8, 9}:
+        return _LegacyPendingRegularPublicationActiveEntryIndex({})
+    planned_by_parent: dict[
+        tuple[Path, tuple[int, int]], set[tuple[int, int, int]]
+    ] = {}
+    for record in batch.records:
+        phases: list[str] = []
+        if (
+            record.is_regular()
+            and record.action in {"create", "replace", "quarantine-replace"}
+            and _pending_regular_publication_uses_receiptless_cleanup(
+                batch, record, "produced"
+            )
+        ):
+            phases.append("produced")
+        if (
+            record.before_is_regular()
+            and record.action
+            in {"replace", "quarantine-replace", "remove", "quarantine-remove"}
+            and _pending_regular_publication_uses_receiptless_cleanup(
+                batch, record, "before"
+            )
+        ):
+            phases.append("before")
+        if not phases:
+            continue
+        target = home / Path(*record.target.parts)
+        for phase in phases:
+            (
+                parent_identity,
+                file_identity,
+                _evidence_path,
+                _other_alias_paths,
+                _planned,
+            ) = _legacy_pending_regular_publication_phase_authority(record, phase)
+            planned_by_parent.setdefault((target.parent, parent_identity), set()).add(
+                (file_identity[0], file_identity[1], stat.S_IFREG)
+            )
+
+    names_by_parent_plan: dict[
+        tuple[Path, tuple[int, int], tuple[int, int, int]], set[str]
+    ] = {}
+    scanned_entries = 0
+    for (parent, parent_identity), plans in sorted(
+        planned_by_parent.items(),
+        key=lambda item: (str(item[0][0]), item[0][1]),
+    ):
+        parent_fd = _open_directory_beneath(home, parent)
+        try:
+            if _directory_identity(
+                parent_fd
+            ) != parent_identity or not _bound_directory_matches(
+                home, parent, parent_fd
+            ):
+                raise SyncError("pending legacy regular publication parent changed")
+            _require_managed_regular_parent_chain_access(
+                home,
+                parent,
+                bound_parent_fd=parent_fd,
+            )
+            with os.scandir(parent_fd) as entries:
+                for entry in entries:
+                    scanned_entries += 1
+                    if scanned_entries > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
+                        raise SyncError(
+                            "pending legacy regular publication active-entry scan "
+                            "exceeds the batch limit"
+                        )
+                    planned = _pending_cleanup_internal_entry_plan(
+                        entry.name,
+                        PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                        parent_identity,
+                    )
+                    if planned in plans:
+                        names_by_parent_plan.setdefault(
+                            (parent, parent_identity, planned), set()
+                        ).add(entry.name)
+            _require_managed_regular_parent_chain_access(
+                home,
+                parent,
+                bound_parent_fd=parent_fd,
+            )
+            if not _bound_directory_matches(home, parent, parent_fd):
+                raise SyncError("pending legacy regular publication parent changed")
+        finally:
+            _close_fd_quietly(parent_fd)
+    return _LegacyPendingRegularPublicationActiveEntryIndex(names_by_parent_plan)
+
+
+def _recover_legacy_pending_regular_publication_active_entry(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    *,
+    active_entry_index: _LegacyPendingRegularPublicationActiveEntryIndex | None = None,
+) -> None:
+    if not _pending_regular_publication_uses_receiptless_cleanup(
+        batch,
+        record,
+        phase,
+    ):
+        return
+    (
+        parent_identity,
+        file_identity,
+        evidence_path,
+        other_alias_paths,
+        planned_regular,
+    ) = _legacy_pending_regular_publication_phase_authority(record, phase)
+    target = home / Path(*record.target.parts)
+    planned = (file_identity[0], file_identity[1], stat.S_IFREG)
+    if active_entry_index is None:
+        active_entry_index = (
+            _build_legacy_pending_regular_publication_active_entry_index(home, batch)
+        )
+    candidates = active_entry_index.names(target.parent, parent_identity, planned)
+    parent_fd = _open_directory_beneath(home, target.parent)
+    try:
+        if _directory_identity(
+            parent_fd
+        ) != parent_identity or not _bound_directory_matches(
+            home, target.parent, parent_fd
+        ):
+            raise SyncError("pending legacy regular publication parent changed")
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
+        private_snapshot = _pending_regular_publication_private_alias_snapshot(
+            home,
+            batch,
+            record,
+            phase,
+            file_identity,
+        )
+        if not candidates and private_snapshot is None:
+            return
+        target_identity = _named_entry_identity(parent_fd, target.name)
+        if (
+            len(candidates) + (private_snapshot is not None) != 1
+            or target_identity == file_identity
+        ):
+            raise SyncError("pending legacy regular publication cleanup is ambiguous")
+        evidence = batch.batch_root / Path(*evidence_path.parts)
+        evidence_snapshot = _read_regular_file_snapshot_beneath(
+            home,
+            evidence,
+            require_managed_access=False,
+        )
+        if phase == "produced":
+            evidence_matches = (
+                evidence_snapshot.file_identity == record.evidence_identity
+                and evidence_snapshot.sha256 == record.regular_sha256
+                and evidence_snapshot.size == record.regular_size
+                and evidence_snapshot.mode == record.regular_mode
+                and evidence_snapshot.uid == record.regular_uid
+            )
+        else:
+            assert planned_regular is not None
+            evidence_matches = _regular_snapshot_leaf_matches(
+                evidence_snapshot,
+                planned_regular,
+            )
+        if evidence_snapshot.file_identity != file_identity or not evidence_matches:
+            raise SyncError("pending legacy regular publication evidence changed")
+        bound_alias_count = 1
+        for relative_alias in other_alias_paths:
+            if relative_alias is None:
+                continue
+            alias = batch.batch_root / Path(*relative_alias.parts)
+            if _regular_alias_identity_beneath(home, alias) == file_identity:
+                bound_alias_count += 1
+        if phase == "produced" and bound_alias_count != record.regular_link_count:
+            raise SyncError("pending legacy regular publication aliases changed")
+        expected_link_count = bound_alias_count + 1
+        if evidence_snapshot.link_count != expected_link_count:
+            raise SyncError("pending legacy regular publication link count changed")
+        if private_snapshot is not None:
+            active_name = None
+            active = private_snapshot
+            if phase == "produced":
+                matches = (
+                    _regular_snapshot_leaf_matches(active, evidence_snapshot)
+                    and active.link_count == expected_link_count
+                )
+            else:
+                assert planned_regular is not None
+                matches = (
+                    _regular_snapshot_leaf_matches(active, planned_regular)
+                    and active.link_count == expected_link_count
+                )
+        else:
+            active_name = candidates[0]
+            active = _regular_file_snapshot_at(
+                parent_fd,
+                active_name,
+                target.with_name(active_name),
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+            if phase == "produced":
+                matches = _pending_regular_publication_snapshot_matches(
+                    active,
+                    record,
+                    expected_link_count=expected_link_count,
+                )
+            else:
+                assert planned_regular is not None
+                matches = _regular_snapshot_matches(
+                    active,
+                    parent_identity,
+                    planned_regular,
+                    expected_link_count=expected_link_count,
+                )
+        if not matches:
+            raise SyncError("pending legacy regular publication active entry changed")
+        if private_snapshot is not None:
+            if not _recover_pending_regular_publication_private_alias(
+                home,
+                batch,
+                record,
+                phase,
+                target.parent,
+                parent_fd,
+                (target.name, *candidates),
+                active,
+                expected_link_count=expected_link_count,
+                label="pending legacy regular publication",
+            ):
+                raise SyncError(
+                    "pending legacy regular publication private active entry "
+                    "disappeared"
+                )
+            return
+        # Child-entry churn is allowed. Move the exact active leaf out of the
+        # public managed parent before deleting it so a pathname replacement at
+        # the final boundary is preserved instead of unlinked.
+        destructive_snapshot = _regular_file_snapshot_at(
+            parent_fd,
+            active_name,
+            target.with_name(active_name),
+            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+        )
+        if phase == "produced":
+            destructive_matches = _pending_regular_publication_snapshot_matches(
+                destructive_snapshot,
+                record,
+                expected_link_count=expected_link_count,
+            )
+        else:
+            assert planned_regular is not None
+            destructive_matches = _regular_snapshot_matches(
+                destructive_snapshot,
+                parent_identity,
+                planned_regular,
+                expected_link_count=expected_link_count,
+            )
+        if (
+            not destructive_matches
+            or _pending_cleanup_internal_entry_plan(
+                active_name,
+                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                parent_identity,
+            )
+            != planned
+        ):
+            raise SyncError("pending legacy regular publication active entry changed")
+        _isolate_and_delete_pending_regular_publication_candidate(
+            home,
+            batch,
+            record,
+            phase,
+            target.parent,
+            parent_fd,
+            active_name,
+            destructive_snapshot,
+            expected_link_count=expected_link_count,
+            label="pending legacy regular publication",
+        )
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=parent_fd,
+        )
+        if _named_entry_identity(
+            parent_fd, active_name
+        ) is not None or not _bound_directory_matches(home, target.parent, parent_fd):
+            raise SyncError(
+                "pending legacy regular publication active entry reappeared"
+            )
+        active_entry_index.consume(
+            target.parent,
+            parent_identity,
+            planned,
+            active_name,
+        )
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _recover_pending_regular_publication_cleanup(
+    home: Path,
+    batch: PendingLinkBatch,
+    record: PendingLinkRecord,
+    phase: str,
+    *,
+    legacy_active_entry_index: _LegacyPendingRegularPublicationActiveEntryIndex
+    | None = None,
+) -> None:
+    produced_authority = (
+        phase == "produced"
+        and record.is_regular()
+        and record.action in {"create", "replace", "quarantine-replace"}
+    )
+    before_authority = (
+        phase == "before"
+        and record.before_is_regular()
+        and record.action
+        in {"replace", "quarantine-replace", "remove", "quarantine-remove"}
+    )
+    if not (produced_authority or before_authority):
+        return
+    if _pending_regular_publication_uses_receiptless_cleanup(
+        batch,
+        record,
+        phase,
+    ):
+        _recover_legacy_pending_regular_publication_active_entry(
+            home,
+            batch,
+            record,
+            phase,
+            active_entry_index=legacy_active_entry_index,
+        )
+        return
+    journal = _read_pending_regular_publication_cleanup(home, batch, record, phase)
+    if journal is None:
+        return
+    journal_snapshot, active_name, journal_phase, expected = journal
+    lifecycle = _pending_regular_publication_cleanup_lifecycle(journal_snapshot)
+    if journal_snapshot.parent_identity is None:
+        raise SyncError("pending regular publication cleanup journal changed")
+    private_authority_anchor = _read_pending_regular_publication_private_authority(
+        home,
+        batch,
+        record,
+        phase,
+        expected,
+        active_name,
+        journal_snapshot.parent_identity,
+    )
+    private_authority = (
+        lifecycle == "private-authority" or private_authority_anchor is not None
+    )
+
+    def verify_completed_cleanup(*, expected_evidence_link_count: int) -> None:
+        evidence_path = (
+            record.evidence if journal_phase == "produced" else record.before_evidence
+        )
+        if evidence_path is None:
+            raise SyncError("pending regular publication cleanup evidence is missing")
+        evidence = batch.batch_root / Path(*evidence_path.parts)
+        evidence_snapshot = _read_regular_file_snapshot_beneath(
+            home, evidence, require_managed_access=False
+        )
+        if (
+            not _regular_snapshot_leaf_matches(
+                evidence_snapshot,
+                expected,
+            )
+            or evidence_snapshot.link_count != expected_evidence_link_count
+        ):
+            raise SyncError("pending regular publication cleanup evidence changed")
+
+    target = home / Path(*record.target.parts)
+    parent_fd = _open_directory_beneath(home, target.parent)
+    try:
+        if (
+            record.planned_snapshot.parent_identity is None
+            or _directory_identity(parent_fd) != record.planned_snapshot.parent_identity
+            or not _bound_directory_matches(home, target.parent, parent_fd)
+        ):
+            raise SyncError("pending regular publication cleanup parent changed")
+        if _recover_pending_regular_publication_private_alias(
+            home,
+            batch,
+            record,
+            phase,
+            target.parent,
+            parent_fd,
+            (target.name, active_name),
+            expected,
+            expected_link_count=expected.link_count,
+            label="pending regular publication",
+        ):
+            return
+        if lifecycle != "public-authorized" or private_authority:
+            _require_managed_regular_parent_chain_access(
+                home,
+                target.parent,
+                bound_parent_fd=parent_fd,
+            )
+            if (
+                private_authority
+                and journal_phase == "before"
+                and _named_entry_identity(parent_fd, active_name) is None
+            ):
+                restored_before = None
+                if _named_entry_identity(parent_fd, target.name) is not None:
+                    restored_before = _regular_file_snapshot_at(
+                        parent_fd,
+                        target.name,
+                        target,
+                        maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                    )
+                if _regular_snapshot_matches(
+                    restored_before,
+                    expected.parent_identity,
+                    expected,
+                    expected_link_count=expected.link_count,
+                ):
+                    # Private authority proves the journal's destructive phase
+                    # already completed. A later rollback step may then have
+                    # relinked the receipt-bound before preimage at its canonical
+                    # name before crashing. Accept only that exact identity,
+                    # content, access policy, parent binding, and restored
+                    # hard-link count; all other occupants remain fail-closed.
+                    verify_completed_cleanup(
+                        expected_evidence_link_count=expected.link_count,
+                    )
+                    confirmed_before = _regular_file_snapshot_at(
+                        parent_fd,
+                        target.name,
+                        target,
+                        maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                    )
+                    if (
+                        not _regular_snapshot_matches(
+                            confirmed_before,
+                            expected.parent_identity,
+                            expected,
+                            expected_link_count=expected.link_count,
+                        )
+                        or _named_entry_identity(parent_fd, active_name) is not None
+                        or not _bound_directory_matches(
+                            home,
+                            target.parent,
+                            parent_fd,
+                        )
+                    ):
+                        raise SyncError(
+                            "pending regular publication restored preimage changed"
+                        )
+                    return
+            if not _pending_regular_publication_public_names_are_allowed(
+                home,
+                batch,
+                record,
+                phase,
+                target.parent,
+                parent_fd,
+                (target.name, active_name),
+            ):
+                raise SyncError(
+                    "pending regular publication public cleanup authority was "
+                    "revoked; the public object was retained"
+                )
+            # Version 1 receipts predate the monotonic lifecycle. With no
+            # surviving private alias they cannot distinguish an untouched
+            # public candidate from evidence relinked after private deletion.
+            # Only absence or the independently recorded rollback preimage is
+            # therefore admissible, and neither is mutated here.
+            verify_completed_cleanup(
+                expected_evidence_link_count=expected.link_count - 1,
+            )
+            return
+        target_snapshot: RegularFileSnapshot | None
+        active_snapshot: RegularFileSnapshot | None
+        try:
+            os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            target_snapshot = None
+        else:
+            target_snapshot = _regular_file_snapshot_at(
+                parent_fd, target.name, target, maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES
+            )
+        try:
+            os.stat(active_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            active_snapshot = None
+        else:
+            active_snapshot = _regular_file_snapshot_at(
+                parent_fd,
+                active_name,
+                target.with_name(active_name),
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        if target_snapshot is not None and active_snapshot is not None:
+            raise SyncError("pending regular publication cleanup is ambiguous")
+        if target_snapshot is not None:
+            if not _regular_snapshot_matches(
+                target_snapshot,
+                expected.parent_identity,
+                expected,
+                expected_link_count=expected.link_count,
+            ):
+                if journal_phase == "produced" and active_snapshot is None:
+                    # A completed publication deletion can be followed by
+                    # restoration of a replace preimage before the whole batch
+                    # finalizer consumes this durable receipt. Leave the
+                    # current target for the normal rollback state machine to
+                    # validate; it has no authority to delete it here.
+                    verify_completed_cleanup(
+                        expected_evidence_link_count=expected.link_count - 1,
+                    )
+                    return
+                raise SyncError("pending regular publication target changed")
+            destructive_target_snapshot = _regular_file_snapshot_at(
+                parent_fd,
+                target.name,
+                target,
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+            if not _regular_snapshot_matches(
+                destructive_target_snapshot,
+                expected.parent_identity,
+                expected,
+                expected_link_count=expected.link_count,
+            ):
+                raise SyncError("pending regular publication target changed")
+            _require_managed_regular_parent_chain_access(
+                home,
+                target.parent,
+                bound_parent_fd=parent_fd,
+            )
+            current_journal = _read_pending_regular_publication_cleanup(
+                home,
+                batch,
+                record,
+                phase,
+            )
+            if (
+                current_journal is None
+                or not _managed_state_snapshot_matches_bound_file_evidence(
+                    current_journal[0],
+                    journal_snapshot,
+                )
+                or _pending_regular_publication_cleanup_lifecycle(current_journal[0])
+                != "public-authorized"
+            ):
+                raise SyncError(
+                    "pending regular publication public cleanup authority changed"
+                )
+            _rename_noreplace_at(parent_fd, target.name, parent_fd, active_name)
+            os.fsync(parent_fd)
+            active_snapshot = _regular_file_snapshot_at(
+                parent_fd,
+                active_name,
+                target.with_name(active_name),
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        if active_snapshot is not None:
+            if not _regular_snapshot_matches(
+                active_snapshot,
+                expected.parent_identity,
+                expected,
+                expected_link_count=expected.link_count,
+            ):
+                raise SyncError("pending regular publication active entry changed")
+            _isolate_and_delete_pending_regular_publication_candidate(
+                home,
+                batch,
+                record,
+                phase,
+                target.parent,
+                parent_fd,
+                active_name,
+                expected,
+                public_names=(target.name, active_name),
+                expected_link_count=expected.link_count,
+                label="pending regular publication",
+            )
+        else:
+            verify_completed_cleanup(
+                expected_evidence_link_count=expected.link_count - 1,
+            )
+    finally:
+        _close_fd_quietly(parent_fd)
+    # Keep this lifecycle receipt until whole-batch finalization.
 
 
 def _pending_current_owner(
@@ -12078,6 +20916,8 @@ def _managed_state_value_from_snapshot(
 def _pending_state_claim_semantics(
     home: Path,
     state: ManagedState,
+    *,
+    metadata_version: int,
 ) -> list[tuple[str, PurePosixPath, str, PurePosixPath | None, str, str, str]]:
     claims: list[
         tuple[str, PurePosixPath, str, PurePosixPath | None, str, str, str]
@@ -12096,6 +20936,12 @@ def _pending_state_claim_semantics(
             )
         )
     for record in state.links.values():
+        if metadata_version >= 6 and _record_materializes_regular_file(record):
+            # Regular-file preimages are carried by the action record's exact
+            # before evidence. Since pending metadata v6, they intentionally do
+            # not masquerade as symlink claims. Legacy v4/v5 metadata still
+            # describes every managed agents/*.toml target as a symlink claim.
+            continue
         claims.append(
             (
                 "managed",
@@ -12232,13 +21078,22 @@ def _verify_pending_record_bound_foreign_relinquishment(
     _require_pending_record_bound_foreign_relinquishment(record)
     target = home / Path(*record.target.parts)
     try:
-        actual = _capture_reconcile_target_snapshot(home, target)
+        actual = _capture_reconcile_target_snapshot(
+            home,
+            target,
+            capture_regular_content=(
+                record.planned_snapshot.regular_sha256 is not None
+            ),
+        )
     except (OSError, SyncError) as error:
         raise SyncError(
             f"pending {phase} foreign relinquishment could not be verified: "
             f"{record.target}"
         ) from error
-    if actual != record.planned_snapshot:
+    if not _reconcile_target_snapshot_matches(
+        actual,
+        record.planned_snapshot,
+    ):
         raise SyncError(
             f"pending {phase} foreign relinquishment changed: {record.target}"
         )
@@ -12256,7 +21111,11 @@ def _stage_pending_link_claims(
         raise SyncError(f"unsupported pending claim phase: {phase}")
     record_by_target = {(record.scope, record.target): record for record in records}
     claims: list[PendingLinkClaim] = []
-    for semantic in _pending_state_claim_semantics(home, state):
+    for semantic in _pending_state_claim_semantics(
+        home,
+        state,
+        metadata_version=PENDING_LINK_METADATA_VERSION,
+    ):
         (
             scope,
             target,
@@ -12396,6 +21255,31 @@ def _pending_link_record_for_action(
     owner: str | None = None
     release_sha: str | None = None
     link_target = action.link_target if producing else None
+    materialization = action.materialization if producing or destructive else "symlink"
+    if materialization not in {"symlink", "regular"}:
+        raise SyncError(f"unsupported pending materialization: {materialization}")
+    if materialization == "regular" and scope != "managed":
+        raise SyncError("only managed targets may materialize as regular files")
+    removed_link_key = action.removed_link_key
+    if removed_link_key is not None:
+        removed_link_key = _validate_removed_link_key(
+            removed_link_key,
+            "pending removed link",
+        )
+    planned_regular = _regular_snapshot_from_reconcile(action.planned_snapshot)
+    before_materialization = (
+        ("regular" if planned_regular is not None else "symlink")
+        if destructive
+        else None
+    )
+    if (
+        before_materialization == "regular"
+        and materialization == "symlink"
+        and not _regular_to_symlink_reconcile_action_is_typed(action)
+    ):
+        raise SyncError(
+            f"regular-file preimage has an untyped symlink action: {target}"
+        )
     if scope == "managed" and relinquishing_foreign:
         entry = desired_by_target.get(target)
         state_record = current_owner_state.links.get(target)
@@ -12462,6 +21346,15 @@ def _pending_link_record_for_action(
         owner=owner,
         link_target=link_target,
         release_sha=release_sha,
+        before_materialization=before_materialization,
+        materialization=materialization,
+        removed_link_key=removed_link_key,
+        regular_sha256=None,
+        regular_size=None,
+        regular_mode=None,
+        regular_uid=None,
+        regular_gid=None,
+        regular_link_count=None,
         before_evidence=(
             PurePosixPath("pending", "before", leaf) if destructive else None
         ),
@@ -12473,6 +21366,12 @@ def _pending_link_record_for_action(
         stage_identity=None,
         evidence=(PurePosixPath("pending", "evidence", leaf) if producing else None),
         evidence_identity=None,
+        publication_cleanup=(
+            PurePosixPath("pending", "cleanup", leaf + ".json")
+            if (producing and materialization == "regular")
+            or (destructive and before_materialization == "regular")
+            else None
+        ),
     )
 
 
@@ -12491,12 +21390,20 @@ def _projected_pending_snapshot_payload(
         candidate_targets,
         key=lambda value: len(json.dumps(value, sort_keys=False).encode("utf-8")),
     )
+    projects_regular = snapshot is not None and snapshot.regular_sha256 is not None
+    maximum_scalar = _MAX_PENDING_IDENTITY[0]
     return {
         "parent_identity": _identity_payload(_MAX_PENDING_IDENTITY),
         "link_identity": _identity_payload(_MAX_PENDING_IDENTITY),
         "link_target": link_target,
         "ancestor_identity": _identity_payload(_MAX_PENDING_IDENTITY),
         "missing_parent_parts": list(relative_parent.parts),
+        "regular_sha256": _MAX_PENDING_DIGEST if projects_regular else None,
+        "regular_size": MAX_ARCHIVE_MEMBER_BYTES if projects_regular else None,
+        "regular_mode": 0o7777 if projects_regular else None,
+        "regular_uid": maximum_scalar if projects_regular else None,
+        "regular_gid": maximum_scalar if projects_regular else None,
+        "regular_link_count": maximum_scalar if projects_regular else None,
     }
 
 
@@ -12558,6 +21465,35 @@ def _projected_pending_record_payload(
         "owner": owner,
         "link_target": action.link_target if producing else None,
         "release_sha": release_sha if producing else None,
+        "before_materialization": (
+            "regular"
+            if destructive
+            and action.planned_snapshot is not None
+            and _regular_snapshot_from_reconcile(action.planned_snapshot) is not None
+            else "symlink"
+            if destructive
+            else None
+        ),
+        "materialization": (
+            action.materialization if producing or destructive else "symlink"
+        ),
+        "removed_link": action.removed_link_key,
+        "regular_sha256": "f" * 64
+        if producing and action.materialization == "regular"
+        else None,
+        "regular_size": MAX_ARCHIVE_MEMBER_BYTES
+        if producing and action.materialization == "regular"
+        else None,
+        "regular_mode": 0o600
+        if producing and action.materialization == "regular"
+        else None,
+        "regular_uid": _MAX_PENDING_IDENTITY
+        if producing and action.materialization == "regular"
+        else None,
+        "regular_gid": None,
+        "regular_link_count": 2
+        if producing and action.materialization == "regular"
+        else None,
         "before_evidence": (
             PurePosixPath("pending", "before", leaf).as_posix() if destructive else None
         ),
@@ -12578,6 +21514,17 @@ def _projected_pending_record_payload(
         ),
         "evidence_identity": (
             _identity_payload(_MAX_PENDING_IDENTITY) if producing else None
+        ),
+        "publication_cleanup": (
+            PurePosixPath("pending", "cleanup", leaf + ".json").as_posix()
+            if (producing and action.materialization == "regular")
+            or (
+                destructive
+                and action.planned_snapshot is not None
+                and _regular_snapshot_from_reconcile(action.planned_snapshot)
+                is not None
+            )
+            else None
         ),
     }
 
@@ -12603,6 +21550,15 @@ def _projected_retired_absence_record_payload(
         "owner": None,
         "link_target": None,
         "release_sha": None,
+        "before_materialization": None,
+        "materialization": "symlink",
+        "removed_link": None,
+        "regular_sha256": None,
+        "regular_size": None,
+        "regular_mode": None,
+        "regular_uid": None,
+        "regular_gid": None,
+        "regular_link_count": None,
         "before_evidence": None,
         "before_evidence_identity": None,
         "backup": None,
@@ -12610,6 +21566,7 @@ def _projected_retired_absence_record_payload(
         "stage_identity": None,
         "evidence": None,
         "evidence_identity": None,
+        "publication_cleanup": None,
     }
 
 
@@ -12634,6 +21591,15 @@ def _projected_retired_current_absence_record_payload(
         "owner": owner,
         "link_target": None,
         "release_sha": None,
+        "before_materialization": None,
+        "materialization": "symlink",
+        "removed_link": None,
+        "regular_sha256": None,
+        "regular_size": None,
+        "regular_mode": None,
+        "regular_uid": None,
+        "regular_gid": None,
+        "regular_link_count": None,
         "before_evidence": None,
         "before_evidence_identity": None,
         "backup": None,
@@ -12641,6 +21607,7 @@ def _projected_retired_current_absence_record_payload(
         "stage_identity": None,
         "evidence": None,
         "evidence_identity": None,
+        "publication_cleanup": None,
     }
 
 
@@ -12685,7 +21652,11 @@ def _projected_pending_claim_payloads(
     record_actions: dict[tuple[str, PurePosixPath], str],
 ) -> list[dict[str, Any]]:
     claims: list[dict[str, Any]] = []
-    for semantic in _pending_state_claim_semantics(home, state):
+    for semantic in _pending_state_claim_semantics(
+        home,
+        state,
+        metadata_version=PENDING_LINK_METADATA_VERSION,
+    ):
         action = record_actions.get((semantic[0], semantic[1]))
         if phase == "before" and action in {
             "create",
@@ -12717,6 +21688,27 @@ def _projected_pending_release_payloads(
     ]
 
 
+def _projected_pending_terminal_regular_payloads(
+    state: ManagedState,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "target": target.as_posix(),
+            "parent_identity": _identity_payload(_MAX_PENDING_IDENTITY),
+            "file_identity": _identity_payload(_MAX_PENDING_IDENTITY),
+            "sha256": _MAX_PENDING_DIGEST,
+            "size": MAX_ARCHIVE_MEMBER_BYTES,
+            "mode": 0o600,
+            "uid": _MAX_PENDING_IDENTITY[0],
+        }
+        for target, record in sorted(
+            state.links.items(),
+            key=lambda item: item[0].as_posix(),
+        )
+        if _record_materializes_regular_file(record)
+    ]
+
+
 def _projected_pending_metadata_payload(
     *,
     state_before_exists: bool,
@@ -12725,6 +21717,8 @@ def _projected_pending_metadata_payload(
     claims_after: list[dict[str, Any]],
     releases_before: list[dict[str, Any]],
     releases_after: list[dict[str, Any]],
+    terminal_regular_before: list[dict[str, Any]],
+    terminal_regular_after: list[dict[str, Any]],
 ) -> dict[str, Any]:
     state_before_evidence = (
         PENDING_STATE_BEFORE_EVIDENCE.as_posix() if state_before_exists else None
@@ -12742,6 +21736,8 @@ def _projected_pending_metadata_payload(
                 if state_before_exists
                 else None
             ),
+            "uid": _MAX_PENDING_IDENTITY[0] if state_before_exists else None,
+            "gid": _MAX_PENDING_IDENTITY[0] if state_before_exists else None,
             "evidence": state_before_evidence,
         },
         "state_after": {
@@ -12749,15 +21745,21 @@ def _projected_pending_metadata_payload(
             "mode": 0o600,
             "sha256": _MAX_PENDING_DIGEST,
             "identity": _identity_payload(_MAX_PENDING_IDENTITY),
+            "uid": _MAX_PENDING_IDENTITY[0],
+            "gid": _MAX_PENDING_IDENTITY[0],
             "evidence": PENDING_STATE_AFTER_EVIDENCE.as_posix(),
         },
         "releases_before": releases_before,
         "releases_after": releases_after,
+        "terminal_regular_before": terminal_regular_before,
+        "terminal_regular_after": terminal_regular_after,
         "commit_evidence": {
             "exists": True,
             "mode": 0o600,
             "sha256": _MAX_PENDING_DIGEST,
             "identity": _identity_payload(_MAX_PENDING_IDENTITY),
+            "uid": _MAX_PENDING_IDENTITY[0],
+            "gid": _MAX_PENDING_IDENTITY[0],
             "evidence": PENDING_STATE_COMMIT_EVIDENCE.as_posix(),
         },
         "commit_marker": PENDING_STATE_COMMIT_MARKER.as_posix(),
@@ -12819,6 +21821,29 @@ def _projected_top_level_array_delta(
     )
 
 
+def _projected_manifest_record_snapshot(
+    record: ManagedLinkRecord,
+) -> ReconcileTargetSnapshot:
+    if _record_materializes_regular_file(record):
+        return ReconcileTargetSnapshot(
+            parent_identity=_MAX_PENDING_IDENTITY,
+            link_identity=_MAX_PENDING_IDENTITY,
+            ancestor_identity=_MAX_PENDING_IDENTITY,
+            regular_sha256=_MAX_PENDING_DIGEST,
+            regular_size=MAX_ARCHIVE_MEMBER_BYTES,
+            regular_mode=0o7777,
+            regular_uid=_MAX_PENDING_IDENTITY[0],
+            regular_gid=_MAX_PENDING_IDENTITY[0],
+            regular_link_count=_MAX_PENDING_IDENTITY[0],
+        )
+    return ReconcileTargetSnapshot(
+        parent_identity=_MAX_PENDING_IDENTITY,
+        link_identity=_MAX_PENDING_IDENTITY,
+        link_target=record.link_target,
+        ancestor_identity=_MAX_PENDING_IDENTITY,
+    )
+
+
 def _manifest_transition_capacity_profile(
     owner: str,
     links: dict[str, dict[str, Any]],
@@ -12862,7 +21887,11 @@ def _manifest_transition_capacity_profile(
 
     before_current_claim_size: int | None = None
     before_claim_sizes: dict[PurePosixPath, int] = {}
-    for semantic in _pending_state_claim_semantics(home, state):
+    for semantic in _pending_state_claim_semantics(
+        home,
+        state,
+        metadata_version=PENDING_LINK_METADATA_VERSION,
+    ):
         item_size = _projected_top_level_array_element_size(
             _projected_pending_claim_payload("before", semantic, 0)
         )
@@ -12877,7 +21906,11 @@ def _manifest_transition_capacity_profile(
 
     after_claim_size_sum = 0
     after_claim_count = 0
-    for semantic in _pending_state_claim_semantics(home, state):
+    for semantic in _pending_state_claim_semantics(
+        home,
+        state,
+        metadata_version=PENDING_LINK_METADATA_VERSION,
+    ):
         after_claim_size_sum += _projected_top_level_array_element_size(
             _projected_pending_claim_payload("after", semantic, 0)
         )
@@ -12886,6 +21919,11 @@ def _manifest_transition_capacity_profile(
     release_payloads = _projected_pending_release_payloads(state)
     release_size_sum = sum(
         _projected_top_level_array_element_size(payload) for payload in release_payloads
+    )
+    terminal_regular_payloads = _projected_pending_terminal_regular_payloads(state)
+    terminal_regular_size_sum = sum(
+        _projected_top_level_array_element_size(payload)
+        for payload in terminal_regular_payloads
     )
     current_action = ReconcileAction(
         "replace",
@@ -12924,6 +21962,11 @@ def _manifest_transition_capacity_profile(
                     planned_snapshot=ReconcileTargetSnapshot(
                         parent_identity=_MAX_PENDING_IDENTITY,
                     ),
+                    materialization=(
+                        "regular"
+                        if _record_materializes_regular_file(record)
+                        else "symlink"
+                    ),
                 ),
                 state,
                 state,
@@ -12941,11 +21984,11 @@ def _manifest_transition_capacity_profile(
                     "",
                     record.kind,
                     expected_link_target=record.link_target,
-                    planned_snapshot=ReconcileTargetSnapshot(
-                        parent_identity=_MAX_PENDING_IDENTITY,
-                        link_identity=_MAX_PENDING_IDENTITY,
-                        link_target=record.link_target,
-                        ancestor_identity=_MAX_PENDING_IDENTITY,
+                    planned_snapshot=_projected_manifest_record_snapshot(record),
+                    materialization=(
+                        "regular"
+                        if _record_materializes_regular_file(record)
+                        else "symlink"
                     ),
                 ),
                 state,
@@ -13040,6 +22083,11 @@ def _manifest_transition_capacity_profile(
                     link_target=removed_target,
                     ancestor_identity=_MAX_PENDING_IDENTITY,
                 ),
+                materialization=(
+                    "regular"
+                    if _record_materializes_regular_file(current_record)
+                    else "symlink"
+                ),
             )
         record_size = _projected_top_level_array_element_size(
             _projected_pending_record_payload(
@@ -13066,6 +22114,8 @@ def _manifest_transition_capacity_profile(
         after_claim_count=after_claim_count,
         release_size_sum=release_size_sum,
         release_count=len(release_payloads),
+        terminal_regular_size_sum=terminal_regular_size_sum,
+        terminal_regular_count=len(terminal_regular_payloads),
         current_record_size=current_record_size,
         create_record_sizes=create_record_sizes,
         remove_record_sizes=remove_record_sizes,
@@ -13108,8 +22158,18 @@ def _manifest_transition_metadata_size(
                 record_count_max += 1
                 total_before_record_count_max += 1
                 continue
+            before_claim_size = previous.before_claim_sizes.get(target)
+            if before_claim_size is None:
+                before_record_element_sum += max(
+                    current.create_record_sizes[target],
+                    previous.relinquish_foreign_record_sizes.get(target, 0),
+                    historical_record_size or 0,
+                )
+                record_count_max += 1
+                total_before_record_count_max += 1
+                continue
             before_record_element_sum += max(
-                previous.before_claim_sizes[target],
+                before_claim_size,
                 current.create_record_sizes[target],
                 previous.relinquish_foreign_record_sizes.get(target, 0),
                 historical_record_size or 0,
@@ -13127,9 +22187,11 @@ def _manifest_transition_metadata_size(
             record_count_max += 1
             total_before_record_count_max += 1
             continue
-        before_claim_size = previous.before_claim_sizes[target]
+        before_claim_size = previous.before_claim_sizes.get(target)
         if current_record is None:
-            canonical_size = before_claim_size + previous.remove_record_sizes[target]
+            canonical_size = (before_claim_size or 0) + previous.remove_record_sizes[
+                target
+            ]
             noncanonical_size = max(
                 previous.retired_absence_record_sizes[target],
                 previous.relinquish_foreign_record_sizes.get(target, 0),
@@ -13146,11 +22208,13 @@ def _manifest_transition_metadata_size(
                     current_record.link_target,
                     current_record.kind,
                     expected_link_target=previous_record.link_target,
-                    planned_snapshot=ReconcileTargetSnapshot(
-                        parent_identity=_MAX_PENDING_IDENTITY,
-                        link_identity=_MAX_PENDING_IDENTITY,
-                        link_target=previous_record.link_target,
-                        ancestor_identity=_MAX_PENDING_IDENTITY,
+                    planned_snapshot=_projected_manifest_record_snapshot(
+                        previous_record
+                    ),
+                    materialization=(
+                        "regular"
+                        if _record_materializes_regular_file(current_record)
+                        else "symlink"
                     ),
                 ),
                 previous.state,
@@ -13159,9 +22223,8 @@ def _manifest_transition_metadata_size(
                 0,
             )
             canonical_size = (
-                before_claim_size
-                + _projected_top_level_array_element_size(replace_payload)
-            )
+                before_claim_size or 0
+            ) + _projected_top_level_array_element_size(replace_payload)
             noncanonical_size = max(
                 current.create_record_sizes[target],
                 previous.relinquish_foreign_record_sizes.get(target, 0),
@@ -13171,9 +22234,10 @@ def _manifest_transition_metadata_size(
             canonical_size,
             noncanonical_size,
         )
-        before_count_max += 1
+        if before_claim_size is not None:
+            before_count_max += 1
         record_count_max += 1
-        total_before_record_count_max += 2
+        total_before_record_count_max += 1 + int(before_claim_size is not None)
 
     if record_count_max > MAX_PENDING_LINK_RECORDS:
         raise SyncError("projected pending transaction has too many records")
@@ -13197,6 +22261,8 @@ def _manifest_transition_metadata_size(
         claims_after=[],
         releases_before=[],
         releases_after=[],
+        terminal_regular_before=[],
+        terminal_regular_after=[],
     )
     return (
         _projected_json_size(envelope, trailing_newline=True)
@@ -13214,6 +22280,16 @@ def _manifest_transition_metadata_size(
         + _projected_top_level_array_delta(
             current.release_size_sum,
             current.release_count,
+            indexed=False,
+        )
+        + _projected_top_level_array_delta(
+            previous.terminal_regular_size_sum,
+            previous.terminal_regular_count,
+            indexed=False,
+        )
+        + _projected_top_level_array_delta(
+            current.terminal_regular_size_sum,
+            current.terminal_regular_count,
             indexed=False,
         )
     )
@@ -13295,6 +22371,12 @@ def _validate_pending_link_metadata_capacity(
         ),
         releases_before=_projected_pending_release_payloads(state_before_value),
         releases_after=_projected_pending_release_payloads(state_after_value),
+        terminal_regular_before=_projected_pending_terminal_regular_payloads(
+            state_before_value
+        ),
+        terminal_regular_after=_projected_pending_terminal_regular_payloads(
+            state_after_value
+        ),
     )
     _bounded_json_document(
         payload,
@@ -13333,6 +22415,7 @@ def _build_pending_link_capacity_plan(
     )
     if len(flattened_actions) > MAX_PENDING_LINK_RECORDS:
         raise SyncError("pending transaction has too many actions")
+    _validate_pending_regular_materialization_budget(flattened_actions)
     action_keys: set[tuple[str, PurePosixPath]] = set()
     create_keys: set[tuple[str, PurePosixPath]] = set()
     relinquish_foreign_keys: set[tuple[str, PurePosixPath]] = set()
@@ -13428,9 +22511,16 @@ def _build_pending_link_capacity_plan(
         for semantic in _pending_state_claim_semantics(
             home,
             state_before_value,
+            metadata_version=PENDING_LINK_METADATA_VERSION,
         )
     )
-    after_claim_count = len(_pending_state_claim_semantics(home, state_after_value))
+    after_claim_count = len(
+        _pending_state_claim_semantics(
+            home,
+            state_after_value,
+            metadata_version=PENDING_LINK_METADATA_VERSION,
+        )
+    )
     if before_claim_count > MAX_PENDING_LINK_CLAIMS:
         raise SyncError("pending transaction has too many before-state claims")
     if after_claim_count > MAX_PENDING_LINK_CLAIMS:
@@ -13507,6 +22597,35 @@ def _build_pending_link_batch_plan(
     )
 
 
+def _validate_pending_regular_materialization_budget(
+    actions: tuple[ReconcileAction, ...] | list[ReconcileAction],
+) -> None:
+    total = 0
+    for action in actions:
+        if action.materialization != "regular" or action.action not in {
+            "create",
+            "replace",
+            "quarantine-replace",
+        }:
+            continue
+        size = action.regular_size
+        if (
+            size is None
+            or isinstance(size, bool)
+            or size < 0
+            or action.regular_source is None
+        ):
+            raise SyncError(
+                f"managed regular-file action has no bounded payload: {action.target}"
+            )
+        if size > MAX_PENDING_REGULAR_MATERIALIZATION_BYTES - total:
+            raise SyncError(
+                "pending regular-file materialization exceeds the aggregate "
+                f"size limit: {action.target}"
+            )
+        total += size
+
+
 def _stage_pending_link_batch(
     home: Path,
     action_groups: list[tuple[str, list[ReconcileAction]]],
@@ -13534,29 +22653,69 @@ def _stage_pending_link_batch(
     canonical_state_before_value = plan.state_before_value
     retired_absence_specs = plan.capacity.retired_absence_specs
     retired_current_absence_specs = plan.capacity.retired_current_absence_specs
-    batch_root = _quarantine_batch_root(home, flattened_actions)
-    batch_root_fd = _open_directory_beneath(home, batch_root)
-    try:
-        batch_root_identity = _directory_identity(batch_root_fd)
-        if not _bound_directory_matches(home, batch_root, batch_root_fd):
-            raise SyncError(f"quarantine batch changed: {batch_root}")
-    finally:
-        _close_fd_quietly(batch_root_fd)
+    batch_allocation = _quarantine_batch_root(
+        home,
+        flattened_actions,
+        retain_binding=True,
+    )
+    assert isinstance(batch_allocation, tuple)
+    batch_root, batch_root_fd, batch_root_identity = batch_allocation
     directories = [
         batch_root / "pending" / "before",
         batch_root / "pending" / "stage",
         batch_root / "pending" / "evidence",
+        batch_root / "pending" / "cleanup",
         batch_root / "pending" / "state",
         batch_root / "pending" / "claims" / "before",
         batch_root / "pending" / "claims" / "after",
     ]
-    for directory in directories:
-        directory_fd = _open_or_create_directory_beneath(home, directory, mode=0o700)
-        _close_fd_quietly(directory_fd)
+    try:
+        for directory in directories:
+            relative_parts = directory.relative_to(batch_root).parts
+            directory_fd = _create_quarantine_batch_directory_at(
+                batch_root_fd,
+                relative_parts,
+            )
+            _close_fd_quietly(directory_fd)
+        if _directory_identity(
+            batch_root_fd
+        ) != batch_root_identity or not _bound_directory_matches(
+            home, batch_root, batch_root_fd
+        ):
+            raise SyncError(f"quarantine batch changed: {batch_root}")
+    finally:
+        _close_fd_quietly(batch_root_fd)
     records: list[PendingLinkRecord] = []
     seen: set[tuple[str, PurePosixPath]] = set()
     created_parent_identities: dict[Path, tuple[int, int]] = {}
+    staging_authority_published = False
     try:
+        batch_root_fd = _open_directory_beneath(home, batch_root)
+        try:
+            if _directory_identity(
+                batch_root_fd
+            ) != batch_root_identity or not _bound_directory_matches(
+                home, batch_root, batch_root_fd
+            ):
+                raise SyncError(f"quarantine batch changed: {batch_root}")
+        finally:
+            _close_fd_quietly(batch_root_fd)
+        _mark_pending_batch_staging_cleanup_ready(
+            home,
+            batch_root,
+            batch_root_identity,
+        )
+        batch_root_fd = _open_directory_beneath(home, batch_root)
+        try:
+            if _directory_identity(
+                batch_root_fd
+            ) != batch_root_identity or not _bound_directory_matches(
+                home, batch_root, batch_root_fd
+            ):
+                raise SyncError(f"quarantine batch changed: {batch_root}")
+        finally:
+            _close_fd_quietly(batch_root_fd)
+        staging_authority_published = True
         for scope, actions in ordered_groups:
             for action in actions:
                 planned_snapshot = action.planned_snapshot
@@ -13574,11 +22733,17 @@ def _stage_pending_link_batch(
                         action.target,
                         planned_snapshot,
                         created_parent_identities,
+                        require_managed_parent_access=(
+                            action.materialization == "regular"
+                        ),
                     )
                     _close_fd_quietly(parent_fd)
                     refreshed_snapshot = _capture_reconcile_target_snapshot(
                         home,
                         action.target,
+                        require_managed_parent_access=(
+                            action.materialization == "regular"
+                        ),
                     )
                     if (
                         refreshed_snapshot.parent_identity is None
@@ -13615,22 +22780,72 @@ def _stage_pending_link_batch(
                 seen.add(key)
                 if record.before_evidence is not None:
                     assert record.planned_snapshot.link_identity is not None
-                    assert record.planned_snapshot.link_target is not None
                     before_path = batch_root / Path(*record.before_evidence.parts)
-                    before_plan = _capture_reconcile_target_snapshot(home, before_path)
-                    before_snapshot = _publish_symlink_hardlink_beneath(
-                        home,
-                        action.target,
-                        before_path,
-                        SymlinkSnapshot(
-                            parent_identity=record.planned_snapshot.parent_identity,
-                            link_identity=record.planned_snapshot.link_identity,
-                            link_target=record.planned_snapshot.link_target,
-                        ),
-                        before_plan,
-                        created_parent_identities,
+                    planned_regular = _regular_snapshot_from_reconcile(
+                        record.planned_snapshot
                     )
-                    if before_snapshot.link_identity != record.before_evidence_identity:
+                    if planned_regular is not None:
+                        source_parent_fd = _open_directory_beneath(
+                            home, action.target.parent
+                        )
+                        try:
+                            regular_state_snapshot = _read_managed_state_file_snapshot(
+                                home,
+                                action.target,
+                                source_parent_fd,
+                                expected_identity=planned_regular.file_identity,
+                                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                            )
+                        finally:
+                            _close_fd_quietly(source_parent_fd)
+                        before_regular = _publish_regular_hardlink_beneath(
+                            home,
+                            action.target,
+                            before_path,
+                            regular_state_snapshot,
+                        )
+                        before_identity = before_regular.file_identity
+                        refreshed_regular = _read_regular_file_snapshot_beneath(
+                            home,
+                            action.target,
+                            require_managed_access=False,
+                        )
+                        if not _regular_snapshot_matches(
+                            refreshed_regular,
+                            planned_regular.parent_identity,
+                            planned_regular,
+                            expected_link_count=planned_regular.link_count + 1,
+                        ):
+                            raise SyncError(
+                                "pending live regular preimage changed during "
+                                f"staging: {record.target}"
+                            )
+                        record = replace(
+                            record,
+                            planned_snapshot=replace(
+                                record.planned_snapshot,
+                                regular_link_count=planned_regular.link_count + 1,
+                            ),
+                        )
+                    else:
+                        assert record.planned_snapshot.link_target is not None
+                        before_plan = _capture_reconcile_target_snapshot(
+                            home, before_path
+                        )
+                        before_snapshot = _publish_symlink_hardlink_beneath(
+                            home,
+                            action.target,
+                            before_path,
+                            SymlinkSnapshot(
+                                parent_identity=record.planned_snapshot.parent_identity,
+                                link_identity=record.planned_snapshot.link_identity,
+                                link_target=record.planned_snapshot.link_target,
+                            ),
+                            before_plan,
+                            created_parent_identities,
+                        )
+                        before_identity = before_snapshot.link_identity
+                    if before_identity != record.before_evidence_identity:
                         raise SyncError(
                             f"pending before evidence changed: {record.target}"
                         )
@@ -13639,26 +22854,110 @@ def _stage_pending_link_batch(
                     assert record.link_target is not None
                     stage = batch_root / Path(*record.stage.parts)
                     evidence = batch_root / Path(*record.evidence.parts)
-                    stage_snapshot = _create_symlink_beneath(
-                        home,
-                        stage,
-                        record.link_target,
-                        record.kind,
-                    )
-                    evidence_plan = _capture_reconcile_target_snapshot(home, evidence)
-                    evidence_snapshot = _publish_symlink_hardlink_beneath(
-                        home,
-                        stage,
-                        evidence,
-                        stage_snapshot,
-                        evidence_plan,
-                        created_parent_identities,
-                    )
-                    record = replace(
-                        record,
-                        stage_identity=stage_snapshot.link_identity,
-                        evidence_identity=evidence_snapshot.link_identity,
-                    )
+                    if record.is_regular():
+                        if action.regular_size is None:
+                            raise SyncError(
+                                "pending regular-file action has no planned size: "
+                                f"{record.target}"
+                            )
+                        source = _record_regular_source_path(
+                            home, record.managed_record()
+                        )
+                        _create_regular_file_beneath(home, source, stage)
+                        stage_parent_fd = _open_directory_beneath(home, stage.parent)
+                        try:
+                            stage_state = _read_managed_state_file_snapshot(
+                                home,
+                                stage,
+                                stage_parent_fd,
+                                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                            )
+                        finally:
+                            _close_fd_quietly(stage_parent_fd)
+                        guard_path, guard = (
+                            _publish_pending_regular_staging_publication_guard(
+                                home,
+                                batch_root,
+                                batch_root_identity,
+                                record,
+                            )
+                        )
+                        try:
+                            _publish_regular_hardlink_beneath(
+                                home,
+                                stage,
+                                evidence,
+                                stage_state,
+                            )
+                            _delete_pending_regular_staging_publication_guard(
+                                home,
+                                guard_path,
+                                guard,
+                            )
+                        except BaseException as error:
+                            raise SyncError(
+                                "pending regular staging publication was retained "
+                                f"for manual recovery: {record.target}: {error}",
+                                code=PENDING_REGULAR_PUBLICATION_RETAINED_CODE,
+                            ) from error
+                        stage_snapshot = _read_regular_file_snapshot_beneath(
+                            home,
+                            stage,
+                            require_managed_access=False,
+                        )
+                        evidence_snapshot = _read_regular_file_snapshot_beneath(
+                            home,
+                            evidence,
+                            require_managed_access=False,
+                        )
+                        if (
+                            stage_snapshot.file_identity
+                            != evidence_snapshot.file_identity
+                            or stage_snapshot.sha256 != evidence_snapshot.sha256
+                            or stage_snapshot.size != evidence_snapshot.size
+                            or stage_snapshot.size != action.regular_size
+                            or stage_snapshot.mode != 0o600
+                            or stage_snapshot.uid != os.geteuid()
+                            or stage_snapshot.link_count != 2
+                            or evidence_snapshot.link_count != 2
+                        ):
+                            raise SyncError(
+                                f"pending regular-file evidence changed: {record.target}"
+                            )
+                        record = replace(
+                            record,
+                            stage_identity=stage_snapshot.file_identity,
+                            evidence_identity=evidence_snapshot.file_identity,
+                            regular_sha256=stage_snapshot.sha256,
+                            regular_size=stage_snapshot.size,
+                            regular_mode=stage_snapshot.mode,
+                            regular_uid=stage_snapshot.uid,
+                            regular_gid=None,
+                            regular_link_count=stage_snapshot.link_count,
+                        )
+                    else:
+                        stage_snapshot = _create_symlink_beneath(
+                            home,
+                            stage,
+                            record.link_target,
+                            record.kind,
+                        )
+                        evidence_plan = _capture_reconcile_target_snapshot(
+                            home, evidence
+                        )
+                        evidence_snapshot = _publish_symlink_hardlink_beneath(
+                            home,
+                            stage,
+                            evidence,
+                            stage_snapshot,
+                            evidence_plan,
+                            created_parent_identities,
+                        )
+                        record = replace(
+                            record,
+                            stage_identity=stage_snapshot.link_identity,
+                            evidence_identity=evidence_snapshot.link_identity,
+                        )
                 records.append(record)
 
         for target, state_record in retired_absence_specs:
@@ -13684,6 +22983,15 @@ def _stage_pending_link_batch(
                 owner=None,
                 link_target=None,
                 release_sha=None,
+                before_materialization=None,
+                materialization="symlink",
+                removed_link_key=None,
+                regular_sha256=None,
+                regular_size=None,
+                regular_mode=None,
+                regular_uid=None,
+                regular_gid=None,
+                regular_link_count=None,
                 before_evidence=None,
                 before_evidence_identity=None,
                 backup=None,
@@ -13691,6 +22999,7 @@ def _stage_pending_link_batch(
                 stage_identity=None,
                 evidence=None,
                 evidence_identity=None,
+                publication_cleanup=None,
             )
             _require_pending_record_bound_retired_absence(record)
             key = (record.scope, record.target)
@@ -13724,6 +23033,15 @@ def _stage_pending_link_batch(
                 owner=owner,
                 link_target=None,
                 release_sha=None,
+                before_materialization=None,
+                materialization="symlink",
+                removed_link_key=None,
+                regular_sha256=None,
+                regular_size=None,
+                regular_mode=None,
+                regular_uid=None,
+                regular_gid=None,
+                regular_link_count=None,
                 before_evidence=None,
                 before_evidence_identity=None,
                 backup=None,
@@ -13731,6 +23049,7 @@ def _stage_pending_link_batch(
                 stage_identity=None,
                 evidence=None,
                 evidence_identity=None,
+                publication_cleanup=None,
             )
             _require_pending_record_bound_retired_absence(record)
             key = (record.scope, record.target)
@@ -13742,6 +23061,18 @@ def _stage_pending_link_batch(
             records.append(record)
 
         record_tuple = tuple(records)
+        terminal_regular_before = _stage_pending_terminal_regular_targets(
+            home,
+            canonical_state_before_value,
+            record_tuple,
+            phase="before",
+        )
+        terminal_regular_after = _stage_pending_terminal_regular_targets(
+            home,
+            state_after_value,
+            record_tuple,
+            phase="after",
+        )
         claims_before = _stage_pending_link_claims(
             home,
             batch_root,
@@ -13823,13 +23154,34 @@ def _stage_pending_link_batch(
                 PENDING_STATE_AFTER_EVIDENCE,
                 releases_before,
                 releases_after,
+                terminal_regular_before,
+                terminal_regular_after,
                 commit_evidence,
             ),
         )
-    except BaseException:
-        # The unreferenced durable batch is deliberately retained for auditability.
+    except BaseException as error:
+        if staging_authority_published:
+            if (
+                isinstance(error, SyncError)
+                and error.code == PENDING_REGULAR_PUBLICATION_RETAINED_CODE
+            ):
+                raise
+            try:
+                _cleanup_failed_pending_staging_batch(
+                    home,
+                    batch_root,
+                    batch_root_identity,
+                )
+            except BaseException as cleanup_error:
+                raise SyncError(
+                    "pending transaction staging failed and exact cleanup was "
+                    f"incomplete: {cleanup_error}"
+                ) from error
+        # Failures before cleanup authority was published cannot have created a
+        # live-file hard link, so retaining that empty batch is harmless.
         raise
     return PendingLinkBatch(
+        metadata_version=PENDING_LINK_METADATA_VERSION,
         batch_root=batch_root,
         batch_root_identity=batch_root_identity,
         records=record_tuple,
@@ -13843,6 +23195,8 @@ def _stage_pending_link_batch(
         state_after_value=state_after_value,
         releases_before=releases_before,
         releases_after=releases_after,
+        terminal_regular_before=terminal_regular_before,
+        terminal_regular_after=terminal_regular_after,
         commit_evidence=commit_evidence,
         commit_evidence_path=PENDING_STATE_COMMIT_EVIDENCE,
         commit_marker_path=PENDING_STATE_COMMIT_MARKER,
@@ -13867,14 +23221,30 @@ def _parse_pending_identity(value: object, label: str) -> tuple[int, int] | None
     return value[0], value[1]
 
 
-def _parse_pending_planned_snapshot(value: object) -> ReconcileTargetSnapshot:
-    if not isinstance(value, dict) or set(value) != {
+def _parse_pending_planned_snapshot(
+    value: object,
+    *,
+    allow_regular: bool,
+) -> ReconcileTargetSnapshot:
+    legacy_fields = {
         "parent_identity",
         "link_identity",
         "link_target",
         "ancestor_identity",
         "missing_parent_parts",
-    }:
+    }
+    regular_fields = {
+        "regular_sha256",
+        "regular_size",
+        "regular_mode",
+        "regular_uid",
+        "regular_gid",
+        "regular_link_count",
+    }
+    allowed_shapes = {frozenset(legacy_fields)}
+    if allow_regular:
+        allowed_shapes.add(frozenset(legacy_fields | regular_fields))
+    if not isinstance(value, dict) or set(value) not in allowed_shapes:
         raise SyncError("pending transaction planned-before snapshot is invalid")
     link_target = value.get("link_target")
     if link_target is not None and (
@@ -13896,6 +23266,23 @@ def _parse_pending_planned_snapshot(value: object) -> ReconcileTargetSnapshot:
         )
     ):
         raise SyncError("pending transaction missing-parent binding is invalid")
+    regular_sha256 = value.get("regular_sha256")
+    numeric_regular = [
+        value.get("regular_size"),
+        value.get("regular_mode"),
+        value.get("regular_uid"),
+        value.get("regular_gid"),
+        value.get("regular_link_count"),
+    ]
+    if regular_sha256 is not None and (
+        not isinstance(regular_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", regular_sha256) is None
+        or any(
+            not isinstance(part, int) or isinstance(part, bool) or part < 0
+            for part in numeric_regular
+        )
+    ):
+        raise SyncError("pending transaction planned regular-file evidence is invalid")
     try:
         return ReconcileTargetSnapshot(
             parent_identity=_parse_pending_identity(
@@ -13912,6 +23299,12 @@ def _parse_pending_planned_snapshot(value: object) -> ReconcileTargetSnapshot:
                 "pending ancestor identity",
             ),
             missing_parent_parts=tuple(raw_missing),
+            regular_sha256=regular_sha256,
+            regular_size=value.get("regular_size"),
+            regular_mode=value.get("regular_mode"),
+            regular_uid=value.get("regular_uid"),
+            regular_gid=value.get("regular_gid"),
+            regular_link_count=value.get("regular_link_count"),
         )
     except ValueError as error:
         raise SyncError(
@@ -13932,6 +23325,7 @@ def _parse_pending_link_claims(
     raw_claims: object,
     state: ManagedState,
     *,
+    metadata_version: int,
     omitted_keys: set[tuple[str, PurePosixPath]] | None = None,
 ) -> tuple[PendingLinkClaim, ...]:
     if phase not in {"before", "after"}:
@@ -13939,7 +23333,11 @@ def _parse_pending_link_claims(
     omitted_keys = set() if omitted_keys is None else omitted_keys
     if phase != "before" and omitted_keys:
         raise SyncError("only pending before-state claims may use absence coverage")
-    all_semantics = _pending_state_claim_semantics(home, state)
+    all_semantics = _pending_state_claim_semantics(
+        home,
+        state,
+        metadata_version=metadata_version,
+    )
     semantic_keys = {(semantic[0], semantic[1]) for semantic in all_semantics}
     if not omitted_keys.issubset(semantic_keys):
         raise SyncError(
@@ -14078,14 +23476,18 @@ def _read_pending_state_evidence(
     state_parent_identity: tuple[int, int],
     require_exists: bool,
     required_mode: int | None,
+    metadata_version: int,
 ) -> tuple[ManagedStateFileSnapshot, PurePosixPath | None]:
-    if not isinstance(raw, dict) or set(raw) != {
+    expected_fields = {
         "exists",
         "mode",
         "sha256",
         "identity",
         "evidence",
-    }:
+    }
+    if metadata_version >= 9:
+        expected_fields.update({"uid", "gid"})
+    if not isinstance(raw, dict) or set(raw) != expected_fields:
         raise SyncError(f"pending transaction {label} evidence is invalid")
     exists = raw.get("exists")
     if not isinstance(exists, bool) or (require_exists and not exists):
@@ -14100,8 +23502,12 @@ def _read_pending_state_evidence(
         raw.get("evidence"),
         f"pending transaction {label} evidence path",
     )
+    uid = raw.get("uid") if metadata_version >= 9 else None
+    gid = raw.get("gid") if metadata_version >= 9 else None
     if not exists:
-        if any(value is not None for value in (mode, digest, identity, evidence)):
+        if any(
+            value is not None for value in (mode, digest, identity, uid, gid, evidence)
+        ):
             raise SyncError(f"missing pending transaction {label} has file metadata")
         return (
             ManagedStateFileSnapshot(
@@ -14120,6 +23526,18 @@ def _read_pending_state_evidence(
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         or identity is None
         or evidence is None
+        or (
+            metadata_version >= 9
+            and (
+                type(uid) is not int
+                or uid < 0
+                or uid >= 2**64
+                or type(gid) is not int
+                or gid < 0
+                or gid >= 2**64
+            )
+        )
+        or (metadata_version < 9 and bool(mode & 0o070))
     ):
         raise SyncError(f"pending transaction {label} file metadata is invalid")
     evidence_path = batch_root / Path(*evidence.parts)
@@ -14138,6 +23556,15 @@ def _read_pending_state_evidence(
         or actual.mode != mode
         or actual.file_identity != identity
         or _snapshot_payload_digest(actual) != digest
+        or actual.uid != (uid if metadata_version >= 9 else os.geteuid())
+        or (
+            metadata_version >= 9
+            and not _gid_matches_regular_file_access_policy(
+                actual.gid,
+                gid,
+                mode,
+            )
+        )
     ):
         raise SyncError(f"pending transaction {label} evidence changed")
     return (
@@ -14225,6 +23652,7 @@ def _read_pending_commit_evidence(
     *,
     state_parent_identity: tuple[int, int],
     state_after: ManagedStateFileSnapshot,
+    metadata_version: int,
 ) -> tuple[ManagedStateFileSnapshot, PurePosixPath]:
     snapshot, evidence = _read_pending_state_evidence(
         home,
@@ -14234,6 +23662,7 @@ def _read_pending_commit_evidence(
         state_parent_identity=state_parent_identity,
         require_exists=True,
         required_mode=0o600,
+        metadata_version=metadata_version,
     )
     if evidence != PENDING_STATE_COMMIT_EVIDENCE:
         raise SyncError("pending transaction commit evidence path is not canonical")
@@ -14279,7 +23708,13 @@ def _parse_pending_link_batch(
     pointer_snapshot: ManagedStateFileSnapshot,
 ) -> PendingLinkBatch:
     data = _decode_managed_state_json(payload, _pending_link_pointer_path(home))
-    if set(data) != {
+    version = data.get("version")
+    if (
+        type(version) is not int
+        or version not in SUPPORTED_PENDING_LINK_METADATA_VERSIONS
+    ):
+        raise SyncError("pending transaction has unsupported fields or version")
+    expected_top_level_fields = {
         "version",
         "batch",
         "state_parent_identity",
@@ -14292,13 +23727,12 @@ def _parse_pending_link_batch(
         "claims_before",
         "claims_after",
         "records",
-    }:
-        raise SyncError("pending transaction has unsupported fields or version")
-    version = data.get("version")
-    if (
-        type(version) is not int
-        or version not in SUPPORTED_PENDING_LINK_METADATA_VERSIONS
-    ):
+    }
+    if version >= 7:
+        expected_top_level_fields.update(
+            {"terminal_regular_before", "terminal_regular_after"}
+        )
+    if set(data) != expected_top_level_fields:
         raise SyncError("pending transaction has unsupported fields or version")
     batch_name = data.get("batch")
     if (
@@ -14342,6 +23776,7 @@ def _parse_pending_link_batch(
         state_parent_identity=state_parent_identity,
         require_exists=False,
         required_mode=None,
+        metadata_version=version,
     )
     state_after, state_after_evidence = _read_pending_state_evidence(
         home,
@@ -14351,6 +23786,7 @@ def _parse_pending_link_batch(
         state_parent_identity=state_parent_identity,
         require_exists=True,
         required_mode=0o600,
+        metadata_version=version,
     )
     if state_before.exists:
         if state_before_evidence != PENDING_STATE_BEFORE_EVIDENCE:
@@ -14409,12 +23845,19 @@ def _parse_pending_link_batch(
                 "pending transaction reused release expectation changed between "
                 f"phases: {expectation.owner}@{expectation.sha}"
             )
+    before_expectations_by_owner = {
+        expectation.owner: expectation for expectation in releases_before
+    }
+    after_expectations_by_owner = {
+        expectation.owner: expectation for expectation in releases_after
+    }
     commit_evidence, commit_evidence_path = _read_pending_commit_evidence(
         home,
         batch_root,
         data.get("commit_evidence"),
         state_parent_identity=state_parent_identity,
         state_after=state_after,
+        metadata_version=version,
     )
     if data.get("commit_marker") != PENDING_STATE_COMMIT_MARKER.as_posix():
         raise SyncError("pending transaction commit marker path is not canonical")
@@ -14423,6 +23866,8 @@ def _parse_pending_link_batch(
         raise SyncError("pending transaction records must be a bounded array")
     records: list[PendingLinkRecord] = []
     seen: set[tuple[str, PurePosixPath]] = set()
+    removal_authority_by_release: dict[tuple[str, str], dict[str, RemovedLink]] = {}
+    regular_source_evidence = _PendingRegularSourceEvidenceBudget()
     relinquishment_desired_by_target: dict[PurePosixPath, LinkEntry] | None = None
     expected_fields = {
         "index",
@@ -14443,6 +23888,21 @@ def _parse_pending_link_batch(
         "evidence",
         "evidence_identity",
     }
+    v6_fields = {
+        "materialization",
+        "regular_sha256",
+        "regular_size",
+        "regular_mode",
+        "regular_uid",
+        "regular_gid",
+        "regular_link_count",
+    }
+    if version >= 6:
+        expected_fields.update(v6_fields)
+    if version >= 8:
+        expected_fields.add("publication_cleanup")
+    if version >= 10:
+        expected_fields.update({"before_materialization", "removed_link"})
     for index, raw_record in enumerate(raw_records):
         if not isinstance(raw_record, dict) or set(raw_record) != expected_fields:
             raise SyncError(f"pending transaction record #{index + 1} is invalid")
@@ -14457,7 +23917,10 @@ def _parse_pending_link_batch(
         kind = raw_record.get("kind")
         if kind not in {"file", "directory", "skill"}:
             raise SyncError(f"pending target {target} has unsupported kind")
-        planned = _parse_pending_planned_snapshot(raw_record.get("planned_before"))
+        planned = _parse_pending_planned_snapshot(
+            raw_record.get("planned_before"),
+            allow_regular=version >= 6,
+        )
         producing = action in {"create", "replace", "quarantine-replace"}
         destructive = action in {
             "replace",
@@ -14493,6 +23956,110 @@ def _parse_pending_link_batch(
             raise SyncError(f"pending target {target} has invalid link target")
         raw_sha = raw_record.get("release_sha")
         release_sha = None if raw_sha is None else _validate_release_sha(raw_sha)
+        materialization = (
+            raw_record.get("materialization") if version >= 6 else "symlink"
+        )
+        if materialization not in {"symlink", "regular"}:
+            raise SyncError(f"pending target {target} has invalid materialization")
+        regular_sha256 = raw_record.get("regular_sha256") if version >= 6 else None
+        regular_size = raw_record.get("regular_size") if version >= 6 else None
+        regular_mode = raw_record.get("regular_mode") if version >= 6 else None
+        regular_uid = raw_record.get("regular_uid") if version >= 6 else None
+        regular_gid = raw_record.get("regular_gid") if version >= 6 else None
+        regular_link_count = (
+            raw_record.get("regular_link_count") if version >= 6 else None
+        )
+        regular_values = (
+            regular_sha256,
+            regular_size,
+            regular_mode,
+            regular_uid,
+            regular_link_count,
+        )
+        all_regular_values = (*regular_values, regular_gid)
+        planned_regular = _regular_snapshot_from_reconcile(planned)
+        before_materialization = (
+            raw_record.get("before_materialization")
+            if version >= 10
+            else (
+                "regular"
+                if destructive and planned_regular is not None
+                else "symlink"
+                if destructive
+                else None
+            )
+        )
+        expected_before_materialization = (
+            "regular"
+            if destructive and planned_regular is not None
+            else "symlink"
+            if destructive
+            else None
+        )
+        if before_materialization != expected_before_materialization:
+            raise SyncError(
+                f"pending target {target} has invalid before materialization"
+            )
+        raw_removed_link = raw_record.get("removed_link") if version >= 10 else None
+        removed_link_key = (
+            None
+            if raw_removed_link is None
+            else _validate_removed_link_key(raw_removed_link, "pending removed link")
+        )
+        if materialization == "regular":
+            produced_regular_is_invalid = producing and (
+                not isinstance(regular_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", regular_sha256) is None
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool) or value < 0
+                    for value in regular_values[1:]
+                )
+                or (
+                    version == 6
+                    and regular_gid is not None
+                    and (
+                        not isinstance(regular_gid, int)
+                        or isinstance(regular_gid, bool)
+                        or regular_gid < 0
+                    )
+                )
+                or (version >= 7 and regular_gid is not None)
+                or regular_mode != 0o600
+                or regular_uid != os.geteuid()
+                or regular_link_count != 2
+            )
+            removed_regular_is_invalid = not producing and (
+                not destructive
+                or planned_regular is None
+                or any(value is not None for value in all_regular_values)
+            )
+            if (
+                scope != "managed"
+                or produced_regular_is_invalid
+                or removed_regular_is_invalid
+            ):
+                raise SyncError(
+                    f"pending target {target} has invalid regular-file evidence"
+                )
+        elif any(value is not None for value in all_regular_values):
+            raise SyncError(
+                f"pending symlink target {target} has regular-file evidence"
+            )
+        elif (
+            planned_regular is not None
+            and not relinquishing_foreign
+            and not (
+                version >= 10
+                and action == "quarantine-replace"
+                and scope == "managed"
+                and kind in {"directory", "skill"}
+                and before_materialization == "regular"
+                and removed_link_key is not None
+            )
+        ):
+            raise SyncError(
+                f"pending regular-file preimage {target} has symlink materialization"
+            )
         leaf = f"{index:08d}"
         before_evidence = _parse_pending_relative_or_none(
             raw_record.get("before_evidence"),
@@ -14519,6 +24086,34 @@ def _parse_pending_link_batch(
             raw_record.get("evidence_identity"),
             "pending evidence identity",
         )
+        publication_cleanup = (
+            _parse_pending_relative_or_none(
+                raw_record.get("publication_cleanup"),
+                "pending regular publication cleanup",
+            )
+            if version >= 8
+            else None
+        )
+        expected_cleanup = (
+            PurePosixPath("pending", "cleanup", leaf + ".json")
+            if version >= 8
+            and (
+                (producing and materialization == "regular")
+                or (destructive and before_materialization == "regular")
+            )
+            else None
+        )
+        receiptless_v8_v9_before = (
+            version in {8, 9}
+            and destructive
+            and before_materialization == "regular"
+            and not (producing and materialization == "regular")
+            and publication_cleanup is None
+        )
+        if publication_cleanup != expected_cleanup and not receiptless_v8_v9_before:
+            raise SyncError(
+                f"pending target {target} has invalid publication cleanup path"
+            )
         if destructive:
             if (
                 before_evidence != PurePosixPath("pending", "before", leaf)
@@ -14526,16 +24121,33 @@ def _parse_pending_link_batch(
                 or backup != PurePosixPath("links") / target
             ):
                 raise SyncError(f"pending target {target} has invalid preimage paths")
-            assert planned.link_target is not None
-            before_snapshot = _read_symlink_snapshot_beneath(
-                home,
-                batch_root / Path(*before_evidence.parts),
-            )
-            if (
-                before_snapshot.link_identity != before_identity
-                or before_snapshot.link_target != planned.link_target
-            ):
-                raise SyncError(f"pending target {target} before evidence changed")
+            planned_regular = _regular_snapshot_from_reconcile(planned)
+            if planned_regular is not None:
+                before_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    batch_root / Path(*before_evidence.parts),
+                    require_managed_access=False,
+                )
+                if (
+                    before_snapshot.file_identity != before_identity
+                    or not _regular_snapshot_leaf_matches(
+                        before_snapshot,
+                        planned_regular,
+                    )
+                ):
+                    raise SyncError(f"pending target {target} before evidence changed")
+            else:
+                if planned.link_target is None:
+                    raise SyncError(f"pending target {target} has no typed preimage")
+                before_snapshot = _read_symlink_snapshot_beneath(
+                    home,
+                    batch_root / Path(*before_evidence.parts),
+                )
+                if (
+                    before_snapshot.link_identity != before_identity
+                    or before_snapshot.link_target != planned.link_target
+                ):
+                    raise SyncError(f"pending target {target} before evidence changed")
         elif any(
             value is not None for value in (before_evidence, before_identity, backup)
         ):
@@ -14551,21 +24163,54 @@ def _parse_pending_link_batch(
                 raise SyncError(
                     f"pending target {target} has invalid produced evidence"
                 )
-            stage_snapshot = _read_symlink_snapshot_beneath(
-                home,
-                batch_root / Path(*stage.parts),
-            )
-            evidence_snapshot = _read_symlink_snapshot_beneath(
-                home,
-                batch_root / Path(*evidence.parts),
-            )
-            if (
-                stage_snapshot.link_identity != stage_identity
-                or evidence_snapshot.link_identity != evidence_identity
-                or stage_snapshot.link_target != link_target
-                or evidence_snapshot.link_target != link_target
-            ):
-                raise SyncError(f"pending target {target} produced evidence changed")
+            if materialization == "regular":
+                stage_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    batch_root / Path(*stage.parts),
+                    require_managed_access=False,
+                )
+                evidence_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    batch_root / Path(*evidence.parts),
+                    require_managed_access=False,
+                )
+                if (
+                    stage_snapshot.file_identity != stage_identity
+                    or evidence_snapshot.file_identity != evidence_identity
+                    or stage_snapshot.file_identity != evidence_snapshot.file_identity
+                    or stage_snapshot.sha256 != regular_sha256
+                    or evidence_snapshot.sha256 != regular_sha256
+                    or stage_snapshot.size != regular_size
+                    or evidence_snapshot.size != regular_size
+                    or stage_snapshot.mode != regular_mode
+                    or evidence_snapshot.mode != regular_mode
+                    or stage_snapshot.uid != regular_uid
+                    or evidence_snapshot.uid != regular_uid
+                    or stage_snapshot.link_count
+                    not in {regular_link_count, regular_link_count + 1}
+                    or evidence_snapshot.link_count != stage_snapshot.link_count
+                ):
+                    raise SyncError(
+                        f"pending target {target} produced evidence changed"
+                    )
+            else:
+                stage_snapshot = _read_symlink_snapshot_beneath(
+                    home,
+                    batch_root / Path(*stage.parts),
+                )
+                evidence_snapshot = _read_symlink_snapshot_beneath(
+                    home,
+                    batch_root / Path(*evidence.parts),
+                )
+                if (
+                    stage_snapshot.link_identity != stage_identity
+                    or evidence_snapshot.link_identity != evidence_identity
+                    or stage_snapshot.link_target != link_target
+                    or evidence_snapshot.link_target != link_target
+                ):
+                    raise SyncError(
+                        f"pending target {target} produced evidence changed"
+                    )
         elif any(
             value is not None
             for value in (
@@ -14713,27 +24358,54 @@ def _parse_pending_link_batch(
         if key in seen:
             raise SyncError(f"duplicate pending transaction target: {target}")
         seen.add(key)
-        records.append(
-            PendingLinkRecord(
-                index=index,
-                scope=scope,
-                action=action,
-                target=target,
-                kind=kind,
-                planned_snapshot=planned,
-                source=source,
-                owner=owner,
-                link_target=link_target,
-                release_sha=release_sha,
-                before_evidence=before_evidence,
-                before_evidence_identity=before_identity,
-                backup=backup,
-                stage=stage,
-                stage_identity=stage_identity,
-                evidence=evidence,
-                evidence_identity=evidence_identity,
-            )
+        pending_record = PendingLinkRecord(
+            index=index,
+            scope=scope,
+            action=action,
+            target=target,
+            kind=kind,
+            planned_snapshot=planned,
+            source=source,
+            owner=owner,
+            link_target=link_target,
+            release_sha=release_sha,
+            before_materialization=before_materialization,
+            materialization=materialization,
+            removed_link_key=removed_link_key,
+            regular_sha256=regular_sha256,
+            regular_size=regular_size,
+            regular_mode=regular_mode,
+            regular_uid=regular_uid,
+            regular_gid=regular_gid,
+            regular_link_count=regular_link_count,
+            before_evidence=before_evidence,
+            before_evidence_identity=before_identity,
+            backup=backup,
+            stage=stage,
+            stage_identity=stage_identity,
+            evidence=evidence,
+            evidence_identity=evidence_identity,
+            publication_cleanup=publication_cleanup,
         )
+        if (
+            pending_record.before_is_regular()
+            and not pending_record.is_regular()
+            and not _pending_regular_to_symlink_transition_is_authorized(
+                home,
+                pending_record,
+                state_before_value,
+                state_after_value,
+                before_expectations_by_owner,
+                after_expectations_by_owner,
+                removal_authority_by_release,
+                regular_source_evidence,
+            )
+        ):
+            raise SyncError(
+                "pending regular-to-symlink transition lacks exact removal "
+                f"authority: {target}"
+            )
+        records.append(pending_record)
     for record in records:
         if record.action == "create":
             _require_pending_record_bound_create_absence(record)
@@ -14741,9 +24413,84 @@ def _parse_pending_link_batch(
             _require_pending_record_bound_retired_absence(record)
         elif record.action == PENDING_RELINQUISH_FOREIGN_ACTION:
             _require_pending_record_bound_foreign_relinquishment(record)
+    if version >= 7:
+        terminal_regular_before = _parse_pending_terminal_regular_targets(
+            data.get("terminal_regular_before"),
+            batch_name=batch_name,
+        )
+        terminal_regular_after = _parse_pending_terminal_regular_targets(
+            data.get("terminal_regular_after"),
+            batch_name=batch_name,
+        )
+        _validate_pending_terminal_regular_targets_for_state(
+            home,
+            terminal_regular_before,
+            state_before_value,
+            tuple(records),
+            phase="before",
+            source_expectations_by_owner=(
+                before_expectations_by_owner if version >= 10 else None
+            ),
+            regular_source_evidence=(
+                regular_source_evidence if version >= 10 else None
+            ),
+        )
+        _validate_pending_terminal_regular_targets_for_state(
+            home,
+            terminal_regular_after,
+            state_after_value,
+            tuple(records),
+            phase="after",
+            source_expectations_by_owner=(
+                after_expectations_by_owner if version >= 10 else None
+            ),
+            regular_source_evidence=(
+                regular_source_evidence if version >= 10 else None
+            ),
+        )
+    elif version >= 6:
+        terminal_regular_before = _pending_terminal_regular_targets_from_records(
+            tuple(records),
+            phase="before",
+        )
+        terminal_regular_after = _pending_terminal_regular_targets_from_records(
+            tuple(records),
+            phase="after",
+        )
+        expected_before = {
+            target
+            for target, _state_record, pending_record in _terminal_regular_state_items(
+                state_before_value,
+                tuple(records),
+                phase="before",
+            )
+            if pending_record is not None
+        }
+        expected_after = {
+            target
+            for target, _state_record, pending_record in _terminal_regular_state_items(
+                state_after_value,
+                tuple(records),
+                phase="after",
+            )
+            if pending_record is not None
+        }
+        if {target.target for target in terminal_regular_before} != expected_before or {
+            target.target for target in terminal_regular_after
+        } != expected_after:
+            raise SyncError(
+                "pending transaction lacks complete regular terminal authority"
+            )
+    else:
+        terminal_regular_before = ()
+        terminal_regular_after = ()
     before_semantic_keys = {
         (semantic[0], semantic[1])
-        for semantic in _pending_state_claim_semantics(home, state_before_value)
+        for semantic in _pending_state_claim_semantics(
+            home,
+            state_before_value,
+            metadata_version=version,
+        )
     }
     state_claimed_absences = {
         (record.scope, record.target)
@@ -14762,6 +24509,7 @@ def _parse_pending_link_batch(
         "before",
         data.get("claims_before"),
         state_before_value,
+        metadata_version=version,
         omitted_keys=state_claimed_absences,
     )
     claims_after = _parse_pending_link_claims(
@@ -14770,6 +24518,7 @@ def _parse_pending_link_batch(
         "after",
         data.get("claims_after"),
         state_after_value,
+        metadata_version=version,
     )
     before_claims_by_target = {
         (claim.scope, claim.target): claim for claim in claims_before
@@ -14816,11 +24565,16 @@ def _parse_pending_link_batch(
                 f"pending before-state action claim is inconsistent: {record.target}"
             )
         if producing:
-            if after_claim is None or (
-                after_claim.parent_identity != record.planned_snapshot.parent_identity
-                or after_claim.link_identity != record.evidence_identity
-                or after_claim.link_target != record.link_target
-            ):
+            if record.is_regular():
+                invalid_after_claim = after_claim is not None
+            else:
+                invalid_after_claim = after_claim is None or (
+                    after_claim.parent_identity
+                    != record.planned_snapshot.parent_identity
+                    or after_claim.link_identity != record.evidence_identity
+                    or after_claim.link_target != record.link_target
+                )
+            if invalid_after_claim:
                 raise SyncError(
                     f"pending after-state action claim is inconsistent: {record.target}"
                 )
@@ -14828,8 +24582,11 @@ def _parse_pending_link_batch(
             raise SyncError(
                 f"pending removed target still has an after-state claim: {record.target}"
             )
+    if version >= 10:
+        regular_source_evidence.finalize(home)
     assert state_after_evidence is not None
-    return PendingLinkBatch(
+    batch = PendingLinkBatch(
+        metadata_version=version,
         batch_root=batch_root,
         batch_root_identity=batch_root_identity,
         records=tuple(records),
@@ -14843,11 +24600,14 @@ def _parse_pending_link_batch(
         state_after_value=state_after_value,
         releases_before=releases_before,
         releases_after=releases_after,
+        terminal_regular_before=terminal_regular_before,
+        terminal_regular_after=terminal_regular_after,
         commit_evidence=commit_evidence,
         commit_evidence_path=commit_evidence_path,
         commit_marker_path=PENDING_STATE_COMMIT_MARKER,
         pointer_snapshot=pointer_snapshot,
     )
+    return batch
 
 
 def _load_pending_link_batch(home: Path) -> PendingLinkBatch | None:
@@ -14873,6 +24633,7 @@ def _publish_pending_link_pointer(home: Path, batch: PendingLinkBatch) -> None:
     source_parent_fd = -1
     target_parent_fd = -1
     published = False
+    pointer_authoritative = False
     try:
         source_parent_fd = _open_directory_beneath(
             home,
@@ -14922,8 +24683,10 @@ def _publish_pending_link_pointer(home: Path, batch: PendingLinkBatch) -> None:
         ) or not _bound_directory_matches(home, pointer_path.parent, target_parent_fd):
             raise SyncError("pending link pointer parent changed during publication")
         batch.pointer_snapshot = target_snapshot
+        pointer_authoritative = True
+        _retire_pending_staging_cleanup_authority(home, batch)
     except BaseException as error:
-        if published:
+        if published and not pointer_authoritative:
             try:
                 _quarantine_pending_link_pointer(
                     home,
@@ -14988,11 +24751,8 @@ def _pending_commit_snapshot_matches(
     expected: ManagedStateFileSnapshot,
 ) -> bool:
     return (
-        actual.exists
-        and expected.exists
-        and actual.file_identity == expected.file_identity
-        and actual.mode == expected.mode
-        and actual.payload == expected.payload
+        _managed_state_snapshot_matches_file_evidence(actual, expected)
+        and actual.uid == os.geteuid()
     )
 
 
@@ -15085,6 +24845,56 @@ def _publish_pending_commit_marker(home: Path, batch: PendingLinkBatch) -> None:
         _close_fd_quietly(parent_fd)
 
 
+def _pending_rollback_marker_snapshot(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> ManagedStateFileSnapshot | None:
+    marker_path = batch.batch_root / Path(*PENDING_STATE_ROLLBACK_MARKER.parts)
+    parent_fd = _open_directory_beneath(home, marker_path.parent)
+    try:
+        marker = _read_managed_state_file_snapshot(
+            home,
+            marker_path,
+            parent_fd,
+        )
+        if not marker.exists:
+            return None
+        expected_payload = _pending_rollback_marker_payload(batch)
+        if (
+            marker.file_type != stat.S_IFREG
+            or marker.payload != expected_payload
+            or marker.mode != 0o600
+            or marker.uid != os.geteuid()
+            or marker.parent_identity != _directory_identity(parent_fd)
+        ):
+            raise SyncError("pending transaction rollback marker changed")
+        return marker
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _publish_pending_rollback_marker(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> ManagedStateFileSnapshot:
+    existing = _pending_rollback_marker_snapshot(home, batch)
+    if existing is not None:
+        return existing
+    marker_path = batch.batch_root / Path(*PENDING_STATE_ROLLBACK_MARKER.parts)
+    marker = _publish_atomic_exclusive_internal_file(
+        home,
+        marker_path,
+        _pending_rollback_marker_payload(batch),
+    )
+    verified = _pending_rollback_marker_snapshot(home, batch)
+    if verified is None or not _managed_state_snapshot_matches_bound_file_evidence(
+        verified,
+        marker,
+    ):
+        raise SyncError("pending transaction rollback marker changed")
+    return verified
+
+
 def _pending_cleanup_index_path(home: Path) -> Path:
     return _personal_sync_root(home) / PENDING_CLEANUP_INDEX_RELATIVE_PATH
 
@@ -15100,8 +24910,936 @@ def _pending_cleanup_ticket_path(home: Path, batch_name: str) -> Path:
     )
 
 
+def _pending_cleanup_authority_classification_error(
+    batch_name: str,
+    error: BaseException,
+) -> SyncError:
+    return SyncError(
+        "pending cleanup authority could not be safely classified and was "
+        f"retained: {batch_name}: {error}. Restore the exact canonical ticket "
+        "and retry the installer; do not delete pending cleanup evidence manually."
+    )
+
+
+def _pending_cleanup_empty_proof_path(home: Path, batch_name: str) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("pending cleanup empty proof has an invalid batch name")
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_CLEANUP_EMPTY_PROOF_SUFFIX
+    )
+
+
+def _pending_cleanup_terminal_validation_path(
+    home: Path,
+    batch_name: str,
+) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("pending cleanup terminal validation has an invalid batch name")
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX
+    )
+
+
+def _pending_private_use_retirement_path(home: Path, batch_name: str) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("private-use retirement receipt has an invalid batch name")
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+    )
+
+
 def _pending_cleanup_isolated_batch_name(batch_name: str) -> str:
     return PENDING_CLEANUP_ISOLATED_BATCH_PREFIX + batch_name
+
+
+def _pending_quarantine_allocation_path(home: Path, batch_name: str) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("pending quarantine allocation has an invalid batch name")
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_QUARANTINE_ALLOCATION_SUFFIX
+    )
+
+
+def _pending_quarantine_metadata_stage_path(home: Path, batch_name: str) -> Path:
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("pending quarantine metadata stage has an invalid batch name")
+    return _pending_cleanup_index_path(home) / (
+        batch_name + PENDING_QUARANTINE_METADATA_STAGE_SUFFIX
+    )
+
+
+def _pending_quarantine_allocation_payload(
+    batch_name: str,
+    quarantine_root_identity: tuple[int, int],
+    metadata_payload: bytes,
+) -> bytes:
+    return _pending_quarantine_allocation_payload_from_plan(
+        batch_name,
+        quarantine_root_identity,
+        hashlib.sha256(metadata_payload).hexdigest(),
+        len(metadata_payload),
+    )
+
+
+def _pending_quarantine_allocation_payload_from_plan(
+    batch_name: str,
+    quarantine_root_identity: tuple[int, int],
+    metadata_sha256: str,
+    metadata_size: int,
+) -> bytes:
+    return _bounded_json_document(
+        {
+            "version": 8,
+            "kind": "ephemeral-quarantine-allocation",
+            "batch": batch_name,
+            "quarantine_root_identity": _identity_payload(quarantine_root_identity),
+            "isolated_name": _pending_cleanup_isolated_batch_name(batch_name),
+            "batch_mode": 0o700,
+            "metadata": {
+                "path": "metadata.json",
+                "sha256": metadata_sha256,
+                "size": metadata_size,
+                "mode": 0o600,
+            },
+            "leaf": {"path": "leaf", "mode": 0o700},
+            "capacity_units": 1,
+            "batch_initial_state": "absent",
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending quarantine allocation exceeds the size limit",
+    )
+
+
+def _pending_quarantine_allocation_batch_name(name: str) -> str | None:
+    if not name.endswith(PENDING_QUARANTINE_ALLOCATION_SUFFIX):
+        return None
+    batch_name = name[: -len(PENDING_QUARANTINE_ALLOCATION_SUFFIX)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_quarantine_allocation_temp_batch_name(name: str) -> str | None:
+    if not name.endswith(PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX):
+        return None
+    batch_name = name[: -len(PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_quarantine_metadata_stage_batch_name(name: str) -> str | None:
+    if not name.endswith(PENDING_QUARANTINE_METADATA_STAGE_SUFFIX):
+        return None
+    batch_name = name[: -len(PENDING_QUARANTINE_METADATA_STAGE_SUFFIX)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_quarantine_retained_allocation_name(
+    name: str,
+) -> tuple[str, str] | None:
+    canonical = _pending_cleanup_retained_canonical_name(name)
+    if canonical is None:
+        return None
+    batch_name = _pending_quarantine_allocation_batch_name(canonical)
+    if batch_name is None:
+        return None
+    return canonical, batch_name
+
+
+def _pending_quarantine_retained_allocation_temp_name(
+    name: str,
+) -> tuple[str, str] | None:
+    canonical = _pending_cleanup_retained_canonical_name(name)
+    if canonical is None:
+        return None
+    batch_name = _pending_quarantine_allocation_temp_batch_name(canonical)
+    if batch_name is None:
+        return None
+    return canonical, batch_name
+
+
+def _pending_quarantine_retained_metadata_stage_name(
+    name: str,
+) -> tuple[str, str] | None:
+    canonical = _pending_cleanup_retained_canonical_name(name)
+    if canonical is None:
+        return None
+    batch_name = _pending_quarantine_metadata_stage_batch_name(canonical)
+    if batch_name is None:
+        return None
+    return canonical, batch_name
+
+
+def _pending_quarantine_allocation_control_batch_name(name: str) -> str | None:
+    """Return the batch reserved by any strict v8 allocation control name."""
+    direct = _pending_quarantine_allocation_batch_name(name)
+    temporary = _pending_quarantine_allocation_temp_batch_name(name)
+    metadata_stage = _pending_quarantine_metadata_stage_batch_name(name)
+    if direct is not None or temporary is not None or metadata_stage is not None:
+        return direct or temporary or metadata_stage
+    for retained in (
+        _pending_quarantine_retained_allocation_name(name),
+        _pending_quarantine_retained_allocation_temp_name(name),
+        _pending_quarantine_retained_metadata_stage_name(name),
+    ):
+        if retained is not None:
+            return retained[1]
+    return None
+
+
+def _pending_quarantine_allocation_representation_batch_name(
+    name: str,
+) -> str | None:
+    """Classify v8-derived residue as blocking evidence, never authority.
+
+    The exact parsers above recognize only names that the durable recovery
+    protocol can bind and reread.  This deliberately broader classifier also
+    recognizes suffix-added descendants of those names.  Its result proves
+    only that bytes occupy the v8 control namespace for a syntactically valid
+    batch; callers must use it to stop rather than to recover, promote, or
+    delete an entry.
+    """
+    candidate = name
+    if candidate.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        candidate = candidate[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    for marker in (
+        PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX,
+        PENDING_QUARANTINE_ALLOCATION_SUFFIX,
+        PENDING_QUARANTINE_METADATA_STAGE_SUFFIX,
+    ):
+        marker_index = candidate.find(marker)
+        if marker_index <= 0:
+            continue
+        batch_name = candidate[:marker_index]
+        if (
+            len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+            and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+        ):
+            return batch_name
+    return None
+
+
+def _pending_quarantine_unresolved_allocation_representation(
+    name: str,
+) -> tuple[str, str] | None:
+    """Return v8-derived residue which cannot enter automatic recovery."""
+    batch_name = _pending_quarantine_allocation_representation_batch_name(name)
+    if batch_name is None:
+        return None
+    if _pending_quarantine_allocation_control_batch_name(name) == batch_name:
+        return None
+    return batch_name, name
+
+
+def _pending_quarantine_unresolved_allocation_representation_error(
+    unresolved: tuple[str, str],
+) -> SyncError:
+    batch_name, name = unresolved
+    return SyncError(
+        "pending quarantine allocation representation must be reconciled before "
+        f"new mutation: {batch_name}: {name}"
+    )
+
+
+def _pending_quarantine_unresolved_allocation_representation_issue(
+    home: Path,
+) -> tuple[str, str] | None:
+    """Observe malformed v8 control residue without granting it authority."""
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return None
+    try:
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending quarantine allocation index changed")
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending quarantine allocation scan exceeds the limit",
+        )
+        for name in names:
+            unresolved = _pending_quarantine_unresolved_allocation_representation(name)
+            if unresolved is not None:
+                return unresolved
+        return None
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _pending_quarantine_allocation_cleanup_control_batch_name(
+    name: str,
+) -> str | None:
+    """Classify any durable cleanup-control residue for a v8 batch.
+
+    This is deliberately broader than the recovery parsers.  Canonical,
+    publication-temp, retained, and suffix-added descendants can all preserve
+    competing cleanup evidence, so none may be ignored at a v8-only deletion
+    boundary merely because it cannot itself be recovered automatically.
+    """
+    candidate = name
+    if candidate.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        candidate = candidate[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    for marker in (
+        PENDING_QUARANTINE_ALLOCATION_TEMP_SUFFIX,
+        PENDING_QUARANTINE_ALLOCATION_SUFFIX,
+        PENDING_QUARANTINE_METADATA_STAGE_SUFFIX,
+        PENDING_CLEANUP_TICKET_SUFFIX,
+        PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
+        PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+        PENDING_PRIVATE_USE_RETIREMENT_SUFFIX,
+    ):
+        marker_index = candidate.find(marker)
+        if marker_index <= 0:
+            continue
+        batch_name = candidate[:marker_index]
+        if (
+            len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+            and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+        ):
+            return batch_name
+    return None
+
+
+def _require_pending_quarantine_allocation_cleanup_controls_absent(
+    home: Path,
+    index_root: Path,
+    index_fd: int,
+    ticket: PendingQuarantineAllocationTicket,
+    *,
+    allowed_allocation_name: str,
+    allowed_companion_names: tuple[str, ...] = (),
+) -> None:
+    """Require the exact v8 allocation to be the batch's sole control.
+
+    The protected index property is its bound directory identity and owner-only
+    access policy.  The bounded complete scan rejects every same-batch durable
+    cleanup-control representation except the exact current allocation name.
+    During allocation retirement that name may be the helper's exact isolated
+    tombstone; its inode, content, and policy are rebound separately through the
+    retained ticket snapshot immediately before this boundary is called.
+    """
+    _require_pending_cleanup_fd_access_policy(
+        index_fd,
+        index_root,
+        expected_mode=0o700,
+    )
+    if not _bound_directory_matches(home, index_root, index_fd):
+        raise SyncError("pending quarantine allocation cleanup index changed")
+    names = _directory_member_names(
+        index_fd,
+        maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+        overflow_message=(
+            "pending quarantine allocation cleanup control scan exceeds the limit"
+        ),
+    )
+    batch_name = ticket.batch_root.name
+    for name in names:
+        if (
+            _pending_quarantine_allocation_cleanup_control_batch_name(name)
+            != batch_name
+            or name == allowed_allocation_name
+            or name in allowed_companion_names
+        ):
+            continue
+        raise SyncError(
+            "pending quarantine allocation cleanup control remained before "
+            f"v8-only mutation: {batch_name}: {name}"
+        )
+    _require_pending_cleanup_fd_access_policy(
+        index_fd,
+        index_root,
+        expected_mode=0o700,
+    )
+    if not _bound_directory_matches(home, index_root, index_fd):
+        raise SyncError("pending quarantine allocation cleanup index changed")
+
+
+def _read_pending_quarantine_allocation_ticket(
+    home: Path,
+    path: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+    _captured_snapshot: ManagedStateFileSnapshot | None = None,
+) -> PendingQuarantineAllocationTicket | None:
+    batch_name = _pending_quarantine_allocation_batch_name(path.name)
+    if batch_name is None:
+        raise SyncError("pending quarantine allocation has an invalid file name")
+    if _captured_snapshot is None:
+        index_fd = _open_directory_beneath(home, path.parent)
+        try:
+            snapshot = _read_managed_state_file_snapshot(
+                home,
+                path,
+                index_fd,
+                expected_identity=expected_identity,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
+            if not snapshot.exists:
+                return None
+            if (
+                not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+                or snapshot.file_type != stat.S_IFREG
+                or snapshot.mode != 0o600
+                or snapshot.uid != os.geteuid()
+                or snapshot.payload is None
+            ):
+                raise SyncError(f"pending quarantine allocation changed: {batch_name}")
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                path,
+                index_fd,
+                snapshot,
+            )
+        finally:
+            _close_fd_quietly(index_fd)
+    else:
+        snapshot = _captured_snapshot
+        if (
+            expected_identity is not None
+            and snapshot.file_identity != expected_identity
+        ):
+            raise SyncError(f"pending quarantine allocation changed: {batch_name}")
+        if not snapshot.exists:
+            return None
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.file_type != stat.S_IFREG
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+            or snapshot.payload is None
+        ):
+            raise SyncError(f"pending quarantine allocation changed: {batch_name}")
+    data = _decode_managed_state_json(snapshot.payload, path)
+    expected_fields = {
+        "version",
+        "kind",
+        "batch",
+        "quarantine_root_identity",
+        "isolated_name",
+        "batch_mode",
+        "metadata",
+        "leaf",
+        "capacity_units",
+        "batch_initial_state",
+    }
+    metadata = data.get("metadata")
+    leaf = data.get("leaf")
+    root_identity = _parse_pending_identity(
+        data.get("quarantine_root_identity"),
+        "pending quarantine allocation root identity",
+    )
+    metadata_sha256 = metadata.get("sha256") if isinstance(metadata, dict) else None
+    metadata_size = metadata.get("size") if isinstance(metadata, dict) else None
+    if (
+        set(data) != expected_fields
+        or data.get("version") != 8
+        or data.get("kind") != "ephemeral-quarantine-allocation"
+        or data.get("batch") != batch_name
+        or root_identity is None
+        or data.get("isolated_name") != _pending_cleanup_isolated_batch_name(batch_name)
+        or data.get("batch_mode") != 0o700
+        or not isinstance(metadata, dict)
+        or set(metadata) != {"path", "sha256", "size", "mode"}
+        or metadata.get("path") != "metadata.json"
+        or not isinstance(metadata_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is None
+        or type(metadata_size) is not int
+        or metadata_size < 0
+        or metadata_size > MAX_MANAGED_STATE_BYTES
+        or metadata.get("mode") != 0o600
+        or leaf != {"path": "leaf", "mode": 0o700}
+        or data.get("capacity_units") != 1
+        or data.get("batch_initial_state") != "absent"
+    ):
+        raise SyncError(f"pending quarantine allocation changed: {batch_name}")
+    canonical_payload = _pending_quarantine_allocation_payload_from_plan(
+        batch_name,
+        root_identity,
+        metadata_sha256,
+        metadata_size,
+    )
+    if snapshot.payload != canonical_payload:
+        raise SyncError(f"pending quarantine allocation changed: {batch_name}")
+    return PendingQuarantineAllocationTicket(
+        path=path,
+        snapshot=snapshot,
+        batch_root=(_personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name),
+        quarantine_root_identity=root_identity,
+        isolated_name=_pending_cleanup_isolated_batch_name(batch_name),
+        batch_mode=0o700,
+        metadata_sha256=metadata_sha256,
+        metadata_size=metadata_size,
+        metadata_mode=0o600,
+        leaf_mode=0o700,
+    )
+
+
+def _pending_quarantine_allocation_ticket_matches(
+    actual: PendingQuarantineAllocationTicket,
+    expected: PendingQuarantineAllocationTicket,
+) -> bool:
+    # A supplementary-group-equivalent gid transition does not weaken a 0600
+    # file.  Compare the protected identity/content/access properties through
+    # the shared evidence predicate instead of raw dataclass equality.
+    matches = (
+        actual.path == expected.path
+        and _managed_state_snapshot_matches_bound_file_evidence(
+            actual.snapshot,
+            expected.snapshot,
+        )
+        and actual.batch_root == expected.batch_root
+        and actual.quarantine_root_identity == expected.quarantine_root_identity
+        and actual.isolated_name == expected.isolated_name
+        and actual.batch_mode == expected.batch_mode
+        and actual.metadata_sha256 == expected.metadata_sha256
+        and actual.metadata_size == expected.metadata_size
+        and actual.metadata_mode == expected.metadata_mode
+        and actual.leaf_mode == expected.leaf_mode
+    )
+    return matches
+
+
+def _require_pending_quarantine_allocation_ticket_unchanged(
+    home: Path,
+    ticket: PendingQuarantineAllocationTicket,
+) -> PendingQuarantineAllocationTicket:
+    current = _read_pending_quarantine_allocation_ticket(
+        home,
+        ticket.path,
+        expected_identity=ticket.snapshot.file_identity,
+    )
+    if current is None or not _pending_quarantine_allocation_ticket_matches(
+        current,
+        ticket,
+    ):
+        raise SyncError(
+            f"pending quarantine allocation changed: {ticket.batch_root.name}"
+        )
+    return current
+
+
+def _require_quarantine_allocation_matches_binding(
+    home: Path,
+    binding: EphemeralQuarantineBatchBinding,
+) -> PendingQuarantineAllocationTicket | None:
+    ticket = binding.allocation_ticket
+    if ticket is None:
+        return None
+    current = _read_pending_quarantine_allocation_ticket(
+        home,
+        ticket.path,
+        expected_identity=ticket.snapshot.file_identity,
+    )
+    metadata = binding.metadata
+    # The durable reread binds ticket identity and bytes.  The remaining fields
+    # join the append-only reservation to cleanup authority: exact root and
+    # names prevent namespace substitution, while mode/size/digest prevent a
+    # different scaffold shape or metadata body from borrowing the fence.
+    comparisons = {
+        "durable ticket": current is not None
+        and _pending_quarantine_allocation_ticket_matches(current, ticket),
+        "batch path": ticket.batch_root == binding.batch_root,
+        "root identity": ticket.quarantine_root_identity
+        == binding.quarantine_root_identity,
+        "isolated name": ticket.isolated_name
+        == _pending_cleanup_isolated_batch_name(binding.batch_root.name),
+        "batch mode": ticket.batch_mode == 0o700,
+        "metadata mode": ticket.metadata_mode == metadata.mode,
+        "metadata size": ticket.metadata_size == metadata.size,
+        "metadata digest": metadata.payload is not None
+        and ticket.metadata_sha256 == hashlib.sha256(metadata.payload).hexdigest(),
+        "leaf mode": ticket.leaf_mode == 0o700,
+    }
+    mismatch = next(
+        (name for name, matches in comparisons.items() if not matches), None
+    )
+    if mismatch is not None:
+        raise SyncError(
+            f"pending quarantine allocation does not join exact cleanup "
+            f"authority ({mismatch}): {binding.batch_root.name}"
+        )
+    return current
+
+
+def _cleanup_ticket_matches_quarantine_allocation(
+    cleanup: PendingBatchCleanupTicket,
+    allocation: PendingQuarantineAllocationTicket,
+) -> bool:
+    return (
+        cleanup.version in {5, 7}
+        and cleanup.batch_root == allocation.batch_root
+        and cleanup.quarantine_root_identity == allocation.quarantine_root_identity
+        and cleanup.isolated_name == allocation.isolated_name
+        and cleanup.metadata_mode == allocation.metadata_mode
+        # Persisted v5 authority predates the redundant metadata size field.
+        # Its canonical digest still binds the complete byte content; v7 adds
+        # the explicit size without changing the historical v5 schema.
+        and (cleanup.version == 5 or cleanup.metadata_size == allocation.metadata_size)
+        and cleanup.metadata_sha256 == allocation.metadata_sha256
+    )
+
+
+def _read_joined_quarantine_allocation_for_cleanup(
+    home: Path,
+    cleanup: PendingBatchCleanupTicket,
+) -> PendingQuarantineAllocationTicket | None:
+    """Read the sole canonical v8 control and require its exact v5/v7 join."""
+    if cleanup.version not in {5, 7}:
+        raise SyncError("pending quarantine allocation join requires v5/v7 cleanup")
+    batch_name = cleanup.batch_root.name
+    index_root = _pending_cleanup_index_path(home)
+    index_fd = _open_directory_beneath(home, index_root)
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            index_fd,
+            index_root,
+            expected_mode=0o700,
+        )
+        if _directory_identity(
+            index_fd
+        ) != cleanup.snapshot.parent_identity or not _bound_directory_matches(
+            home, index_root, index_fd
+        ):
+            raise SyncError("pending quarantine allocation index changed")
+
+        def control_names() -> tuple[str, ...]:
+            names = _directory_member_names(
+                index_fd,
+                maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+                overflow_message=(
+                    "pending quarantine allocation control scan exceeds the limit"
+                ),
+            )
+            for name in names:
+                unresolved = _pending_quarantine_unresolved_allocation_representation(
+                    name
+                )
+                if unresolved is not None and unresolved[0] == batch_name:
+                    raise _pending_quarantine_unresolved_allocation_representation_error(
+                        unresolved
+                    )
+            return tuple(
+                name
+                for name in names
+                if _pending_quarantine_allocation_control_batch_name(name) == batch_name
+            )
+
+        before_names = control_names()
+        allocation_path = _pending_quarantine_allocation_path(home, batch_name)
+        allocation_snapshot = _read_managed_state_file_snapshot(
+            home,
+            allocation_path,
+            index_fd,
+            maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        )
+        if allocation_snapshot.exists:
+            if (
+                not _managed_state_snapshot_has_complete_file_evidence(
+                    allocation_snapshot
+                )
+                or allocation_snapshot.file_type != stat.S_IFREG
+                or allocation_snapshot.mode != 0o600
+                or allocation_snapshot.uid != os.geteuid()
+                or allocation_snapshot.payload is None
+                or allocation_snapshot.parent_identity
+                != cleanup.snapshot.parent_identity
+            ):
+                raise SyncError(f"pending quarantine allocation changed: {batch_name}")
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                allocation_path,
+                index_fd,
+                allocation_snapshot,
+            )
+        allocation = _read_pending_quarantine_allocation_ticket(
+            home,
+            allocation_path,
+            _captured_snapshot=allocation_snapshot,
+        )
+        after_names = control_names()
+        _require_pending_cleanup_fd_access_policy(
+            index_fd,
+            index_root,
+            expected_mode=0o700,
+        )
+        if (
+            before_names != after_names
+            or _directory_identity(index_fd) != cleanup.snapshot.parent_identity
+            or not _bound_directory_matches(home, index_root, index_fd)
+        ):
+            raise SyncError(
+                f"pending quarantine allocation control changed: {batch_name}"
+            )
+        expected_names = (allocation_path.name,) if allocation is not None else ()
+        if after_names != expected_names:
+            raise SyncError(
+                "pending quarantine allocation control does not join cleanup "
+                f"authority: {batch_name}: {', '.join(after_names)}"
+            )
+        if allocation is not None and not _cleanup_ticket_matches_quarantine_allocation(
+            cleanup,
+            allocation,
+        ):
+            raise SyncError(
+                "pending quarantine allocation does not join cleanup authority: "
+                f"{batch_name}"
+            )
+        return allocation
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _require_joined_quarantine_allocation_unchanged(
+    home: Path,
+    cleanup: PendingBatchCleanupTicket,
+    expected: PendingQuarantineAllocationTicket | None,
+) -> None:
+    """Revalidate the original v8 join immediately before cleanup mutation."""
+    current = _read_joined_quarantine_allocation_for_cleanup(home, cleanup)
+    if expected is None:
+        if current is not None:
+            raise SyncError(
+                "pending quarantine allocation appeared during cleanup: "
+                f"{cleanup.batch_root.name}"
+            )
+        return
+    if current is None or not _pending_quarantine_allocation_ticket_matches(
+        current,
+        expected,
+    ):
+        raise SyncError(
+            "pending quarantine allocation changed during cleanup: "
+            f"{cleanup.batch_root.name}"
+        )
+
+
+def _delete_pending_quarantine_allocation_ticket(
+    home: Path,
+    ticket: PendingQuarantineAllocationTicket,
+    *,
+    boundary_revalidator: Callable[[], None],
+    allowed_companion_names: tuple[str, ...] = (),
+) -> None:
+    index_fd = _open_directory_beneath(home, ticket.path.parent)
+    try:
+        current = _read_pending_quarantine_allocation_ticket(
+            home,
+            ticket.path,
+            expected_identity=ticket.snapshot.file_identity,
+        )
+        if current is None or not _pending_quarantine_allocation_ticket_matches(
+            current,
+            ticket,
+        ):
+            raise SyncError(
+                f"pending quarantine allocation changed: {ticket.batch_root.name}"
+            )
+
+        def revalidate_ticket_and_boundary(current_name: str) -> None:
+            current_path = ticket.path.with_name(current_name)
+            snapshot = _read_managed_state_file_snapshot(
+                home,
+                current_path,
+                index_fd,
+                expected_identity=ticket.snapshot.file_identity,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                snapshot,
+                ticket.snapshot,
+            ):
+                raise SyncError(
+                    "pending quarantine allocation changed before retirement: "
+                    f"{ticket.batch_root.name}"
+                )
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                current_path,
+                index_fd,
+                snapshot,
+            )
+            cleanup_control_kwargs: dict[str, object] = {
+                "allowed_allocation_name": current_name,
+            }
+            if allowed_companion_names:
+                cleanup_control_kwargs["allowed_companion_names"] = (
+                    allowed_companion_names
+                )
+            _require_pending_quarantine_allocation_cleanup_controls_absent(
+                home,
+                ticket.path.parent,
+                index_fd,
+                ticket,
+                **cleanup_control_kwargs,
+            )
+            boundary_revalidator()
+
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            ticket.path,
+            index_fd,
+            ticket.snapshot,
+            label=f"pending quarantine allocation {ticket.batch_root.name}",
+            mutation_revalidator=revalidate_ticket_and_boundary,
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _retire_pending_private_use_controls(
+    home: Path,
+    receipt: PendingPrivateUseRetirementReceipt,
+) -> None:
+    """Retire v5, v8, then this receipt without mutating private evidence."""
+    batch_name = receipt.batch_root.name
+    receipt_name = receipt.path.name
+
+    def require_receipt_boundary() -> tuple[
+        PendingBatchCleanupTicket | None,
+        PendingQuarantineAllocationTicket | None,
+    ]:
+        return _require_pending_private_use_retirement_boundary(
+            home, receipt, receipt_member=receipt_name
+        )
+
+    cleanup, allocation = require_receipt_boundary()
+    if cleanup is not None:
+        _delete_pending_cleanup_ticket(
+            home,
+            cleanup,
+            boundary_revalidator=lambda: require_receipt_boundary(),
+        )
+    cleanup, allocation = require_receipt_boundary()
+    if cleanup is not None:
+        raise SyncError(
+            f"private-use retirement cleanup control remained: {batch_name}"
+        )
+    if allocation is not None:
+        _delete_pending_quarantine_allocation_ticket(
+            home,
+            allocation,
+            boundary_revalidator=lambda: require_receipt_boundary(),
+            allowed_companion_names=(receipt_name,),
+        )
+    cleanup, allocation = require_receipt_boundary()
+    if cleanup is not None or allocation is not None:
+        raise SyncError(f"private-use retirement controls remained: {batch_name}")
+    index_fd = _open_directory_beneath(home, receipt.path.parent)
+    try:
+
+        def require_final_receipt_boundary(current_name: str) -> None:
+            current_receipt = replace(
+                receipt,
+                path=receipt.path.with_name(current_name),
+            )
+            controls = _require_pending_private_use_retirement_boundary(
+                home, current_receipt, receipt_member=current_name
+            )
+            if controls != (None, None):
+                raise SyncError(
+                    f"private-use retirement controls reappeared: {batch_name}"
+                )
+
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            receipt.path,
+            index_fd,
+            receipt.snapshot,
+            label=f"private-use retirement receipt {batch_name}",
+            maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            mutation_revalidator=require_final_receipt_boundary,
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _retire_quarantine_allocation_after_batch_absent(
+    home: Path,
+    ticket: PendingQuarantineAllocationTicket,
+) -> None:
+    quarantine_root = ticket.batch_root.parent
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    try:
+
+        def require_absent_reservation() -> None:
+            _require_quarantine_allocation_root_absent(
+                home,
+                quarantine_root,
+                quarantine_fd,
+                ticket.batch_root.name,
+                ticket.quarantine_root_identity,
+            )
+
+        _delete_pending_quarantine_allocation_ticket(
+            home,
+            ticket,
+            boundary_revalidator=require_absent_reservation,
+        )
+    finally:
+        _close_fd_quietly(quarantine_fd)
+
+
+def _retire_joined_quarantine_allocation(
+    home: Path,
+    cleanup: PendingBatchCleanupTicket,
+    expected: PendingQuarantineAllocationTicket | None,
+) -> None:
+    path = _pending_quarantine_allocation_path(
+        home,
+        cleanup.batch_root.name,
+    )
+    allocation = _read_pending_quarantine_allocation_ticket(
+        home,
+        path,
+        expected_identity=(
+            expected.snapshot.file_identity if expected is not None else None
+        ),
+    )
+    if expected is None:
+        if allocation is not None:
+            raise SyncError(
+                "pending quarantine allocation appeared during cleanup: "
+                f"{cleanup.batch_root.name}"
+            )
+        return
+    if (
+        allocation is None
+        or not _pending_quarantine_allocation_ticket_matches(allocation, expected)
+        or not _cleanup_ticket_matches_quarantine_allocation(cleanup, allocation)
+    ):
+        raise SyncError(
+            "pending quarantine allocation does not join cleanup authority: "
+            f"{cleanup.batch_root.name}"
+        )
+    _retire_quarantine_allocation_after_batch_absent(home, allocation)
 
 
 def _pending_cleanup_batch_name_from_quarantine_entry(
@@ -15118,15 +25856,16 @@ def _pending_cleanup_batch_name_from_quarantine_entry(
     return batch_name
 
 
-def _quarantine_batch_count_from_fd(quarantine_fd: int) -> int:
+def _quarantine_batch_names_from_fd(quarantine_fd: int) -> set[str]:
     names = _directory_member_names(
         quarantine_fd,
         maximum_entries=MAX_PENDING_CLEANUP_BATCH_SCAN,
         overflow_message="quarantine batch scan exceeds the size limit",
     )
-    retained_batches = 0
+    retained_batches: set[str] = set()
     for name in names:
-        if _pending_cleanup_batch_name_from_quarantine_entry(name) is None:
+        batch_name = _pending_cleanup_batch_name_from_quarantine_entry(name)
+        if batch_name is None:
             continue
         try:
             metadata = os.stat(
@@ -15137,8 +25876,61 @@ def _quarantine_batch_count_from_fd(quarantine_fd: int) -> int:
         except OSError as error:
             raise SyncError(f"quarantine batch changed during audit: {name}") from error
         if stat.S_ISDIR(metadata.st_mode):
-            retained_batches += 1
+            retained_batches.add(batch_name)
     return retained_batches
+
+
+def _pending_quarantine_allocation_batch_names(home: Path) -> set[str]:
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return set()
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending quarantine allocation scan exceeds the limit",
+        )
+        batches: set[str] = set()
+        for name in names:
+            unresolved = _pending_quarantine_unresolved_allocation_representation(name)
+            if unresolved is not None:
+                raise _pending_quarantine_unresolved_allocation_representation_error(
+                    unresolved
+                )
+            direct = _pending_quarantine_allocation_batch_name(name)
+            temp = _pending_quarantine_allocation_temp_batch_name(name)
+            retained = _pending_quarantine_retained_allocation_name(name)
+            retained_temp = _pending_quarantine_retained_allocation_temp_name(name)
+            metadata_stage = _pending_quarantine_metadata_stage_batch_name(name)
+            retained_metadata_stage = _pending_quarantine_retained_metadata_stage_name(
+                name
+            )
+            batch_name = direct or temp or metadata_stage
+            if batch_name is None and retained is not None:
+                batch_name = retained[1]
+            if batch_name is None and retained_temp is not None:
+                batch_name = retained_temp[1]
+            if batch_name is None and retained_metadata_stage is not None:
+                batch_name = retained_metadata_stage[1]
+            if batch_name is not None:
+                batches.add(batch_name)
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending quarantine allocation index changed")
+        return batches
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _quarantine_capacity_batch_count(home: Path, quarantine_fd: int) -> int:
+    batches = _quarantine_batch_names_from_fd(quarantine_fd)
+    batches.update(_pending_quarantine_allocation_batch_names(home))
+    return len(batches)
+
+
+def _quarantine_batch_count_from_fd(quarantine_fd: int) -> int:
+    return len(_quarantine_batch_names_from_fd(quarantine_fd))
 
 
 def _quarantine_batch_count(home: Path) -> int:
@@ -15146,9 +25938,9 @@ def _quarantine_batch_count(home: Path) -> int:
     try:
         quarantine_fd = _open_directory_beneath(home, quarantine_root)
     except FileNotFoundError:
-        return 0
+        return len(_pending_quarantine_allocation_batch_names(home))
     try:
-        retained_batches = _quarantine_batch_count_from_fd(quarantine_fd)
+        retained_batches = _quarantine_capacity_batch_count(home, quarantine_fd)
         if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
             raise SyncError("quarantine root changed during audit")
         return retained_batches
@@ -15181,7 +25973,7 @@ def _retained_pending_cleanup_file(
     with os.scandir(parent_fd) as entries:
         for entry in entries:
             scanned += 1
-            if scanned > MAX_ACTIVE_SKILL_ENTRIES:
+            if scanned > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
                 raise SyncError(
                     f"{label} parent exceeds the retained-evidence scan limit"
                 )
@@ -15209,24 +26001,29 @@ def _retained_pending_cleanup_file(
     return retained_name, retained_snapshot
 
 
-def _restore_retained_pending_cleanup_file(
+def _restore_exact_retained_pending_cleanup_file(
     home: Path,
     path: Path,
     parent_fd: int,
+    retained_name: str,
     expected: ManagedStateFileSnapshot,
     *,
     label: str,
-) -> ManagedStateFileSnapshot | None:
-    retained = _retained_pending_cleanup_file(
+) -> ManagedStateFileSnapshot:
+    retained_path = path.with_name(retained_name)
+    retained_snapshot = _read_managed_state_file_snapshot(
         home,
-        path,
+        retained_path,
         parent_fd,
-        expected=expected,
-        label=label,
+        expected_identity=expected.file_identity,
     )
-    if retained is None:
-        return None
-    retained_name, _retained_snapshot = retained
+    if not _managed_state_snapshot_matches_file_evidence(
+        retained_snapshot,
+        expected,
+    ):
+        raise SyncError(f"{label} retained evidence changed")
+    if not _bound_directory_matches(home, path.parent, parent_fd):
+        raise SyncError(f"{label} parent changed before retained-evidence recovery")
     try:
         _rename_noreplace_at(
             parent_fd,
@@ -15252,6 +26049,153 @@ def _restore_retained_pending_cleanup_file(
     return restored
 
 
+def _restore_retained_pending_cleanup_file(
+    home: Path,
+    path: Path,
+    parent_fd: int,
+    expected: ManagedStateFileSnapshot,
+    *,
+    label: str,
+) -> ManagedStateFileSnapshot | None:
+    retained = _retained_pending_cleanup_file(
+        home,
+        path,
+        parent_fd,
+        expected=expected,
+        label=label,
+    )
+    if retained is None:
+        return None
+    retained_name, _retained_snapshot = retained
+    return _restore_exact_retained_pending_cleanup_file(
+        home,
+        path,
+        parent_fd,
+        retained_name,
+        expected,
+        label=label,
+    )
+
+
+def _retained_pending_cleanup_names_for_path(
+    home: Path,
+    path: Path,
+    parent_fd: int,
+    *,
+    label: str,
+) -> tuple[str, ...]:
+    if not _bound_directory_matches(home, path.parent, parent_fd):
+        raise SyncError(f"{label} parent changed while scanning retained evidence")
+    prefix = f"{PENDING_CLEANUP_RETAINED_PREFIX}{path.name}-"
+    pattern = re.compile(re.escape(prefix) + r"[0-9]+-[0-9a-f]{16}")
+    matches: list[str] = []
+    with os.scandir(parent_fd) as entries:
+        for scanned, entry in enumerate(entries, start=1):
+            if scanned > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
+                raise SyncError(
+                    f"{label} parent exceeds the retained-evidence scan limit"
+                )
+            if pattern.fullmatch(entry.name) is not None:
+                matches.append(entry.name)
+    if not _bound_directory_matches(home, path.parent, parent_fd):
+        raise SyncError(f"{label} parent changed while scanning retained evidence")
+    return tuple(sorted(matches))
+
+
+def _exclusive_internal_object_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _cleanup_created_exclusive_internal_file(
+    home: Path,
+    path: Path,
+    parent_fd: int,
+    file_fd: int,
+    parent_identity: tuple[int, int],
+    created_identity: tuple[int, int, int],
+    *,
+    label: str,
+) -> None:
+    """Remove only the inode retained from this function's O_EXCL create."""
+
+    def require_parent_binding(stage: str) -> None:
+        try:
+            descriptor_parent_identity = _directory_identity(parent_fd)
+        except (OSError, SyncError) as error:
+            raise SyncError(f"{label} parent is unreadable {stage}") from error
+        if (
+            descriptor_parent_identity != parent_identity
+            or not _bound_directory_matches(home, path.parent, parent_fd)
+        ):
+            raise SyncError(f"{label} parent changed {stage}")
+
+    def require_descriptor_identity(stage: str) -> None:
+        try:
+            identity = _exclusive_internal_object_identity(os.fstat(file_fd))
+        except OSError as error:
+            raise SyncError(
+                f"{label} retained descriptor is unreadable {stage}"
+            ) from error
+        if identity != created_identity:
+            raise SyncError(f"{label} retained descriptor changed {stage}")
+
+    def named_identity(name: str, stage: str) -> tuple[int, int, int] | None:
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise SyncError(f"{label} name is unreadable {stage}: {name}") from error
+        return _exclusive_internal_object_identity(metadata)
+
+    if created_identity[2] != stat.S_IFREG:
+        raise SyncError(f"{label} has no regular-file creation identity")
+    require_parent_binding("before isolation")
+    require_descriptor_identity("before isolation")
+    final_identity = named_identity(path.name, "before isolation")
+    if final_identity is None:
+        raise SyncError(f"{label} disappeared before isolation")
+    if final_identity != created_identity:
+        raise SyncError(f"{label} was replaced before isolation")
+
+    retained_name: str | None = None
+    for candidate in _retained_pending_cleanup_names(path):
+        try:
+            _rename_noreplace_at(parent_fd, path.name, parent_fd, candidate)
+        except FileExistsError:
+            continue
+        except FileNotFoundError as error:
+            raise SyncError(f"{label} disappeared during isolation") from error
+        retained_name = candidate
+        break
+    assert retained_name is not None
+    os.fsync(parent_fd)
+
+    require_parent_binding("after isolation")
+    require_descriptor_identity("after isolation")
+    retained_identity = named_identity(retained_name, "after isolation")
+    if retained_identity is None:
+        raise SyncError(f"{label} retained name disappeared after isolation")
+    if retained_identity != created_identity:
+        raise SyncError(
+            f"{label} retained name was replaced after isolation: {retained_name}"
+        )
+    if named_identity(path.name, "after isolation") == created_identity:
+        raise SyncError(f"{label} final name rebound to the created object")
+
+    os.unlink(retained_name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+    require_parent_binding("after deletion")
+    require_descriptor_identity("after deletion")
+    if named_identity(retained_name, "after deletion") is not None:
+        raise SyncError(f"{label} retained name reappeared after deletion")
+    if named_identity(path.name, "after deletion") == created_identity:
+        raise SyncError(f"{label} final name rebound after deletion")
+
+
 def _isolate_and_delete_pending_cleanup_file(
     home: Path,
     path: Path,
@@ -15259,6 +26203,8 @@ def _isolate_and_delete_pending_cleanup_file(
     expected: ManagedStateFileSnapshot,
     *,
     label: str,
+    maximum_bytes: int = MAX_MANAGED_STATE_BYTES,
+    mutation_revalidator: Callable[[str], None] | None = None,
 ) -> None:
     if (
         not _managed_state_snapshot_has_complete_file_evidence(expected)
@@ -15269,8 +26215,46 @@ def _isolate_and_delete_pending_cleanup_file(
     if not _bound_directory_matches(home, path.parent, parent_fd):
         raise SyncError(f"{label} parent changed before isolation")
 
+    preflight_fd = -1
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        try:
+            preflight_fd = os.open(path.name, flags, dir_fd=parent_fd)
+            preflight = _require_release_identity_fd_access_policy(
+                preflight_fd,
+                path,
+                os.geteuid(),
+            )
+            named_preflight = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise SyncError(f"{label} changed before isolation") from error
+        if (
+            not _regular_stat_matches_managed_state_file_snapshot(
+                preflight,
+                expected,
+            )
+            or not _regular_stat_metadata_matches(named_preflight, preflight)
+            or not _bound_directory_matches(home, path.parent, parent_fd)
+        ):
+            raise SyncError(f"{label} changed before isolation")
+    finally:
+        if preflight_fd >= 0:
+            _close_fd_quietly(preflight_fd)
+
     retained_name: str | None = None
     for candidate in _retained_pending_cleanup_names(path):
+        if mutation_revalidator is not None:
+            # The caller's authority can include sibling absence, external
+            # tickets, and ancestor policy that this generic file helper cannot
+            # infer.  Revalidate it inside the syscall loop so failed
+            # no-replace candidates do not create an unchecked retry window.
+            mutation_revalidator(path.name)
         try:
             _rename_noreplace_at(
                 parent_fd,
@@ -15290,48 +26274,76 @@ def _isolate_and_delete_pending_cleanup_file(
     retained_path = path.with_name(retained_name)
     file_fd = -1
     try:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        flags |= getattr(os, "O_NONBLOCK", 0)
+
+        def require_open_file_unchanged(stage: str) -> None:
+            try:
+                before = _require_release_identity_fd_access_policy(
+                    file_fd,
+                    retained_path,
+                    os.geteuid(),
+                )
+                os.lseek(file_fd, 0, os.SEEK_SET)
+                payload = _read_managed_state_bytes(
+                    file_fd,
+                    retained_path,
+                    maximum_bytes,
+                )
+                os.lseek(file_fd, 0, os.SEEK_SET)
+                confirmed_payload = _read_managed_state_bytes(
+                    file_fd,
+                    retained_path,
+                    maximum_bytes,
+                )
+                after = _require_release_identity_fd_access_policy(
+                    file_fd,
+                    retained_path,
+                    os.geteuid(),
+                )
+                named = os.stat(
+                    retained_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except (OSError, SyncError) as error:
+                raise SyncError(
+                    f"{label} changed {stage}; preserved as {retained_name}"
+                ) from error
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or not _regular_stat_metadata_matches(after, before)
+                or not _regular_stat_metadata_matches(named, before)
+                or not _regular_stat_matches_managed_state_file_snapshot(
+                    after,
+                    expected,
+                )
+                or payload != expected.payload
+                or confirmed_payload != expected.payload
+                or not _bound_directory_matches(home, path.parent, parent_fd)
+            ):
+                raise SyncError(
+                    f"{label} changed {stage}; preserved as {retained_name}"
+                )
+
         try:
             file_fd = os.open(retained_name, flags, dir_fd=parent_fd)
-            before = os.fstat(file_fd)
-            payload = _read_managed_state_bytes(file_fd, retained_path)
-            os.lseek(file_fd, 0, os.SEEK_SET)
-            confirmed_payload = _read_managed_state_bytes(file_fd, retained_path)
-            after = os.fstat(file_fd)
-            named = os.stat(
-                retained_name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
         except OSError as error:
             raise SyncError(
                 f"{label} changed before deletion; preserved as {retained_name}"
             ) from error
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or _managed_state_metadata_snapshot(before)
-            != _managed_state_metadata_snapshot(after)
-            or _managed_state_metadata_snapshot(named)
-            != _managed_state_metadata_snapshot(after)
-            or _managed_state_metadata_snapshot(after)
-            != (
-                expected.file_identity[0],
-                expected.file_identity[1],
-                expected.file_type,
-                expected.mode,
-                expected.uid,
-                expected.gid,
-                expected.size,
-            )
-            or payload != expected.payload
-            or confirmed_payload != expected.payload
-            or not _bound_directory_matches(home, path.parent, parent_fd)
-        ):
-            raise SyncError(
-                f"{label} changed before deletion; preserved as {retained_name}"
-            )
+        require_open_file_unchanged("before deletion")
+        if mutation_revalidator is not None:
+            # The canonical-to-tombstone rename may have committed before an
+            # injected exception or concurrent namespace change.  Reprove the
+            # broader authority with the retained name immediately before the
+            # irreversible unlink.
+            mutation_revalidator(retained_name)
+            # The broader callback may itself run arbitrary filesystem probes.
+            # Re-read through the descriptor it could not replace, then bind
+            # the retained name back to that exact identity before unlinking.
+            # Same-inode content changes and access-policy changes therefore
+            # fail closed, while unrelated child-entry timestamp churn remains
+            # outside the protected property set.
+            require_open_file_unchanged("after mutation revalidation")
         os.unlink(retained_name, dir_fd=parent_fd)
         os.fsync(parent_fd)
         if _named_entry_identity(
@@ -15371,118 +26383,1475 @@ def _pending_cleanup_ticket_payload(
     )
 
 
+def _pending_ephemeral_quarantine_cleanup_ticket_payload(
+    binding: EphemeralQuarantineBatchBinding,
+    quarantine_root_identity: tuple[int, int],
+) -> bytes:
+    metadata = binding.metadata
+    if (
+        binding.leaf_identity is None
+        or metadata.parent_identity != binding.batch_identity
+        or metadata.file_identity is None
+        or metadata.payload is None
+        or metadata.file_type != stat.S_IFREG
+        or metadata.mode != 0o600
+        or metadata.uid != os.geteuid()
+    ):
+        raise SyncError("ephemeral quarantine cleanup authority is incomplete")
+    batch_name = binding.batch_root.name
+    return _bounded_json_document(
+        {
+            "version": 5,
+            "kind": "ephemeral-quarantine",
+            "batch": batch_name,
+            "batch_root_identity": _identity_payload(binding.batch_identity),
+            "quarantine_root_identity": _identity_payload(quarantine_root_identity),
+            "isolated_name": _pending_cleanup_isolated_batch_name(batch_name),
+            "leaf": {
+                "path": "leaf",
+                "directory_identity": _identity_payload(binding.leaf_identity),
+            },
+            "metadata": {
+                "path": "metadata.json",
+                "file_identity": _identity_payload(metadata.file_identity),
+                "mode": metadata.mode,
+                "sha256": hashlib.sha256(metadata.payload).hexdigest(),
+            },
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup ticket exceeds the size limit",
+    )
+
+
+def _pending_private_use_control_payload(
+    evidence: PendingPrivateUseControlEvidence,
+) -> dict[str, object]:
+    return {
+        "name": evidence.name,
+        "file_identity": _identity_payload(evidence.file_identity),
+        "sha256": evidence.sha256,
+        "size": evidence.size,
+        "mode": evidence.mode,
+        "uid": evidence.uid,
+        "gid": evidence.gid,
+    }
+
+
+def _pending_private_use_directory_payload(
+    evidence: PendingPrivateUseDirectoryEvidence,
+) -> dict[str, object]:
+    return {
+        "identity": _identity_payload(evidence.identity),
+        "mode": evidence.mode,
+        "uid": evidence.uid,
+        "gid": evidence.gid,
+    }
+
+
+def _pending_private_use_retirement_receipt_payload(
+    receipt: PendingPrivateUseRetirementReceipt,
+) -> bytes:
+    private = receipt.private_member
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "kind": "ephemeral-quarantine-private-use-retirement",
+            "batch": receipt.batch_root.name,
+            "canonical_name": receipt.canonical_name,
+            "isolated_name": receipt.isolated_name,
+            "cleanup_control": _pending_private_use_control_payload(
+                receipt.cleanup_control
+            ),
+            "allocation_control": _pending_private_use_control_payload(
+                receipt.allocation_control
+            ),
+            "cleanup_index": _pending_private_use_directory_payload(
+                receipt.cleanup_index
+            ),
+            "quarantine_root": _pending_private_use_directory_payload(
+                receipt.quarantine_root
+            ),
+            "batch_directory": _pending_private_use_directory_payload(receipt.batch),
+            "leaf_directory": _pending_private_use_directory_payload(receipt.leaf),
+            "metadata": {
+                "file_identity": _identity_payload(receipt.metadata_file_identity),
+                "sha256": receipt.metadata_sha256,
+                "size": receipt.metadata_size,
+                "mode": receipt.metadata_mode,
+                "uid": receipt.metadata_uid,
+                "gid": receipt.metadata_gid,
+            },
+            "private_member": {
+                "name": receipt.private_member_name,
+                "parent_identity": _identity_payload(private.parent_identity),
+                "file_identity": _identity_payload(private.file_identity),
+                "sha256": private.sha256,
+                "size": private.size,
+                "mode": private.mode,
+                "uid": private.uid,
+                "gid": private.gid,
+                "link_count": private.link_count,
+            },
+        },
+        max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        overflow_error="private-use retirement receipt exceeds the size limit",
+    )
+
+
+def _pending_private_use_control_from_payload(
+    value: object,
+    *,
+    expected_name: str,
+    label: str,
+) -> PendingPrivateUseControlEvidence:
+    fields = {"name", "file_identity", "sha256", "size", "mode", "uid", "gid"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise SyncError(f"private-use retirement {label} changed")
+    identity = _parse_pending_identity(
+        value.get("file_identity"),
+        f"private-use retirement {label} identity",
+    )
+    digest = value.get("sha256")
+    size = value.get("size")
+    mode = value.get("mode")
+    uid = value.get("uid")
+    gid = value.get("gid")
+    if (
+        value.get("name") != expected_name
+        or identity is None
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or type(size) is not int
+        or not 0 <= size <= MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES
+        or mode != 0o600
+        or uid != os.geteuid()
+        or type(gid) is not int
+        or gid < 0
+    ):
+        raise SyncError(f"private-use retirement {label} changed")
+    return PendingPrivateUseControlEvidence(
+        name=expected_name,
+        file_identity=identity,
+        sha256=digest,
+        size=size,
+        mode=mode,
+        uid=uid,
+        gid=gid,
+    )
+
+
+def _pending_private_use_directory_from_payload(
+    value: object,
+    *,
+    label: str,
+) -> PendingPrivateUseDirectoryEvidence:
+    if not isinstance(value, dict) or set(value) != {"identity", "mode", "uid", "gid"}:
+        raise SyncError(f"private-use retirement {label} changed")
+    identity = _parse_pending_identity(
+        value.get("identity"), f"private-use retirement {label} identity"
+    )
+    gid = value.get("gid")
+    if (
+        identity is None
+        or value.get("mode") != 0o700
+        or value.get("uid") != os.geteuid()
+        or type(gid) is not int
+        or gid < 0
+    ):
+        raise SyncError(f"private-use retirement {label} changed")
+    return PendingPrivateUseDirectoryEvidence(
+        identity=identity,
+        mode=0o700,
+        uid=os.geteuid(),
+        gid=gid,
+    )
+
+
+def _read_pending_private_use_retirement_receipt(
+    home: Path,
+    path: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+    allow_temporary: bool = False,
+    _captured_snapshot: ManagedStateFileSnapshot | None = None,
+) -> PendingPrivateUseRetirementReceipt | None:
+    if allow_temporary:
+        batch_name = _pending_private_use_retirement_temp_batch_name(path.name)
+    else:
+        batch_name = _pending_private_use_retirement_batch_name(path.name)
+    if batch_name is None:
+        raise SyncError("private-use retirement receipt has an invalid file name")
+    if _captured_snapshot is not None and not allow_temporary:
+        raise ValueError("captured retirement parsing is limited to temp files")
+    index_fd = -1
+    try:
+        if _captured_snapshot is None:
+            index_fd = _open_directory_beneath(home, path.parent)
+            snapshot = _read_managed_state_file_snapshot(
+                home,
+                path,
+                index_fd,
+                expected_identity=expected_identity,
+                maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            )
+        else:
+            snapshot = _captured_snapshot
+            if (
+                expected_identity is not None
+                and snapshot.file_identity != expected_identity
+            ):
+                raise SyncError(f"private-use retirement receipt changed: {batch_name}")
+        if not snapshot.exists:
+            return None
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.file_type != stat.S_IFREG
+            or snapshot.payload is None
+            or snapshot.mode != 0o600
+            or snapshot.uid != os.geteuid()
+        ):
+            raise SyncError(f"private-use retirement receipt changed: {batch_name}")
+        if _captured_snapshot is None:
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home, path, index_fd, snapshot
+            )
+    finally:
+        if index_fd >= 0:
+            _close_fd_quietly(index_fd)
+    data = _decode_managed_state_json(snapshot.payload, path)
+    fields = {
+        "version",
+        "kind",
+        "batch",
+        "canonical_name",
+        "isolated_name",
+        "cleanup_control",
+        "allocation_control",
+        "cleanup_index",
+        "quarantine_root",
+        "batch_directory",
+        "leaf_directory",
+        "metadata",
+        "private_member",
+    }
+    canonical_name = data.get("canonical_name")
+    isolated_name = data.get("isolated_name")
+    if (
+        set(data) != fields
+        or data.get("version") != 1
+        or data.get("kind") != "ephemeral-quarantine-private-use-retirement"
+        or data.get("batch") != batch_name
+        or canonical_name != batch_name
+        or isolated_name != _pending_cleanup_isolated_batch_name(batch_name)
+    ):
+        raise SyncError(f"private-use retirement receipt changed: {batch_name}")
+    cleanup = _pending_private_use_control_from_payload(
+        data.get("cleanup_control"),
+        expected_name=batch_name + PENDING_CLEANUP_TICKET_SUFFIX,
+        label="cleanup control",
+    )
+    allocation = _pending_private_use_control_from_payload(
+        data.get("allocation_control"),
+        expected_name=batch_name + PENDING_QUARANTINE_ALLOCATION_SUFFIX,
+        label="allocation control",
+    )
+    cleanup_index = _pending_private_use_directory_from_payload(
+        data.get("cleanup_index"), label="cleanup index"
+    )
+    quarantine_root = _pending_private_use_directory_from_payload(
+        data.get("quarantine_root"), label="quarantine root"
+    )
+    batch = _pending_private_use_directory_from_payload(
+        data.get("batch_directory"), label="batch directory"
+    )
+    leaf = _pending_private_use_directory_from_payload(
+        data.get("leaf_directory"), label="leaf directory"
+    )
+    metadata = data.get("metadata")
+    metadata_fields = {"file_identity", "sha256", "size", "mode", "uid", "gid"}
+    if not isinstance(metadata, dict) or set(metadata) != metadata_fields:
+        raise SyncError(f"private-use retirement metadata changed: {batch_name}")
+    metadata_identity = _parse_pending_identity(
+        metadata.get("file_identity"),
+        "private-use retirement metadata identity",
+    )
+    metadata_sha256 = metadata.get("sha256")
+    metadata_size = metadata.get("size")
+    metadata_gid = metadata.get("gid")
+    if (
+        metadata_identity is None
+        or not isinstance(metadata_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is None
+        or type(metadata_size) is not int
+        or not 0 <= metadata_size <= MAX_MANAGED_STATE_BYTES
+        or metadata.get("mode") != 0o600
+        or metadata.get("uid") != os.geteuid()
+        or type(metadata_gid) is not int
+        or metadata_gid < 0
+    ):
+        raise SyncError(f"private-use retirement metadata changed: {batch_name}")
+    private = data.get("private_member")
+    private_fields = {
+        "name",
+        "parent_identity",
+        "file_identity",
+        "sha256",
+        "size",
+        "mode",
+        "uid",
+        "gid",
+        "link_count",
+    }
+    if not isinstance(private, dict) or set(private) != private_fields:
+        raise SyncError(f"private-use retirement private member changed: {batch_name}")
+    private_name = private.get("name")
+    private_parent_identity = _parse_pending_identity(
+        private.get("parent_identity"),
+        "private-use retirement private parent identity",
+    )
+    private_identity = _parse_pending_identity(
+        private.get("file_identity"),
+        "private-use retirement private member identity",
+    )
+    private_digest = private.get("sha256")
+    private_size = private.get("size")
+    private_mode = private.get("mode")
+    private_uid = private.get("uid")
+    private_gid = private.get("gid")
+    private_links = private.get("link_count")
+    if (
+        not isinstance(private_name, str)
+        or private_name in {"", ".", ".."}
+        or "/" in private_name
+        or private_parent_identity != leaf.identity
+        or private_identity is None
+        or not isinstance(private_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", private_digest) is None
+        or type(private_size) is not int
+        or not 0 <= private_size <= MAX_ARCHIVE_MEMBER_BYTES
+        or type(private_mode) is not int
+        or not 0 <= private_mode <= 0o7777
+        or private_uid != os.geteuid()
+        or type(private_gid) is not int
+        or private_gid < 0
+        or type(private_links) is not int
+        or private_links < 1
+    ):
+        raise SyncError(f"private-use retirement private member changed: {batch_name}")
+    private_snapshot = RegularFileSnapshot(
+        parent_identity=private_parent_identity,
+        file_identity=private_identity,
+        sha256=private_digest,
+        size=private_size,
+        mode=private_mode,
+        uid=private_uid,
+        gid=private_gid,
+        link_count=private_links,
+    )
+    receipt = PendingPrivateUseRetirementReceipt(
+        path=path,
+        snapshot=snapshot,
+        batch_root=(_personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name),
+        canonical_name=canonical_name,
+        isolated_name=isolated_name,
+        cleanup_control=cleanup,
+        allocation_control=allocation,
+        cleanup_index=cleanup_index,
+        quarantine_root=quarantine_root,
+        batch=batch,
+        leaf=leaf,
+        metadata_file_identity=metadata_identity,
+        metadata_sha256=metadata_sha256,
+        metadata_size=metadata_size,
+        metadata_mode=0o600,
+        metadata_uid=os.geteuid(),
+        metadata_gid=metadata_gid,
+        private_member_name=private_name,
+        private_member=private_snapshot,
+    )
+    if _pending_private_use_retirement_receipt_payload(receipt) != snapshot.payload:
+        raise SyncError(f"private-use retirement receipt changed: {batch_name}")
+    return receipt
+
+
+def _pending_ephemeral_quarantine_scaffold_cleanup_ticket_payload(
+    binding: EphemeralQuarantineBatchBinding,
+) -> bytes:
+    metadata = binding.metadata
+    if (
+        binding.leaf_identity is not None
+        or metadata.parent_identity != binding.batch_identity
+        or metadata.file_identity is None
+        or metadata.payload is None
+        or metadata.file_type != stat.S_IFREG
+        or metadata.mode != 0o600
+        or metadata.uid != os.geteuid()
+    ):
+        raise SyncError("ephemeral quarantine scaffold authority is incomplete")
+    batch_name = binding.batch_root.name
+    return _bounded_json_document(
+        {
+            "version": 7,
+            "kind": "ephemeral-quarantine-scaffold",
+            "batch": batch_name,
+            "batch_root_identity": _identity_payload(binding.batch_identity),
+            "quarantine_root_identity": _identity_payload(
+                binding.quarantine_root_identity
+            ),
+            "isolated_name": _pending_cleanup_isolated_batch_name(batch_name),
+            # Absence is an explicit protected property.  Recovery rejects a
+            # leaf that appears after publication instead of treating it as an
+            # empty v5 leaf eligible for deletion.
+            "leaf": None,
+            "metadata": {
+                "path": "metadata.json",
+                "file_identity": _identity_payload(metadata.file_identity),
+                "mode": metadata.mode,
+                "size": metadata.size,
+                "sha256": hashlib.sha256(metadata.payload).hexdigest(),
+            },
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup ticket exceeds the size limit",
+    )
+
+
+def _pending_ephemeral_quarantine_leaf_cleanup_ticket_payload(
+    home: Path,
+    batch_name: str,
+    quarantine_root_identity: tuple[int, int],
+    target: Path,
+    expected: RegularFileSnapshot,
+) -> bytes:
+    try:
+        relative_target = PurePosixPath(*target.relative_to(home).parts)
+    except ValueError as error:
+        raise SyncError(
+            "ephemeral cleanup target is outside the managed home"
+        ) from error
+    _validate_relative_path(
+        relative_target.as_posix(),
+        "pending ephemeral cleanup target",
+    )
+    return _bounded_json_document(
+        {
+            "version": 6,
+            "kind": "ephemeral-quarantine-leaf",
+            "batch": batch_name,
+            "quarantine_root_identity": _identity_payload(quarantine_root_identity),
+            "public_target": relative_target.as_posix(),
+            "public_parent_identity": _identity_payload(expected.parent_identity),
+            "payload": {
+                "file_identity": _identity_payload(expected.file_identity),
+                "sha256": expected.sha256,
+                "size": expected.size,
+                "mode": expected.mode,
+                "uid": expected.uid,
+                "gid": expected.gid,
+                "link_count": expected.link_count,
+            },
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup ticket exceeds the size limit",
+    )
+
+
+def _pending_rollback_cleanup_ticket_payload(
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+    marker: ManagedStateFileSnapshot,
+) -> bytes:
+    if (
+        marker.parent_identity is None
+        or marker.file_identity is None
+        or marker.payload is None
+        or marker.mode != 0o600
+    ):
+        raise SyncError("pending rollback marker is not fully bound")
+    return _bounded_json_document(
+        {
+            "version": 2,
+            "batch": batch_root.name,
+            "batch_root_identity": _identity_payload(batch_root_identity),
+            "finalization_marker": {
+                "phase": "before",
+                "path": PENDING_STATE_ROLLBACK_MARKER.as_posix(),
+                "parent_identity": _identity_payload(marker.parent_identity),
+                "file_identity": _identity_payload(marker.file_identity),
+                "mode": marker.mode,
+                "sha256": hashlib.sha256(marker.payload).hexdigest(),
+            },
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup ticket exceeds the size limit",
+    )
+
+
+def _pending_staging_marker_payload(
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+) -> bytes:
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "batch": batch_root.name,
+            "phase": "staging",
+            "batch_root_identity": _identity_payload(batch_root_identity),
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending staging cleanup marker exceeds the size limit",
+    )
+
+
+def _pending_staging_cleanup_ticket_payload(
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+    marker: ManagedStateFileSnapshot,
+) -> bytes:
+    if (
+        marker.parent_identity is None
+        or marker.file_identity is None
+        or marker.payload is None
+        or marker.mode != 0o600
+    ):
+        raise SyncError("pending staging cleanup marker is not fully bound")
+    return _bounded_json_document(
+        {
+            "version": 3,
+            "batch": batch_root.name,
+            "batch_root_identity": _identity_payload(batch_root_identity),
+            "finalization_marker": {
+                "phase": "staging",
+                "path": PENDING_STATE_STAGING_MARKER.as_posix(),
+                "parent_identity": _identity_payload(marker.parent_identity),
+                "file_identity": _identity_payload(marker.file_identity),
+                "mode": marker.mode,
+                "sha256": hashlib.sha256(marker.payload).hexdigest(),
+            },
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup ticket exceeds the size limit",
+    )
+
+
+def _pending_regular_staging_publication_guard_payload(
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+    record: PendingLinkRecord,
+) -> bytes:
+    if record.publication_cleanup is None or not record.is_regular():
+        raise SyncError("pending regular staging guard has no record authority")
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "phase": "staging-publication",
+            "batch": batch_root.name,
+            "batch_root_identity": _identity_payload(batch_root_identity),
+            "record": record.index,
+            "stage": record.stage.as_posix() if record.stage is not None else None,
+            "evidence": (
+                record.evidence.as_posix() if record.evidence is not None else None
+            ),
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending regular staging guard exceeds the size limit",
+    )
+
+
+def _publish_pending_regular_staging_publication_guard(
+    home: Path,
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+    record: PendingLinkRecord,
+) -> tuple[Path, ManagedStateFileSnapshot]:
+    if record.publication_cleanup is None:
+        raise SyncError("pending regular staging guard path is missing")
+    guard_path = batch_root / Path(*record.publication_cleanup.parts)
+    guard = _publish_atomic_exclusive_internal_file(
+        home,
+        guard_path,
+        _pending_regular_staging_publication_guard_payload(
+            batch_root,
+            batch_root_identity,
+            record,
+        ),
+    )
+    parent_fd = _open_directory_beneath(home, guard_path.parent)
+    try:
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            guard_path,
+            parent_fd,
+            guard,
+        )
+        os.fsync(parent_fd)
+    finally:
+        _close_fd_quietly(parent_fd)
+    return guard_path, guard
+
+
+def _delete_pending_regular_staging_publication_guard(
+    home: Path,
+    guard_path: Path,
+    guard: ManagedStateFileSnapshot,
+) -> None:
+    parent_fd = _open_directory_beneath(home, guard_path.parent)
+    try:
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            guard_path,
+            parent_fd,
+            guard,
+        )
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            guard_path,
+            parent_fd,
+            guard,
+            label="pending regular staging publication guard",
+        )
+        os.fsync(parent_fd)
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _pending_terminal_regular_targets_from_records(
+    records: tuple[PendingLinkRecord, ...],
+    *,
+    phase: str,
+) -> tuple[PendingRegularTargetExpectation, ...]:
+    if phase not in {"before", "after"}:
+        raise SyncError("pending terminal cleanup phase is invalid")
+    targets: list[PendingRegularTargetExpectation] = []
+    seen: set[PurePosixPath] = set()
+    for record in records:
+        if phase == "after":
+            if not record.is_regular() or record.action not in {
+                "create",
+                "replace",
+                "quarantine-replace",
+            }:
+                continue
+            parent_identity = record.planned_snapshot.parent_identity
+            file_identity = record.evidence_identity
+            digest = record.regular_sha256
+            size = record.regular_size
+            mode = record.regular_mode
+            uid = record.regular_uid
+        else:
+            planned = _regular_snapshot_from_reconcile(record.planned_snapshot)
+            if planned is None or record.action not in {
+                "replace",
+                "quarantine-replace",
+                "remove",
+                "quarantine-remove",
+            }:
+                continue
+            parent_identity = record.planned_snapshot.parent_identity
+            file_identity = planned.file_identity
+            digest = planned.sha256
+            size = planned.size
+            mode = planned.mode
+            uid = planned.uid
+        if (
+            parent_identity is None
+            or file_identity is None
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or mode != 0o600
+            or uid != os.geteuid()
+        ):
+            raise SyncError(
+                f"pending terminal regular target is incomplete: {record.target}"
+            )
+        if record.target in seen:
+            raise SyncError(
+                f"pending terminal regular target is duplicated: {record.target}"
+            )
+        seen.add(record.target)
+        targets.append(
+            PendingRegularTargetExpectation(
+                target=record.target,
+                parent_identity=parent_identity,
+                file_identity=file_identity,
+                sha256=digest,
+                size=size,
+                mode=mode,
+                uid=uid,
+            )
+        )
+    return tuple(sorted(targets, key=lambda target: target.target.as_posix()))
+
+
+def _pending_terminal_regular_targets(
+    batch: PendingLinkBatch,
+    *,
+    phase: str,
+) -> tuple[PendingRegularTargetExpectation, ...]:
+    if phase == "before":
+        return batch.terminal_regular_before
+    if phase == "after":
+        return batch.terminal_regular_after
+    raise SyncError("pending terminal cleanup phase is invalid")
+
+
+def _pending_terminal_cleanup_ticket_payload(
+    batch: PendingLinkBatch,
+    marker: ManagedStateFileSnapshot,
+    *,
+    phase: str,
+) -> bytes:
+    if (
+        marker.parent_identity is None
+        or marker.file_identity is None
+        or marker.payload is None
+        or marker.mode != 0o600
+    ):
+        raise SyncError("pending terminal cleanup marker is not fully bound")
+    marker_path = (
+        PENDING_STATE_COMMIT_MARKER
+        if phase == "after"
+        else PENDING_STATE_ROLLBACK_MARKER
+    )
+    targets = _pending_terminal_regular_targets(batch, phase=phase)
+    return _bounded_json_document(
+        {
+            "version": 4,
+            "batch": batch.batch_root.name,
+            "batch_root_identity": _identity_payload(batch.batch_root_identity),
+            "finalization_marker": {
+                "phase": phase,
+                "path": marker_path.as_posix(),
+                "parent_identity": _identity_payload(marker.parent_identity),
+                "file_identity": _identity_payload(marker.file_identity),
+                "mode": marker.mode,
+                "sha256": hashlib.sha256(marker.payload).hexdigest(),
+            },
+            "terminal_regular_targets": [
+                {
+                    "target": target.target.as_posix(),
+                    "parent_identity": _identity_payload(target.parent_identity),
+                    "file_identity": _identity_payload(target.file_identity),
+                    "sha256": target.sha256,
+                    "size": target.size,
+                    "mode": target.mode,
+                    "uid": target.uid,
+                }
+                for target in targets
+            ],
+        },
+        max_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        overflow_error="pending terminal cleanup ticket exceeds the size limit",
+    )
+
+
+def _parse_pending_terminal_regular_targets(
+    raw_targets: object,
+    *,
+    batch_name: str,
+) -> tuple[PendingRegularTargetExpectation, ...]:
+    if not isinstance(raw_targets, list) or len(raw_targets) > MAX_PENDING_LINK_RECORDS:
+        raise SyncError(f"pending terminal regular targets are invalid: {batch_name}")
+    expected_fields = {
+        "target",
+        "parent_identity",
+        "file_identity",
+        "sha256",
+        "size",
+        "mode",
+        "uid",
+    }
+    targets: list[PendingRegularTargetExpectation] = []
+    previous_target: PurePosixPath | None = None
+    for raw_target in raw_targets:
+        if not isinstance(raw_target, dict) or set(raw_target) != expected_fields:
+            raise SyncError(f"pending terminal regular target changed: {batch_name}")
+        target = _validate_relative_path(
+            raw_target.get("target"),
+            "pending terminal regular target",
+        )
+        if (
+            previous_target is not None
+            and target.as_posix() <= previous_target.as_posix()
+        ):
+            raise SyncError(
+                f"pending terminal regular target order changed: {batch_name}"
+            )
+        previous_target = target
+        parent_identity = _parse_pending_identity(
+            raw_target.get("parent_identity"),
+            "pending terminal regular parent identity",
+        )
+        file_identity = _parse_pending_identity(
+            raw_target.get("file_identity"),
+            "pending terminal regular file identity",
+        )
+        digest = raw_target.get("sha256")
+        size = raw_target.get("size")
+        mode = raw_target.get("mode")
+        uid = raw_target.get("uid")
+        if (
+            parent_identity is None
+            or file_identity is None
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or mode != 0o600
+            or uid != os.geteuid()
+        ):
+            raise SyncError(f"pending terminal regular target changed: {batch_name}")
+        targets.append(
+            PendingRegularTargetExpectation(
+                target=target,
+                parent_identity=parent_identity,
+                file_identity=file_identity,
+                sha256=digest,
+                size=size,
+                mode=mode,
+                uid=uid,
+            )
+        )
+    return tuple(targets)
+
+
+def _validate_pending_terminal_regular_targets_for_state(
+    home: Path,
+    expectations: tuple[PendingRegularTargetExpectation, ...],
+    state: ManagedState,
+    records: tuple[PendingLinkRecord, ...],
+    *,
+    phase: str,
+    source_expectations_by_owner: (dict[str, PendingReleaseExpectation] | None) = None,
+    regular_source_evidence: _PendingRegularSourceEvidenceBudget | None = None,
+) -> None:
+    if (source_expectations_by_owner is None) != (regular_source_evidence is None):
+        raise SyncError("pending regular-file source evidence cache is incomplete")
+    state_items = _terminal_regular_state_items(
+        state,
+        records,
+        phase=phase,
+    )
+    expected_targets = tuple(target for target, _state_record, _record in state_items)
+    if tuple(expectation.target for expectation in expectations) != expected_targets:
+        raise SyncError("pending transaction lacks complete regular terminal authority")
+    _require_pending_terminal_regular_group_size_budget(
+        tuple(expectation.size for expectation in expectations),
+        phase=phase,
+    )
+    file_identities: set[tuple[int, int]] = set()
+    for expectation, (_target, state_record, pending_record) in zip(
+        expectations,
+        state_items,
+    ):
+        if expectation.file_identity in file_identities:
+            raise SyncError(
+                "pending transaction reuses a regular terminal file identity"
+            )
+        file_identities.add(expectation.file_identity)
+        if regular_source_evidence is None:
+            source_payload = _read_regular_source_payload(
+                home,
+                _record_regular_source_path(home, state_record),
+            )
+            source_digest = hashlib.sha256(source_payload).hexdigest()
+            source_size = len(source_payload)
+        else:
+            assert source_expectations_by_owner is not None
+            source_expectation = source_expectations_by_owner.get(state_record.owner)
+            if source_expectation is None:
+                raise SyncError(
+                    "pending terminal regular target lacks source release binding: "
+                    f"{expectation.target}"
+                )
+            source_evidence = regular_source_evidence.evidence(
+                home,
+                state_record,
+                source_expectation,
+            )
+            source_digest = source_evidence.sha256
+            source_size = source_evidence.size
+        if expectation.sha256 != source_digest or expectation.size != source_size:
+            raise SyncError(
+                "pending terminal regular target does not match its immutable "
+                f"release source: {expectation.target}"
+            )
+        if (
+            phase == "after"
+            and pending_record is not None
+            and pending_record.action in {"create", "replace", "quarantine-replace"}
+        ):
+            expected = PendingRegularTargetExpectation(
+                target=expectation.target,
+                parent_identity=pending_record.planned_snapshot.parent_identity,
+                file_identity=pending_record.evidence_identity,
+                sha256=pending_record.regular_sha256,
+                size=pending_record.regular_size,
+                mode=pending_record.regular_mode,
+                uid=pending_record.regular_uid,
+            )
+            if expectation != expected:
+                raise SyncError(
+                    "pending produced regular terminal authority changed: "
+                    f"{expectation.target}"
+                )
+        elif (
+            phase == "before"
+            and pending_record is not None
+            and pending_record.action
+            in {"replace", "quarantine-replace", "remove", "quarantine-remove"}
+        ):
+            planned = _regular_snapshot_from_reconcile(pending_record.planned_snapshot)
+            if planned is None:
+                raise SyncError(
+                    "pending regular terminal preimage is missing: "
+                    f"{expectation.target}"
+                )
+            expected = PendingRegularTargetExpectation(
+                target=expectation.target,
+                parent_identity=planned.parent_identity,
+                file_identity=planned.file_identity,
+                sha256=planned.sha256,
+                size=planned.size,
+                mode=planned.mode,
+                uid=planned.uid,
+            )
+            if expectation != expected:
+                raise SyncError(
+                    "pending regular terminal preimage authority changed: "
+                    f"{expectation.target}"
+                )
+
+
 def _read_pending_cleanup_ticket(
     home: Path,
     ticket_path: Path,
     *,
     expected_ticket_identity: tuple[int, int] | None = None,
+    allow_temporary: bool = False,
+    _captured_snapshot: ManagedStateFileSnapshot | None = None,
 ) -> PendingBatchCleanupTicket | None:
-    suffix = PENDING_CLEANUP_TICKET_SUFFIX
-    if not ticket_path.name.endswith(suffix):
-        raise SyncError("pending cleanup ticket has an invalid file name")
-    batch_name = ticket_path.name[: -len(suffix)]
+    """Read and parse one ticket, or purely parse an admitted temp snapshot.
+
+    ``_captured_snapshot`` is restricted to temp recovery.  Its caller must
+    have already read the exact object and admitted its access policy.  This
+    mode performs no filesystem revalidation, so a schema rejection can be
+    distinguished from uncertain I/O or identity/policy drift during capture.
+    """
+    if allow_temporary:
+        batch_name = _pending_cleanup_ticket_temp_batch_name(ticket_path.name)
+        if batch_name is None:
+            raise SyncError("pending cleanup ticket temp has an invalid file name")
+    else:
+        suffix = PENDING_CLEANUP_TICKET_SUFFIX
+        if not ticket_path.name.endswith(suffix):
+            raise SyncError("pending cleanup ticket has an invalid file name")
+        batch_name = ticket_path.name[: -len(suffix)]
     if (
         len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
         or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
     ):
         raise SyncError("pending cleanup ticket has an invalid batch name")
-    index_fd = _open_directory_beneath(home, ticket_path.parent)
+    if _captured_snapshot is not None and not allow_temporary:
+        raise ValueError("captured cleanup ticket parsing is limited to temp files")
+    index_fd = -1
     try:
-        snapshot = _read_managed_state_file_snapshot(
-            home,
-            ticket_path,
-            index_fd,
-            expected_identity=expected_ticket_identity,
-        )
+        if _captured_snapshot is None:
+            index_fd = _open_directory_beneath(home, ticket_path.parent)
+            snapshot = _read_managed_state_file_snapshot(
+                home,
+                ticket_path,
+                index_fd,
+                expected_identity=expected_ticket_identity,
+            )
+        else:
+            snapshot = _captured_snapshot
+            if (
+                expected_ticket_identity is not None
+                and snapshot.file_identity != expected_ticket_identity
+            ):
+                raise SyncError(
+                    f"pending cleanup ticket identity changed: {batch_name}"
+                )
         if not snapshot.exists:
             return None
-        if (
-            snapshot.payload is None
-            or len(snapshot.payload) > MAX_PENDING_CLEANUP_TICKET_BYTES
+        if snapshot.payload is None or (
+            len(snapshot.payload) > MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES
         ):
             raise SyncError(f"pending cleanup ticket exceeds its limit: {batch_name}")
         if snapshot.mode != 0o600:
             raise SyncError(f"pending cleanup ticket mode changed: {batch_name}")
+        if snapshot.uid != os.geteuid():
+            raise SyncError(f"pending cleanup ticket owner changed: {batch_name}")
+        if _captured_snapshot is None:
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                ticket_path,
+                index_fd,
+                snapshot,
+            )
         data = _decode_managed_state_json(snapshot.payload, ticket_path)
-        if set(data) != {
-            "version",
-            "batch",
-            "batch_root_identity",
-            "commit_marker",
-        }:
+        version = data.get("version")
+        if type(version) is not int or version not in {1, 2, 3, 4, 5, 6, 7}:
             raise SyncError(
                 f"pending cleanup ticket has unsupported fields: {batch_name}"
             )
-        version = data.get("version")
-        if type(version) is not int or version != 1:
+        if version == 1:
+            expected_top_level_fields = {
+                "version",
+                "batch",
+                "batch_root_identity",
+                "commit_marker",
+            }
+        elif version in {2, 3, 4}:
+            expected_top_level_fields = {
+                "version",
+                "batch",
+                "batch_root_identity",
+                "finalization_marker",
+            }
+            if version == 4:
+                expected_top_level_fields.add("terminal_regular_targets")
+        elif version in {5, 7}:
+            expected_top_level_fields = {
+                "version",
+                "kind",
+                "batch",
+                "batch_root_identity",
+                "quarantine_root_identity",
+                "isolated_name",
+                "leaf",
+                "metadata",
+            }
+        else:
+            expected_top_level_fields = {
+                "version",
+                "kind",
+                "batch",
+                "quarantine_root_identity",
+                "public_target",
+                "public_parent_identity",
+                "payload",
+            }
+        if set(data) != expected_top_level_fields:
             raise SyncError(
                 f"pending cleanup ticket has unsupported fields: {batch_name}"
             )
         if data.get("batch") != batch_name:
             raise SyncError(f"pending cleanup ticket batch changed: {batch_name}")
+        if version == 6:
+            if len(snapshot.payload) > MAX_PENDING_CLEANUP_TICKET_BYTES:
+                raise SyncError(
+                    f"pending cleanup ticket exceeds its limit: {batch_name}"
+                )
+            quarantine_root_identity = _parse_pending_identity(
+                data.get("quarantine_root_identity"),
+                "pending cleanup quarantine root identity",
+            )
+            public_target = _validate_relative_path(
+                data.get("public_target"),
+                "pending ephemeral cleanup target",
+            )
+            public_parent_identity = _parse_pending_identity(
+                data.get("public_parent_identity"),
+                "pending ephemeral cleanup public parent identity",
+            )
+            payload = data.get("payload")
+            payload_fields = {
+                "file_identity",
+                "sha256",
+                "size",
+                "mode",
+                "uid",
+                "gid",
+                "link_count",
+            }
+            if (
+                data.get("kind") != "ephemeral-quarantine-leaf"
+                or quarantine_root_identity is None
+                or public_parent_identity is None
+                or not isinstance(payload, dict)
+                or set(payload) != payload_fields
+            ):
+                raise SyncError(
+                    f"pending cleanup ephemeral leaf authority changed: {batch_name}"
+                )
+            payload_file_identity = _parse_pending_identity(
+                payload.get("file_identity"),
+                "pending cleanup ephemeral payload identity",
+            )
+            payload_sha256 = payload.get("sha256")
+            payload_size = payload.get("size")
+            payload_mode = payload.get("mode")
+            payload_uid = payload.get("uid")
+            payload_gid = payload.get("gid")
+            payload_link_count = payload.get("link_count")
+            if (
+                payload_file_identity is None
+                or not isinstance(payload_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", payload_sha256) is None
+                or type(payload_size) is not int
+                or payload_size < 0
+                or payload_size > MAX_ARCHIVE_MEMBER_BYTES
+                or payload_mode != 0o600
+                or payload_uid != os.geteuid()
+                or type(payload_gid) is not int
+                or payload_gid < 0
+                or type(payload_link_count) is not int
+                or payload_link_count < 1
+            ):
+                raise SyncError(
+                    f"pending cleanup ephemeral leaf authority changed: {batch_name}"
+                )
+            expected_payload = _bounded_json_document(
+                {
+                    "version": 6,
+                    "kind": "ephemeral-quarantine-leaf",
+                    "batch": batch_name,
+                    "quarantine_root_identity": _identity_payload(
+                        quarantine_root_identity
+                    ),
+                    "public_target": public_target.as_posix(),
+                    "public_parent_identity": _identity_payload(public_parent_identity),
+                    "payload": {
+                        "file_identity": _identity_payload(payload_file_identity),
+                        "sha256": payload_sha256,
+                        "size": payload_size,
+                        "mode": payload_mode,
+                        "uid": payload_uid,
+                        "gid": payload_gid,
+                        "link_count": payload_link_count,
+                    },
+                },
+                max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+                overflow_error="pending cleanup ticket exceeds the size limit",
+            )
+            if snapshot.payload != expected_payload:
+                raise SyncError(f"pending cleanup ticket changed: {batch_name}")
+            if _captured_snapshot is None:
+                _require_pending_cleanup_file_snapshot_access_policy(
+                    home,
+                    ticket_path,
+                    index_fd,
+                    snapshot,
+                )
+            quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+            return PendingBatchCleanupTicket(
+                version=version,
+                phase="ephemeral-quarantine-leaf",
+                path=ticket_path,
+                snapshot=snapshot,
+                batch_root=quarantine_root / batch_name,
+                batch_root_identity=quarantine_root_identity,
+                marker_path=None,
+                marker_parent_identity=None,
+                marker_file_identity=None,
+                marker_mode=None,
+                marker_sha256=None,
+                kind="ephemeral-quarantine-leaf",
+                quarantine_root_identity=quarantine_root_identity,
+                public_target=public_target,
+                public_parent_identity=public_parent_identity,
+                payload_file_identity=payload_file_identity,
+                payload_sha256=payload_sha256,
+                payload_size=payload_size,
+                payload_mode=payload_mode,
+                payload_uid=payload_uid,
+                payload_gid=payload_gid,
+                payload_link_count=payload_link_count,
+            )
         batch_identity = _parse_pending_identity(
             data.get("batch_root_identity"),
             "pending cleanup batch root identity",
         )
         if batch_identity is None:
             raise SyncError(f"pending cleanup batch identity is missing: {batch_name}")
-        marker = data.get("commit_marker")
-        if (
-            not isinstance(marker, dict)
-            or set(marker)
-            != {
-                "path",
-                "parent_identity",
-                "file_identity",
-                "mode",
-                "sha256",
-            }
-            or marker.get("path") != PENDING_STATE_COMMIT_MARKER.as_posix()
-        ):
-            raise SyncError(f"pending cleanup commit marker changed: {batch_name}")
+        batch_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name
+        if version in {5, 7}:
+            if len(snapshot.payload) > MAX_PENDING_CLEANUP_TICKET_BYTES:
+                raise SyncError(
+                    f"pending cleanup ticket exceeds its limit: {batch_name}"
+                )
+            quarantine_root_identity = _parse_pending_identity(
+                data.get("quarantine_root_identity"),
+                "pending cleanup quarantine root identity",
+            )
+            leaf = data.get("leaf")
+            metadata = data.get("metadata")
+            expected_kind = (
+                "ephemeral-quarantine"
+                if version == 5
+                else "ephemeral-quarantine-scaffold"
+            )
+            leaf_fields_valid = (
+                isinstance(leaf, dict)
+                and set(leaf) == {"path", "directory_identity"}
+                and leaf.get("path") == "leaf"
+                if version == 5
+                else leaf is None
+            )
+            expected_metadata_fields = (
+                {"path", "file_identity", "mode", "sha256"}
+                if version == 5
+                else {"path", "file_identity", "mode", "size", "sha256"}
+            )
+            if (
+                data.get("kind") != expected_kind
+                or quarantine_root_identity is None
+                or data.get("isolated_name")
+                != _pending_cleanup_isolated_batch_name(batch_name)
+                or not leaf_fields_valid
+                or not isinstance(metadata, dict)
+                or set(metadata) != expected_metadata_fields
+                or metadata.get("path") != "metadata.json"
+            ):
+                raise SyncError(
+                    f"pending cleanup ephemeral authority changed: {batch_name}"
+                )
+            leaf_identity = (
+                _parse_pending_identity(
+                    leaf.get("directory_identity"),
+                    "pending cleanup ephemeral leaf identity",
+                )
+                if isinstance(leaf, dict)
+                else None
+            )
+            metadata_file_identity = _parse_pending_identity(
+                metadata.get("file_identity"),
+                "pending cleanup ephemeral metadata identity",
+            )
+            metadata_mode = metadata.get("mode")
+            metadata_size = metadata.get("size") if version == 7 else None
+            metadata_sha256 = metadata.get("sha256")
+            if (
+                (version == 5 and leaf_identity is None)
+                or (version == 7 and leaf_identity is not None)
+                or metadata_file_identity is None
+                or metadata_mode != 0o600
+                or (
+                    version == 7
+                    and (
+                        type(metadata_size) is not int
+                        or metadata_size < 0
+                        or metadata_size > MAX_MANAGED_STATE_BYTES
+                    )
+                )
+                or not isinstance(metadata_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is None
+            ):
+                raise SyncError(
+                    f"pending cleanup ephemeral authority changed: {batch_name}"
+                )
+            expected_metadata: dict[str, object] = (
+                {
+                    "path": "metadata.json",
+                    "file_identity": _identity_payload(metadata_file_identity),
+                    "mode": metadata_mode,
+                    "sha256": metadata_sha256,
+                }
+                if version == 5
+                else {
+                    "path": "metadata.json",
+                    "file_identity": _identity_payload(metadata_file_identity),
+                    "mode": metadata_mode,
+                    "size": metadata_size,
+                    "sha256": metadata_sha256,
+                }
+            )
+            expected_payload = _bounded_json_document(
+                {
+                    "version": version,
+                    "kind": expected_kind,
+                    "batch": batch_name,
+                    "batch_root_identity": _identity_payload(batch_identity),
+                    "quarantine_root_identity": _identity_payload(
+                        quarantine_root_identity
+                    ),
+                    "isolated_name": _pending_cleanup_isolated_batch_name(batch_name),
+                    "leaf": (
+                        {
+                            "path": "leaf",
+                            "directory_identity": _identity_payload(leaf_identity),
+                        }
+                        if version == 5
+                        else None
+                    ),
+                    "metadata": expected_metadata,
+                },
+                max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+                overflow_error="pending cleanup ticket exceeds the size limit",
+            )
+            if snapshot.payload != expected_payload:
+                raise SyncError(f"pending cleanup ticket changed: {batch_name}")
+            if _captured_snapshot is None:
+                _require_pending_cleanup_file_snapshot_access_policy(
+                    home,
+                    ticket_path,
+                    index_fd,
+                    snapshot,
+                )
+            return PendingBatchCleanupTicket(
+                version=version,
+                phase=expected_kind,
+                path=ticket_path,
+                snapshot=snapshot,
+                batch_root=batch_root,
+                batch_root_identity=batch_identity,
+                marker_path=None,
+                marker_parent_identity=None,
+                marker_file_identity=None,
+                marker_mode=None,
+                marker_sha256=None,
+                kind=expected_kind,
+                quarantine_root_identity=quarantine_root_identity,
+                isolated_name=_pending_cleanup_isolated_batch_name(batch_name),
+                leaf_identity=leaf_identity,
+                metadata_file_identity=metadata_file_identity,
+                metadata_mode=metadata_mode,
+                metadata_sha256=metadata_sha256,
+                metadata_size=metadata_size,
+            )
+        marker = data.get("commit_marker" if version == 1 else "finalization_marker")
+        expected_marker_fields = {
+            "path",
+            "parent_identity",
+            "file_identity",
+            "mode",
+            "sha256",
+        }
+        if version in {2, 3, 4}:
+            expected_marker_fields.add("phase")
+        if not isinstance(marker, dict) or set(marker) != expected_marker_fields:
+            raise SyncError(
+                f"pending cleanup finalization marker changed: {batch_name}"
+            )
+        phase = "after" if version == 1 else marker.get("phase")
+        if version == 4:
+            if phase not in {"before", "after"}:
+                raise SyncError(
+                    f"pending cleanup finalization marker changed: {batch_name}"
+                )
+            marker_path = (
+                PENDING_STATE_COMMIT_MARKER
+                if phase == "after"
+                else PENDING_STATE_ROLLBACK_MARKER
+            )
+            expected_phase = phase
+        else:
+            marker_path = {
+                1: PENDING_STATE_COMMIT_MARKER,
+                2: PENDING_STATE_ROLLBACK_MARKER,
+                3: PENDING_STATE_STAGING_MARKER,
+            }[version]
+            expected_phase = {1: "after", 2: "before", 3: "staging"}[version]
+        if phase != expected_phase or marker.get("path") != marker_path.as_posix():
+            raise SyncError(
+                f"pending cleanup finalization marker changed: {batch_name}"
+            )
         marker_parent_identity = _parse_pending_identity(
             marker.get("parent_identity"),
-            "pending cleanup commit marker parent identity",
+            "pending cleanup finalization marker parent identity",
         )
         marker_file_identity = _parse_pending_identity(
             marker.get("file_identity"),
-            "pending cleanup commit marker file identity",
+            "pending cleanup finalization marker file identity",
         )
         if marker_parent_identity is None or marker_file_identity is None:
             raise SyncError(
-                f"pending cleanup commit marker identity is missing: {batch_name}"
+                f"pending cleanup finalization marker identity is missing: {batch_name}"
             )
         marker_mode = marker.get("mode")
         marker_sha256 = marker.get("sha256")
         if marker_mode != 0o600:
-            raise SyncError(f"pending cleanup commit marker mode changed: {batch_name}")
+            raise SyncError(
+                f"pending cleanup finalization marker mode changed: {batch_name}"
+            )
         if (
             not isinstance(marker_sha256, str)
             or re.fullmatch(r"[0-9a-f]{64}", marker_sha256) is None
         ):
             raise SyncError(
-                f"pending cleanup commit marker digest changed: {batch_name}"
+                f"pending cleanup finalization marker digest changed: {batch_name}"
             )
-        batch_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH / batch_name
-        expected_payload = _pending_cleanup_ticket_payload(
-            batch_root,
-            batch_identity,
-            marker_parent_identity,
-            marker_file_identity,
-            marker_mode,
-            marker_sha256,
+        terminal_regular_targets = (
+            _parse_pending_terminal_regular_targets(
+                data.get("terminal_regular_targets"),
+                batch_name=batch_name,
+            )
+            if version == 4
+            else ()
         )
+        if version == 1:
+            expected_payload = _pending_cleanup_ticket_payload(
+                batch_root,
+                batch_identity,
+                marker_parent_identity,
+                marker_file_identity,
+                marker_mode,
+                marker_sha256,
+            )
+        else:
+            payload_data: dict[str, Any] = {
+                "version": version,
+                "batch": batch_name,
+                "batch_root_identity": _identity_payload(batch_identity),
+                "finalization_marker": {
+                    "phase": phase,
+                    "path": marker_path.as_posix(),
+                    "parent_identity": _identity_payload(marker_parent_identity),
+                    "file_identity": _identity_payload(marker_file_identity),
+                    "mode": marker_mode,
+                    "sha256": marker_sha256,
+                },
+            }
+            if version == 4:
+                payload_data["terminal_regular_targets"] = [
+                    {
+                        "target": target.target.as_posix(),
+                        "parent_identity": _identity_payload(target.parent_identity),
+                        "file_identity": _identity_payload(target.file_identity),
+                        "sha256": target.sha256,
+                        "size": target.size,
+                        "mode": target.mode,
+                        "uid": target.uid,
+                    }
+                    for target in terminal_regular_targets
+                ]
+            expected_payload = _bounded_json_document(
+                payload_data,
+                max_bytes=(
+                    MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES
+                    if version == 4
+                    else MAX_PENDING_CLEANUP_TICKET_BYTES
+                ),
+                overflow_error="pending cleanup ticket exceeds the size limit",
+            )
         if snapshot.payload != expected_payload:
             raise SyncError(f"pending cleanup ticket changed: {batch_name}")
+        if _captured_snapshot is None:
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                ticket_path,
+                index_fd,
+                snapshot,
+            )
         return PendingBatchCleanupTicket(
+            version=version,
+            phase=phase,
             path=ticket_path,
             snapshot=snapshot,
             batch_root=batch_root,
             batch_root_identity=batch_identity,
+            marker_path=marker_path,
             marker_parent_identity=marker_parent_identity,
             marker_file_identity=marker_file_identity,
             marker_mode=marker_mode,
             marker_sha256=marker_sha256,
+            terminal_regular_targets=terminal_regular_targets,
         )
     finally:
         _close_fd_quietly(index_fd)
@@ -15491,7 +27860,141 @@ def _read_pending_cleanup_ticket(
 def _discard_incomplete_pending_cleanup_ticket(
     home: Path,
     temp_path: Path,
-) -> None:
+    *,
+    max_actions: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+    expected_snapshot: ManagedStateFileSnapshot | None = None,
+) -> int:
+    if max_actions < 0:
+        raise SyncError("pending cleanup temp action budget is invalid")
+    index_fd = _open_directory_beneath(home, temp_path.parent)
+    discarded = 0
+    try:
+        label = f"incomplete pending cleanup ticket {temp_path.name}"
+        while discarded < max_actions:
+            snapshot = _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                index_fd,
+                expected_identity=(
+                    expected_snapshot.file_identity
+                    if expected_snapshot is not None
+                    else None
+                ),
+            )
+            if expected_snapshot is not None and (
+                not snapshot.exists
+                or not _managed_state_snapshot_matches_bound_file_evidence(
+                    snapshot,
+                    expected_snapshot,
+                )
+            ):
+                raise SyncError(
+                    "incomplete pending cleanup ticket changed after "
+                    f"classification: {temp_path.name}"
+                )
+            if snapshot.exists:
+                if (
+                    snapshot.file_type != stat.S_IFREG
+                    or snapshot.mode != 0o600
+                    or snapshot.uid != os.geteuid()
+                    or not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+                ):
+                    raise SyncError(
+                        f"incomplete pending cleanup ticket changed: {temp_path.name}"
+                    )
+                _require_pending_cleanup_file_snapshot_access_policy(
+                    home,
+                    temp_path,
+                    index_fd,
+                    snapshot,
+                )
+                _isolate_and_delete_pending_cleanup_file(
+                    home,
+                    temp_path,
+                    index_fd,
+                    snapshot,
+                    label=label,
+                )
+                discarded += 1
+                if expected_snapshot is not None:
+                    # Classification authorized at most the exact captured
+                    # object.  A new object that appears under the temp name is
+                    # left for a fresh scanner pass rather than being consumed
+                    # by this stale decision.
+                    replacement = _read_managed_state_file_snapshot(
+                        home,
+                        temp_path,
+                        index_fd,
+                    )
+                    if replacement.exists:
+                        raise SyncError(
+                            "pending cleanup ticket temp replacement appeared "
+                            f"after classified discard: {temp_path.name}"
+                        )
+                    break
+                continue
+            if expected_snapshot is not None:
+                raise SyncError(
+                    "incomplete pending cleanup ticket disappeared after "
+                    f"classification: {temp_path.name}"
+                )
+            retained_names = _retained_pending_cleanup_names_for_path(
+                home,
+                temp_path,
+                index_fd,
+                label=label,
+            )
+            if not retained_names:
+                break
+            retained_name = retained_names[0]
+            retained_path = temp_path.with_name(retained_name)
+            retained_snapshot = _read_managed_state_file_snapshot(
+                home,
+                retained_path,
+                index_fd,
+            )
+            if (
+                retained_snapshot.file_type != stat.S_IFREG
+                or retained_snapshot.mode != 0o600
+                or retained_snapshot.uid != os.geteuid()
+                or not _managed_state_snapshot_has_complete_file_evidence(
+                    retained_snapshot
+                )
+            ):
+                raise SyncError(
+                    f"incomplete pending cleanup retained temp changed: {retained_name}"
+                )
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                retained_path,
+                index_fd,
+                retained_snapshot,
+            )
+            restored = _restore_exact_retained_pending_cleanup_file(
+                home,
+                temp_path,
+                index_fd,
+                retained_name,
+                retained_snapshot,
+                label=label,
+            )
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                temp_path,
+                index_fd,
+                restored,
+                label=label,
+            )
+            discarded += 1
+    finally:
+        _close_fd_quietly(index_fd)
+    return discarded
+
+
+def _pending_cleanup_temp_residue_is_observed(
+    home: Path,
+    temp_path: Path,
+) -> bool:
     index_fd = _open_directory_beneath(home, temp_path.parent)
     try:
         snapshot = _read_managed_state_file_snapshot(
@@ -15499,18 +28002,15 @@ def _discard_incomplete_pending_cleanup_ticket(
             temp_path,
             index_fd,
         )
-        if not snapshot.exists:
-            return
-        if snapshot.mode != 0o600:
-            raise SyncError(
-                f"incomplete pending cleanup ticket mode changed: {temp_path.name}"
+        if snapshot.exists:
+            return True
+        return bool(
+            _retained_pending_cleanup_names_for_path(
+                home,
+                temp_path,
+                index_fd,
+                label=f"pending cleanup temp {temp_path.name}",
             )
-        _isolate_and_delete_pending_cleanup_file(
-            home,
-            temp_path,
-            index_fd,
-            snapshot,
-            label=f"incomplete pending cleanup ticket {temp_path.name}",
         )
     finally:
         _close_fd_quietly(index_fd)
@@ -15526,7 +28026,16 @@ def _publish_pending_cleanup_ticket(
     # and can be discarded by the next lock holder before retrying publication.
     temp_path = ticket_path.with_name(ticket_path.name + ".tmp")
     _discard_incomplete_pending_cleanup_ticket(home, temp_path)
-    staged = _write_exclusive_internal_file(home, temp_path, payload)
+    if _pending_cleanup_temp_residue_is_observed(home, temp_path):
+        raise SyncError(
+            "incomplete pending cleanup ticket temp backlog was retained; retry"
+        )
+    try:
+        staged = _write_exclusive_internal_file(home, temp_path, payload)
+    except _PendingCleanupAccessPolicyError as error:
+        raise SyncError(
+            "pending cleanup ticket appeared with changed content"
+        ) from error
     index_fd = _open_directory_beneath(home, ticket_path.parent)
     try:
         current_temp = _read_managed_state_file_snapshot(
@@ -15535,7 +28044,13 @@ def _publish_pending_cleanup_ticket(
             index_fd,
             expected_identity=staged.file_identity,
         )
-        if current_temp != staged or current_temp.payload != payload:
+        if (
+            not _managed_state_snapshot_matches_bound_file_evidence(
+                current_temp,
+                staged,
+            )
+            or current_temp.payload != payload
+        ):
             raise SyncError("pending cleanup ticket changed before publication")
         try:
             _rename_noreplace_at(
@@ -15550,7 +28065,12 @@ def _publish_pending_cleanup_ticket(
                 ticket_path,
                 index_fd,
             )
-            if not existing.exists or existing.payload != payload:
+            if (
+                not existing.exists
+                or existing.mode != 0o600
+                or existing.uid != os.geteuid()
+                or existing.payload != payload
+            ):
                 raise SyncError("pending cleanup ticket appeared with changed content")
             current_temp = _read_managed_state_file_snapshot(
                 home,
@@ -15558,7 +28078,10 @@ def _publish_pending_cleanup_ticket(
                 index_fd,
                 expected_identity=staged.file_identity,
             )
-            if current_temp != staged:
+            if not _managed_state_snapshot_matches_bound_file_evidence(
+                current_temp,
+                staged,
+            ):
                 raise SyncError(
                     "pending cleanup ticket temp changed after publication race"
                 )
@@ -15577,11 +28100,123 @@ def _publish_pending_cleanup_ticket(
             index_fd,
             expected_identity=staged.file_identity,
         )
-        if published.payload != payload or published.mode != 0o600:
+        if (
+            published.payload != payload
+            or published.mode != 0o600
+            or published.uid != os.geteuid()
+        ):
             raise SyncError("pending cleanup ticket changed during publication")
         return published
     finally:
         _close_fd_quietly(index_fd)
+
+
+def _require_quarantine_allocation_root_absent(
+    home: Path,
+    quarantine_root: Path,
+    quarantine_fd: int,
+    batch_name: str,
+    root_identity: tuple[int, int],
+) -> None:
+    _require_pending_cleanup_fd_access_policy(
+        quarantine_fd,
+        quarantine_root,
+        expected_mode=0o700,
+    )
+    if (
+        _directory_identity(quarantine_fd) != root_identity
+        or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+        or _named_entry_identity(quarantine_fd, batch_name) is not None
+        or _named_entry_identity(
+            quarantine_fd,
+            _pending_cleanup_isolated_batch_name(batch_name),
+        )
+        is not None
+    ):
+        raise SyncError(
+            f"pending quarantine allocation reservation changed: {batch_name}"
+        )
+
+
+def _publish_pending_quarantine_allocation_ticket(
+    home: Path,
+    quarantine_root: Path,
+    quarantine_fd: int,
+    batch_name: str,
+    metadata_payload: bytes,
+) -> PendingQuarantineAllocationTicket:
+    """Durably reserve an absent batch without granting deletion authority."""
+    root_identity = _directory_identity(quarantine_fd)
+    _require_quarantine_allocation_root_absent(
+        home,
+        quarantine_root,
+        quarantine_fd,
+        batch_name,
+        root_identity,
+    )
+    expected_payload = _pending_quarantine_allocation_payload(
+        batch_name,
+        root_identity,
+        metadata_payload,
+    )
+    index_root = _pending_cleanup_index_path(home)
+    index_fd = _open_or_create_directory_beneath(home, index_root, mode=0o700)
+    _close_fd_quietly(index_fd)
+    path = _pending_quarantine_allocation_path(home, batch_name)
+    index_fd = _open_directory_beneath(home, index_root)
+    try:
+        retained = _retained_pending_cleanup_file(
+            home,
+            path,
+            index_fd,
+            expected=None,
+            label=f"pending quarantine allocation {batch_name}",
+        )
+        if retained is not None:
+            raise SyncError(
+                "pending quarantine allocation retained evidence must be "
+                f"recovered before publication: {batch_name}"
+            )
+        existing = _read_pending_quarantine_allocation_ticket(home, path)
+        if existing is not None:
+            if existing.snapshot.payload != expected_payload:
+                raise SyncError(
+                    f"pending quarantine allocation payload changed: {batch_name}"
+                )
+            published = existing.snapshot
+        else:
+            published = _publish_pending_cleanup_ticket(
+                home,
+                path,
+                expected_payload,
+            )
+        os.fsync(index_fd)
+    finally:
+        _close_fd_quietly(index_fd)
+    index_parent_fd = _open_directory_beneath(home, index_root.parent)
+    try:
+        os.fsync(index_parent_fd)
+    finally:
+        _close_fd_quietly(index_parent_fd)
+    verified = _read_pending_quarantine_allocation_ticket(
+        home,
+        path,
+        expected_identity=published.file_identity,
+    )
+    if verified is None or verified.snapshot.payload != expected_payload:
+        raise SyncError(
+            f"pending quarantine allocation changed after fsync: {batch_name}"
+        )
+    # The durable ticket describes an initially absent reservation.  Reprove
+    # both possible batch names after its durable reread before mkdir.
+    _require_quarantine_allocation_root_absent(
+        home,
+        quarantine_root,
+        quarantine_fd,
+        batch_name,
+        root_identity,
+    )
+    return verified
 
 
 def _verify_pending_cleanup_ticket_durable(
@@ -15610,7 +28245,10 @@ def _verify_pending_cleanup_ticket_durable(
             ticket.path,
             expected_ticket_identity=ticket.snapshot.file_identity,
         )
-        if durable != ticket:
+        if durable is None or not _pending_cleanup_ticket_matches(
+            durable,
+            ticket,
+        ):
             raise SyncError("pending cleanup ticket changed after fsync")
     finally:
         if index_parent_fd >= 0:
@@ -15618,39 +28256,37 @@ def _verify_pending_cleanup_ticket_durable(
         _close_fd_quietly(index_fd)
 
 
-def _mark_pending_batch_cleanup_ready(
+def _publish_pending_batch_cleanup_ticket_for_root(
     home: Path,
-    batch: PendingLinkBatch,
+    batch_root: Path,
+    expected_payload: bytes,
 ) -> None:
-    marker = _pending_commit_marker_snapshot(home, batch)
-    if marker is None:
-        raise SyncError("refusing to mark an uncommitted pending batch for cleanup")
-    if (
-        not marker.exists
-        or marker.parent_identity is None
-        or marker.file_identity is None
-        or marker.payload is None
-        or marker.mode != 0o600
-    ):
-        raise SyncError("pending cleanup commit marker is not fully bound")
     index_fd = _open_or_create_directory_beneath(
         home,
         _pending_cleanup_index_path(home),
         mode=0o700,
     )
     _close_fd_quietly(index_fd)
-    ticket_path = _pending_cleanup_ticket_path(home, batch.batch_root.name)
+    ticket_path = _pending_cleanup_ticket_path(home, batch_root.name)
+    index_fd = _open_directory_beneath(home, ticket_path.parent)
+    try:
+        retained = _retained_pending_cleanup_file(
+            home,
+            ticket_path,
+            index_fd,
+            expected=None,
+            label=f"pending cleanup ticket {batch_root.name}",
+        )
+        if retained is not None:
+            raise SyncError(
+                "pending cleanup ticket retained evidence must be recovered before "
+                f"publication: {batch_root.name}"
+            )
+    finally:
+        _close_fd_quietly(index_fd)
     existing = _read_pending_cleanup_ticket(
         home,
         ticket_path,
-    )
-    expected_payload = _pending_cleanup_ticket_payload(
-        batch.batch_root,
-        batch.batch_root_identity,
-        marker.parent_identity,
-        marker.file_identity,
-        marker.mode,
-        hashlib.sha256(marker.payload).hexdigest(),
     )
     if existing is not None:
         if existing.snapshot.payload != expected_payload:
@@ -15669,9 +28305,788 @@ def _mark_pending_batch_cleanup_ready(
         ticket_path,
         expected_ticket_identity=published.file_identity,
     )
-    if verified is None or verified.snapshot != published:
+    if verified is None or not _managed_state_snapshot_matches_bound_file_evidence(
+        verified.snapshot,
+        published,
+    ):
         raise SyncError("pending cleanup ticket changed after publication")
     _verify_pending_cleanup_ticket_durable(home, verified)
+
+
+def _publish_pending_batch_cleanup_ticket(
+    home: Path,
+    batch: PendingLinkBatch,
+    expected_payload: bytes,
+) -> None:
+    _publish_pending_batch_cleanup_ticket_for_root(
+        home,
+        batch.batch_root,
+        expected_payload,
+    )
+
+
+def _pending_staging_marker_snapshot(
+    home: Path,
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot | None:
+    marker_path = batch_root / Path(*PENDING_STATE_STAGING_MARKER.parts)
+    parent_fd = _open_directory_beneath(home, marker_path.parent)
+    try:
+        marker = _read_managed_state_file_snapshot(
+            home,
+            marker_path,
+            parent_fd,
+        )
+        if not marker.exists:
+            return None
+        expected_payload = _pending_staging_marker_payload(
+            batch_root,
+            batch_root_identity,
+        )
+        if (
+            marker.file_type != stat.S_IFREG
+            or marker.mode != 0o600
+            or marker.uid != os.geteuid()
+            or marker.payload != expected_payload
+            or marker.parent_identity != _directory_identity(parent_fd)
+        ):
+            raise SyncError("pending staging cleanup marker changed")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            marker_path,
+            parent_fd,
+            marker,
+        )
+        return marker
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _bound_directory_member_names_for_staging_recovery(
+    home: Path,
+    path: Path,
+    *,
+    expected_entries: int,
+    expected_identity: tuple[int, int] | None = None,
+) -> tuple[str, ...]:
+    if expected_entries < 0:
+        raise SyncError("pending staging expected entry count is invalid")
+    directory_fd = _open_directory_beneath(home, path)
+    try:
+        before = os.fstat(directory_fd)
+        before_identity = (before.st_dev, before.st_ino)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or stat.S_IMODE(before.st_mode) != 0o700
+            or before.st_uid != os.geteuid()
+            or (expected_identity is not None and before_identity != expected_identity)
+        ):
+            raise SyncError(
+                f"pending staging directory owner, mode, or identity changed: {path}"
+            )
+        _require_pending_cleanup_fd_access_policy(
+            directory_fd,
+            path,
+            expected_mode=0o700,
+        )
+        if not _bound_directory_matches(home, path, directory_fd):
+            raise SyncError(f"pending staging directory changed: {path}")
+        names = _directory_member_names(
+            directory_fd,
+            maximum_entries=expected_entries + 1,
+            overflow_message="pending staging recovery exceeds the entry limit",
+        )
+        after = os.fstat(directory_fd)
+        if (
+            (after.st_dev, after.st_ino) != before_identity
+            or not stat.S_ISDIR(after.st_mode)
+            or stat.S_IMODE(after.st_mode) != 0o700
+            or after.st_uid != os.geteuid()
+            or not _bound_directory_matches(home, path, directory_fd)
+        ):
+            raise SyncError(f"pending staging directory changed: {path}")
+        _require_pending_cleanup_fd_access_policy(
+            directory_fd,
+            path,
+            expected_mode=0o700,
+        )
+        return names
+    finally:
+        _close_fd_quietly(directory_fd)
+
+
+def _require_pending_staging_initial_skeleton(
+    home: Path,
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+) -> None:
+    if set(
+        _bound_directory_member_names_for_staging_recovery(
+            home,
+            batch_root,
+            expected_entries=2,
+            expected_identity=batch_root_identity,
+        )
+    ) != {"metadata.json", "pending"}:
+        raise SyncError(
+            f"pending staging temp batch is not an initial skeleton: {batch_root.name}"
+        )
+    batch_fd = _open_directory_beneath(home, batch_root)
+    try:
+        if _directory_identity(
+            batch_fd
+        ) != batch_root_identity or not _bound_directory_matches(
+            home, batch_root, batch_fd
+        ):
+            raise SyncError(f"pending staging batch changed: {batch_root.name}")
+        metadata = _read_managed_state_file_snapshot(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            maximum_bytes=MAX_MANAGED_STATE_BYTES,
+        )
+        if (
+            metadata.file_type != stat.S_IFREG
+            or metadata.mode != 0o600
+            or metadata.uid != os.geteuid()
+            or metadata.payload is None
+            or metadata.parent_identity != batch_root_identity
+            or not _managed_state_snapshot_has_complete_file_evidence(metadata)
+        ):
+            raise SyncError(f"pending staging metadata changed: {batch_root.name}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            batch_root / "metadata.json",
+            batch_fd,
+            metadata,
+        )
+    finally:
+        _close_fd_quietly(batch_fd)
+    pending_root = batch_root / "pending"
+    if set(
+        _bound_directory_member_names_for_staging_recovery(
+            home,
+            pending_root,
+            expected_entries=6,
+        )
+    ) != {"before", "stage", "evidence", "cleanup", "state", "claims"}:
+        raise SyncError(
+            f"pending staging temp batch already progressed: {batch_root.name}"
+        )
+    claims_root = pending_root / "claims"
+    if set(
+        _bound_directory_member_names_for_staging_recovery(
+            home,
+            claims_root,
+            expected_entries=2,
+        )
+    ) != {"before", "after"}:
+        raise SyncError(f"pending staging claim skeleton changed: {batch_root.name}")
+    for empty_path in (
+        pending_root / "before",
+        pending_root / "stage",
+        pending_root / "evidence",
+        pending_root / "cleanup",
+        claims_root / "before",
+        claims_root / "after",
+    ):
+        if _bound_directory_member_names_for_staging_recovery(
+            home,
+            empty_path,
+            expected_entries=0,
+        ):
+            raise SyncError(
+                f"pending staging temp batch already contains evidence: "
+                f"{batch_root.name}"
+            )
+    marker_path = batch_root / Path(*PENDING_STATE_STAGING_MARKER.parts)
+    temp_name = marker_path.name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+    state_names = _bound_directory_member_names_for_staging_recovery(
+        home,
+        marker_path.parent,
+        expected_entries=1,
+    )
+    if len(state_names) != 1 or any(
+        name != temp_name
+        and _pending_cleanup_retained_canonical_name(name) != temp_name
+        for name in state_names
+    ):
+        raise SyncError(
+            f"pending staging temp authority is ambiguous: {batch_root.name}"
+        )
+    temp_path = marker_path.parent / state_names[0]
+    state_fd = _open_directory_beneath(home, marker_path.parent)
+    try:
+        temp = _read_managed_state_file_snapshot(
+            home,
+            temp_path,
+            state_fd,
+        )
+        if (
+            temp.file_type != stat.S_IFREG
+            or temp.mode != 0o600
+            or temp.uid != os.geteuid()
+            or not _managed_state_snapshot_has_complete_file_evidence(temp)
+        ):
+            raise SyncError(
+                f"pending staging temp authority owner or mode changed: "
+                f"{batch_root.name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            temp_path,
+            state_fd,
+            temp,
+        )
+    finally:
+        _close_fd_quietly(state_fd)
+
+
+def _discover_pending_staging_marker_temps(
+    home: Path,
+) -> tuple[tuple[Path, tuple[int, int]], ...]:
+    quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+    try:
+        quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    except FileNotFoundError:
+        return ()
+    discovered: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
+            raise SyncError("pending staging quarantine root changed")
+        with os.scandir(quarantine_fd) as iterator:
+            for scanned, entry in enumerate(iterator, start=1):
+                if scanned > MAX_PENDING_CLEANUP_BATCH_SCAN:
+                    raise SyncError("pending staging batch scan exceeds the size limit")
+                batch_name = _pending_cleanup_batch_name_from_quarantine_entry(
+                    entry.name
+                )
+                if batch_name is None or entry.name != batch_name:
+                    continue
+                metadata = entry.stat(follow_symlinks=False)
+                if not stat.S_ISDIR(metadata.st_mode):
+                    continue
+                batch_root = quarantine_root / batch_name
+                batch_identity = (metadata.st_dev, metadata.st_ino)
+                try:
+                    existing_ticket = _read_pending_cleanup_ticket(
+                        home,
+                        _pending_cleanup_ticket_path(home, batch_name),
+                    )
+                except FileNotFoundError:
+                    existing_ticket = None
+                except (OSError, SyncError) as error:
+                    raise _pending_cleanup_authority_classification_error(
+                        batch_name,
+                        error,
+                    ) from error
+                if existing_ticket is not None:
+                    continue
+                marker_path = batch_root / Path(*PENDING_STATE_STAGING_MARKER.parts)
+                try:
+                    marker = _pending_staging_marker_snapshot(
+                        home,
+                        batch_root,
+                        batch_identity,
+                    )
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                if marker is not None:
+                    continue
+                temp_path = marker_path.with_name(
+                    marker_path.name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                )
+                try:
+                    observed = _pending_cleanup_temp_residue_is_observed(
+                        home,
+                        temp_path,
+                    )
+                except FileNotFoundError:
+                    continue
+                if observed:
+                    discovered.append((batch_root, batch_identity))
+    finally:
+        _close_fd_quietly(quarantine_fd)
+    return tuple(discovered)
+
+
+def _recover_pending_staging_marker_temps(
+    home: Path,
+    *,
+    budget: PendingCleanupActionBudget,
+) -> int:
+    recovered = 0
+    for batch_root, batch_identity in sorted(
+        _discover_pending_staging_marker_temps(home),
+        key=lambda item: item[0].name,
+    ):
+        if not budget.charge_batch(batch_root.name):
+            continue
+        _require_pending_staging_initial_skeleton(
+            home,
+            batch_root,
+            batch_identity,
+        )
+        marker_path = batch_root / Path(*PENDING_STATE_STAGING_MARKER.parts)
+        _publish_atomic_exclusive_internal_file(
+            home,
+            marker_path,
+            _pending_staging_marker_payload(batch_root, batch_identity),
+        )
+        recovered += 1
+    return recovered
+
+
+def _discover_pending_staging_markers(
+    home: Path,
+) -> tuple[
+    tuple[Path, tuple[int, int], ManagedStateFileSnapshot],
+    ...,
+]:
+    quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+    try:
+        quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    except FileNotFoundError:
+        return ()
+    discovered: list[tuple[Path, tuple[int, int], ManagedStateFileSnapshot]] = []
+    try:
+        if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
+            raise SyncError("pending staging quarantine root changed")
+        with os.scandir(quarantine_fd) as iterator:
+            for scanned, entry in enumerate(iterator, start=1):
+                if scanned > MAX_PENDING_CLEANUP_BATCH_SCAN:
+                    raise SyncError("pending staging batch scan exceeds the size limit")
+                batch_name = _pending_cleanup_batch_name_from_quarantine_entry(
+                    entry.name
+                )
+                if batch_name is None or entry.name != batch_name:
+                    continue
+                try:
+                    existing_ticket = _read_pending_cleanup_ticket(
+                        home,
+                        _pending_cleanup_ticket_path(home, batch_name),
+                    )
+                except FileNotFoundError:
+                    existing_ticket = None
+                except (OSError, SyncError) as error:
+                    raise _pending_cleanup_authority_classification_error(
+                        batch_name,
+                        error,
+                    ) from error
+                if existing_ticket is not None:
+                    continue
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise SyncError(
+                        f"pending staging batch changed: {entry.name}"
+                    ) from error
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise SyncError(
+                        f"pending staging batch is not a directory: {entry.name}"
+                    )
+                batch_root = quarantine_root / batch_name
+                batch_identity = (metadata.st_dev, metadata.st_ino)
+                try:
+                    marker = _pending_staging_marker_snapshot(
+                        home,
+                        batch_root,
+                        batch_identity,
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise SyncError(
+                        f"pending staging marker changed: {batch_name}"
+                    ) from error
+                if marker is not None:
+                    discovered.append((batch_root, batch_identity, marker))
+        if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
+            raise SyncError("pending staging quarantine root changed")
+    finally:
+        _close_fd_quietly(quarantine_fd)
+    return tuple(discovered)
+
+
+def _publish_discovered_staging_cleanup_tickets(
+    home: Path,
+    *,
+    limit: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+    budget: PendingCleanupActionBudget | None = None,
+) -> int:
+    if limit < 0:
+        raise SyncError("pending staging cleanup action budget is invalid")
+    published = 0
+    action_budget = budget or PendingCleanupActionBudget(limit)
+    _recover_pending_staging_marker_temps(
+        home,
+        budget=action_budget,
+    )
+    discovered = sorted(
+        _discover_pending_staging_markers(home),
+        key=lambda item: item[0].name,
+    )
+    for batch_root, batch_identity, marker in discovered:
+        ticket_path = _pending_cleanup_ticket_path(home, batch_root.name)
+        try:
+            existing = _read_pending_cleanup_ticket(home, ticket_path)
+        except FileNotFoundError:
+            existing = None
+        except (OSError, SyncError) as error:
+            raise _pending_cleanup_authority_classification_error(
+                batch_root.name,
+                error,
+            ) from error
+        if existing is not None:
+            continue
+        if not action_budget.charge_batch(batch_root.name):
+            continue
+        _publish_pending_batch_cleanup_ticket_for_root(
+            home,
+            batch_root,
+            _pending_staging_cleanup_ticket_payload(
+                batch_root,
+                batch_identity,
+                marker,
+            ),
+        )
+        published += 1
+    return published
+
+
+def _mark_pending_batch_staging_cleanup_ready(
+    home: Path,
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+) -> PendingBatchCleanupTicket:
+    marker_path = batch_root / Path(*PENDING_STATE_STAGING_MARKER.parts)
+    marker = _publish_atomic_exclusive_internal_file(
+        home,
+        marker_path,
+        _pending_staging_marker_payload(batch_root, batch_root_identity),
+    )
+    verified_marker = _pending_staging_marker_snapshot(
+        home,
+        batch_root,
+        batch_root_identity,
+    )
+    if (
+        verified_marker is None
+        or not _managed_state_snapshot_matches_bound_file_evidence(
+            verified_marker,
+            marker,
+        )
+    ):
+        raise SyncError("pending staging cleanup marker changed after publication")
+    expected_payload = _pending_staging_cleanup_ticket_payload(
+        batch_root,
+        batch_root_identity,
+        verified_marker,
+    )
+    _publish_pending_batch_cleanup_ticket_for_root(
+        home,
+        batch_root,
+        expected_payload,
+    )
+    ticket = _read_pending_cleanup_ticket(
+        home,
+        _pending_cleanup_ticket_path(home, batch_root.name),
+    )
+    if (
+        ticket is None
+        or ticket.version != 3
+        or ticket.phase != "staging"
+        or ticket.batch_root_identity != batch_root_identity
+        or ticket.snapshot.payload != expected_payload
+    ):
+        raise SyncError("pending staging cleanup ticket changed after publication")
+    return ticket
+
+
+def _read_or_restore_active_pointer_cleanup_ticket(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> PendingBatchCleanupTicket | None:
+    if batch.pointer_snapshot is None:
+        raise SyncError(
+            "refusing to recover pending cleanup ticket tombstone without an "
+            "active pointer"
+        )
+    ticket_path = _pending_cleanup_ticket_path(home, batch.batch_root.name)
+    try:
+        index_fd = _open_directory_beneath(home, ticket_path.parent)
+    except FileNotFoundError as error:
+        if batch.metadata_version in {4, 5}:
+            return None
+        if batch.metadata_version == 6:
+            # Early v6 batches predate staging cleanup authority. A missing
+            # index proves that ticket, ticket-temp, and retained ticket forms
+            # are absent. Accept that legacy state only when the bound batch
+            # state directory also has no marker, marker-temp, or retained form.
+            marker_path = batch.batch_root / Path(*PENDING_STATE_STAGING_MARKER.parts)
+            marker_parent_fd = _open_directory_beneath(home, marker_path.parent)
+            try:
+                names = _directory_member_names(
+                    marker_parent_fd,
+                    maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+                    overflow_message=(
+                        "active pending staging authority scan exceeds the limit"
+                    ),
+                )
+                temp_name = marker_path.name + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+                protected_names = {marker_path.name, temp_name}
+                retained_prefixes = tuple(
+                    f"{PENDING_CLEANUP_RETAINED_PREFIX}{name}-"
+                    for name in protected_names
+                )
+                if any(
+                    name in protected_names or name.startswith(retained_prefixes)
+                    for name in names
+                ):
+                    raise SyncError(
+                        "active pending transaction has partial legacy staging "
+                        f"cleanup authority: {batch.batch_root.name}"
+                    )
+                if not _bound_directory_matches(
+                    home,
+                    marker_path.parent,
+                    marker_parent_fd,
+                ):
+                    raise SyncError("active pending staging authority parent changed")
+            finally:
+                _close_fd_quietly(marker_parent_fd)
+            return None
+        raise SyncError(
+            "active pending transaction cleanup index is missing: "
+            f"metadata v{batch.metadata_version}"
+        ) from error
+    restored: ManagedStateFileSnapshot | None = None
+    try:
+        canonical = _read_managed_state_file_snapshot(
+            home,
+            ticket_path,
+            index_fd,
+        )
+        retained = _retained_pending_cleanup_file(
+            home,
+            ticket_path,
+            index_fd,
+            expected=None,
+            label=f"active pending cleanup ticket {batch.batch_root.name}",
+        )
+        if canonical.exists and retained is not None:
+            raise SyncError(
+                "active pending cleanup ticket overlaps retained evidence: "
+                f"{batch.batch_root.name}"
+            )
+        if not canonical.exists and retained is not None:
+            retained_name, retained_snapshot = retained
+            if not _managed_state_snapshot_has_complete_file_evidence(
+                retained_snapshot
+            ):
+                raise SyncError(
+                    "active pending cleanup ticket retained evidence changed: "
+                    f"{batch.batch_root.name}"
+                )
+            restored = _restore_exact_retained_pending_cleanup_file(
+                home,
+                ticket_path,
+                index_fd,
+                retained_name,
+                retained_snapshot,
+                label=f"active pending cleanup ticket {batch.batch_root.name}",
+            )
+    finally:
+        _close_fd_quietly(index_fd)
+    ticket = _read_pending_cleanup_ticket(
+        home,
+        ticket_path,
+        expected_ticket_identity=(
+            restored.file_identity if restored is not None else None
+        ),
+    )
+    if restored is not None and (
+        ticket is None
+        or ticket.version != 3
+        or ticket.phase != "staging"
+        or ticket.batch_root_identity != batch.batch_root_identity
+    ):
+        raise SyncError(
+            "active pending staging cleanup ticket tombstone changed during recovery"
+        )
+    return ticket
+
+
+def _retire_pending_staging_cleanup_authority(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> None:
+    if batch.pointer_snapshot is None:
+        raise SyncError(
+            "refusing to retire pending staging cleanup authority without an "
+            "active pointer"
+        )
+    ticket = _read_or_restore_active_pointer_cleanup_ticket(home, batch)
+    marker = _pending_staging_marker_snapshot(
+        home,
+        batch.batch_root,
+        batch.batch_root_identity,
+    )
+    if ticket is not None and ticket.version != 3:
+        if marker is not None:
+            raise SyncError(
+                "pending staging cleanup marker overlaps finalized cleanup authority"
+            )
+        return
+    if ticket is None and marker is None:
+        return
+    if ticket is not None:
+        if (
+            ticket.version != 3
+            or ticket.phase != "staging"
+            or ticket.batch_root_identity != batch.batch_root_identity
+            or marker is None
+            or marker.parent_identity != ticket.marker_parent_identity
+            or marker.file_identity != ticket.marker_file_identity
+            or marker.mode != ticket.marker_mode
+            or marker.payload is None
+            or hashlib.sha256(marker.payload).hexdigest() != ticket.marker_sha256
+        ):
+            raise SyncError("pending staging cleanup authority changed")
+        # The active pointer was fsynced before this deletion. Once the ticket
+        # is gone, only the pointer may authorize transaction recovery. A crash
+        # before marker deletion is recovered by the ticket-absent branch.
+        _delete_pending_cleanup_ticket(home, ticket)
+    if marker is None:
+        return
+    marker_path = batch.batch_root / Path(*PENDING_STATE_STAGING_MARKER.parts)
+    parent_fd = _open_directory_beneath(home, marker_path.parent)
+    try:
+        current = _read_managed_state_file_snapshot(
+            home,
+            marker_path,
+            parent_fd,
+            expected_identity=marker.file_identity,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current,
+            marker,
+        ):
+            raise SyncError("pending staging cleanup marker changed before deletion")
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            marker_path,
+            parent_fd,
+            marker,
+            label="pending staging cleanup marker",
+        )
+    finally:
+        _close_fd_quietly(parent_fd)
+
+
+def _cleanup_failed_pending_staging_batch(
+    home: Path,
+    batch_root: Path,
+    batch_root_identity: tuple[int, int],
+) -> None:
+    ticket = _read_pending_cleanup_ticket(
+        home,
+        _pending_cleanup_ticket_path(home, batch_root.name),
+    )
+    if (
+        ticket is None
+        or ticket.version != 3
+        or ticket.phase != "staging"
+        or ticket.batch_root_identity != batch_root_identity
+    ):
+        raise SyncError("pending staging cleanup ticket is missing or changed")
+    if not _remove_cleanup_ready_batch(home, ticket):
+        raise SyncError("pending staging cleanup was deferred")
+
+
+def _mark_pending_batch_cleanup_ready(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> None:
+    marker = _pending_commit_marker_snapshot(home, batch)
+    if marker is None:
+        raise SyncError("refusing to mark an uncommitted pending batch for cleanup")
+    if (
+        not marker.exists
+        or marker.parent_identity is None
+        or marker.file_identity is None
+        or marker.payload is None
+        or marker.mode != 0o600
+    ):
+        raise SyncError("pending cleanup commit marker is not fully bound")
+    cleanup_batch = batch
+    if batch.metadata_version == 6:
+        # v6 records bind only regular targets acted on by the transaction.
+        # A later terminal-cleanup ticket must still bind the entire after-state
+        # regular target group, including unchanged targets. Reconstruct that
+        # group from the committed state and immutable release sources instead
+        # of treating an action-scoped record set as blanket alias authority.
+        cleanup_batch = replace(
+            batch,
+            terminal_regular_after=_stage_pending_terminal_regular_targets(
+                home,
+                batch.state_after_value,
+                batch.records,
+                phase="after",
+            ),
+        )
+    payload = (
+        _pending_terminal_cleanup_ticket_payload(
+            cleanup_batch,
+            marker,
+            phase="after",
+        )
+        if cleanup_batch.terminal_regular_after
+        else _pending_cleanup_ticket_payload(
+            batch.batch_root,
+            batch.batch_root_identity,
+            marker.parent_identity,
+            marker.file_identity,
+            marker.mode,
+            hashlib.sha256(marker.payload).hexdigest(),
+        )
+    )
+    _publish_pending_batch_cleanup_ticket(home, batch, payload)
+
+
+def _mark_pending_batch_rollback_cleanup_ready(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> None:
+    marker = _publish_pending_rollback_marker(home, batch)
+    cleanup_batch = batch
+    if batch.metadata_version == 6:
+        # See the committed counterpart above. The same reconstruction is
+        # required when an interrupted v6 transaction rolls back.
+        cleanup_batch = replace(
+            batch,
+            terminal_regular_before=_stage_pending_terminal_regular_targets(
+                home,
+                batch.state_before_value,
+                batch.records,
+                phase="before",
+            ),
+        )
+    payload = (
+        _pending_terminal_cleanup_ticket_payload(
+            cleanup_batch,
+            marker,
+            phase="before",
+        )
+        if cleanup_batch.terminal_regular_before
+        else _pending_rollback_cleanup_ticket_payload(
+            batch.batch_root,
+            batch.batch_root_identity,
+            marker,
+        )
+    )
+    _publish_pending_batch_cleanup_ticket(home, batch, payload)
 
 
 def _pending_link_pointer_is_absent(home: Path) -> bool:
@@ -15808,10 +29223,18 @@ def _isolate_pending_cleanup_entry(
     name: str,
     parent_identity: tuple[int, int],
     planned: tuple[int, int, int],
+    *,
+    links_content_root: bool = False,
+    retain_mismatch: bool = True,
 ) -> tuple[str, os.stat_result]:
+    active_prefix = (
+        PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX
+        if links_content_root
+        else PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+    )
     for _attempt in range(128):
         active_name = _pending_cleanup_entry_name(
-            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+            active_prefix,
             parent_identity,
             planned,
         )
@@ -15840,18 +29263,25 @@ def _isolate_pending_cleanup_entry(
             dir_fd=directory_fd,
             follow_symlinks=False,
         )
-    except OSError as error:
-        raise SyncError(
-            f"pending cleanup isolated entry changed: {active_name}"
-        ) from error
+    except OSError:
+        if retain_mismatch:
+            _retain_pending_cleanup_entry(
+                directory_fd,
+                active_name,
+                parent_identity,
+                planned,
+                label=f"pending cleanup isolated entry changed: {name}",
+            )
+        raise SyncError(f"pending cleanup isolated entry changed: {active_name}")
     if _pending_cleanup_entry_plan(current) != planned:
-        _retain_pending_cleanup_entry(
-            directory_fd,
-            active_name,
-            parent_identity,
-            planned,
-            label=f"pending cleanup entry changed before deletion: {name}",
-        )
+        if retain_mismatch:
+            _retain_pending_cleanup_entry(
+                directory_fd,
+                active_name,
+                parent_identity,
+                planned,
+                label=f"pending cleanup entry changed before deletion: {name}",
+            )
     # The verified active name is high entropy and exists only inside the
     # locked, mode-0700 sync quarantine. Portable Unix APIs do not offer an
     # inode-conditional unlink; a same-uid process deliberately observing and
@@ -15860,22 +29290,219 @@ def _isolate_pending_cleanup_entry(
     return active_name, current
 
 
-def _remove_pending_batch_directory_contents(
+def _pending_batch_cleanup_name_is_authorized(
+    relative_parent: tuple[str, ...],
+    name: str,
+    parent_identity: tuple[int, int],
+) -> bool:
+    deletion_alias_base = _pending_regular_publication_private_deletion_alias_base(name)
+    if deletion_alias_base is not None:
+        return (
+            relative_parent == ("pending", "cleanup")
+            and _pending_cleanup_internal_entry_plan(
+                deletion_alias_base,
+                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                parent_identity,
+            )
+            is not None
+        )
+    active_links_plan = _pending_cleanup_internal_entry_plan(
+        name,
+        PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX,
+        parent_identity,
+    )
+    if active_links_plan is not None:
+        return not relative_parent
+    if (
+        _pending_cleanup_internal_entry_plan(
+            name,
+            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+            parent_identity,
+        )
+        is not None
+        or _pending_cleanup_internal_entry_plan(
+            name,
+            PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
+            parent_identity,
+        )
+        is not None
+    ):
+        return True
+    if not relative_parent:
+        if (
+            re.fullmatch(
+                re.escape(PENDING_CLEANUP_TERMINAL_ALIAS_PREFIX) + r"[0-9]{8}",
+                name,
+            )
+            is not None
+        ):
+            return True
+        return name in {
+            "metadata.json",
+            "pending",
+            "links",
+            "state",
+            PENDING_LINK_METADATA_NAME,
+        }
+    if relative_parent == ("pending",):
+        return name in {
+            "before",
+            "stage",
+            "evidence",
+            "cleanup",
+            "state",
+            "claims",
+        }
+    if relative_parent == ("pending", "claims"):
+        return name in {"before", "after"}
+    if relative_parent in {
+        ("pending", "before"),
+        ("pending", "stage"),
+        ("pending", "evidence"),
+        ("pending", "claims", "before"),
+        ("pending", "claims", "after"),
+    }:
+        return re.fullmatch(r"[0-9]{8}", name) is not None
+    if relative_parent == ("pending", "cleanup"):
+        canonical = re.fullmatch(
+            r"[0-9]{8}(?:\.before)?(?:\.private-authority)?"
+            r"\.json(?:\.publish-tmp)?",
+            name,
+        )
+        if canonical is not None:
+            return True
+        retained_canonical = _pending_cleanup_retained_canonical_name(name)
+        return (
+            retained_canonical is not None
+            and re.fullmatch(
+                r"[0-9]{8}(?:\.before)?(?:\.private-authority)?"
+                r"\.json(?:\.publish-tmp)?",
+                retained_canonical,
+            )
+            is not None
+        )
+    if relative_parent == ("pending", "state"):
+        canonical_names = {
+            PENDING_STATE_BEFORE_EVIDENCE.name,
+            PENDING_STATE_AFTER_EVIDENCE.name,
+            PENDING_STATE_COMMIT_EVIDENCE.name,
+            PENDING_STATE_COMMIT_MARKER.name,
+            PENDING_STATE_ROLLBACK_MARKER.name,
+            PENDING_STATE_STAGING_MARKER.name,
+        }
+        if name in canonical_names:
+            return True
+        if name.endswith(PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX):
+            return (
+                name[: -len(PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX)] in canonical_names
+            )
+        retained_canonical = _pending_cleanup_retained_canonical_name(name)
+        return retained_canonical in canonical_names or retained_canonical in {
+            canonical + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+            for canonical in canonical_names
+        }
+    if relative_parent and relative_parent[0] == "links":
+        return True
+    if relative_parent and relative_parent[0] == "state":
+        return True
+    return False
+
+
+def _require_no_pending_staging_manual_retention(
+    home: Path,
+    bound_batch_root: Path,
+) -> None:
+    cleanup_root = bound_batch_root / "pending" / "cleanup"
+    try:
+        names = _bound_directory_member_names_for_staging_recovery(
+            home,
+            cleanup_root,
+            expected_entries=MAX_PENDING_LINK_RECORDS * 2,
+        )
+    except FileNotFoundError:
+        return
+    if names:
+        raise SyncError(
+            "pending staging regular-file evidence requires manual cleanup; "
+            f"the batch was retained without deletion: {bound_batch_root.name}"
+        )
+
+
+def _cleanup_directory_expected_mode(
+    configured_expected_mode: int | None,
+    relative_parts: tuple[str, ...],
+) -> int | None:
+    """Select exact control-directory or flexible content access policy.
+
+    A ``None`` configuration marks a release content tree, where current-euid
+    ownership and no group/world write authority are protected while ordinary
+    0755 directories remain valid. Pending cleanup defaults to exact 0700, but
+    its ``links/**`` evidence namespace is ordinary content with the same
+    flexible policy.
+    """
+    if configured_expected_mode is None:
+        return None
+    if relative_parts and relative_parts[0] == "links":
+        return None
+    return configured_expected_mode
+
+
+def _cleanup_regular_file_expected_mode(
+    configured_expected_mode: int | None,
+    relative_parts: tuple[str, ...],
+    *,
+    links_content_root: bool,
+) -> int | None:
+    """Select exact control-file or flexible typed links-content policy."""
+    if configured_expected_mode is None:
+        return None
+    if links_content_root or (relative_parts and relative_parts[0] == "links"):
+        return None
+    return configured_expected_mode
+
+
+def _capture_pending_cleanup_identity_ledger(
     directory_fd: int,
     directory_identity: tuple[int, int],
     root_mount_identity: tuple[int, int | None],
     budget: list[int],
+    ledger: dict[
+        tuple[int, int],
+        tuple[tuple[str, tuple[int, int, int], bool, bool], ...],
+    ],
     *,
     depth: int,
-    skipped_names: frozenset[str] = frozenset(),
+    relative_parts: tuple[str, ...],
+    skipped_names: frozenset[str],
+    name_validator: (Callable[[tuple[str, ...], str, tuple[int, int]], bool] | None),
+    directory_expected_mode: int | None,
 ) -> None:
     if depth > MAX_PENDING_CLEANUP_DEPTH:
         raise SyncError("pending cleanup directory depth exceeds the limit")
+    display_path = Path("<pending-cleanup-scan>") / Path(*relative_parts)
+    effective_expected_mode = _cleanup_directory_expected_mode(
+        directory_expected_mode,
+        relative_parts,
+    )
+    if effective_expected_mode is None:
+        _require_current_user_cleanup_fd_access_policy(
+            directory_fd,
+            display_path,
+        )
+    else:
+        _require_pending_cleanup_fd_access_policy(
+            directory_fd,
+            display_path,
+            expected_mode=effective_expected_mode,
+        )
     if _directory_identity(directory_fd) != directory_identity:
         raise SyncError("pending cleanup directory identity changed")
     if _directory_mount_identity(directory_fd) != root_mount_identity:
         raise SyncError("pending cleanup directory crosses a mount boundary")
-    entries: list[tuple[str, tuple[int, int, int], bool]] = []
+    if directory_identity in ledger:
+        raise SyncError("pending cleanup directory identity is duplicated")
+
+    entries: list[tuple[str, tuple[int, int, int], bool, bool]] = []
     with os.scandir(directory_fd) as iterator:
         for entry in iterator:
             if entry.name in skipped_names:
@@ -15883,6 +29510,15 @@ def _remove_pending_batch_directory_contents(
             if budget[0] <= 0:
                 raise SyncError("pending cleanup entry count exceeds the limit")
             budget[0] -= 1
+            if name_validator is not None and not name_validator(
+                relative_parts,
+                entry.name,
+                directory_identity,
+            ):
+                raise SyncError(
+                    "pending cleanup found an unknown entry and retained the "
+                    f"batch without deletion: {'/'.join((*relative_parts, entry.name))}"
+                )
             retained_plan = _pending_cleanup_internal_entry_plan(
                 entry.name,
                 PENDING_CLEANUP_RETAINED_ENTRY_PREFIX,
@@ -15891,6 +29527,11 @@ def _remove_pending_batch_directory_contents(
             if retained_plan is not None:
                 raise SyncError(
                     "pending cleanup retained entry requires manual cleanup: "
+                    f"{entry.name}"
+                )
+            if _pending_cleanup_retained_canonical_name(entry.name) is not None:
+                raise SyncError(
+                    "pending cleanup retained file requires manual cleanup: "
                     f"{entry.name}"
                 )
             try:
@@ -15903,24 +29544,202 @@ def _remove_pending_batch_directory_contents(
                 raise SyncError(
                     f"pending cleanup entry crosses a device boundary: {entry.name}"
                 )
+            planned = _pending_cleanup_entry_plan(metadata)
+            if planned[2] not in {stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK}:
+                raise SyncError(
+                    f"pending cleanup found an unsupported entry: {entry.name}"
+                )
+            active_name = (
+                _pending_regular_publication_private_deletion_alias_base(entry.name)
+                or entry.name
+            )
             active_plan = _pending_cleanup_internal_entry_plan(
-                entry.name,
+                active_name,
                 PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
                 directory_identity,
+            )
+            active_links_plan = None
+            if not relative_parts:
+                active_links_plan = _pending_cleanup_internal_entry_plan(
+                    entry.name,
+                    PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX,
+                    directory_identity,
+                )
+            links_content_root = not relative_parts and (
+                entry.name == "links" or active_links_plan is not None
             )
             entries.append(
                 (
                     entry.name,
-                    active_plan or _pending_cleanup_entry_plan(metadata),
-                    active_plan is not None,
+                    active_links_plan or active_plan or planned,
+                    active_links_plan is not None or active_plan is not None,
+                    links_content_root,
                 )
             )
+    ledger[directory_identity] = tuple(entries)
+    if effective_expected_mode is None:
+        _require_current_user_cleanup_fd_access_policy(
+            directory_fd,
+            display_path,
+        )
+    else:
+        _require_pending_cleanup_fd_access_policy(
+            directory_fd,
+            display_path,
+            expected_mode=effective_expected_mode,
+        )
+
+    directory_flags = _directory_open_flags(nofollow=True)
+    for name, planned, _already_active, links_content_root in entries:
+        if planned[2] != stat.S_IFDIR:
+            continue
+        child_fd = -1
+        try:
+            child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+            child_identity = _directory_identity(child_fd)
+            if child_identity != planned[:2]:
+                raise SyncError(f"pending cleanup child directory changed: {name}")
+            _capture_pending_cleanup_identity_ledger(
+                child_fd,
+                child_identity,
+                root_mount_identity,
+                budget,
+                ledger,
+                depth=depth + 1,
+                relative_parts=(
+                    ("links",) if links_content_root else (*relative_parts, name)
+                ),
+                skipped_names=frozenset(),
+                name_validator=name_validator,
+                directory_expected_mode=directory_expected_mode,
+            )
+        finally:
+            if child_fd >= 0:
+                _close_fd_quietly(child_fd)
+
+
+def _remove_pending_batch_directory_contents(
+    directory_fd: int,
+    directory_identity: tuple[int, int],
+    root_mount_identity: tuple[int, int | None],
+    budget: list[int],
+    *,
+    depth: int,
+    skipped_names: frozenset[str] = frozenset(),
+    relative_parts: tuple[str, ...] = (),
+    identity_ledger: (
+        dict[
+            tuple[int, int],
+            tuple[tuple[str, tuple[int, int, int], bool, bool], ...],
+        ]
+        | None
+    ) = None,
+    name_validator: (
+        Callable[[tuple[str, ...], str, tuple[int, int]], bool] | None
+    ) = None,
+    directory_expected_mode: int | None = 0o700,
+    regular_file_expected_mode: int | None = 0o600,
+) -> None:
+    if depth > MAX_PENDING_CLEANUP_DEPTH:
+        raise SyncError("pending cleanup directory depth exceeds the limit")
+    display_path = Path(
+        f"<pending-cleanup-fd:{directory_identity[0]}:{directory_identity[1]}>"
+    )
+    effective_expected_mode = _cleanup_directory_expected_mode(
+        directory_expected_mode,
+        relative_parts,
+    )
+    if effective_expected_mode is None:
+        _require_current_user_cleanup_fd_access_policy(
+            directory_fd,
+            display_path,
+        )
+    else:
+        _require_pending_cleanup_fd_access_policy(
+            directory_fd,
+            display_path,
+            expected_mode=effective_expected_mode,
+        )
+    if _directory_identity(directory_fd) != directory_identity:
+        raise SyncError("pending cleanup directory identity changed")
+    if _directory_mount_identity(directory_fd) != root_mount_identity:
+        raise SyncError("pending cleanup directory crosses a mount boundary")
+    owns_ledger = identity_ledger is None
+    if identity_ledger is None:
+        identity_ledger = {}
+        _capture_pending_cleanup_identity_ledger(
+            directory_fd,
+            directory_identity,
+            root_mount_identity,
+            budget,
+            identity_ledger,
+            depth=depth,
+            relative_parts=relative_parts,
+            skipped_names=skipped_names,
+            name_validator=name_validator,
+            directory_expected_mode=directory_expected_mode,
+        )
+    planned_entries = identity_ledger.pop(directory_identity, None)
+    if planned_entries is None:
+        raise SyncError("pending cleanup directory is absent from the identity ledger")
+    entries = list(planned_entries)
+    current_entries: dict[str, tuple[int, int, int]] = {}
+    with os.scandir(directory_fd) as iterator:
+        for entry in iterator:
+            if entry.name in skipped_names:
+                continue
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise SyncError(
+                    f"pending cleanup entry changed: {entry.name}"
+                ) from error
+            active_name = (
+                _pending_regular_publication_private_deletion_alias_base(entry.name)
+                or entry.name
+            )
+            active_plan = _pending_cleanup_internal_entry_plan(
+                active_name,
+                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+                directory_identity,
+            )
+            active_links_plan = None
+            if not relative_parts:
+                active_links_plan = _pending_cleanup_internal_entry_plan(
+                    entry.name,
+                    PENDING_CLEANUP_ACTIVE_LINKS_ENTRY_PREFIX,
+                    directory_identity,
+                )
+            current_entries[entry.name] = (
+                active_links_plan
+                or active_plan
+                or _pending_cleanup_entry_plan(metadata)
+            )
+    expected_entries = {
+        name: planned for name, planned, _active, _links_root in entries
+    }
+    if current_entries != expected_entries:
+        raise SyncError(
+            "pending cleanup directory changed after identity-ledger capture; "
+            "the batch was retained without deleting unknown entries"
+        )
+    if effective_expected_mode is None:
+        _require_current_user_cleanup_fd_access_policy(
+            directory_fd,
+            display_path,
+        )
+    else:
+        _require_pending_cleanup_fd_access_policy(
+            directory_fd,
+            display_path,
+            expected_mode=effective_expected_mode,
+        )
 
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     directory_flags |= getattr(os, "O_CLOEXEC", 0)
     directory_flags |= getattr(os, "O_NOFOLLOW", 0)
     mutated = False
-    for name, planned, already_active in entries:
+    for name, planned, already_active, links_content_root in entries:
         if planned[2] not in {
             stat.S_IFDIR,
             stat.S_IFREG,
@@ -15954,6 +29773,7 @@ def _remove_pending_batch_directory_contents(
             name,
             directory_identity,
             planned,
+            links_content_root=links_content_root,
         )
         mutated = True
         if stat.S_ISDIR(current.st_mode):
@@ -15997,6 +29817,13 @@ def _remove_pending_batch_directory_contents(
                     root_mount_identity,
                     budget,
                     depth=depth + 1,
+                    relative_parts=(
+                        ("links",) if links_content_root else (*relative_parts, name)
+                    ),
+                    identity_ledger=identity_ledger,
+                    name_validator=name_validator,
+                    directory_expected_mode=directory_expected_mode,
+                    regular_file_expected_mode=regular_file_expected_mode,
                 )
                 try:
                     current = os.stat(
@@ -16037,6 +29864,51 @@ def _remove_pending_batch_directory_contents(
             finally:
                 _close_fd_quietly(child_fd)
         elif stat.S_ISREG(current.st_mode) or stat.S_ISLNK(current.st_mode):
+            if stat.S_ISREG(current.st_mode):
+                file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                file_flags |= getattr(os, "O_NOFOLLOW", 0)
+                file_flags |= getattr(os, "O_NONBLOCK", 0)
+                file_fd = -1
+                try:
+                    file_fd = os.open(
+                        active_name,
+                        file_flags,
+                        dir_fd=directory_fd,
+                    )
+                    display_path = (
+                        Path("<pending-cleanup-file>") / Path(*relative_parts) / name
+                    )
+                    effective_regular_file_expected_mode = (
+                        _cleanup_regular_file_expected_mode(
+                            regular_file_expected_mode,
+                            relative_parts,
+                            links_content_root=links_content_root,
+                        )
+                    )
+                    if effective_regular_file_expected_mode is None:
+                        opened = _require_current_user_cleanup_fd_access_policy(
+                            file_fd,
+                            display_path,
+                        )
+                    else:
+                        opened = _require_pending_cleanup_fd_access_policy(
+                            file_fd,
+                            display_path,
+                            expected_mode=effective_regular_file_expected_mode,
+                        )
+                    if _pending_cleanup_entry_plan(opened) != planned:
+                        raise SyncError(f"pending cleanup regular file changed: {name}")
+                except BaseException:
+                    _retain_pending_cleanup_entry(
+                        directory_fd,
+                        active_name,
+                        directory_identity,
+                        planned,
+                        label=f"pending cleanup regular file changed: {name}",
+                    )
+                finally:
+                    if file_fd >= 0:
+                        _close_fd_quietly(file_fd)
             try:
                 os.unlink(active_name, dir_fd=directory_fd)
             except OSError:
@@ -16084,20 +29956,2064 @@ def _remove_pending_batch_directory_contents(
                 raise SyncError(
                     f"pending cleanup directory gained an entry: {entry.name}"
                 ) from error
-            active_plan = _pending_cleanup_internal_entry_plan(
-                entry.name,
-                PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
-                directory_identity,
-            )
-            _retain_pending_cleanup_entry(
-                directory_fd,
-                entry.name,
-                directory_identity,
-                active_plan or _pending_cleanup_entry_plan(metadata),
-                label=f"pending cleanup directory gained an entry: {entry.name}",
+            raise SyncError(
+                "pending cleanup directory gained an unknown entry; the batch "
+                f"was retained without deletion: {entry.name}"
             )
     if mutated:
         os.fsync(directory_fd)
+    if effective_expected_mode is None:
+        _require_current_user_cleanup_fd_access_policy(
+            directory_fd,
+            display_path,
+        )
+    else:
+        _require_pending_cleanup_fd_access_policy(
+            directory_fd,
+            display_path,
+            expected_mode=effective_expected_mode,
+        )
+    if owns_ledger and identity_ledger:
+        raise SyncError("pending cleanup identity ledger was not fully consumed")
+
+
+def _pending_terminal_snapshot_matches_expectation(
+    snapshot: RegularFileSnapshot,
+    expectation: PendingRegularTargetExpectation,
+    *,
+    expected_parent_identity: tuple[int, int],
+) -> bool:
+    return (
+        snapshot.parent_identity == expected_parent_identity
+        and snapshot.file_identity == expectation.file_identity
+        and snapshot.sha256 == expectation.sha256
+        and snapshot.size == expectation.size
+        and snapshot.mode == expectation.mode
+        and snapshot.uid == expectation.uid
+        and snapshot.link_count >= 1
+    )
+
+
+def _pending_terminal_recovery_alias_name(index: int) -> str:
+    if index < 0 or index >= MAX_PENDING_LINK_RECORDS:
+        raise SyncError("pending terminal recovery alias index is invalid")
+    return f"{PENDING_CLEANUP_TERMINAL_ALIAS_PREFIX}{index:08d}"
+
+
+def _validate_pending_terminal_target_and_alias(
+    home: Path,
+    bound_batch_root: Path,
+    batch_root_identity: tuple[int, int],
+    expectation: PendingRegularTargetExpectation,
+    alias_name: str,
+) -> None:
+    target = home / Path(*expectation.target.parts)
+    target_snapshot = _read_regular_file_snapshot_beneath(
+        home,
+        target,
+        require_managed_access=False,
+    )
+    if not _pending_terminal_snapshot_matches_expectation(
+        target_snapshot,
+        expectation,
+        expected_parent_identity=expectation.parent_identity,
+    ):
+        raise SyncError(f"final managed regular file changed: {expectation.target}")
+    alias = bound_batch_root / alias_name
+    alias_snapshot = _read_regular_file_snapshot_beneath(
+        home,
+        alias,
+        require_managed_access=False,
+    )
+    if not _pending_terminal_snapshot_matches_expectation(
+        alias_snapshot,
+        expectation,
+        expected_parent_identity=batch_root_identity,
+    ):
+        raise SyncError(
+            f"pending terminal recovery alias changed: {expectation.target}"
+        )
+
+
+def _ensure_pending_terminal_validation_receipt(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    bound_batch_root: Path,
+    batch_fd: int,
+    quarantine_root_identity: tuple[int, int],
+) -> None:
+    if ticket.version != 4 or not ticket.terminal_regular_targets:
+        return
+    existing_receipt = _read_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if existing_receipt is not None:
+        return
+
+    for index, expectation in enumerate(ticket.terminal_regular_targets):
+        alias_name = _pending_terminal_recovery_alias_name(index)
+        alias_identity = _named_entry_identity(batch_fd, alias_name)
+        target = home / Path(*expectation.target.parts)
+        if alias_identity is None:
+            target_parent_fd = _open_directory_beneath(home, target.parent)
+            try:
+                target_state = _read_managed_state_file_snapshot(
+                    home,
+                    target,
+                    target_parent_fd,
+                    expected_identity=expectation.file_identity,
+                    maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                )
+            finally:
+                _close_fd_quietly(target_parent_fd)
+            _publish_regular_hardlink_beneath(
+                home,
+                target,
+                bound_batch_root / alias_name,
+                target_state,
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        elif alias_identity != expectation.file_identity:
+            raise SyncError(
+                f"pending terminal recovery alias changed: {expectation.target}"
+            )
+        _validate_pending_terminal_target_and_alias(
+            home,
+            bound_batch_root,
+            ticket.batch_root_identity,
+            expectation,
+            alias_name,
+        )
+
+    os.fsync(batch_fd)
+    current_ticket = _read_pending_cleanup_ticket(
+        home,
+        ticket.path,
+        expected_ticket_identity=ticket.snapshot.file_identity,
+    )
+    if current_ticket is None or not _pending_cleanup_ticket_matches(
+        current_ticket,
+        ticket,
+    ):
+        raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
+    _publish_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    for index, expectation in enumerate(ticket.terminal_regular_targets):
+        _validate_pending_terminal_target_and_alias(
+            home,
+            bound_batch_root,
+            ticket.batch_root_identity,
+            expectation,
+            _pending_terminal_recovery_alias_name(index),
+        )
+
+
+def _pending_cleanup_terminal_validation_payload(
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> bytes:
+    if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
+        raise SyncError("pending cleanup ticket has no validation identity")
+    if ticket.version == 6:
+        if (
+            ticket.kind != "ephemeral-quarantine-leaf"
+            or ticket.public_target is None
+            or ticket.public_parent_identity is None
+            or ticket.payload_file_identity is None
+            or ticket.quarantine_root_identity != quarantine_root_identity
+        ):
+            raise SyncError("pending ephemeral cleanup has no private-phase authority")
+        return _bounded_json_document(
+            {
+                "version": 1,
+                "phase": "ephemeral-private-isolated",
+                "batch": ticket.batch_root.name,
+                "quarantine_root_identity": _identity_payload(quarantine_root_identity),
+                "public_target": ticket.public_target.as_posix(),
+                "public_parent_identity": _identity_payload(
+                    ticket.public_parent_identity
+                ),
+                "payload_file_identity": _identity_payload(
+                    ticket.payload_file_identity
+                ),
+                "ticket_identity": _identity_payload(ticket.snapshot.file_identity),
+                "ticket_sha256": hashlib.sha256(ticket.snapshot.payload).hexdigest(),
+            },
+            max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            overflow_error="pending cleanup validation receipt exceeds the size limit",
+        )
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "phase": "terminal-validation",
+            "batch": ticket.batch_root.name,
+            "batch_root_identity": _identity_payload(ticket.batch_root_identity),
+            "quarantine_root_identity": _identity_payload(quarantine_root_identity),
+            "ticket_identity": _identity_payload(ticket.snapshot.file_identity),
+            "ticket_sha256": hashlib.sha256(ticket.snapshot.payload).hexdigest(),
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup validation receipt exceeds the size limit",
+    )
+
+
+def _read_pending_cleanup_terminal_validation(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot | None:
+    receipt_path = _pending_cleanup_terminal_validation_path(
+        home,
+        ticket.batch_root.name,
+    )
+    index_fd = _open_directory_beneath(home, receipt_path.parent)
+    try:
+        receipt = _read_managed_state_file_snapshot(
+            home,
+            receipt_path,
+            index_fd,
+        )
+        if not receipt.exists:
+            return None
+        if (
+            receipt.file_type != stat.S_IFREG
+            or receipt.mode != 0o600
+            or receipt.uid != os.geteuid()
+            or receipt.payload
+            != _pending_cleanup_terminal_validation_payload(
+                ticket,
+                quarantine_root_identity,
+            )
+            or receipt.parent_identity != _directory_identity(index_fd)
+        ):
+            raise SyncError(
+                f"pending cleanup terminal validation changed: {ticket.batch_root.name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            receipt_path,
+            index_fd,
+            receipt,
+        )
+        return receipt
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _publish_pending_cleanup_terminal_validation(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot:
+    existing = _read_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if existing is not None:
+        return existing
+    receipt_path = _pending_cleanup_terminal_validation_path(
+        home,
+        ticket.batch_root.name,
+    )
+    receipt = _publish_atomic_exclusive_internal_file(
+        home,
+        receipt_path,
+        _pending_cleanup_terminal_validation_payload(
+            ticket,
+            quarantine_root_identity,
+        ),
+    )
+    verified = _read_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if verified is None or not _managed_state_snapshot_matches_bound_file_evidence(
+        verified,
+        receipt,
+    ):
+        raise SyncError(
+            "pending cleanup terminal validation changed after publication: "
+            f"{ticket.batch_root.name}"
+        )
+    return verified
+
+
+def _delete_pending_cleanup_terminal_validation(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+    *,
+    mutation_revalidator: Callable[[str, int], None] | None = None,
+) -> None:
+    receipt = _read_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if receipt is None:
+        return
+    receipt_path = _pending_cleanup_terminal_validation_path(
+        home,
+        ticket.batch_root.name,
+    )
+    index_fd = _open_directory_beneath(home, receipt_path.parent)
+    try:
+
+        def revalidate_mutation(receipt_member: str) -> None:
+            if mutation_revalidator is not None:
+                mutation_revalidator(receipt_member, index_fd)
+
+        label = f"pending cleanup terminal validation {ticket.batch_root.name}"
+        if mutation_revalidator is None:
+            # Preserve the historical generic-helper call shape for v4 and
+            # test/mirror compatibility; only v6 needs the expanded boundary.
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                receipt_path,
+                index_fd,
+                receipt,
+                label=label,
+            )
+        else:
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                receipt_path,
+                index_fd,
+                receipt,
+                label=label,
+                mutation_revalidator=revalidate_mutation,
+            )
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _pending_cleanup_empty_proof_payload(
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> bytes:
+    if ticket.snapshot.file_identity is None or ticket.snapshot.payload is None:
+        raise SyncError("pending cleanup ticket has no empty-proof identity")
+    return _bounded_json_document(
+        {
+            "version": 1,
+            "batch": ticket.batch_root.name,
+            "batch_root_identity": _identity_payload(ticket.batch_root_identity),
+            "quarantine_root_identity": _identity_payload(quarantine_root_identity),
+            "isolated_name": _pending_cleanup_isolated_batch_name(
+                ticket.batch_root.name
+            ),
+            "ticket_identity": _identity_payload(ticket.snapshot.file_identity),
+            "ticket_sha256": hashlib.sha256(ticket.snapshot.payload).hexdigest(),
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup empty proof exceeds the size limit",
+    )
+
+
+def _read_pending_cleanup_empty_proof(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot | None:
+    proof_path = _pending_cleanup_empty_proof_path(
+        home,
+        ticket.batch_root.name,
+    )
+    index_fd = _open_directory_beneath(home, proof_path.parent)
+    try:
+        proof = _read_managed_state_file_snapshot(
+            home,
+            proof_path,
+            index_fd,
+        )
+        if not proof.exists:
+            return None
+        expected_payload = _pending_cleanup_empty_proof_payload(
+            ticket,
+            quarantine_root_identity,
+        )
+        if (
+            proof.file_type != stat.S_IFREG
+            or proof.mode != 0o600
+            or proof.uid != os.geteuid()
+            or proof.payload != expected_payload
+            or proof.parent_identity != _directory_identity(index_fd)
+        ):
+            raise SyncError(
+                f"pending cleanup empty proof changed: {ticket.batch_root.name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            proof_path,
+            index_fd,
+            proof,
+        )
+        return proof
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _publish_pending_cleanup_empty_proof(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> ManagedStateFileSnapshot:
+    existing = _read_pending_cleanup_empty_proof(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if existing is not None:
+        return existing
+    proof_path = _pending_cleanup_empty_proof_path(
+        home,
+        ticket.batch_root.name,
+    )
+    proof = _publish_atomic_exclusive_internal_file(
+        home,
+        proof_path,
+        _pending_cleanup_empty_proof_payload(
+            ticket,
+            quarantine_root_identity,
+        ),
+    )
+    verified = _read_pending_cleanup_empty_proof(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    if verified is None or not _managed_state_snapshot_matches_bound_file_evidence(
+        verified,
+        proof,
+    ):
+        raise SyncError(
+            f"pending cleanup empty proof changed after publication: "
+            f"{ticket.batch_root.name}"
+        )
+    return verified
+
+
+def _delete_pending_cleanup_empty_proof(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root_identity: tuple[int, int],
+) -> None:
+    proof_path = _pending_cleanup_empty_proof_path(
+        home,
+        ticket.batch_root.name,
+    )
+    index_fd = _open_directory_beneath(home, proof_path.parent)
+    try:
+        joined_allocation = (
+            _read_joined_quarantine_allocation_for_cleanup(home, ticket)
+            if ticket.version in {5, 7}
+            else None
+        )
+        # v5/v7 retire an allocation after the proof is gone.  A canonical
+        # ticket may have just been deleted while a retained or suffix-added
+        # representation of its exact bytes remains.  Such a representation is
+        # blocking evidence only: it must never gain recovery or deletion
+        # authority, but the proof must survive so canonical recovery does not
+        # lose its exact empty-batch evidence.
+        mutation_revalidator: Callable[[str], None] | None = None
+        if ticket.version in {5, 7}:
+
+            def revalidate_ticket_representations(_proof_member: str) -> None:
+                _require_pending_ephemeral_ticket_representations_absent(
+                    home,
+                    proof_path.parent,
+                    index_fd,
+                    ticket.batch_root.name,
+                )
+                _require_joined_quarantine_allocation_unchanged(
+                    home,
+                    ticket,
+                    joined_allocation,
+                )
+
+            mutation_revalidator = revalidate_ticket_representations
+            mutation_revalidator(proof_path.name)
+
+        proof = _read_pending_cleanup_empty_proof(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
+        if proof is None:
+            return
+        _isolate_and_delete_pending_cleanup_file(
+            home,
+            proof_path,
+            index_fd,
+            proof,
+            label=f"pending cleanup empty proof {ticket.batch_root.name}",
+            mutation_revalidator=mutation_revalidator,
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _read_pending_ephemeral_metadata_snapshot(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    bound_batch_root: Path,
+    batch_fd: int,
+    name: str,
+) -> ManagedStateFileSnapshot:
+    if (
+        ticket.metadata_file_identity is None
+        or ticket.metadata_mode != 0o600
+        or ticket.metadata_sha256 is None
+    ):
+        raise SyncError("pending ephemeral cleanup authority is incomplete")
+    path = bound_batch_root / name
+    snapshot = _read_managed_state_file_snapshot(
+        home,
+        path,
+        batch_fd,
+        expected_identity=ticket.metadata_file_identity,
+        maximum_bytes=MAX_MANAGED_STATE_BYTES,
+    )
+    if (
+        not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+        or snapshot.parent_identity != ticket.batch_root_identity
+        or snapshot.file_type != stat.S_IFREG
+        or snapshot.mode != ticket.metadata_mode
+        or (ticket.metadata_size is not None and snapshot.size != ticket.metadata_size)
+        or snapshot.uid != os.geteuid()
+        or snapshot.payload is None
+        or hashlib.sha256(snapshot.payload).hexdigest() != ticket.metadata_sha256
+    ):
+        raise SyncError(
+            f"pending ephemeral quarantine metadata changed: {ticket.batch_root.name}"
+        )
+    _require_pending_cleanup_file_snapshot_access_policy(
+        home,
+        path,
+        batch_fd,
+        snapshot,
+    )
+    return snapshot
+
+
+def _pending_ephemeral_batch_members(
+    batch_fd: int,
+    batch_name: str,
+) -> tuple[tuple[str, ...], str | None]:
+    names = _directory_member_names(
+        batch_fd,
+        maximum_entries=4,
+        overflow_message="pending ephemeral quarantine batch has too many entries",
+    )
+    retained_metadata = tuple(
+        name
+        for name in names
+        if _pending_cleanup_retained_canonical_name(name) == "metadata.json"
+    )
+    if len(retained_metadata) > 1:
+        raise SyncError(
+            f"pending ephemeral quarantine metadata has multiple retained names: "
+            f"{batch_name}"
+        )
+    batch_identity = _directory_identity(batch_fd)
+    active_directories: list[str] = []
+    for name in names:
+        if name.startswith(PENDING_CLEANUP_RETAINED_ENTRY_PREFIX):
+            raise SyncError(
+                "pending ephemeral quarantine has retained directory evidence: "
+                f"{batch_name}: {name}"
+            )
+        if not name.startswith(PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX):
+            continue
+        active_plan = _pending_cleanup_internal_entry_plan(
+            name,
+            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX,
+            batch_identity,
+        )
+        if active_plan is None or active_plan[2] != stat.S_IFDIR:
+            raise SyncError(
+                "pending ephemeral quarantine has malformed directory evidence: "
+                f"{batch_name}: {name}"
+            )
+        active_directories.append(name)
+    if len(active_directories) > 1:
+        raise SyncError(
+            "pending ephemeral quarantine has ambiguous directory evidence: "
+            f"{batch_name}"
+        )
+    retained_name = retained_metadata[0] if retained_metadata else None
+    allowed = {"leaf", "metadata.json"}
+    if retained_name is not None:
+        allowed.add(retained_name)
+    allowed.update(active_directories)
+    unknown = tuple(name for name in names if name not in allowed)
+    if unknown:
+        raise SyncError(
+            "pending ephemeral quarantine batch has an unknown member and was "
+            f"retained: {batch_name}: {unknown[0]}"
+        )
+    if "metadata.json" in names and retained_name is not None:
+        raise SyncError(
+            f"pending ephemeral quarantine metadata has canonical and retained "
+            f"names: {batch_name}"
+        )
+    return names, retained_name
+
+
+def _pending_cleanup_directory_tombstone_name(
+    parent_fd: int,
+    names: tuple[str, ...],
+    expected_identity: tuple[int, int],
+    *,
+    reject_unrelated: bool,
+    label: str,
+) -> str | None:
+    """Resolve one exact active-directory tombstone or fail on competition."""
+    parent_identity = _directory_identity(parent_fd)
+    expected_plan = (expected_identity[0], expected_identity[1], stat.S_IFDIR)
+    matches: list[str] = []
+    for name in names:
+        is_active = name.startswith(PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+        is_retained = name.startswith(PENDING_CLEANUP_RETAINED_ENTRY_PREFIX)
+        if not is_active and not is_retained:
+            continue
+        prefix = (
+            PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX
+            if is_active
+            else PENDING_CLEANUP_RETAINED_ENTRY_PREFIX
+        )
+        encoded_plan = _pending_cleanup_internal_entry_plan(
+            name,
+            prefix,
+            parent_identity,
+        )
+        actual_identity = _named_entry_identity(parent_fd, name)
+        if encoded_plan is None:
+            raise SyncError(f"{label} has malformed private directory evidence")
+        if is_retained and (
+            encoded_plan == expected_plan or actual_identity == expected_identity
+        ):
+            raise SyncError(f"{label} has retained private directory evidence")
+        if is_active and encoded_plan == expected_plan:
+            if actual_identity != expected_identity:
+                raise SyncError(f"{label} private directory evidence changed")
+            matches.append(name)
+            continue
+        if actual_identity == expected_identity or reject_unrelated:
+            raise SyncError(f"{label} has competing private directory evidence")
+    if len(matches) > 1:
+        raise SyncError(f"{label} has ambiguous private directory evidence")
+    return matches[0] if matches else None
+
+
+def _pending_ephemeral_batch_root_binding(
+    quarantine_fd: int,
+    batch_name: str,
+    isolated_name: str,
+    expected_identity: tuple[int, int],
+) -> tuple[str, tuple[int, int]] | None:
+    names = _directory_member_names(
+        quarantine_fd,
+        maximum_entries=MAX_PENDING_CLEANUP_BATCH_SCAN,
+        overflow_message="pending cleanup quarantine root exceeds the scan limit",
+    )
+    private_name = _pending_cleanup_directory_tombstone_name(
+        quarantine_fd,
+        names,
+        expected_identity,
+        reject_unrelated=False,
+        label=f"pending ephemeral quarantine batch {batch_name}",
+    )
+    candidates: list[tuple[str, tuple[int, int]]] = []
+    for name in (batch_name, isolated_name):
+        identity = _named_entry_identity(quarantine_fd, name)
+        if identity is not None:
+            candidates.append((name, identity))
+    if len(candidates) == 2:
+        raise SyncError(
+            "pending ephemeral quarantine has canonical and isolated roots: "
+            f"{batch_name}"
+        )
+    if private_name is not None:
+        candidates.append((private_name, expected_identity))
+    if len(candidates) > 1:
+        raise SyncError(
+            "pending ephemeral quarantine batch changed before removal: "
+            f"{batch_name}: namespace is ambiguous"
+        )
+    return candidates[0] if candidates else None
+
+
+def _pending_ephemeral_leaf_binding(
+    batch_fd: int,
+    names: tuple[str, ...],
+    batch_name: str,
+    expected_identity: tuple[int, int],
+) -> tuple[str, tuple[int, int]] | None:
+    private_name = _pending_cleanup_directory_tombstone_name(
+        batch_fd,
+        names,
+        expected_identity,
+        reject_unrelated=True,
+        label=f"pending ephemeral quarantine leaf {batch_name}",
+    )
+    candidates: list[tuple[str, tuple[int, int]]] = []
+    canonical_identity = _named_entry_identity(batch_fd, "leaf")
+    if canonical_identity is not None:
+        candidates.append(("leaf", canonical_identity))
+    if private_name is not None:
+        candidates.append((private_name, expected_identity))
+    if len(candidates) > 1:
+        raise SyncError(
+            f"pending ephemeral quarantine leaf namespace is ambiguous: {batch_name}"
+        )
+    return candidates[0] if candidates else None
+
+
+def _require_pending_ephemeral_metadata_cleanup_boundary(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+    quarantine_root: Path,
+    quarantine_fd: int,
+    bound_batch_root: Path,
+    bound_name: str,
+    batch_fd: int,
+    metadata_name: str,
+) -> None:
+    """Reprove v5/v7 authority at a metadata rename or unlink boundary.
+
+    Protected properties are ticket identity/content, root and batch identity,
+    canonical-or-isolated path membership, owner-only access policy, and exact
+    batch members.  In particular, leaf absence is rechecked here rather than
+    only by the recovery caller before entering the generic deletion helper.
+    """
+    batch_name = ticket.batch_root.name
+    isolated_name = ticket.isolated_name
+    if isolated_name is None:
+        raise SyncError("pending ephemeral cleanup isolated name is missing")
+    _require_pending_cleanup_ticket_unchanged(home, ticket)
+    _require_pending_cleanup_fd_access_policy(
+        quarantine_fd,
+        quarantine_root,
+        expected_mode=0o700,
+    )
+    _require_pending_cleanup_fd_access_policy(
+        batch_fd,
+        bound_batch_root,
+        expected_mode=0o700,
+    )
+    canonical_identity = _named_entry_identity(quarantine_fd, batch_name)
+    isolated_identity = _named_entry_identity(quarantine_fd, isolated_name)
+    expected_root_names = (
+        canonical_identity == ticket.batch_root_identity and isolated_identity is None
+        if bound_name == batch_name
+        else canonical_identity is None
+        and isolated_identity == ticket.batch_root_identity
+    )
+    names, retained_metadata_name = _pending_ephemeral_batch_members(
+        batch_fd,
+        batch_name,
+    )
+    expected_retained_name = None if metadata_name == "metadata.json" else metadata_name
+    if any(
+        name == "leaf" or name.startswith(PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+        for name in names
+    ):
+        raise SyncError(
+            f"pending ephemeral scaffold leaf appeared before metadata mutation: "
+            f"{batch_name}"
+        )
+    if (
+        not expected_root_names
+        or _directory_identity(quarantine_fd) != ticket.quarantine_root_identity
+        or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+        or _directory_identity(batch_fd) != ticket.batch_root_identity
+        or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+        or names != (metadata_name,)
+        or retained_metadata_name != expected_retained_name
+    ):
+        raise SyncError(
+            "pending ephemeral quarantine namespace changed before metadata "
+            f"mutation: {batch_name}"
+        )
+    # Ticket policy/content may change while the filesystem namespace is being
+    # sampled.  Make its exact second read the final external authority check.
+    _require_pending_cleanup_ticket_unchanged(home, ticket)
+
+
+def _require_pending_cleanup_ticket_unchanged(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+) -> None:
+    current = _read_pending_cleanup_ticket(
+        home,
+        ticket.path,
+        expected_ticket_identity=ticket.snapshot.file_identity,
+    )
+    if current is None or not _pending_cleanup_ticket_matches(current, ticket):
+        raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
+
+
+def _pending_ephemeral_quarantine_leaf_expectation(
+    ticket: PendingBatchCleanupTicket,
+) -> RegularFileSnapshot:
+    if (
+        ticket.public_parent_identity is None
+        or ticket.payload_file_identity is None
+        or ticket.payload_sha256 is None
+        or ticket.payload_size is None
+        or ticket.payload_mode is None
+        or ticket.payload_uid is None
+        or ticket.payload_gid is None
+        or ticket.payload_link_count is None
+    ):
+        raise SyncError("pending ephemeral leaf cleanup authority is incomplete")
+    return RegularFileSnapshot(
+        parent_identity=ticket.public_parent_identity,
+        file_identity=ticket.payload_file_identity,
+        sha256=ticket.payload_sha256,
+        size=ticket.payload_size,
+        mode=ticket.payload_mode,
+        uid=ticket.payload_uid,
+        gid=ticket.payload_gid,
+        link_count=ticket.payload_link_count,
+    )
+
+
+def _remove_pending_ephemeral_quarantine_leaf(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+) -> bool:
+    """Resume one exact receiptless publication cleanup.
+
+    Object identity, content stability, link count and access policy are bound
+    in the durable ticket before mutation. Before the exact inode is unlinked,
+    an immutable private-phase receipt binds that ticket and inode after private
+    isolation. Its continued presence makes a crash after unlink distinguishable
+    from the initial public state. A foreign canonical or alias observed before
+    exact private isolation is evacuated from a loadable pathname and retained
+    as private evidence; once exact private isolation is observable, later
+    public entries are outside cleanup authority and remain in place.
+    """
+    if (
+        ticket.version != 6
+        or ticket.kind != "ephemeral-quarantine-leaf"
+        or ticket.quarantine_root_identity is None
+        or ticket.public_target is None
+    ):
+        raise SyncError("pending ephemeral leaf cleanup authority is incomplete")
+    expected = _pending_ephemeral_quarantine_leaf_expectation(ticket)
+    batch_name = ticket.batch_root.name
+    alias_names = _pending_ephemeral_public_alias_names(batch_name)
+    evidence_names = _pending_ephemeral_quarantine_evidence_names(batch_name)
+    target = home / Path(*ticket.public_target.parts)
+    quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+    public_parent_fd = -1
+    quarantine_fd = -1
+
+    def require_bound_parents() -> None:
+        _require_managed_regular_parent_chain_access(
+            home,
+            target.parent,
+            bound_parent_fd=public_parent_fd,
+        )
+        if _directory_identity(
+            public_parent_fd
+        ) != expected.parent_identity or not _bound_directory_matches(
+            home, target.parent, public_parent_fd
+        ):
+            raise SyncError(
+                f"pending ephemeral cleanup public parent changed: {target.parent}"
+            )
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        if _directory_identity(
+            quarantine_fd
+        ) != ticket.quarantine_root_identity or not _bound_directory_matches(
+            home, quarantine_root, quarantine_fd
+        ):
+            raise SyncError("pending cleanup quarantine root changed")
+
+    def public_inventory() -> tuple[
+        tuple[int, int] | None,
+        tuple[tuple[str, tuple[int, int]], ...],
+    ]:
+        canonical = _named_entry_identity(public_parent_fd, target.name)
+        aliases = tuple(
+            (name, identity)
+            for name in alias_names
+            if (identity := _named_entry_identity(public_parent_fd, name)) is not None
+        )
+        return canonical, aliases
+
+    def private_inventory() -> tuple[tuple[str, tuple[int, int]], ...]:
+        return _pending_ephemeral_quarantine_private_inventory(
+            quarantine_fd,
+            batch_name,
+        )
+
+    def require_phase_receipt_unchanged(
+        expected_receipt: ManagedStateFileSnapshot,
+    ) -> None:
+        current_receipt = _read_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            ticket.quarantine_root_identity,
+        )
+        if current_receipt is None or not (
+            _managed_state_snapshot_matches_bound_file_evidence(
+                current_receipt,
+                expected_receipt,
+            )
+        ):
+            raise SyncError(
+                "pending ephemeral cleanup private-phase receipt changed before "
+                f"payload deletion: {batch_name}"
+            )
+
+    def public_evacuation_snapshot(
+        name: str,
+        identity: tuple[int, int],
+        *,
+        label: str,
+        exact: bool,
+    ) -> RegularFileSnapshot:
+        """Capture complete, descriptor-bound evidence before a public rename.
+
+        The protected leaf properties are object identity, regular-file type,
+        content digest and size, mode/UID access policy, policy-relevant GID,
+        and exact link count. The parent property is its bound identity and
+        owner-controlled access policy; directory ctime and child-entry churn
+        are deliberately not mutation evidence.
+        """
+        path = target.with_name(name)
+        try:
+            current = _regular_file_snapshot_at(
+                public_parent_fd,
+                name,
+                path,
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        except (OSError, SyncError) as error:
+            raise SyncError(
+                f"pending ephemeral cleanup {label} payload cannot be verified "
+                f"before evacuation: {batch_name}"
+            ) from error
+        if (
+            current.parent_identity != expected.parent_identity
+            or current.file_identity != identity
+            or current.uid != os.geteuid()
+            or current.mode & 0o022
+            or (
+                exact
+                and not _regular_snapshot_matches(
+                    current,
+                    expected.parent_identity,
+                    expected,
+                    expected_link_count=expected.link_count,
+                )
+            )
+        ):
+            raise SyncError(
+                f"pending ephemeral cleanup {label} payload changed before "
+                f"evacuation: {batch_name}"
+            )
+        return current
+
+    def require_public_evacuation_unchanged(
+        name: str,
+        identity: tuple[int, int],
+        captured: RegularFileSnapshot,
+        *,
+        label: str,
+        exact: bool,
+    ) -> RegularFileSnapshot:
+        current = public_evacuation_snapshot(
+            name,
+            identity,
+            label=label,
+            exact=exact,
+        )
+        if not _regular_snapshot_matches(
+            current,
+            expected.parent_identity,
+            captured,
+            expected_link_count=captured.link_count,
+        ):
+            raise SyncError(
+                f"pending ephemeral cleanup {label} payload changed before "
+                f"evacuation: {batch_name}"
+            )
+        return current
+
+    def require_evacuation_destination(
+        destination_parent_fd: int,
+        destination_parent_identity: tuple[int, int],
+        destination: str,
+        captured: RegularFileSnapshot,
+        *,
+        label: str,
+        allow_public_alias_recovery: bool = False,
+    ) -> bool:
+        destination_path = (
+            target.with_name(destination)
+            if destination_parent_fd == public_parent_fd
+            else quarantine_root / destination
+        )
+        try:
+            moved = _regular_file_snapshot_at(
+                destination_parent_fd,
+                destination,
+                destination_path,
+                maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+            )
+        except (OSError, SyncError) as error:
+            raise SyncError(
+                f"pending ephemeral cleanup {label} evacuation cannot be "
+                f"verified: {batch_name}"
+            ) from error
+        if moved.parent_identity != destination_parent_identity:
+            raise SyncError(
+                f"pending ephemeral cleanup {label} evacuation changed: {batch_name}"
+            )
+        if (
+            not _regular_snapshot_leaf_matches(moved, captured)
+            or moved.link_count != captured.link_count
+        ):
+            if allow_public_alias_recovery:
+                # The caller moved into a non-loadable public alias. Keep the
+                # replacement intact, then re-inventory it so the ordinary
+                # alias-to-private path can preserve it as private evidence.
+                # A changed destination parent is never recoverable here.
+                return False
+            raise SyncError(
+                f"pending ephemeral cleanup {label} replacement was retained as "
+                f"isolated evidence: {batch_name}"
+            )
+        return True
+
+    def move_canonical_to_safe_name(
+        identity: tuple[int, int],
+        *,
+        exact: bool,
+    ) -> None:
+        for _evacuation_attempt in range(128):
+            destination_parent_fd = public_parent_fd
+            destination_parent_identity = expected.parent_identity
+            destination = next(
+                (
+                    name
+                    for name in alias_names
+                    if _named_entry_identity(public_parent_fd, name) is None
+                ),
+                None,
+            )
+            if destination is None:
+                # Every bounded non-loadable public alias may legitimately be
+                # occupied by foreign evidence. Never overwrite or delete it:
+                # move the exact ticket-bound canonical directly into a
+                # collision-resistant final-private name. That name is already
+                # recognized by v6 recovery after a crash before receipt
+                # publication.
+                destination_parent_fd = quarantine_fd
+                destination_parent_identity = ticket.quarantine_root_identity
+                destination = _pending_ephemeral_quarantine_final_private_name(
+                    evidence_names[0]
+                )
+
+            captured = public_evacuation_snapshot(
+                target.name,
+                identity,
+                label="canonical",
+                exact=exact,
+            )
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            require_bound_parents()
+            captured = require_public_evacuation_unchanged(
+                target.name,
+                identity,
+                captured,
+                label="canonical",
+                exact=exact,
+            )
+            # Hashing the full descriptor-bound leaf can take time. Rebind
+            # both authority parents and the ticket immediately before the
+            # namespace mutation rather than relying on the pre-hash sample.
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            require_bound_parents()
+            try:
+                _rename_noreplace_at(
+                    public_parent_fd,
+                    target.name,
+                    destination_parent_fd,
+                    destination,
+                )
+            except FileExistsError:
+                # A same-UID competitor may reserve the selected public alias
+                # or private evidence name after the last scan. Preserve that
+                # entry and choose a fresh bounded no-replace destination.
+                continue
+            except FileNotFoundError as error:
+                raise SyncError(
+                    "pending ephemeral cleanup canonical payload disappeared "
+                    f"during evacuation: {batch_name}"
+                ) from error
+
+            if destination_parent_fd != public_parent_fd:
+                # Persist the private addition before the public removal. If
+                # the second fsync reports an error, recovery can observe a
+                # durable private exact inode (and safely retain any replayed
+                # public duplicate) rather than losing both names.
+                os.fsync(quarantine_fd)
+            os.fsync(public_parent_fd)
+            require_bound_parents()
+            destination_matches = require_evacuation_destination(
+                destination_parent_fd,
+                destination_parent_identity,
+                destination,
+                captured,
+                label="canonical",
+                allow_public_alias_recovery=(destination_parent_fd == public_parent_fd),
+            )
+            if not destination_matches:
+                # The replacement is safely non-loadable at this point. The
+                # outer reconciliation loop will snapshot it afresh and move
+                # it to private quarantine without deleting any evidence.
+                return
+            return
+        raise SyncError(
+            "pending ephemeral cleanup could not allocate a safe canonical "
+            f"evacuation name: {batch_name}"
+        )
+
+    def move_alias_to_private(name: str, identity: tuple[int, int]) -> None:
+        for _evacuation_attempt in range(128):
+            destination = next(
+                (
+                    candidate
+                    for candidate in evidence_names
+                    if _named_entry_identity(quarantine_fd, candidate) is None
+                ),
+                None,
+            )
+            if destination is None:
+                destination = _pending_ephemeral_quarantine_retained_private_name(
+                    batch_name
+                )
+            captured = public_evacuation_snapshot(
+                name,
+                identity,
+                label="alias",
+                exact=False,
+            )
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            require_bound_parents()
+            captured = require_public_evacuation_unchanged(
+                name,
+                identity,
+                captured,
+                label="alias",
+                exact=False,
+            )
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            require_bound_parents()
+            try:
+                _rename_noreplace_at(
+                    public_parent_fd,
+                    name,
+                    quarantine_fd,
+                    destination,
+                )
+            except FileExistsError:
+                continue
+            except FileNotFoundError as error:
+                raise SyncError(
+                    "pending ephemeral cleanup alias payload disappeared during "
+                    f"evacuation: {batch_name}"
+                ) from error
+            os.fsync(quarantine_fd)
+            os.fsync(public_parent_fd)
+            require_bound_parents()
+            require_evacuation_destination(
+                quarantine_fd,
+                ticket.quarantine_root_identity,
+                destination,
+                captured,
+                label="alias",
+            )
+            return
+        raise SyncError(
+            "pending ephemeral cleanup could not allocate private evidence: "
+            f"{batch_name}"
+        )
+
+    def private_expected_snapshots(
+        private: tuple[tuple[str, tuple[int, int]], ...],
+    ) -> tuple[tuple[str, RegularFileSnapshot], ...]:
+        snapshots: list[tuple[str, RegularFileSnapshot]] = []
+        for name, identity in private:
+            if identity != expected.file_identity:
+                continue
+            try:
+                current = _regular_file_snapshot_at(
+                    quarantine_fd,
+                    name,
+                    quarantine_root / name,
+                    maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                )
+            except (OSError, SyncError) as error:
+                raise SyncError(
+                    "pending ephemeral cleanup private payload cannot be verified: "
+                    f"{batch_name}"
+                ) from error
+            if (
+                current.parent_identity != ticket.quarantine_root_identity
+                or not _regular_snapshot_leaf_matches(current, expected)
+            ):
+                raise SyncError(
+                    f"pending ephemeral cleanup private payload changed: {batch_name}"
+                )
+            snapshots.append((name, current))
+        return tuple(snapshots)
+
+    def receipt_private_snapshots(
+        private: tuple[tuple[str, tuple[int, int]], ...],
+    ) -> tuple[tuple[str, RegularFileSnapshot], ...]:
+        return tuple(
+            (name, snapshot)
+            for name, snapshot in private_expected_snapshots(private)
+            if (
+                name in evidence_names
+                or _pending_ephemeral_quarantine_final_private_base(batch_name, name)
+                is not None
+            )
+            and snapshot.link_count == expected.link_count
+        )
+
+    def no_public_exact_payload(
+        canonical_identity: tuple[int, int] | None,
+        aliases: tuple[tuple[str, tuple[int, int]], ...],
+    ) -> bool:
+        return canonical_identity != expected.file_identity and all(
+            identity != expected.file_identity for _name, identity in aliases
+        )
+
+    try:
+        public_parent_fd = _open_directory_beneath(home, target.parent)
+        quarantine_fd = _open_directory_beneath(home, quarantine_root)
+        for _attempt in range(32):
+            require_bound_parents()
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            private = private_inventory()
+            canonical_identity, aliases = public_inventory()
+            phase_receipt = _read_pending_cleanup_terminal_validation(
+                home,
+                ticket,
+                ticket.quarantine_root_identity,
+            )
+
+            # A crash can land after the cross-directory rename and before the
+            # receipt publication. Before acknowledging private authority,
+            # prove the complete ticket snapshot and link count from the
+            # private descriptor and prove that its inode is absent from every
+            # derived public name. Foreign public evidence may remain, but it
+            # never supplies ticket authority.
+            receipt_private = (
+                receipt_private_snapshots(private) if phase_receipt is None else ()
+            )
+            if (
+                phase_receipt is None
+                and len(receipt_private) == 1
+                and no_public_exact_payload(canonical_identity, aliases)
+            ):
+                _require_pending_cleanup_ticket_unchanged(home, ticket)
+                require_bound_parents()
+                refreshed_private = private_inventory()
+                refreshed_receipt_private = receipt_private_snapshots(refreshed_private)
+                refreshed_canonical, refreshed_aliases = public_inventory()
+                _require_pending_cleanup_ticket_unchanged(home, ticket)
+                require_bound_parents()
+                if len(refreshed_receipt_private) == 1 and no_public_exact_payload(
+                    refreshed_canonical,
+                    refreshed_aliases,
+                ):
+                    _publish_pending_cleanup_terminal_validation(
+                        home,
+                        ticket,
+                        ticket.quarantine_root_identity,
+                    )
+                    continue
+                private = refreshed_private
+                canonical_identity, aliases = (
+                    refreshed_canonical,
+                    refreshed_aliases,
+                )
+            if phase_receipt is not None:
+                if canonical_identity is not None:
+                    raise SyncError(
+                        "pending ephemeral cleanup public canonical reappeared "
+                        "after private isolation and was retained in place: "
+                        f"{target}"
+                    )
+                if aliases:
+                    raise SyncError(
+                        "pending ephemeral cleanup public alias reappeared after "
+                        "private isolation and was retained in place: "
+                        f"{target.with_name(aliases[0][0])}"
+                    )
+                if len(private) > 1 or (
+                    private
+                    and (
+                        private[0][1] != expected.file_identity
+                        or (
+                            private[0][0] not in evidence_names
+                            and _pending_ephemeral_quarantine_final_private_base(
+                                batch_name,
+                                private[0][0],
+                            )
+                            is None
+                        )
+                    )
+                ):
+                    raise SyncError(
+                        "pending ephemeral cleanup retained replacement as isolated "
+                        f"evidence after private isolation: {batch_name}"
+                    )
+                if not private:
+                    break
+
+                quarantine_name, _private_identity = private[0]
+                quarantine_path = quarantine_root / quarantine_name
+                current = _regular_file_snapshot_at(
+                    quarantine_fd,
+                    quarantine_name,
+                    quarantine_path,
+                    maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                )
+                if (
+                    not _regular_snapshot_leaf_matches(current, expected)
+                    or current.link_count != expected.link_count
+                ):
+                    raise SyncError(
+                        f"pending ephemeral cleanup private payload changed: "
+                        f"{batch_name}"
+                    )
+                final_private_base = _pending_ephemeral_quarantine_final_private_base(
+                    batch_name,
+                    quarantine_name,
+                )
+                if final_private_base is None:
+                    deletion_name: str | None = None
+                    for _isolation_attempt in range(128):
+                        candidate = _pending_ephemeral_quarantine_final_private_name(
+                            quarantine_name
+                        )
+                        require_bound_parents()
+                        final_snapshot = _regular_file_snapshot_at(
+                            quarantine_fd,
+                            quarantine_name,
+                            quarantine_path,
+                            maximum_bytes=MAX_ARCHIVE_MEMBER_BYTES,
+                        )
+                        if (
+                            not _regular_snapshot_leaf_matches(
+                                final_snapshot,
+                                expected,
+                            )
+                            or final_snapshot.link_count != expected.link_count
+                            or public_inventory() != (None, ())
+                            or private_inventory()
+                            != ((quarantine_name, expected.file_identity),)
+                        ):
+                            raise SyncError(
+                                "pending ephemeral cleanup private payload changed "
+                                f"before final isolation: {batch_name}"
+                            )
+                        require_bound_parents()
+                        _require_pending_cleanup_ticket_unchanged(home, ticket)
+                        require_phase_receipt_unchanged(phase_receipt)
+                        try:
+                            _rename_noreplace_at(
+                                quarantine_fd,
+                                quarantine_name,
+                                quarantine_fd,
+                                candidate,
+                            )
+                        except FileExistsError:
+                            continue
+                        except FileNotFoundError as error:
+                            raise SyncError(
+                                "pending ephemeral cleanup private payload "
+                                f"disappeared during final isolation: {batch_name}"
+                            ) from error
+                        deletion_name = candidate
+                        break
+                    if deletion_name is None:
+                        raise SyncError(
+                            "pending ephemeral cleanup could not allocate a final "
+                            f"private isolation name: {batch_name}"
+                        )
+                    os.fsync(quarantine_fd)
+                    continue
+
+                private_fd = -1
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                flags |= getattr(os, "O_NONBLOCK", 0)
+                try:
+                    try:
+                        private_fd = os.open(
+                            quarantine_name,
+                            flags,
+                            dir_fd=quarantine_fd,
+                        )
+                    except OSError as error:
+                        raise SyncError(
+                            "pending ephemeral cleanup final private payload "
+                            f"became unreadable: {batch_name}"
+                        ) from error
+
+                    def require_open_private_unchanged(stage: str) -> None:
+                        try:
+                            before = _require_release_identity_fd_access_policy(
+                                private_fd,
+                                quarantine_path,
+                                os.geteuid(),
+                            )
+                            os.lseek(private_fd, 0, os.SEEK_SET)
+                            payload = _read_managed_state_bytes(
+                                private_fd,
+                                quarantine_path,
+                                MAX_ARCHIVE_MEMBER_BYTES,
+                            )
+                            os.lseek(private_fd, 0, os.SEEK_SET)
+                            confirmed_payload = _read_managed_state_bytes(
+                                private_fd,
+                                quarantine_path,
+                                MAX_ARCHIVE_MEMBER_BYTES,
+                            )
+                            after = _require_release_identity_fd_access_policy(
+                                private_fd,
+                                quarantine_path,
+                                os.geteuid(),
+                            )
+                            named = os.stat(
+                                quarantine_name,
+                                dir_fd=quarantine_fd,
+                                follow_symlinks=False,
+                            )
+                        except (OSError, SyncError) as error:
+                            raise SyncError(
+                                "pending ephemeral cleanup final private payload "
+                                f"changed {stage}: {batch_name}"
+                            ) from error
+                        expected_mode = stat.S_IMODE(before.st_mode)
+                        if (
+                            not stat.S_ISREG(before.st_mode)
+                            or not _regular_stat_metadata_matches(after, before)
+                            or not _regular_stat_metadata_matches(named, before)
+                            or (before.st_dev, before.st_ino) != expected.file_identity
+                            or expected_mode != expected.mode
+                            or before.st_uid != expected.uid
+                            or not _gid_matches_regular_file_access_policy(
+                                before.st_gid,
+                                expected.gid,
+                                expected.mode,
+                            )
+                            or before.st_size != expected.size
+                            or before.st_nlink != expected.link_count
+                            or hashlib.sha256(payload).hexdigest() != expected.sha256
+                            or hashlib.sha256(confirmed_payload).hexdigest()
+                            != expected.sha256
+                            or _pending_ephemeral_quarantine_final_private_base(
+                                batch_name,
+                                quarantine_name,
+                            )
+                            != final_private_base
+                            or not _bound_directory_matches(
+                                home,
+                                quarantine_root,
+                                quarantine_fd,
+                            )
+                        ):
+                            raise SyncError(
+                                "pending ephemeral cleanup final private payload "
+                                f"changed {stage}: {batch_name}"
+                            )
+
+                    require_open_private_unchanged("before deletion")
+                    require_bound_parents()
+                    if public_inventory() != (None, ()) or private_inventory() != (
+                        (quarantine_name, expected.file_identity),
+                    ):
+                        continue
+                    # Close the namespace sample by proving both live bound
+                    # parents again after walking their child entries.
+                    require_bound_parents()
+                    _require_pending_cleanup_ticket_unchanged(home, ticket)
+                    require_phase_receipt_unchanged(phase_receipt)
+                    # The broader boundary probes can race with the final
+                    # pathname.  Rebind it to the still-open exact descriptor,
+                    # and repeat content/access/link-count validation, before
+                    # issuing the irreversible unlink.
+                    require_open_private_unchanged("after boundary revalidation")
+                    os.unlink(quarantine_name, dir_fd=quarantine_fd)
+                    os.fsync(quarantine_fd)
+                    if (
+                        _named_entry_identity(quarantine_fd, quarantine_name)
+                        is not None
+                    ):
+                        raise SyncError(
+                            "pending ephemeral cleanup final private name "
+                            f"reappeared: {batch_name}"
+                        )
+                finally:
+                    _close_fd_quietly(private_fd)
+                continue
+
+            if canonical_identity == expected.file_identity:
+                # Retire the loadable canonical name before preserving a
+                # competing derived alias.  A same-UID creator can publish an
+                # alias after ticket creation but before this first scan; if
+                # that alias reached private evidence first, the recovery
+                # would fail closed while leaving the ticket-bound canonical
+                # publication loadable.
+                move_canonical_to_safe_name(canonical_identity, exact=True)
+                continue
+            # Preserve every observed foreign alias before advancing the
+            # ticket-bound inode to exact private isolation.  Selecting by
+            # identity, rather than alias-slot order, keeps a foreign creator
+            # from remaining in the public namespace when the canonical
+            # evacuation happened to take an earlier slot.
+            foreign_alias = next(
+                (item for item in aliases if item[1] != expected.file_identity),
+                None,
+            )
+            if foreign_alias is not None:
+                alias_name, alias_identity = foreign_alias
+                move_alias_to_private(alias_name, alias_identity)
+                continue
+            if len(private) > 1 or private:
+                raise SyncError(
+                    "pending ephemeral cleanup retained replacement as isolated "
+                    f"evidence while attempting private isolation: {batch_name}"
+                )
+            if aliases:
+                alias_name, alias_identity = aliases[0]
+                move_alias_to_private(alias_name, alias_identity)
+                continue
+            if canonical_identity is not None:
+                move_canonical_to_safe_name(canonical_identity, exact=False)
+                continue
+            raise SyncError(
+                "pending ephemeral cleanup exact payload disappeared before "
+                f"private isolation: {batch_name}"
+            )
+        else:
+            raise SyncError(
+                "pending ephemeral cleanup did not reach a stable private state: "
+                f"{batch_name}"
+            )
+
+        _require_pending_cleanup_ticket_unchanged(home, ticket)
+        require_bound_parents()
+        if public_inventory() != (None, ()) or private_inventory():
+            raise SyncError(
+                f"pending ephemeral cleanup payload reappeared: {batch_name}"
+            )
+        # Delete the ticket first. The private-phase receipt remains durable
+        # across this boundary, so a crash cannot turn a completed private
+        # unlink into an apparent initial public state. Keep both bound parent
+        # descriptors live through receipt retirement and reprove every derived
+        # public/private name at each mutation boundary.
+        _delete_pending_cleanup_ticket(home, ticket)
+
+        def require_terminal_receipt_boundary(
+            _receipt_member: str,
+            index_fd: int,
+        ) -> None:
+            _require_pending_ephemeral_terminal_names_absent(
+                home,
+                target,
+                public_parent_fd,
+                expected.parent_identity,
+                quarantine_root,
+                quarantine_fd,
+                ticket.quarantine_root_identity,
+                batch_name,
+            )
+            _require_pending_ephemeral_ticket_representations_absent(
+                home,
+                ticket.path.parent,
+                index_fd,
+                batch_name,
+            )
+
+        _delete_pending_cleanup_terminal_validation(
+            home,
+            ticket,
+            ticket.quarantine_root_identity,
+            mutation_revalidator=require_terminal_receipt_boundary,
+        )
+    finally:
+        _close_fd_quietly(quarantine_fd)
+        _close_fd_quietly(public_parent_fd)
+    return True
+
+
+def _remove_pending_ephemeral_quarantine_batch(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+) -> bool:
+    """Resume only the exact empty scaffold authorized by a v5/v7 ticket."""
+    expected_kind = (
+        "ephemeral-quarantine"
+        if ticket.version == 5
+        else "ephemeral-quarantine-scaffold"
+    )
+    if (
+        ticket.version not in {5, 7}
+        or ticket.kind != expected_kind
+        or ticket.quarantine_root_identity is None
+        or ticket.isolated_name
+        != _pending_cleanup_isolated_batch_name(ticket.batch_root.name)
+        or (ticket.version == 5 and ticket.leaf_identity is None)
+        or (ticket.version == 7 and ticket.leaf_identity is not None)
+    ):
+        raise SyncError("pending ephemeral cleanup authority is incomplete")
+    joined_allocation = _read_joined_quarantine_allocation_for_cleanup(home, ticket)
+
+    def require_allocation_join() -> None:
+        _require_joined_quarantine_allocation_unchanged(
+            home,
+            ticket,
+            joined_allocation,
+        )
+
+    require_allocation_join()
+    quarantine_root = ticket.batch_root.parent
+    try:
+        quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    except FileNotFoundError as error:
+        raise SyncError("pending cleanup quarantine root is missing") from error
+    batch_fd = -1
+    leaf_fd = -1
+    quarantine_root_identity = ticket.quarantine_root_identity
+    batch_name = ticket.batch_root.name
+    isolated_name = ticket.isolated_name
+    assert isolated_name is not None
+    bound_batch_root = ticket.batch_root
+    directory_flags = _directory_open_flags(nofollow=True)
+
+    def current_batch_root_binding() -> tuple[str, tuple[int, int]] | None:
+        return _pending_ephemeral_batch_root_binding(
+            quarantine_fd,
+            batch_name,
+            isolated_name,
+            ticket.batch_root_identity,
+        )
+
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        if _directory_identity(
+            quarantine_fd
+        ) != quarantine_root_identity or not _bound_directory_matches(
+            home, quarantine_root, quarantine_fd
+        ):
+            raise SyncError("pending cleanup quarantine root changed")
+        root_binding = current_batch_root_binding()
+        if root_binding is None:
+            proof = _read_pending_cleanup_empty_proof(
+                home,
+                ticket,
+                quarantine_root_identity,
+            )
+            if proof is None:
+                raise SyncError(
+                    "pending cleanup batch root is missing without an exact "
+                    f"empty proof: {batch_name}"
+                )
+            _delete_pending_cleanup_ticket(home, ticket)
+            _delete_pending_cleanup_empty_proof(
+                home,
+                ticket,
+                quarantine_root_identity,
+            )
+            require_allocation_join()
+            _retire_joined_quarantine_allocation(
+                home,
+                ticket,
+                joined_allocation,
+            )
+            return True
+        bound_name, observed_identity = root_binding
+        bound_batch_root = ticket.batch_root.with_name(bound_name)
+        if observed_identity != ticket.batch_root_identity:
+            raise SyncError(f"pending ephemeral quarantine batch changed: {batch_name}")
+        batch_fd = os.open(bound_name, directory_flags, dir_fd=quarantine_fd)
+        if _directory_identity(
+            batch_fd
+        ) != ticket.batch_root_identity or not _bound_directory_matches(
+            home, bound_batch_root, batch_fd
+        ):
+            raise SyncError(f"pending ephemeral quarantine batch changed: {batch_name}")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            bound_batch_root,
+            expected_mode=0o700,
+        )
+        _require_pending_cleanup_ticket_unchanged(home, ticket)
+        names, retained_metadata_name = _pending_ephemeral_batch_members(
+            batch_fd,
+            batch_name,
+        )
+        leaf_binding = (
+            None
+            if ticket.leaf_identity is None
+            else _pending_ephemeral_leaf_binding(
+                batch_fd,
+                names,
+                batch_name,
+                ticket.leaf_identity,
+            )
+        )
+        if ticket.version == 7 and any(
+            name == "leaf" or name.startswith(PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+            for name in names
+        ):
+            raise SyncError(f"pending ephemeral scaffold leaf appeared: {batch_name}")
+        if leaf_binding is not None:
+            leaf_name, observed_leaf_identity = leaf_binding
+            if observed_leaf_identity != ticket.leaf_identity:
+                raise SyncError(
+                    f"pending ephemeral quarantine leaf changed: {batch_name}"
+                )
+            leaf_path = bound_batch_root / leaf_name
+            leaf_fd = os.open(leaf_name, directory_flags, dir_fd=batch_fd)
+            if _directory_identity(
+                leaf_fd
+            ) != ticket.leaf_identity or not _bound_directory_matches(
+                home, leaf_path, leaf_fd
+            ):
+                raise SyncError(
+                    f"pending ephemeral quarantine leaf changed: {batch_name}"
+                )
+            _require_pending_cleanup_fd_access_policy(
+                leaf_fd,
+                leaf_path,
+                expected_mode=0o700,
+            )
+            if _directory_member_names(leaf_fd, maximum_entries=1) != ():
+                raise SyncError(
+                    f"pending ephemeral quarantine leaf is not empty: {batch_name}"
+                )
+            names, retained_metadata_name = _pending_ephemeral_batch_members(
+                batch_fd,
+                batch_name,
+            )
+            current_leaf_binding = _pending_ephemeral_leaf_binding(
+                batch_fd,
+                names,
+                batch_name,
+                ticket.leaf_identity,
+            )
+            if current_leaf_binding != (leaf_name, ticket.leaf_identity):
+                raise SyncError(
+                    f"pending ephemeral quarantine leaf changed: {batch_name}"
+                )
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            _require_pending_cleanup_fd_access_policy(
+                batch_fd,
+                bound_batch_root,
+                expected_mode=0o700,
+            )
+            _require_pending_cleanup_fd_access_policy(
+                leaf_fd,
+                leaf_path,
+                expected_mode=0o700,
+            )
+            if (
+                current_batch_root_binding() != (bound_name, ticket.batch_root_identity)
+                or _directory_identity(quarantine_fd) != quarantine_root_identity
+                or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+                or _directory_identity(batch_fd) != ticket.batch_root_identity
+                or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+                or _directory_identity(leaf_fd) != ticket.leaf_identity
+                or not _bound_directory_matches(home, leaf_path, leaf_fd)
+                or _directory_member_names(leaf_fd, maximum_entries=1) != ()
+                or current_leaf_binding != (leaf_name, ticket.leaf_identity)
+            ):
+                raise SyncError(
+                    f"pending ephemeral quarantine leaf changed before removal: "
+                    f"{batch_name}"
+                )
+            _rmdir_bound_empty_pending_cleanup_directory(
+                home,
+                bound_batch_root,
+                batch_fd,
+                ticket.batch_root_identity,
+                leaf_name,
+                leaf_path,
+                leaf_fd,
+                ticket.leaf_identity,
+                changed_message=(
+                    "pending ephemeral quarantine leaf changed before removal: "
+                    f"{batch_name}"
+                ),
+                mutation_revalidator=require_allocation_join,
+            )
+            os.fsync(batch_fd)
+            names, _retained_metadata_name = _pending_ephemeral_batch_members(
+                batch_fd,
+                batch_name,
+            )
+            if any(
+                name == "leaf" or name.startswith(PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+                for name in names
+            ):
+                raise SyncError(
+                    f"pending ephemeral quarantine leaf reappeared: {batch_name}"
+                )
+        names, retained_metadata_name = _pending_ephemeral_batch_members(
+            batch_fd,
+            batch_name,
+        )
+        if any(
+            name == "leaf" or name.startswith(PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+            for name in names
+        ):
+            raise SyncError(
+                f"pending ephemeral quarantine leaf reappeared: {batch_name}"
+            )
+        metadata_name = (
+            "metadata.json" if "metadata.json" in names else retained_metadata_name
+        )
+        if metadata_name is not None:
+            _require_pending_cleanup_ticket_unchanged(home, ticket)
+            _require_pending_cleanup_fd_access_policy(
+                quarantine_fd,
+                quarantine_root,
+                expected_mode=0o700,
+            )
+            _require_pending_cleanup_fd_access_policy(
+                batch_fd,
+                bound_batch_root,
+                expected_mode=0o700,
+            )
+            metadata = _read_pending_ephemeral_metadata_snapshot(
+                home,
+                ticket,
+                bound_batch_root,
+                batch_fd,
+                metadata_name,
+            )
+            if metadata_name != "metadata.json":
+                require_allocation_join()
+                metadata = _restore_exact_retained_pending_cleanup_file(
+                    home,
+                    bound_batch_root / "metadata.json",
+                    batch_fd,
+                    metadata_name,
+                    metadata,
+                    label=f"pending ephemeral quarantine metadata {batch_name}",
+                )
+                names = tuple(
+                    "metadata.json" if name == metadata_name else name for name in names
+                )
+                retained_metadata_name = None
+            current_names, current_retained_metadata = _pending_ephemeral_batch_members(
+                batch_fd, batch_name
+            )
+            if (
+                current_batch_root_binding() != (bound_name, ticket.batch_root_identity)
+                or _directory_identity(quarantine_fd) != quarantine_root_identity
+                or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+                or _directory_identity(batch_fd) != ticket.batch_root_identity
+                or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+                or current_names != names
+                or current_retained_metadata != retained_metadata_name
+            ):
+                raise SyncError(
+                    "pending ephemeral quarantine namespace changed before "
+                    f"metadata removal: {batch_name}"
+                )
+
+            def require_metadata_mutation_boundary(metadata_member: str) -> None:
+                _require_pending_ephemeral_metadata_cleanup_boundary(
+                    home,
+                    ticket,
+                    quarantine_root,
+                    quarantine_fd,
+                    bound_batch_root,
+                    bound_name,
+                    batch_fd,
+                    metadata_member,
+                )
+                require_allocation_join()
+
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                bound_batch_root / "metadata.json",
+                batch_fd,
+                metadata,
+                label=f"pending ephemeral quarantine metadata {batch_name}",
+                mutation_revalidator=require_metadata_mutation_boundary,
+            )
+        names, _retained_metadata_name = _pending_ephemeral_batch_members(
+            batch_fd,
+            batch_name,
+        )
+        if names:
+            raise SyncError(
+                f"pending ephemeral quarantine batch is not empty: {batch_name}"
+            )
+        _require_pending_cleanup_ticket_unchanged(home, ticket)
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            bound_batch_root,
+            expected_mode=0o700,
+        )
+        if bound_name == batch_name:
+            if (
+                _directory_identity(quarantine_fd) != quarantine_root_identity
+                or not _bound_directory_matches(
+                    home,
+                    quarantine_root,
+                    quarantine_fd,
+                )
+                or _directory_identity(batch_fd) != ticket.batch_root_identity
+                or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+                or _directory_member_names(batch_fd, maximum_entries=1) != ()
+                or current_batch_root_binding()
+                != (batch_name, ticket.batch_root_identity)
+            ):
+                raise SyncError(
+                    f"pending ephemeral quarantine batch changed: {batch_name}"
+                )
+            # Identity alone does not preserve the root's access policy.  Recheck
+            # the exact bound FD immediately before the canonical namespace is
+            # renamed so same-inode mode, UID, or Darwin ACL drift cannot create
+            # an isolated root or a terminal empty proof.
+            _require_pending_cleanup_fd_access_policy(
+                quarantine_fd,
+                quarantine_root,
+                expected_mode=0o700,
+            )
+            require_allocation_join()
+            _rename_noreplace_at(
+                quarantine_fd,
+                batch_name,
+                quarantine_fd,
+                isolated_name,
+            )
+            os.fsync(quarantine_fd)
+            bound_name = isolated_name
+            bound_batch_root = ticket.batch_root.with_name(isolated_name)
+        elif current_batch_root_binding() != (
+            bound_name,
+            ticket.batch_root_identity,
+        ):
+            raise SyncError(f"pending ephemeral quarantine batch changed: {batch_name}")
+        if (
+            _directory_identity(batch_fd) != ticket.batch_root_identity
+            or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+            or _directory_member_names(batch_fd, maximum_entries=1) != ()
+        ):
+            raise SyncError(
+                f"pending ephemeral quarantine batch changed after isolation: "
+                f"{batch_name}"
+            )
+        require_allocation_join()
+        _publish_pending_cleanup_empty_proof(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
+        _require_pending_cleanup_ticket_unchanged(home, ticket)
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            bound_batch_root,
+            expected_mode=0o700,
+        )
+        batch_removal_changed_message = (
+            f"pending ephemeral quarantine batch changed before removal: {batch_name}"
+        )
+
+        def require_batch_rmdir_mutation_boundary() -> None:
+            require_allocation_join()
+            try:
+                root_binding = current_batch_root_binding()
+            except SyncError as error:
+                raise SyncError(batch_removal_changed_message) from error
+            if root_binding != (bound_name, ticket.batch_root_identity):
+                raise SyncError(batch_removal_changed_message)
+
+        try:
+            final_root_binding = current_batch_root_binding()
+        except SyncError as error:
+            raise SyncError(batch_removal_changed_message) from error
+        if (
+            _directory_identity(quarantine_fd) != quarantine_root_identity
+            or not _bound_directory_matches(home, quarantine_root, quarantine_fd)
+            or final_root_binding != (bound_name, ticket.batch_root_identity)
+            or _directory_identity(batch_fd) != ticket.batch_root_identity
+            or not _bound_directory_matches(home, bound_batch_root, batch_fd)
+            or _directory_member_names(batch_fd, maximum_entries=1) != ()
+        ):
+            raise SyncError(batch_removal_changed_message)
+        _rmdir_bound_empty_pending_cleanup_directory(
+            home,
+            quarantine_root,
+            quarantine_fd,
+            quarantine_root_identity,
+            bound_name,
+            bound_batch_root,
+            batch_fd,
+            ticket.batch_root_identity,
+            changed_message=batch_removal_changed_message,
+            mutation_revalidator=require_batch_rmdir_mutation_boundary,
+        )
+        os.fsync(quarantine_fd)
+        if current_batch_root_binding() is not None:
+            raise SyncError(
+                f"pending ephemeral quarantine batch reappeared: {batch_name}"
+            )
+    finally:
+        _close_fd_quietly(leaf_fd)
+        _close_fd_quietly(batch_fd)
+        _close_fd_quietly(quarantine_fd)
+    _delete_pending_cleanup_ticket(home, ticket)
+    _delete_pending_cleanup_empty_proof(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
+    require_allocation_join()
+    _retire_joined_quarantine_allocation(
+        home,
+        ticket,
+        joined_allocation,
+    )
+    return True
 
 
 def _remove_cleanup_ready_batch(
@@ -16111,8 +32027,15 @@ def _remove_cleanup_ready_batch(
         ticket.path,
         expected_ticket_identity=ticket.snapshot.file_identity,
     )
-    if current_ticket is None or current_ticket != ticket:
+    if current_ticket is None or not _pending_cleanup_ticket_matches(
+        current_ticket,
+        ticket,
+    ):
         raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
+    if ticket.version in {5, 7}:
+        return _remove_pending_ephemeral_quarantine_batch(home, ticket)
+    if ticket.version == 6:
+        return _remove_pending_ephemeral_quarantine_leaf(home, ticket)
     quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
     try:
         quarantine_fd = _open_directory_beneath(home, quarantine_root)
@@ -16125,6 +32048,12 @@ def _remove_cleanup_ready_batch(
     try:
         if not _bound_directory_matches(home, quarantine_root, quarantine_fd):
             raise SyncError("pending cleanup quarantine root changed")
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        quarantine_root_identity = _directory_identity(quarantine_fd)
         batch_name = ticket.batch_root.name
         isolated_name = _pending_cleanup_isolated_batch_name(batch_name)
         bound_batch_root = ticket.batch_root
@@ -16143,7 +32072,31 @@ def _remove_cleanup_ready_batch(
                     dir_fd=quarantine_fd,
                 )
             except FileNotFoundError:
+                proof = _read_pending_cleanup_empty_proof(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                )
+                if proof is None:
+                    if ticket.version in {1, 2}:
+                        _delete_pending_cleanup_ticket(home, ticket)
+                        return True
+                    raise SyncError(
+                        "pending cleanup batch root is missing without an exact "
+                        f"empty proof: {batch_name}"
+                    )
+                _verify_final_regular_targets(home, ticket)
+                _delete_pending_cleanup_terminal_validation(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                )
                 _delete_pending_cleanup_ticket(home, ticket)
+                _delete_pending_cleanup_empty_proof(
+                    home,
+                    ticket,
+                    quarantine_root_identity,
+                )
                 return True
         if _directory_identity(
             batch_fd
@@ -16151,12 +32104,30 @@ def _remove_cleanup_ready_batch(
             home, bound_batch_root, batch_fd
         ):
             raise SyncError(f"pending cleanup batch root changed: {batch_name}")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            bound_batch_root,
+            expected_mode=0o700,
+        )
+        if ticket.version == 3:
+            _require_no_pending_staging_manual_retention(
+                home,
+                bound_batch_root,
+            )
+        _ensure_pending_terminal_validation_receipt(
+            home,
+            ticket,
+            bound_batch_root,
+            batch_fd,
+            quarantine_root_identity,
+        )
         _remove_pending_batch_directory_contents(
             batch_fd,
             ticket.batch_root_identity,
             _directory_mount_identity(batch_fd),
             [MAX_PENDING_CLEANUP_ENTRIES],
             depth=0,
+            name_validator=_pending_batch_cleanup_name_is_authorized,
         )
         with os.scandir(batch_fd) as iterator:
             if next(iterator, None) is not None:
@@ -16182,6 +32153,16 @@ def _remove_cleanup_ready_batch(
             or not _bound_directory_matches(home, bound_batch_root, batch_fd)
         ):
             raise SyncError(f"pending cleanup batch root changed: {batch_name}")
+        _require_pending_cleanup_fd_access_policy(
+            batch_fd,
+            bound_batch_root,
+            expected_mode=0o700,
+        )
+        _publish_pending_cleanup_empty_proof(
+            home,
+            ticket,
+            quarantine_root_identity,
+        )
         os.rmdir(isolated_name, dir_fd=quarantine_fd)
         os.fsync(quarantine_fd)
         if _named_entry_identity(quarantine_fd, isolated_name) is not None:
@@ -16190,31 +32171,84 @@ def _remove_cleanup_ready_batch(
         if batch_fd >= 0:
             _close_fd_quietly(batch_fd)
         _close_fd_quietly(quarantine_fd)
+    _verify_final_regular_targets(home, ticket)
+    _delete_pending_cleanup_terminal_validation(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
     _delete_pending_cleanup_ticket(home, ticket)
+    _delete_pending_cleanup_empty_proof(
+        home,
+        ticket,
+        quarantine_root_identity,
+    )
     return True
 
 
 def _delete_pending_cleanup_ticket(
     home: Path,
     ticket: PendingBatchCleanupTicket,
+    *,
+    boundary_revalidator: Callable[[], None] | None = None,
 ) -> None:
     index_fd = _open_directory_beneath(home, ticket.path.parent)
     try:
+        joined_allocation = (
+            _read_joined_quarantine_allocation_for_cleanup(home, ticket)
+            if ticket.version in {5, 7}
+            else None
+        )
         current = _read_managed_state_file_snapshot(
             home,
             ticket.path,
             index_fd,
             expected_identity=ticket.snapshot.file_identity,
         )
-        if current != ticket.snapshot:
-            raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
-        _isolate_and_delete_pending_cleanup_file(
-            home,
-            ticket.path,
-            index_fd,
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current,
             ticket.snapshot,
-            label=f"pending cleanup ticket {ticket.batch_root.name}",
-        )
+        ):
+            raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
+        mutation_revalidator: Callable[[str], None] | None = None
+        if ticket.version in {5, 7}:
+
+            def revalidate_allocation_join(_ticket_member: str) -> None:
+                _require_joined_quarantine_allocation_unchanged(
+                    home,
+                    ticket,
+                    joined_allocation,
+                )
+                if boundary_revalidator is not None:
+                    boundary_revalidator()
+
+            mutation_revalidator = revalidate_allocation_join
+            mutation_revalidator(ticket.path.name)
+        elif boundary_revalidator is not None:
+
+            def revalidate_boundary(_ticket_member: str) -> None:
+                boundary_revalidator()
+
+            mutation_revalidator = revalidate_boundary
+            mutation_revalidator(ticket.path.name)
+        label = f"pending cleanup ticket {ticket.batch_root.name}"
+        if mutation_revalidator is None:
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                ticket.path,
+                index_fd,
+                ticket.snapshot,
+                label=label,
+            )
+        else:
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                ticket.path,
+                index_fd,
+                ticket.snapshot,
+                label=label,
+                mutation_revalidator=mutation_revalidator,
+            )
         remaining = _read_managed_state_file_snapshot(
             home,
             ticket.path,
@@ -16228,7 +32262,7 @@ def _delete_pending_cleanup_ticket(
         _close_fd_quietly(index_fd)
 
 
-def _try_cleanup_committed_pending_batch(
+def _try_cleanup_finalized_pending_batch(
     home: Path,
     batch: PendingLinkBatch,
 ) -> bool:
@@ -16298,11 +32332,25 @@ def _write_pending_cleanup_cursor(
     home: Path,
     index_root: Path,
     ticket_name: str,
-) -> None:
+    *,
+    max_temp_cleanup_actions: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+) -> int:
+    if max_temp_cleanup_actions < 0:
+        raise SyncError("pending cleanup scan cursor temp action budget is invalid")
     cursor_path = index_root / PENDING_CLEANUP_CURSOR_NAME
     temp_path = index_root / PENDING_CLEANUP_CURSOR_TEMP_NAME
     payload = (ticket_name + "\n").encode("ascii")
-    _discard_incomplete_pending_cleanup_ticket(home, temp_path)
+    if max_temp_cleanup_actions == 0 and _pending_cleanup_temp_residue_is_observed(
+        home, temp_path
+    ):
+        return 0
+    discarded = _cleanup_pending_cleanup_cursor_temp(
+        home,
+        index_root,
+        limit=max_temp_cleanup_actions,
+    )
+    if _pending_cleanup_temp_residue_is_observed(home, temp_path):
+        return discarded
     staged = _write_exclusive_internal_file(home, temp_path, payload)
     index_fd = _open_directory_beneath(home, index_root)
     try:
@@ -16312,7 +32360,10 @@ def _write_pending_cleanup_cursor(
             index_fd,
             expected_identity=staged.file_identity,
         )
-        if current_temp != staged:
+        if not _managed_state_snapshot_matches_bound_file_evidence(
+            current_temp,
+            staged,
+        ):
             raise SyncError("pending cleanup scan cursor temp changed")
         os.rename(
             temp_path.name,
@@ -16331,28 +32382,2019 @@ def _write_pending_cleanup_cursor(
             raise SyncError("pending cleanup scan cursor changed during publication")
     finally:
         _close_fd_quietly(index_fd)
+    return discarded
 
 
-def _cleanup_ready_pending_batches(home: Path) -> int:
-    if not _pending_link_pointer_is_absent(home):
+def _cleanup_pending_cleanup_cursor_temp(
+    home: Path,
+    index_root: Path,
+    *,
+    limit: int,
+) -> int:
+    if limit < 0:
+        raise SyncError("pending cleanup scan cursor temp action budget is invalid")
+    return _discard_incomplete_pending_cleanup_ticket(
+        home,
+        index_root / PENDING_CLEANUP_CURSOR_TEMP_NAME,
+        max_actions=limit,
+    )
+
+
+def _pending_cleanup_retained_canonical_name(name: str) -> str | None:
+    if not name.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        return None
+    retained = name[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    match = re.fullmatch(r"(.+)-[0-9]+-[0-9a-f]{16}", retained)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _pending_cleanup_ticket_representation_batch_name(name: str) -> str | None:
+    """Classify ticket-derived residue as blocking evidence, never authority.
+
+    A canonical ticket or its normal retained form has a strict parser elsewhere
+    that may restore only the exact, bound object.  This classifier is
+    intentionally broader: a suffix-added or otherwise malformed descendant of
+    a syntactically valid ``<batch>.json`` name retains recoverable ticket bytes
+    and must block terminal receipt retirement and subsequent mutations.  It is
+    not a recovery parser and callers must never use its result to authorize a
+    destructive action.
+    """
+    candidate = name
+    if candidate.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        candidate = candidate[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    marker_index = candidate.find(PENDING_CLEANUP_TICKET_SUFFIX)
+    if marker_index <= 0:
+        return None
+    batch_name = candidate[:marker_index]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_cleanup_ticket_temp_batch_name(name: str) -> str | None:
+    if not name.endswith(PENDING_CLEANUP_TICKET_TEMP_SUFFIX):
+        return None
+    batch_name = name[: -len(PENDING_CLEANUP_TICKET_TEMP_SUFFIX)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_private_use_retirement_batch_name(name: str) -> str | None:
+    if not name.endswith(PENDING_PRIVATE_USE_RETIREMENT_SUFFIX):
+        return None
+    batch_name = name[: -len(PENDING_PRIVATE_USE_RETIREMENT_SUFFIX)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_private_use_retirement_temp_batch_name(name: str) -> str | None:
+    suffix = (
+        PENDING_PRIVATE_USE_RETIREMENT_SUFFIX + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+    )
+    if not name.endswith(suffix):
+        return None
+    batch_name = name[: -len(suffix)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        return None
+    return batch_name
+
+
+def _pending_private_use_retirement_representation_batch_name(
+    name: str,
+) -> str | None:
+    candidate = name
+    if candidate.startswith(PENDING_CLEANUP_RETAINED_PREFIX):
+        candidate = candidate[len(PENDING_CLEANUP_RETAINED_PREFIX) :]
+    marker_index = candidate.find(PENDING_PRIVATE_USE_RETIREMENT_SUFFIX)
+    if marker_index <= 0:
+        return None
+    batch_name = candidate[:marker_index]
+    if (
+        len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+        and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+    ):
+        return batch_name
+    return None
+
+
+def _pending_private_use_retirement_unresolved_representation(
+    name: str,
+) -> tuple[str, str] | None:
+    batch_name = _pending_private_use_retirement_representation_batch_name(name)
+    if batch_name is None:
+        return None
+    canonical = batch_name + PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+    temporary = canonical + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+    if name in {canonical, temporary}:
+        return None
+    retained = _pending_cleanup_retained_control_name(name)
+    if retained is not None and retained[1] == batch_name and retained[0] == canonical:
+        return None
+    retained_canonical = _pending_cleanup_retained_canonical_name(name)
+    if retained_canonical == temporary:
+        return None
+    return batch_name, name
+
+
+def _pending_cleanup_retained_ticket_temp_name(
+    name: str,
+) -> tuple[str, str] | None:
+    canonical = _pending_cleanup_retained_canonical_name(name)
+    if canonical is None:
+        return None
+    batch_name = _pending_cleanup_ticket_temp_batch_name(canonical)
+    if batch_name is None:
+        return None
+    return canonical, batch_name
+
+
+def _pending_cleanup_cursor_temp_canonical_name(name: str) -> str | None:
+    if name == PENDING_CLEANUP_CURSOR_TEMP_NAME:
+        return name
+    canonical = _pending_cleanup_retained_canonical_name(name)
+    if canonical == PENDING_CLEANUP_CURSOR_TEMP_NAME:
+        return canonical
+    return None
+
+
+def _pending_cleanup_retained_control_name(
+    name: str,
+) -> tuple[str, str] | None:
+    canonical = _pending_cleanup_retained_canonical_name(name)
+    if canonical is None:
+        return None
+    for suffix in (
+        PENDING_QUARANTINE_ALLOCATION_SUFFIX,
+        PENDING_CLEANUP_TICKET_SUFFIX,
+        PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
+        PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+        PENDING_PRIVATE_USE_RETIREMENT_SUFFIX,
+    ):
+        if not canonical.endswith(suffix):
+            continue
+        batch_name = canonical[: -len(suffix)]
+        if (
+            len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+            and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+        ):
+            return canonical, batch_name
+    return None
+
+
+def _pending_cleanup_unresolved_ticket_representation(
+    name: str,
+) -> tuple[str, str] | None:
+    """Return only ticket-derived residue that cannot enter auto-recovery.
+
+    The broad representation classifier deliberately recognizes suffix-added
+    descendants, because their bytes can be the only surviving ticket evidence.
+    Exact canonical tickets, their exact temporary form, and strict retained
+    forms remain eligible for the existing bound recovery protocol.  Every
+    other related name is a blocking ambiguity, never recovery authority.
+    """
+    batch_name = _pending_cleanup_ticket_representation_batch_name(name)
+    if batch_name is None:
+        return None
+    canonical_ticket_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
+    if name in {
+        canonical_ticket_name,
+        batch_name + PENDING_CLEANUP_TICKET_TEMP_SUFFIX,
+    }:
+        return None
+    retained_control = _pending_cleanup_retained_control_name(name)
+    if (
+        retained_control is not None
+        and retained_control[1] == batch_name
+        and retained_control[0] == canonical_ticket_name
+    ):
+        return None
+    retained_temp = _pending_cleanup_retained_ticket_temp_name(name)
+    if retained_temp is not None and retained_temp[1] == batch_name:
+        return None
+    return batch_name, name
+
+
+def _pending_cleanup_unresolved_ticket_representation_issue(
+    home: Path,
+) -> tuple[str, str] | None:
+    """Observe blocking ticket residue without granting it any authority."""
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return None
+    try:
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed")
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup authority scan exceeds the size limit",
+        )
+        for name in names:
+            unresolved = _pending_cleanup_unresolved_ticket_representation(name)
+            if unresolved is not None:
+                return unresolved
+        return None
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _pending_cleanup_unresolved_ticket_representation_error(
+    unresolved: tuple[str, str],
+) -> SyncError:
+    batch_name, name = unresolved
+    return SyncError(
+        "pending cleanup ticket representation must be reconciled before new "
+        f"mutation: {batch_name}: {name}"
+    )
+
+
+def _require_no_pending_unresolved_ticket_representations(home: Path) -> None:
+    unresolved = _pending_cleanup_unresolved_ticket_representation_issue(home)
+    if unresolved is not None:
+        raise _pending_cleanup_unresolved_ticket_representation_error(unresolved)
+    allocation_unresolved = (
+        _pending_quarantine_unresolved_allocation_representation_issue(home)
+    )
+    if allocation_unresolved is not None:
+        raise _pending_quarantine_unresolved_allocation_representation_error(
+            allocation_unresolved
+        )
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="private-use retirement scan exceeds the size limit",
+        )
+        for name in names:
+            unresolved_receipt = (
+                _pending_private_use_retirement_unresolved_representation(name)
+            )
+            if unresolved_receipt is not None:
+                batch_name, representation = unresolved_receipt
+                raise SyncError(
+                    "private-use retirement receipt representation must be "
+                    f"reconciled before new mutation: {batch_name}: {representation}"
+                )
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _restore_pending_cleanup_control_tombstones(
+    home: Path,
+    *,
+    limit: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+    budget: PendingCleanupActionBudget | None = None,
+) -> int:
+    if limit < 0:
+        raise SyncError("pending cleanup control action budget is invalid")
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return 0
+    restored = 0
+    try:
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed")
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup control scan exceeds the size limit",
+        )
+        retained_by_canonical: dict[str, list[str]] = {}
+        for name in names:
+            parsed = _pending_cleanup_retained_control_name(name)
+            if parsed is None:
+                continue
+            canonical, _batch_name = parsed
+            retained_by_canonical.setdefault(canonical, []).append(name)
+        ordered = sorted(
+            retained_by_canonical,
+            key=lambda name: (
+                not name.endswith(PENDING_CLEANUP_TICKET_SUFFIX),
+                name,
+            ),
+        )
+        for canonical in ordered:
+            retained_names = retained_by_canonical[canonical]
+            if len(retained_names) != 1:
+                raise SyncError(
+                    f"pending cleanup control has multiple retained files: {canonical}"
+                )
+            canonical_path = index_root / canonical
+            canonical_snapshot = _read_managed_state_file_snapshot(
+                home,
+                canonical_path,
+                index_fd,
+            )
+            if canonical_snapshot.exists:
+                raise SyncError(
+                    f"pending cleanup control overlaps retained evidence: {canonical}"
+                )
+        action_budget = budget or PendingCleanupActionBudget(limit)
+        for canonical in ordered:
+            retained_names = retained_by_canonical[canonical]
+            parsed = _pending_cleanup_retained_control_name(retained_names[0])
+            assert parsed is not None
+            _parsed_canonical, batch_name = parsed
+            if not action_budget.charge_batch(batch_name):
+                continue
+            canonical_path = index_root / canonical
+            retained_path = index_root / retained_names[0]
+            retained_snapshot = _read_managed_state_file_snapshot(
+                home,
+                retained_path,
+                index_fd,
+            )
+            if not retained_snapshot.exists:
+                raise SyncError(
+                    f"pending cleanup retained control disappeared: {canonical}"
+                )
+            if retained_snapshot.uid != os.geteuid():
+                raise SyncError(
+                    f"pending cleanup retained control owner changed: {canonical}"
+                )
+            _require_pending_cleanup_file_snapshot_access_policy(
+                home,
+                retained_path,
+                index_fd,
+                retained_snapshot,
+            )
+            retirement = _read_current_private_use_retirement_authority(
+                home, batch_name
+            )
+            if retirement is not None:
+                _require_pending_private_use_retirement_boundary(
+                    home,
+                    retirement,
+                    receipt_member=retirement.path.name,
+                )
+            recovered = _restore_retained_pending_cleanup_file(
+                home,
+                canonical_path,
+                index_fd,
+                retained_snapshot,
+                label=f"pending cleanup control {canonical}",
+            )
+            if recovered is None:
+                raise SyncError(
+                    f"pending cleanup retained control disappeared: {canonical}"
+                )
+            retirement = _read_current_private_use_retirement_authority(
+                home, batch_name
+            )
+            if retirement is not None:
+                _require_pending_private_use_retirement_boundary(
+                    home,
+                    retirement,
+                    receipt_member=retirement.path.name,
+                )
+            if canonical.endswith(PENDING_QUARANTINE_ALLOCATION_SUFFIX):
+                allocation = _read_pending_quarantine_allocation_ticket(
+                    home,
+                    canonical_path,
+                    expected_identity=recovered.file_identity,
+                )
+                if allocation is None:
+                    raise SyncError(
+                        f"pending quarantine allocation recovery failed: {canonical}"
+                    )
+            elif canonical.endswith(PENDING_CLEANUP_TICKET_SUFFIX):
+                ticket = _read_pending_cleanup_ticket(
+                    home,
+                    canonical_path,
+                    expected_ticket_identity=recovered.file_identity,
+                )
+                if ticket is None:
+                    raise SyncError(
+                        f"pending cleanup ticket recovery failed: {canonical}"
+                    )
+            elif canonical.endswith(PENDING_PRIVATE_USE_RETIREMENT_SUFFIX):
+                receipt = _read_pending_private_use_retirement_receipt(
+                    home,
+                    canonical_path,
+                    expected_identity=recovered.file_identity,
+                )
+                if receipt is None:
+                    raise SyncError(
+                        f"private-use retirement recovery failed: {canonical}"
+                    )
+            restored += 1
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed")
+    finally:
+        _close_fd_quietly(index_fd)
+    return restored
+
+
+def _promote_pending_ephemeral_cleanup_ticket_temp(
+    home: Path,
+    temp_path: Path,
+    *,
+    classified_snapshot: ManagedStateFileSnapshot | None = None,
+) -> bool:
+    """Promote a canonical v5/v6/v7 ticket temp instead of discarding authority."""
+    batch_name = _pending_cleanup_ticket_temp_batch_name(temp_path.name)
+    if batch_name is None:
+        return False
+    index_fd = _open_directory_beneath(home, temp_path.parent)
+    try:
+        staged = (
+            classified_snapshot
+            if classified_snapshot is not None
+            else _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                index_fd,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
+        )
+        if not staged.exists:
+            return False
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(staged)
+            or staged.file_type != stat.S_IFREG
+            or staged.payload is None
+        ):
+            raise SyncError(
+                "pending cleanup ticket temp could not be safely classified: "
+                f"{batch_name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            temp_path,
+            index_fd,
+            staged,
+        )
+        try:
+            staged_ticket = _read_pending_cleanup_ticket(
+                home,
+                temp_path,
+                expected_ticket_identity=staged.file_identity,
+                allow_temporary=True,
+                _captured_snapshot=staged,
+            )
+        except SyncError:
+            # Only the pure parser runs inside this catch.  A rejection proves
+            # the already captured bytes are noncanonical residue.  Capture,
+            # identity/content revalidation and policy failures occur outside
+            # it and must propagate so recovery retains durable authority.
+            return False
+        if (
+            staged_ticket is None
+            or staged_ticket.version not in {5, 6, 7}
+            or not _managed_state_snapshot_matches_bound_file_evidence(
+                staged_ticket.snapshot,
+                staged,
+            )
+        ):
+            return False
+        ticket_path = _pending_cleanup_ticket_path(home, batch_name)
+        existing = _read_managed_state_file_snapshot(
+            home,
+            ticket_path,
+            index_fd,
+        )
+        if existing.exists:
+            ticket = _read_pending_cleanup_ticket(
+                home,
+                ticket_path,
+                expected_ticket_identity=existing.file_identity,
+            )
+            if (
+                ticket is None
+                or not _managed_state_snapshot_matches_bound_file_evidence(
+                    ticket.snapshot,
+                    existing,
+                )
+                or ticket.snapshot.payload != staged.payload
+            ):
+                raise SyncError(
+                    f"pending cleanup ticket temp conflicts with its canonical "
+                    f"ticket: {batch_name}"
+                )
+
+            def require_canonical_unchanged(_temp_member: str) -> None:
+                _require_pending_cleanup_file_snapshot_unchanged(
+                    home,
+                    ticket_path,
+                    index_fd,
+                    existing,
+                    label=f"pending cleanup canonical ticket {batch_name}",
+                    maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+                )
+
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                temp_path,
+                index_fd,
+                staged,
+                label=f"published pending cleanup ticket temp {batch_name}",
+                mutation_revalidator=require_canonical_unchanged,
+            )
+            return True
+        current = _read_managed_state_file_snapshot(
+            home,
+            temp_path,
+            index_fd,
+            expected_identity=staged.file_identity,
+            maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(current, staged):
+            raise SyncError(
+                f"pending cleanup ticket temp changed before promotion: {batch_name}"
+            )
+        _rename_noreplace_at(
+            index_fd,
+            temp_path.name,
+            index_fd,
+            ticket_path.name,
+        )
+        os.fsync(index_fd)
+        ticket = _read_pending_cleanup_ticket(
+            home,
+            ticket_path,
+            expected_ticket_identity=staged.file_identity,
+        )
+        if ticket is None or ticket.snapshot.payload != staged.payload:
+            raise SyncError(
+                f"pending cleanup ticket changed after temp promotion: {batch_name}"
+            )
+        _verify_pending_cleanup_ticket_durable(home, ticket)
+        return True
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _promote_pending_quarantine_allocation_temp(
+    home: Path,
+    temp_path: Path,
+    *,
+    classified_snapshot: ManagedStateFileSnapshot | None = None,
+) -> bool:
+    """Promote only a complete v8 reservation while its batch is absent."""
+    batch_name = _pending_quarantine_allocation_temp_batch_name(temp_path.name)
+    if batch_name is None:
+        return False
+    index_fd = _open_directory_beneath(home, temp_path.parent)
+    quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+    quarantine_fd = -1
+    try:
+        staged = (
+            classified_snapshot
+            if classified_snapshot is not None
+            else _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                index_fd,
+                maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+            )
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(staged)
+            or staged.file_type != stat.S_IFREG
+            or staged.payload is None
+        ):
+            raise SyncError(
+                "pending quarantine allocation temp could not be safely "
+                f"classified: {batch_name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            temp_path,
+            index_fd,
+            staged,
+        )
+        try:
+            data = _decode_managed_state_json(staged.payload, temp_path)
+            metadata = data.get("metadata")
+            root_identity = _parse_pending_identity(
+                data.get("quarantine_root_identity"),
+                "pending quarantine allocation root identity",
+            )
+            metadata_sha256 = (
+                metadata.get("sha256") if isinstance(metadata, dict) else None
+            )
+            metadata_size = metadata.get("size") if isinstance(metadata, dict) else None
+            expected = (
+                _pending_quarantine_allocation_payload_from_plan(
+                    batch_name,
+                    root_identity,
+                    metadata_sha256,
+                    metadata_size,
+                )
+                if root_identity is not None
+                and isinstance(metadata_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is not None
+                and type(metadata_size) is int
+                and 0 <= metadata_size <= MAX_MANAGED_STATE_BYTES
+                else None
+            )
+        except SyncError:
+            return False
+        if staged.payload != expected:
+            return False
+        path = _pending_quarantine_allocation_path(home, batch_name)
+        existing = _read_managed_state_file_snapshot(home, path, index_fd)
+        if existing.exists:
+            allocation = _read_pending_quarantine_allocation_ticket(
+                home,
+                path,
+                expected_identity=existing.file_identity,
+            )
+            if (
+                allocation is None
+                or not _managed_state_snapshot_matches_bound_file_evidence(
+                    allocation.snapshot,
+                    existing,
+                )
+                or allocation.snapshot.payload != staged.payload
+            ):
+                raise SyncError(
+                    "pending quarantine allocation temp conflicts with canonical "
+                    f"ticket: {batch_name}"
+                )
+
+            def require_canonical_unchanged(_temp_member: str) -> None:
+                _require_pending_cleanup_file_snapshot_unchanged(
+                    home,
+                    path,
+                    index_fd,
+                    existing,
+                    label=f"pending quarantine allocation {batch_name}",
+                    maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+                )
+
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                temp_path,
+                index_fd,
+                staged,
+                label=f"published pending quarantine allocation temp {batch_name}",
+                mutation_revalidator=require_canonical_unchanged,
+            )
+            return True
+        quarantine_fd = _open_directory_beneath(home, quarantine_root)
+        _require_quarantine_allocation_root_absent(
+            home,
+            quarantine_root,
+            quarantine_fd,
+            batch_name,
+            root_identity,
+        )
+        current = _read_managed_state_file_snapshot(
+            home,
+            temp_path,
+            index_fd,
+            expected_identity=staged.file_identity,
+            maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(current, staged):
+            raise SyncError(f"pending quarantine allocation temp changed: {batch_name}")
+        _rename_noreplace_at(index_fd, temp_path.name, index_fd, path.name)
+        os.fsync(index_fd)
+        index_parent_fd = _open_directory_beneath(home, path.parent.parent)
+        try:
+            os.fsync(index_parent_fd)
+        finally:
+            _close_fd_quietly(index_parent_fd)
+        allocation = _read_pending_quarantine_allocation_ticket(
+            home,
+            path,
+            expected_identity=staged.file_identity,
+        )
+        if allocation is None or allocation.snapshot.payload != staged.payload:
+            raise SyncError(
+                f"pending quarantine allocation changed after promotion: {batch_name}"
+            )
+        _require_quarantine_allocation_root_absent(
+            home,
+            quarantine_root,
+            quarantine_fd,
+            batch_name,
+            root_identity,
+        )
+        return True
+    finally:
+        _close_fd_quietly(quarantine_fd)
+        _close_fd_quietly(index_fd)
+
+
+def _promote_pending_private_use_retirement_temp(
+    home: Path,
+    temp_path: Path,
+    *,
+    classified_snapshot: ManagedStateFileSnapshot | None = None,
+) -> bool:
+    batch_name = _pending_private_use_retirement_temp_batch_name(temp_path.name)
+    if batch_name is None:
+        return False
+    index_fd = _open_directory_beneath(home, temp_path.parent)
+    try:
+        staged = (
+            classified_snapshot
+            if classified_snapshot is not None
+            else _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                index_fd,
+                maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+            )
+        )
+        if not staged.exists:
+            return False
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, temp_path, index_fd, staged
+        )
+        receipt = _read_pending_private_use_retirement_receipt(
+            home,
+            temp_path,
+            expected_identity=staged.file_identity,
+            allow_temporary=True,
+            _captured_snapshot=staged,
+        )
+        if receipt is None:
+            return False
+        _require_pending_private_use_retirement_boundary(
+            home, receipt, receipt_member=temp_path.name
+        )
+        canonical_path = _pending_private_use_retirement_path(home, batch_name)
+        canonical = _read_managed_state_file_snapshot(home, canonical_path, index_fd)
+        if canonical.exists:
+            raise SyncError(
+                f"private-use retirement temp overlaps canonical receipt: {batch_name}"
+            )
+        current = _read_managed_state_file_snapshot(
+            home,
+            temp_path,
+            index_fd,
+            expected_identity=staged.file_identity,
+            maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        )
+        if not _managed_state_snapshot_matches_bound_file_evidence(current, staged):
+            raise SyncError(
+                f"private-use retirement temp changed before promotion: {batch_name}"
+            )
+        _require_pending_private_use_retirement_boundary(
+            home, receipt, receipt_member=temp_path.name
+        )
+        _rename_noreplace_at(index_fd, temp_path.name, index_fd, canonical_path.name)
+        os.fsync(index_fd)
+        promoted = _read_pending_private_use_retirement_receipt(
+            home,
+            canonical_path,
+            expected_identity=staged.file_identity,
+        )
+        if promoted is None or promoted.snapshot.payload != staged.payload:
+            raise SyncError(
+                f"private-use retirement receipt changed after promotion: {batch_name}"
+            )
+        _require_pending_private_use_retirement_boundary(
+            home, promoted, receipt_member=canonical_path.name
+        )
+        return True
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _cleanup_pending_cleanup_ticket_temps(
+    home: Path,
+    *,
+    limit: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+    budget: PendingCleanupActionBudget | None = None,
+) -> int:
+    if limit < 0:
+        raise SyncError("pending cleanup temp action budget is invalid")
+    if limit == 0 and budget is None:
         return 0
     index_root = _pending_cleanup_index_path(home)
     try:
         index_fd = _open_directory_beneath(home, index_root)
     except FileNotFoundError:
         return 0
+    temp_names: set[str] = set()
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup control scan exceeds the size limit",
+        )
+        for name in names:
+            if _pending_private_use_retirement_temp_batch_name(name) is not None:
+                temp_names.add(name)
+                continue
+            if _pending_cleanup_ticket_temp_batch_name(name) is not None:
+                temp_names.add(name)
+                continue
+            if _pending_quarantine_allocation_temp_batch_name(name) is not None:
+                temp_names.add(name)
+                continue
+            if _pending_quarantine_metadata_stage_batch_name(name) is not None:
+                temp_names.add(name)
+                continue
+            retained = _pending_cleanup_retained_ticket_temp_name(name)
+            if retained is not None:
+                temp_names.add(retained[0])
+                continue
+            retained_allocation = _pending_quarantine_retained_allocation_temp_name(
+                name
+            )
+            if retained_allocation is not None:
+                temp_names.add(retained_allocation[0])
+                continue
+            retained_metadata_stage = _pending_quarantine_retained_metadata_stage_name(
+                name
+            )
+            if retained_metadata_stage is not None:
+                temp_names.add(retained_metadata_stage[0])
+                continue
+            retained_canonical = _pending_cleanup_retained_canonical_name(name)
+            if (
+                retained_canonical is not None
+                and _pending_private_use_retirement_temp_batch_name(retained_canonical)
+                is not None
+            ):
+                temp_names.add(retained_canonical)
+    finally:
+        _close_fd_quietly(index_fd)
+    action_budget = budget or PendingCleanupActionBudget(limit)
+    discarded = 0
+    for temp_name in sorted(temp_names):
+        batch_name = _pending_cleanup_ticket_temp_batch_name(temp_name)
+        allocation_batch_name = _pending_quarantine_allocation_temp_batch_name(
+            temp_name
+        )
+        metadata_stage_batch_name = _pending_quarantine_metadata_stage_batch_name(
+            temp_name
+        )
+        retirement_batch_name = _pending_private_use_retirement_temp_batch_name(
+            temp_name
+        )
+        if batch_name is None:
+            batch_name = allocation_batch_name
+        if batch_name is None:
+            batch_name = metadata_stage_batch_name
+        if batch_name is None:
+            batch_name = retirement_batch_name
+        assert batch_name is not None
+        if not action_budget.charge_batch(batch_name):
+            continue
+        temp_path = index_root / temp_name
+        index_fd = _open_directory_beneath(home, index_root)
+        try:
+            current = _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                index_fd,
+            )
+            retained = _retained_pending_cleanup_file(
+                home,
+                temp_path,
+                index_fd,
+                expected=None,
+                label=f"pending cleanup ticket temp {batch_name}",
+            )
+            if retained is not None:
+                if current.exists:
+                    raise SyncError(
+                        "pending cleanup ticket temp overlaps retained evidence: "
+                        f"{batch_name}"
+                    )
+                retained_name, retained_snapshot = retained
+                if retirement_batch_name is not None:
+                    retained_receipt = _read_pending_private_use_retirement_receipt(
+                        home,
+                        temp_path,
+                        expected_identity=retained_snapshot.file_identity,
+                        allow_temporary=True,
+                        _captured_snapshot=retained_snapshot,
+                    )
+                    if retained_receipt is None:
+                        raise SyncError(
+                            "private-use retirement retained temp disappeared: "
+                            f"{batch_name}"
+                        )
+                    retained_receipt = replace(
+                        retained_receipt,
+                        path=temp_path.with_name(retained_name),
+                    )
+                    _require_pending_private_use_retirement_boundary(
+                        home,
+                        retained_receipt,
+                        receipt_member=retained_name,
+                    )
+                _restore_exact_retained_pending_cleanup_file(
+                    home,
+                    temp_path,
+                    index_fd,
+                    retained_name,
+                    retained_snapshot,
+                    label=f"pending cleanup ticket temp {batch_name}",
+                )
+                if retirement_batch_name is not None:
+                    restored_receipt = _read_pending_private_use_retirement_receipt(
+                        home,
+                        temp_path,
+                        expected_identity=retained_snapshot.file_identity,
+                        allow_temporary=True,
+                    )
+                    if restored_receipt is None:
+                        raise SyncError(
+                            "private-use retirement temp restoration failed: "
+                            f"{batch_name}"
+                        )
+                    _require_pending_private_use_retirement_boundary(
+                        home,
+                        restored_receipt,
+                        receipt_member=temp_path.name,
+                    )
+            classified = _read_managed_state_file_snapshot(
+                home,
+                temp_path,
+                index_fd,
+                maximum_bytes=(
+                    MAX_MANAGED_STATE_BYTES
+                    if metadata_stage_batch_name is not None
+                    else (
+                        MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES
+                        if retirement_batch_name is not None
+                        else MAX_PENDING_CLEANUP_TICKET_BYTES
+                    )
+                ),
+            )
+            if not classified.exists:
+                raise SyncError(
+                    "pending cleanup ticket temp disappeared before "
+                    f"classification: {batch_name}"
+                )
+        finally:
+            _close_fd_quietly(index_fd)
+        if metadata_stage_batch_name is not None:
+            discarded_for_batch = _discard_incomplete_pending_cleanup_ticket(
+                home,
+                temp_path,
+                max_actions=MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+                expected_snapshot=classified,
+            )
+            discarded += discarded_for_batch
+            if discarded_for_batch > 0:
+                action_budget.mark_batch_completed(batch_name)
+            continue
+        if retirement_batch_name is not None:
+            if not _promote_pending_private_use_retirement_temp(
+                home,
+                temp_path,
+                classified_snapshot=classified,
+            ):
+                raise SyncError(
+                    "private-use retirement temp could not be safely classified: "
+                    f"{batch_name}"
+                )
+            continue
+        if _promote_pending_ephemeral_cleanup_ticket_temp(
+            home,
+            temp_path,
+            classified_snapshot=classified,
+        ):
+            continue
+        if _promote_pending_quarantine_allocation_temp(
+            home,
+            temp_path,
+            classified_snapshot=classified,
+        ):
+            continue
+        discarded_for_batch = _discard_incomplete_pending_cleanup_ticket(
+            home,
+            temp_path,
+            max_actions=MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+            expected_snapshot=classified,
+        )
+        discarded += discarded_for_batch
+        if discarded_for_batch > 0:
+            action_budget.mark_batch_completed(batch_name)
+    return discarded
+
+
+def _read_orphan_pending_cleanup_empty_proof(
+    home: Path,
+    proof_path: Path,
+) -> ManagedStateFileSnapshot:
+    suffix = PENDING_CLEANUP_EMPTY_PROOF_SUFFIX
+    if not proof_path.name.endswith(suffix):
+        raise SyncError("pending cleanup empty proof has an invalid file name")
+    batch_name = proof_path.name[: -len(suffix)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("pending cleanup empty proof has an invalid batch name")
+    index_fd = _open_directory_beneath(home, proof_path.parent)
+    try:
+        proof = _read_managed_state_file_snapshot(
+            home,
+            proof_path,
+            index_fd,
+        )
+        if (
+            not proof.exists
+            or proof.payload is None
+            or proof.mode != 0o600
+            or proof.uid != os.geteuid()
+        ):
+            raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            proof_path,
+            index_fd,
+            proof,
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+    data = _decode_managed_state_json(proof.payload, proof_path)
+    if (
+        set(data)
+        != {
+            "version",
+            "batch",
+            "batch_root_identity",
+            "quarantine_root_identity",
+            "isolated_name",
+            "ticket_identity",
+            "ticket_sha256",
+        }
+        or data.get("version") != 1
+    ):
+        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+    batch_identity = _parse_pending_identity(
+        data.get("batch_root_identity"),
+        "pending cleanup empty-proof batch identity",
+    )
+    quarantine_identity = _parse_pending_identity(
+        data.get("quarantine_root_identity"),
+        "pending cleanup empty-proof quarantine identity",
+    )
+    ticket_identity = _parse_pending_identity(
+        data.get("ticket_identity"),
+        "pending cleanup empty-proof ticket identity",
+    )
+    ticket_sha256 = data.get("ticket_sha256")
+    isolated_name = _pending_cleanup_isolated_batch_name(batch_name)
+    if (
+        data.get("batch") != batch_name
+        or batch_identity is None
+        or quarantine_identity is None
+        or ticket_identity is None
+        or data.get("isolated_name") != isolated_name
+        or not isinstance(ticket_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", ticket_sha256) is None
+    ):
+        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+    expected_payload = _bounded_json_document(
+        {
+            "version": 1,
+            "batch": batch_name,
+            "batch_root_identity": _identity_payload(batch_identity),
+            "quarantine_root_identity": _identity_payload(quarantine_identity),
+            "isolated_name": isolated_name,
+            "ticket_identity": _identity_payload(ticket_identity),
+            "ticket_sha256": ticket_sha256,
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup empty proof exceeds the size limit",
+    )
+    if proof.payload != expected_payload:
+        raise SyncError(f"pending cleanup empty proof changed: {batch_name}")
+    quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    try:
+        if _directory_identity(
+            quarantine_fd
+        ) != quarantine_identity or not _bound_directory_matches(
+            home, quarantine_root, quarantine_fd
+        ):
+            raise SyncError("pending cleanup quarantine root changed")
+        if (
+            _named_entry_identity(quarantine_fd, batch_name) is not None
+            or _named_entry_identity(quarantine_fd, isolated_name) is not None
+        ):
+            raise SyncError(
+                f"pending cleanup empty proof still has a batch root: {batch_name}"
+            )
+    finally:
+        _close_fd_quietly(quarantine_fd)
+    return proof
+
+
+def _cleanup_orphan_pending_cleanup_empty_proofs(
+    home: Path,
+    *,
+    limit: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+    budget: PendingCleanupActionBudget | None = None,
+) -> int:
+    if limit < 0:
+        raise SyncError("pending cleanup proof action budget is invalid")
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return 0
+    proof_names: list[str] = []
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup control scan exceeds the size limit",
+        )
+        name_inventory = frozenset(names)
+        for name in names:
+            if not name.endswith(PENDING_CLEANUP_EMPTY_PROOF_SUFFIX):
+                continue
+            batch_name = name[: -len(PENDING_CLEANUP_EMPTY_PROOF_SUFFIX)]
+            if (
+                len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+                or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+            ):
+                continue
+            ticket_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
+            if ticket_name not in name_inventory:
+                proof_names.append(name)
+    finally:
+        _close_fd_quietly(index_fd)
+    action_budget = budget or PendingCleanupActionBudget(limit)
+    cleaned = 0
+    for proof_name in sorted(proof_names):
+        batch_name = proof_name[: -len(PENDING_CLEANUP_EMPTY_PROOF_SUFFIX)]
+        if not action_budget.charge_batch(batch_name):
+            continue
+        try:
+            ticket = _read_pending_cleanup_ticket(
+                home,
+                _pending_cleanup_ticket_path(home, batch_name),
+            )
+        except (FileNotFoundError, OSError, SyncError) as error:
+            raise _pending_cleanup_authority_classification_error(
+                batch_name,
+                error,
+            ) from error
+        if ticket is not None:
+            continue
+        proof_path = index_root / proof_name
+        proof = _read_orphan_pending_cleanup_empty_proof(home, proof_path)
+        index_fd = _open_directory_beneath(home, index_root)
+        try:
+
+            def revalidate_ticket_representations(_proof_member: str) -> None:
+                # A recovered canonical, retained, or suffix-added ticket can
+                # make this proof the only durable empty-batch evidence. Keep
+                # the proof unless every representation remains absent at both
+                # irreversible deletion boundaries on this exact index FD.
+                _require_pending_ephemeral_ticket_representations_absent(
+                    home,
+                    index_root,
+                    index_fd,
+                    batch_name,
+                )
+
+            revalidate_ticket_representations(proof_path.name)
+            _isolate_and_delete_pending_cleanup_file(
+                home,
+                proof_path,
+                index_fd,
+                proof,
+                label=f"orphan pending cleanup empty proof {batch_name}",
+                mutation_revalidator=revalidate_ticket_representations,
+            )
+        finally:
+            _close_fd_quietly(index_fd)
+        cleaned += 1
+        action_budget.mark_batch_completed(batch_name)
+    return cleaned
+
+
+def _read_orphan_pending_ephemeral_private_phase(
+    home: Path,
+    receipt_path: Path,
+) -> tuple[
+    ManagedStateFileSnapshot,
+    str,
+    PurePosixPath,
+    tuple[int, int],
+    tuple[int, int],
+    tuple[int, int],
+]:
+    suffix = PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX
+    if not receipt_path.name.endswith(suffix):
+        raise SyncError("pending cleanup private phase has an invalid file name")
+    batch_name = receipt_path.name[: -len(suffix)]
+    if (
+        len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+        or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+    ):
+        raise SyncError("pending cleanup private phase has an invalid batch name")
+    index_fd = _open_directory_beneath(home, receipt_path.parent)
+    try:
+        receipt = _read_managed_state_file_snapshot(
+            home,
+            receipt_path,
+            index_fd,
+            maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(receipt)
+            or receipt.file_type != stat.S_IFREG
+            or receipt.mode != 0o600
+            or receipt.uid != os.geteuid()
+            or receipt.payload is None
+            or receipt.parent_identity != _directory_identity(index_fd)
+        ):
+            raise SyncError(
+                f"orphan pending cleanup private phase changed: {batch_name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home,
+            receipt_path,
+            index_fd,
+            receipt,
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+    data = _decode_managed_state_json(receipt.payload, receipt_path)
+    expected_fields = {
+        "version",
+        "phase",
+        "batch",
+        "quarantine_root_identity",
+        "public_target",
+        "public_parent_identity",
+        "payload_file_identity",
+        "ticket_identity",
+        "ticket_sha256",
+    }
+    quarantine_identity = _parse_pending_identity(
+        data.get("quarantine_root_identity"),
+        "orphan pending cleanup quarantine root identity",
+    )
+    public_target = _validate_relative_path(
+        data.get("public_target"),
+        "orphan pending ephemeral cleanup target",
+    )
+    public_parent_identity = _parse_pending_identity(
+        data.get("public_parent_identity"),
+        "orphan pending cleanup public parent identity",
+    )
+    payload_identity = _parse_pending_identity(
+        data.get("payload_file_identity"),
+        "orphan pending cleanup payload identity",
+    )
+    ticket_identity = _parse_pending_identity(
+        data.get("ticket_identity"),
+        "orphan pending cleanup ticket identity",
+    )
+    ticket_sha256 = data.get("ticket_sha256")
+    if (
+        set(data) != expected_fields
+        or data.get("version") != 1
+        or data.get("phase") != "ephemeral-private-isolated"
+        or data.get("batch") != batch_name
+        or quarantine_identity is None
+        or public_parent_identity is None
+        or payload_identity is None
+        or ticket_identity is None
+        or not isinstance(ticket_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", ticket_sha256) is None
+    ):
+        raise SyncError(f"orphan pending cleanup private phase changed: {batch_name}")
+    expected_payload = _bounded_json_document(
+        {
+            "version": 1,
+            "phase": "ephemeral-private-isolated",
+            "batch": batch_name,
+            "quarantine_root_identity": _identity_payload(quarantine_identity),
+            "public_target": public_target.as_posix(),
+            "public_parent_identity": _identity_payload(public_parent_identity),
+            "payload_file_identity": _identity_payload(payload_identity),
+            "ticket_identity": _identity_payload(ticket_identity),
+            "ticket_sha256": ticket_sha256,
+        },
+        max_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        overflow_error="pending cleanup validation receipt exceeds the size limit",
+    )
+    if receipt.payload != expected_payload:
+        raise SyncError(f"orphan pending cleanup private phase changed: {batch_name}")
+    return (
+        receipt,
+        batch_name,
+        public_target,
+        public_parent_identity,
+        quarantine_identity,
+        payload_identity,
+    )
+
+
+def _cleanup_orphan_pending_ephemeral_private_phases(
+    home: Path,
+    *,
+    limit: int = MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
+    budget: PendingCleanupActionBudget | None = None,
+) -> int:
+    """Remove only a terminal v6 phase whose bound names remain empty.
+
+    The receipt protects the ticket/payload object identities and ticket
+    content hash. Recovery additionally revalidates the bound public-parent and
+    quarantine-root identities plus their access policy, then requires every
+    ticket-derived public and private name to be absent. Directory timestamps
+    and link counts are deliberately not compared because ordinary child-entry
+    churn changes them without replacing either protected directory object.
+    """
+    if limit < 0:
+        raise SyncError("pending cleanup private-phase action budget is invalid")
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return 0
+    receipt_names: list[str] = []
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup control scan exceeds the size limit",
+        )
+        name_inventory = frozenset(names)
+        suffix = PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX
+        for name in names:
+            if not name.endswith(suffix):
+                continue
+            batch_name = name[: -len(suffix)]
+            if (
+                len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+                and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+                and batch_name + PENDING_CLEANUP_TICKET_SUFFIX not in name_inventory
+            ):
+                receipt_names.append(name)
+    finally:
+        _close_fd_quietly(index_fd)
+
+    action_budget = budget or PendingCleanupActionBudget(limit)
+    cleaned = 0
+    for receipt_name in sorted(receipt_names):
+        batch_name = receipt_name[: -len(PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX)]
+        if not action_budget.charge_batch(batch_name):
+            continue
+        receipt_path = index_root / receipt_name
+        try:
+            (
+                receipt,
+                _parsed_batch_name,
+                public_target,
+                public_parent_identity,
+                quarantine_identity,
+                _payload_identity,
+            ) = _read_orphan_pending_ephemeral_private_phase(home, receipt_path)
+            target = home / Path(*public_target.parts)
+            quarantine_root = _personal_sync_root(home) / QUARANTINE_RELATIVE_PATH
+            public_parent_fd = -1
+            quarantine_fd = -1
+            index_fd = -1
+            try:
+                public_parent_fd = _open_directory_beneath(home, target.parent)
+                quarantine_fd = _open_directory_beneath(home, quarantine_root)
+                index_fd = _open_directory_beneath(home, index_root)
+
+                def require_orphan_receipt_boundary(_receipt_member: str) -> None:
+                    _require_pending_ephemeral_terminal_names_absent(
+                        home,
+                        target,
+                        public_parent_fd,
+                        public_parent_identity,
+                        quarantine_root,
+                        quarantine_fd,
+                        quarantine_identity,
+                        batch_name,
+                    )
+                    _require_pending_ephemeral_ticket_representations_absent(
+                        home,
+                        index_root,
+                        index_fd,
+                        batch_name,
+                    )
+
+                require_orphan_receipt_boundary(receipt_path.name)
+                _isolate_and_delete_pending_cleanup_file(
+                    home,
+                    receipt_path,
+                    index_fd,
+                    receipt,
+                    label=f"orphan pending cleanup private phase {batch_name}",
+                    mutation_revalidator=require_orphan_receipt_boundary,
+                )
+            finally:
+                _close_fd_quietly(index_fd)
+                _close_fd_quietly(public_parent_fd)
+                _close_fd_quietly(quarantine_fd)
+        except (FileNotFoundError, OSError, SyncError) as error:
+            raise _pending_cleanup_authority_classification_error(
+                batch_name,
+                error,
+            ) from error
+        cleaned += 1
+        action_budget.mark_batch_completed(batch_name)
+    return cleaned
+
+
+def _read_recoverable_joined_cleanup_representation(
+    home: Path,
+    allocation: PendingQuarantineAllocationTicket,
+) -> PendingBatchCleanupTicket | None:
+    """Strictly parse a v5/v7 temp or retained ticket before v8 classification."""
+    batch_name = allocation.batch_root.name
+    index_root = _pending_cleanup_index_path(home)
+    index_fd = _open_directory_beneath(home, index_root)
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            index_fd, index_root, expected_mode=0o700
+        )
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup authority scan exceeds the size limit",
+        )
+        candidates: list[str] = []
+        canonical_name = batch_name + PENDING_CLEANUP_TICKET_SUFFIX
+        temp_name = batch_name + PENDING_CLEANUP_TICKET_TEMP_SUFFIX
+        for name in names:
+            retained = _pending_cleanup_retained_canonical_name(name)
+            represented = retained or name
+            if represented in {canonical_name, temp_name}:
+                candidates.append(name)
+        if canonical_name in candidates:
+            if len(candidates) != 1:
+                raise SyncError(
+                    "pending cleanup authority has overlapping representations: "
+                    f"{batch_name}"
+                )
+            return None
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise SyncError(
+                f"pending cleanup authority has overlapping representations: {batch_name}"
+            )
+        representation = candidates[0]
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            index_root / representation,
+            index_fd,
+            maximum_bytes=MAX_PENDING_CLEANUP_TICKET_BYTES,
+        )
+        if (
+            not _managed_state_snapshot_has_complete_file_evidence(snapshot)
+            or snapshot.payload is None
+            or snapshot.file_type != stat.S_IFREG
+        ):
+            raise SyncError(
+                f"pending cleanup authority representation changed: {batch_name}"
+            )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, index_root / representation, index_fd, snapshot
+        )
+        cleanup = _read_pending_cleanup_ticket(
+            home,
+            index_root / temp_name,
+            expected_ticket_identity=snapshot.file_identity,
+            allow_temporary=True,
+            _captured_snapshot=snapshot,
+        )
+        if (
+            cleanup is None
+            or cleanup.version not in {5, 7}
+            or not _cleanup_ticket_matches_quarantine_allocation(cleanup, allocation)
+        ):
+            raise SyncError(
+                "pending quarantine allocation does not join cleanup authority: "
+                f"{batch_name}"
+            )
+        _require_pending_cleanup_fd_access_policy(
+            index_fd, index_root, expected_mode=0o700
+        )
+        if _directory_identity(
+            index_fd
+        ) != allocation.snapshot.parent_identity or not _bound_directory_matches(
+            home, index_root, index_fd
+        ):
+            raise SyncError("pending quarantine allocation index changed")
+        return cleanup
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _read_recoverable_private_use_receipt_representation(
+    home: Path,
+    batch_name: str,
+) -> PendingPrivateUseRetirementReceipt | None:
+    index_root = _pending_cleanup_index_path(home)
+    index_fd = _open_directory_beneath(home, index_root)
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="private-use retirement scan exceeds the size limit",
+        )
+        canonical = batch_name + PENDING_PRIVATE_USE_RETIREMENT_SUFFIX
+        temporary = canonical + PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+        candidates = []
+        for name in names:
+            retained = _pending_cleanup_retained_canonical_name(name)
+            if (retained or name) in {canonical, temporary}:
+                candidates.append(name)
+        if canonical in candidates:
+            return None
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise SyncError(
+                f"private-use retirement has overlapping receipts: {batch_name}"
+            )
+        representation = candidates[0]
+        snapshot = _read_managed_state_file_snapshot(
+            home,
+            index_root / representation,
+            index_fd,
+            maximum_bytes=MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        )
+        _require_pending_cleanup_file_snapshot_access_policy(
+            home, index_root / representation, index_fd, snapshot
+        )
+        receipt = _read_pending_private_use_retirement_receipt(
+            home,
+            index_root / temporary,
+            expected_identity=snapshot.file_identity,
+            allow_temporary=True,
+            _captured_snapshot=snapshot,
+        )
+        if receipt is None:
+            raise SyncError(f"private-use retirement receipt disappeared: {batch_name}")
+        represented = replace(receipt, path=index_root / representation)
+        _require_pending_private_use_retirement_boundary(
+            home, represented, receipt_member=representation
+        )
+        return represented
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _read_current_private_use_retirement_authority(
+    home: Path,
+    batch_name: str,
+) -> PendingPrivateUseRetirementReceipt | None:
+    receipt = _read_pending_private_use_retirement_receipt(
+        home, _pending_private_use_retirement_path(home, batch_name)
+    )
+    if receipt is not None:
+        return receipt
+    return _read_recoverable_private_use_receipt_representation(home, batch_name)
+
+
+def _pending_quarantine_allocation_recovery_state(
+    home: Path,
+    allocation: PendingQuarantineAllocationTicket,
+) -> tuple[
+    str,
+    EphemeralQuarantineBatchBinding | None,
+    str | None,
+    tuple[int, int] | None,
+]:
+    """Classify one reservation-only v8 fence without adopting an entity.
+
+    V8 proves only that both candidate names were absent when the reservation
+    was published.  It binds neither a later batch inode nor its metadata or
+    leaf, so any present canonical or isolated entity is foreign unless an
+    authoritative matching v5/v7 ticket owns cleanup.  Only double absence may
+    retire v8 directly.
+    """
+    batch_name = allocation.batch_root.name
+    quarantine_root = allocation.batch_root.parent
+    quarantine_fd = _open_directory_beneath(home, quarantine_root)
+    try:
+        _require_pending_cleanup_fd_access_policy(
+            quarantine_fd,
+            quarantine_root,
+            expected_mode=0o700,
+        )
+        if _directory_identity(
+            quarantine_fd
+        ) != allocation.quarantine_root_identity or not _bound_directory_matches(
+            home,
+            quarantine_root,
+            quarantine_fd,
+        ):
+            raise SyncError(f"pending quarantine allocation root changed: {batch_name}")
+        receipt = _read_pending_private_use_retirement_receipt(
+            home, _pending_private_use_retirement_path(home, batch_name)
+        )
+        if receipt is not None:
+            _require_pending_private_use_retirement_boundary(
+                home, receipt, receipt_member=receipt.path.name
+            )
+            return "delegated", None, None, None
+        represented_receipt = _read_recoverable_private_use_receipt_representation(
+            home, batch_name
+        )
+        if represented_receipt is not None:
+            return "delegated", None, None, None
+        represented_cleanup = _read_recoverable_joined_cleanup_representation(
+            home, allocation
+        )
+        if represented_cleanup is not None:
+            return "delegated", None, None, None
+        canonical = _named_entry_identity(quarantine_fd, batch_name)
+        isolated = _named_entry_identity(
+            quarantine_fd,
+            allocation.isolated_name,
+        )
+        if canonical is not None and isolated is not None:
+            raise SyncError(
+                f"pending quarantine allocation has canonical and isolated "
+                f"entities: {batch_name}"
+            )
+        cleanup = _read_pending_cleanup_ticket(
+            home,
+            _pending_cleanup_ticket_path(home, batch_name),
+        )
+        if cleanup is not None:
+            if _cleanup_ticket_matches_quarantine_allocation(cleanup, allocation):
+                return "delegated", None, None, None
+            # The v8 fence has reserved this exact batch name.  A same-name
+            # v5/v7 record that does not bind the identical root, metadata and
+            # isolated-name authority is not an alternative cleanup plan.  In
+            # particular, dry-run must not describe the scaffold as removable
+            # when the real publisher would reject the conflicting ticket.
+            raise SyncError(
+                "pending quarantine allocation does not join cleanup authority: "
+                f"{batch_name}"
+            )
+        if canonical is None and isolated is None:
+            _require_pending_quarantine_allocation_ticket_unchanged(home, allocation)
+            return "absent", None, None, None
+        _require_pending_quarantine_allocation_ticket_unchanged(home, allocation)
+        raise SyncError(
+            "pending quarantine allocation has a present entity without exact "
+            f"cleanup authority and was retained: {batch_name}"
+        )
+    finally:
+        _close_fd_quietly(quarantine_fd)
+
+
+def _pending_quarantine_allocation_fence_is_cleanup_ready(
+    home: Path,
+    allocation: PendingQuarantineAllocationTicket,
+) -> bool:
+    state, _binding, _current_name, _expected_identity = (
+        _pending_quarantine_allocation_recovery_state(home, allocation)
+    )
+    return state == "absent"
+
+
+def _pending_cleanup_ready_batch_is_observed(
+    home: Path,
+    *,
+    allow_v8_control_recovery: bool = False,
+) -> bool:
+    if not _pending_link_pointer_is_absent(home):
+        return False
+    cleanup_ready = bool(_discover_pending_staging_markers(home))
+    cleanup_ready = bool(_discover_pending_staging_marker_temps(home)) or cleanup_ready
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return cleanup_ready
+    try:
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed")
+        with os.scandir(index_fd) as iterator:
+            for scanned, entry in enumerate(iterator, start=1):
+                if scanned > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
+                    raise SyncError(
+                        "pending cleanup ticket scan exceeds the size limit"
+                    )
+                unresolved = _pending_cleanup_unresolved_ticket_representation(
+                    entry.name
+                )
+                if unresolved is not None:
+                    # Do not collapse unclassified ticket-derived bytes into a
+                    # generic cleanup plan.  A caller may have checked moments
+                    # earlier; this complete scan is the final observation
+                    # before status or dry-run reports a recoverable action.
+                    raise _pending_cleanup_unresolved_ticket_representation_error(
+                        unresolved
+                    )
+                unresolved_allocation = (
+                    _pending_quarantine_unresolved_allocation_representation(entry.name)
+                )
+                if unresolved_allocation is not None:
+                    # The same final scan also closes the interval after an
+                    # earlier preflight check. A malformed v8-derived name
+                    # remains evidence only; it cannot turn a read-only
+                    # observation into an automatic cleanup plan.
+                    raise _pending_quarantine_unresolved_allocation_representation_error(
+                        unresolved_allocation
+                    )
+                unresolved_receipt = (
+                    _pending_private_use_retirement_unresolved_representation(
+                        entry.name
+                    )
+                )
+                if unresolved_receipt is not None:
+                    receipt_batch, receipt_name = unresolved_receipt
+                    raise SyncError(
+                        "private-use retirement receipt representation must be "
+                        f"reconciled before new mutation: {receipt_batch}: "
+                        f"{receipt_name}"
+                    )
+                if _pending_private_use_retirement_batch_name(entry.name) is not None:
+                    receipt = _read_pending_private_use_retirement_receipt(
+                        home, index_root / entry.name
+                    )
+                    if receipt is None:
+                        raise SyncError(
+                            f"private-use retirement receipt disappeared: {entry.name}"
+                        )
+                    _require_pending_private_use_retirement_boundary(
+                        home, receipt, receipt_member=entry.name
+                    )
+                    cleanup_ready = True
+                    continue
+                allocation_batch_name = _pending_quarantine_allocation_batch_name(
+                    entry.name
+                )
+                if allocation_batch_name is not None:
+                    allocation = _read_pending_quarantine_allocation_ticket(
+                        home,
+                        index_root / entry.name,
+                    )
+                    if allocation is not None:
+                        cleanup_ready = (
+                            _pending_quarantine_allocation_fence_is_cleanup_ready(
+                                home,
+                                allocation,
+                            )
+                            or cleanup_ready
+                        )
+                    continue
+                allocation_temp_batch_name = (
+                    _pending_quarantine_allocation_temp_batch_name(entry.name)
+                )
+                retained_allocation = _pending_quarantine_retained_allocation_name(
+                    entry.name
+                )
+                retained_allocation_temp = (
+                    _pending_quarantine_retained_allocation_temp_name(entry.name)
+                )
+                if (
+                    allocation_temp_batch_name is not None
+                    or retained_allocation is not None
+                    or retained_allocation_temp is not None
+                ):
+                    blocked_batch_name = allocation_temp_batch_name
+                    if blocked_batch_name is None and retained_allocation is not None:
+                        blocked_batch_name = retained_allocation[1]
+                    if blocked_batch_name is None:
+                        assert retained_allocation_temp is not None
+                        blocked_batch_name = retained_allocation_temp[1]
+                    if not allow_v8_control_recovery:
+                        raise SyncError(
+                            "pending quarantine allocation control requires mutation "
+                            "recovery before cleanup readiness can be classified: "
+                            f"{blocked_batch_name}: {entry.name}"
+                        )
+                    cleanup_ready = True
+                    continue
+                retained = _pending_cleanup_retained_control_name(entry.name)
+                if retained is not None:
+                    cleanup_ready = True
+                if (
+                    _pending_cleanup_ticket_temp_batch_name(entry.name) is not None
+                    or _pending_cleanup_retained_ticket_temp_name(entry.name)
+                    is not None
+                    or _pending_quarantine_metadata_stage_batch_name(entry.name)
+                    is not None
+                    or _pending_quarantine_retained_metadata_stage_name(entry.name)
+                    is not None
+                    or _pending_cleanup_cursor_temp_canonical_name(entry.name)
+                    is not None
+                    or _pending_private_use_retirement_temp_batch_name(entry.name)
+                    is not None
+                ):
+                    cleanup_ready = True
+                for suffix in (
+                    PENDING_CLEANUP_TICKET_SUFFIX,
+                    PENDING_CLEANUP_EMPTY_PROOF_SUFFIX,
+                    PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+                    PENDING_PRIVATE_USE_RETIREMENT_SUFFIX,
+                ):
+                    if not entry.name.endswith(suffix):
+                        continue
+                    batch_name = entry.name[: -len(suffix)]
+                    if (
+                        len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+                        and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+                    ):
+                        cleanup_ready = True
+        return cleanup_ready
+    finally:
+        _close_fd_quietly(index_fd)
+
+
+def _cleanup_pending_quarantine_allocations(
+    home: Path,
+    *,
+    budget: PendingCleanupActionBudget,
+) -> int:
+    """Recover only exact v8 states with independently proven cleanup authority."""
+    _require_no_pending_unresolved_ticket_representations(home)
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return 0
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending quarantine allocation scan exceeds the limit",
+        )
+        for name in names:
+            unresolved = _pending_quarantine_unresolved_allocation_representation(name)
+            if unresolved is not None:
+                raise _pending_quarantine_unresolved_allocation_representation_error(
+                    unresolved
+                )
+        allocation_names = sorted(
+            name
+            for name in names
+            if _pending_quarantine_allocation_batch_name(name) is not None
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+    cleaned = 0
+    for name in allocation_names:
+        batch_name = _pending_quarantine_allocation_batch_name(name)
+        assert batch_name is not None
+        if not budget.charge_batch(batch_name):
+            continue
+        allocation = _read_pending_quarantine_allocation_ticket(
+            home,
+            index_root / name,
+        )
+        if allocation is None:
+            continue
+        state, _binding, _current_name, _expected_identity = (
+            _pending_quarantine_allocation_recovery_state(
+                home,
+                allocation,
+            )
+        )
+        if state == "absent":
+            _retire_quarantine_allocation_after_batch_absent(home, allocation)
+            cleaned += 1
+            budget.mark_batch_completed(batch_name)
+            continue
+        # The exact v5/v7 cleanup protocol owns the entity.  Its scanner may be
+        # budget-deferred; v8 remains as a mutation fence until removal.
+    return cleaned
+
+
+def _cleanup_pending_private_use_retirements(
+    home: Path,
+    *,
+    budget: PendingCleanupActionBudget,
+) -> int:
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return 0
+    try:
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="private-use retirement scan exceeds the size limit",
+        )
+        receipt_names = sorted(
+            name
+            for name in names
+            if _pending_private_use_retirement_batch_name(name) is not None
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+    cleaned = 0
+    for name in receipt_names:
+        batch_name = _pending_private_use_retirement_batch_name(name)
+        assert batch_name is not None
+        if not budget.charge_batch(batch_name):
+            continue
+        try:
+            receipt = _read_pending_private_use_retirement_receipt(
+                home, index_root / name
+            )
+            if receipt is None:
+                continue
+            _retire_pending_private_use_controls(home, receipt)
+        except (FileNotFoundError, OSError, SyncError) as error:
+            raise _pending_cleanup_authority_classification_error(
+                batch_name, error
+            ) from error
+        cleaned += 1
+        budget.mark_batch_completed(batch_name)
+    return cleaned
+
+
+def _cleanup_ready_pending_batches(
+    home: Path,
+    *,
+    budget: PendingCleanupActionBudget | None = None,
+) -> int:
+    if not _pending_link_pointer_is_absent(home):
+        return 0
+    _require_no_pending_unresolved_ticket_representations(home)
+    action_budget = budget or PendingCleanupActionBudget(
+        MAX_PENDING_CLEANUP_BATCHES_PER_RUN
+    )
+    completed_before = action_budget.completed
+    _restore_pending_cleanup_control_tombstones(
+        home,
+        budget=action_budget,
+    )
+    _cleanup_pending_cleanup_ticket_temps(
+        home,
+        budget=action_budget,
+    )
+    _cleanup_pending_private_use_retirements(
+        home,
+        budget=action_budget,
+    )
+    _publish_discovered_staging_cleanup_tickets(
+        home,
+        budget=action_budget,
+    )
+    _cleanup_orphan_pending_cleanup_empty_proofs(
+        home,
+        budget=action_budget,
+    )
+    _cleanup_orphan_pending_ephemeral_private_phases(
+        home,
+        budget=action_budget,
+    )
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return action_budget.completed - completed_before
+    _close_fd_quietly(index_fd)
+    cursor_cleanup_actions = _cleanup_pending_cleanup_cursor_temp(
+        home,
+        index_root,
+        limit=action_budget.remaining,
+    )
+    action_budget.consume_control_actions(cursor_cleanup_actions)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return action_budget.completed - completed_before
     candidates: list[str] = []
     try:
         if not _bound_directory_matches(home, index_root, index_fd):
             raise SyncError("pending cleanup index changed")
         with os.scandir(index_fd) as iterator:
             for scanned, entry in enumerate(iterator, start=1):
-                if scanned > MAX_PENDING_CLEANUP_BATCH_SCAN + 3:
-                    print(
-                        "warning: pending cleanup ticket scan reached its limit; "
-                        "processing the bounded window"
+                if scanned > MAX_PENDING_CLEANUP_CONTROL_ENTRIES:
+                    raise SyncError(
+                        "pending cleanup ticket scan exceeds the size limit"
                     )
-                    break
                 if not entry.name.endswith(PENDING_CLEANUP_TICKET_SUFFIX):
                     continue
                 batch_name = entry.name[: -len(PENDING_CLEANUP_TICKET_SUFFIX)]
@@ -16366,7 +34408,8 @@ def _cleanup_ready_pending_batches(home: Path) -> int:
 
     ordered = sorted(candidates)
     if not ordered:
-        return 0
+        _cleanup_pending_quarantine_allocations(home, budget=action_budget)
+        return action_budget.completed - completed_before
     cursor = _read_pending_cleanup_cursor(home, index_root)
     start = 0
     if cursor is not None:
@@ -16375,8 +34418,11 @@ def _cleanup_ready_pending_batches(home: Path) -> int:
             0,
         )
     rotated = ordered[start:] + ordered[:start]
-    selected = rotated[:MAX_PENDING_CLEANUP_BATCHES_PER_RUN]
-    cleaned = 0
+    selected: list[str] = []
+    for ticket_name in rotated:
+        batch_name = ticket_name[: -len(PENDING_CLEANUP_TICKET_SUFFIX)]
+        if action_budget.charge_batch(batch_name):
+            selected.append(ticket_name)
     for ticket_name in selected:
         batch_name = ticket_name[: -len(PENDING_CLEANUP_TICKET_SUFFIX)]
         try:
@@ -16384,17 +34430,41 @@ def _cleanup_ready_pending_batches(home: Path) -> int:
                 home,
                 index_root / ticket_name,
             )
-            if ticket is None:
-                continue
-            if _remove_cleanup_ready_batch(home, ticket):
-                cleaned += 1
         except (FileNotFoundError, OSError, SyncError) as error:
+            raise _pending_cleanup_authority_classification_error(
+                batch_name,
+                error,
+            ) from error
+        if ticket is None:
+            continue
+        try:
+            if _remove_cleanup_ready_batch(home, ticket):
+                action_budget.mark_batch_completed(batch_name)
+        except (FileNotFoundError, OSError, SyncError) as error:
+            if ticket.version == 4:
+                raise SyncError(
+                    "pending terminal regular-file validation was retained: "
+                    f"{batch_name}: {error}"
+                ) from error
+            if ticket.version in {5, 6, 7}:
+                raise SyncError(
+                    "pending ephemeral quarantine cleanup authority was retained: "
+                    f"{batch_name}: {error}"
+                ) from error
             print(
                 "warning: deferred pending transaction cleanup was retained: "
                 f"{batch_name}: {error}"
             )
-    _write_pending_cleanup_cursor(home, index_root, selected[-1])
-    return cleaned
+    if selected:
+        cursor_cleanup_actions = _write_pending_cleanup_cursor(
+            home,
+            index_root,
+            selected[-1],
+            max_temp_cleanup_actions=action_budget.remaining,
+        )
+        action_budget.consume_control_actions(cursor_cleanup_actions)
+    _cleanup_pending_quarantine_allocations(home, budget=action_budget)
+    return action_budget.completed - completed_before
 
 
 def _try_cleanup_ready_pending_batches(home: Path) -> int:
@@ -16403,6 +34473,146 @@ def _try_cleanup_ready_pending_batches(home: Path) -> int:
     except (OSError, SyncError) as error:
         print(f"warning: pending transaction cleanup scan was deferred: {error}")
         return 0
+
+
+def _require_no_pending_terminal_mutation_authority(home: Path) -> None:
+    if not _pending_link_pointer_is_absent(home):
+        raise SyncError(
+            "active pending transaction must be recovered before new mutation"
+        )
+    _require_no_pending_unresolved_ticket_representations(home)
+    index_root = _pending_cleanup_index_path(home)
+    try:
+        index_fd = _open_directory_beneath(home, index_root)
+    except FileNotFoundError:
+        return
+    try:
+        if not _bound_directory_matches(home, index_root, index_fd):
+            raise SyncError("pending cleanup index changed before mutation")
+        names = _directory_member_names(
+            index_fd,
+            maximum_entries=MAX_PENDING_CLEANUP_CONTROL_ENTRIES,
+            overflow_message="pending cleanup authority scan exceeds the size limit",
+        )
+    finally:
+        _close_fd_quietly(index_fd)
+    for name in names:
+        retirement_batch_name = (
+            _pending_private_use_retirement_representation_batch_name(name)
+        )
+        if retirement_batch_name is not None:
+            raise SyncError(
+                "private-use retirement authority must be reconciled before new "
+                f"mutation: {retirement_batch_name}"
+            )
+        unresolved_allocation = (
+            _pending_quarantine_unresolved_allocation_representation(name)
+        )
+        if unresolved_allocation is not None:
+            raise _pending_quarantine_unresolved_allocation_representation_error(
+                unresolved_allocation
+            )
+        allocation_batch_name = _pending_quarantine_allocation_batch_name(name)
+        allocation_temp_batch_name = _pending_quarantine_allocation_temp_batch_name(
+            name
+        )
+        retained_allocation = _pending_quarantine_retained_allocation_name(name)
+        retained_allocation_temp = _pending_quarantine_retained_allocation_temp_name(
+            name
+        )
+        metadata_stage_batch_name = _pending_quarantine_metadata_stage_batch_name(name)
+        retained_metadata_stage = _pending_quarantine_retained_metadata_stage_name(name)
+        if (
+            allocation_batch_name is not None
+            or allocation_temp_batch_name is not None
+            or retained_allocation is not None
+            or retained_allocation_temp is not None
+            or metadata_stage_batch_name is not None
+            or retained_metadata_stage is not None
+        ):
+            blocked_batch_name = allocation_batch_name or allocation_temp_batch_name
+            if blocked_batch_name is None and retained_allocation is not None:
+                blocked_batch_name = retained_allocation[1]
+            if blocked_batch_name is None:
+                if retained_allocation_temp is not None:
+                    blocked_batch_name = retained_allocation_temp[1]
+                elif metadata_stage_batch_name is not None:
+                    blocked_batch_name = metadata_stage_batch_name
+                else:
+                    assert retained_metadata_stage is not None
+                    blocked_batch_name = retained_metadata_stage[1]
+            raise SyncError(
+                "pending quarantine allocation must be reconciled before new "
+                f"mutation: {blocked_batch_name}"
+            )
+        temp_batch_name = _pending_cleanup_ticket_temp_batch_name(name)
+        retained_temp = _pending_cleanup_retained_ticket_temp_name(name)
+        if temp_batch_name is not None or retained_temp is not None:
+            # Complete v6/v7 temps are durable authority awaiting promotion;
+            # incomplete or unreadable temps are unresolved state.  Neither is
+            # safe to ignore merely because this run spent its cleanup budget.
+            blocked_batch_name = (
+                temp_batch_name if temp_batch_name is not None else retained_temp[1]
+            )
+            raise SyncError(
+                "pending cleanup ticket temp must be reconciled before new "
+                f"mutation: {blocked_batch_name}"
+            )
+        retained = _pending_cleanup_retained_control_name(name)
+        if retained is not None and retained[0].endswith(
+            (
+                PENDING_CLEANUP_TICKET_SUFFIX,
+                PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX,
+            )
+        ):
+            raise SyncError(
+                "retained pending cleanup authority must be reconciled before "
+                f"new mutation: {retained[1]}"
+            )
+        unresolved_ticket_representation = (
+            _pending_cleanup_unresolved_ticket_representation(name)
+        )
+        if unresolved_ticket_representation is not None:
+            related_ticket_batch_name, _related_ticket_name = (
+                unresolved_ticket_representation
+            )
+            raise SyncError(
+                "pending cleanup ticket representation must be reconciled before "
+                f"new mutation: {related_ticket_batch_name}"
+            )
+        if name.endswith(PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX):
+            batch_name = name[: -len(PENDING_CLEANUP_TERMINAL_VALIDATION_SUFFIX)]
+            if (
+                len(batch_name) <= MAX_PENDING_LINK_BATCH_NAME_BYTES
+                and PENDING_LINK_BATCH_RE.fullmatch(batch_name) is not None
+            ):
+                raise SyncError(
+                    "pending cleanup private or terminal authority must be "
+                    f"reconciled before new mutation: {batch_name}"
+                )
+        if not name.endswith(PENDING_CLEANUP_TICKET_SUFFIX):
+            continue
+        batch_name = name[: -len(PENDING_CLEANUP_TICKET_SUFFIX)]
+        if (
+            len(batch_name) > MAX_PENDING_LINK_BATCH_NAME_BYTES
+            or PENDING_LINK_BATCH_RE.fullmatch(batch_name) is None
+        ):
+            continue
+        try:
+            ticket = _read_pending_cleanup_ticket(
+                home,
+                index_root / name,
+            )
+        except (FileNotFoundError, OSError, SyncError) as error:
+            raise _pending_cleanup_authority_classification_error(
+                batch_name,
+                error,
+            ) from error
+        if ticket is not None and ticket.version in {3, 4, 5, 6, 7}:
+            raise SyncError(
+                "pending cleanup authority must reach terminal validation before "
+                f"new mutation: {batch_name} (ticket v{ticket.version})"
+            )
 
 
 def _clear_pending_link_pointer(
@@ -16495,7 +34705,11 @@ def _restore_pending_state_before(
             expected_identity=batch.state_before.file_identity,
         )
         if (
-            evidence_snapshot.payload != batch.state_before.payload
+            not _managed_state_snapshot_matches_file_evidence(
+                evidence_snapshot,
+                batch.state_before,
+            )
+            or evidence_snapshot.payload != batch.state_before.payload
             or evidence_snapshot.mode != batch.state_before.mode
         ):
             raise SyncError("pending transaction state-before evidence changed")
@@ -16514,7 +34728,11 @@ def _restore_pending_state_before(
             expected_identity=batch.state_before.file_identity,
         )
         if (
-            restored.file_identity != batch.state_before.file_identity
+            not _managed_state_snapshot_matches_file_evidence(
+                restored,
+                batch.state_before,
+            )
+            or restored.file_identity != batch.state_before.file_identity
             or restored.payload != batch.state_before.payload
             or restored.mode != batch.state_before.mode
         ):
@@ -16587,7 +34805,7 @@ def _pending_record_evidence_snapshot(
     home: Path,
     batch: PendingLinkBatch,
     record: PendingLinkRecord,
-) -> SymlinkSnapshot:
+) -> SymlinkSnapshot | RegularFileSnapshot:
     if (
         record.evidence is None
         or record.stage is None
@@ -16597,6 +34815,58 @@ def _pending_record_evidence_snapshot(
     ):
         raise SyncError(f"pending record has no produced evidence: {record.target}")
     evidence = batch.batch_root / Path(*record.evidence.parts)
+    stage = batch.batch_root / Path(*record.stage.parts)
+    if record.is_regular():
+        expected_values = (
+            record.regular_sha256,
+            record.regular_size,
+            record.regular_mode,
+            record.regular_uid,
+            record.regular_link_count,
+        )
+        if any(value is None for value in expected_values):
+            raise SyncError(
+                f"pending regular-file record is incomplete: {record.target}"
+            )
+        try:
+            evidence_snapshot = _read_regular_file_snapshot_beneath(
+                home,
+                evidence,
+                require_managed_access=False,
+            )
+            stage_snapshot = _read_regular_file_snapshot_beneath(
+                home,
+                stage,
+                require_managed_access=False,
+            )
+        except (FileNotFoundError, OSError, SyncError) as error:
+            raise SyncError(
+                f"pending regular-file evidence is missing or unsafe: {record.target}"
+            ) from error
+        for snapshot in (stage_snapshot, evidence_snapshot):
+            if (
+                snapshot.file_identity != record.evidence_identity
+                or snapshot.file_identity != record.stage_identity
+                or snapshot.sha256 != record.regular_sha256
+                or snapshot.size != record.regular_size
+                or snapshot.mode != record.regular_mode
+                or snapshot.uid != record.regular_uid
+                or snapshot.link_count
+                not in {
+                    record.regular_link_count,
+                    record.regular_link_count + 1,
+                }
+            ):
+                raise SyncError(
+                    f"pending regular-file evidence changed: {record.target}"
+                )
+        _verify_pending_regular_aliases(
+            home,
+            batch,
+            evidence,
+            evidence_snapshot,
+        )
+        return evidence_snapshot
     try:
         evidence_snapshot = _read_symlink_snapshot_beneath(home, evidence)
     except (FileNotFoundError, OSError, SyncError) as error:
@@ -16608,7 +34878,6 @@ def _pending_record_evidence_snapshot(
         or evidence_snapshot.link_identity != record.evidence_identity
     ):
         raise SyncError(f"pending link evidence changed: {record.target}")
-    stage = batch.batch_root / Path(*record.stage.parts)
     stage_snapshot = _read_optional_symlink_snapshot_beneath(home, stage)
     if stage_snapshot is None or (
         stage_snapshot.link_identity != record.stage_identity
@@ -16623,12 +34892,29 @@ def _pending_record_before_evidence_snapshot(
     home: Path,
     batch: PendingLinkBatch,
     record: PendingLinkRecord,
-) -> SymlinkSnapshot:
-    if (
-        record.before_evidence is None
-        or record.before_evidence_identity is None
-        or record.planned_snapshot.link_target is None
-    ):
+) -> SymlinkSnapshot | RegularFileSnapshot:
+    if record.before_evidence is None or record.before_evidence_identity is None:
+        raise SyncError(f"pending record has no before evidence: {record.target}")
+    planned_regular = _regular_snapshot_from_reconcile(record.planned_snapshot)
+    if planned_regular is not None:
+        snapshot = _read_regular_file_snapshot_beneath(
+            home,
+            batch.batch_root / Path(*record.before_evidence.parts),
+            require_managed_access=False,
+        )
+        if (
+            snapshot.file_identity != record.before_evidence_identity
+            or not _regular_snapshot_leaf_matches(snapshot, planned_regular)
+        ):
+            raise SyncError(f"pending before evidence changed: {record.target}")
+        _verify_pending_regular_aliases(
+            home,
+            batch,
+            batch.batch_root / Path(*record.before_evidence.parts),
+            snapshot,
+        )
+        return snapshot
+    if record.planned_snapshot.link_target is None:
         raise SyncError(f"pending record has no before evidence: {record.target}")
     snapshot = _read_symlink_snapshot_beneath(
         home,
@@ -16647,39 +34933,106 @@ def _pending_record_backup_snapshot(
     home: Path,
     batch: PendingLinkBatch,
     record: PendingLinkRecord,
-) -> SymlinkSnapshot | None:
+) -> SymlinkSnapshot | RegularFileSnapshot | None:
     if record.backup is None:
         return None
     backup = batch.batch_root / Path(*record.backup.parts)
-    snapshot = _read_optional_symlink_snapshot_beneath(home, backup)
-    if snapshot is None:
-        if _path_exists_or_is_link(backup):
-            raise SyncError(f"pending backup is not a symlink: {record.target}")
+    try:
+        parent_fd = _open_directory_beneath(home, backup.parent)
+    except FileNotFoundError:
         return None
-    if (
-        snapshot.link_identity != record.before_evidence_identity
-        or snapshot.link_target != record.planned_snapshot.link_target
-    ):
-        raise SyncError(f"pending backup changed: {record.target}")
-    return snapshot
+    except (OSError, SyncError) as error:
+        raise SyncError(f"pending backup is unreadable: {record.target}") from error
+    try:
+        if not _bound_directory_matches(home, backup.parent, parent_fd):
+            raise SyncError(f"pending backup parent changed: {record.target}")
+        try:
+            metadata = os.stat(
+                backup.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise SyncError(f"pending backup is unreadable: {record.target}") from error
+
+        planned_regular = _regular_snapshot_from_reconcile(record.planned_snapshot)
+        if planned_regular is not None:
+            if not stat.S_ISREG(metadata.st_mode):
+                raise SyncError(
+                    f"pending backup is not a regular file: {record.target}"
+                )
+            snapshot = _regular_file_snapshot_at(
+                parent_fd,
+                backup.name,
+                backup,
+            )
+            if (
+                snapshot.file_identity != record.before_evidence_identity
+                or not _regular_snapshot_leaf_matches(snapshot, planned_regular)
+            ):
+                raise SyncError(f"pending backup changed: {record.target}")
+            _verify_pending_regular_aliases(
+                home,
+                batch,
+                backup,
+                snapshot,
+            )
+            if not _bound_directory_matches(home, backup.parent, parent_fd):
+                raise SyncError(f"pending backup parent changed: {record.target}")
+            return snapshot
+
+        if not stat.S_ISLNK(metadata.st_mode):
+            raise SyncError(f"pending backup is not a symlink: {record.target}")
+        identity, link_target = _symlink_snapshot_at(parent_fd, backup.name)
+        snapshot = SymlinkSnapshot(
+            parent_identity=_directory_identity(parent_fd),
+            link_identity=identity,
+            link_target=link_target,
+        )
+        if (
+            snapshot.link_identity != record.before_evidence_identity
+            or snapshot.link_target != record.planned_snapshot.link_target
+        ):
+            raise SyncError(f"pending backup changed: {record.target}")
+        if not _bound_directory_matches(home, backup.parent, parent_fd):
+            raise SyncError(f"pending backup parent changed: {record.target}")
+        return snapshot
+    finally:
+        _close_fd_quietly(parent_fd)
 
 
 def _pending_target_snapshot(
     home: Path,
     target: Path,
-) -> tuple[SymlinkSnapshot | None, bool]:
-    snapshot = _read_optional_symlink_snapshot_beneath(home, target)
-    return snapshot, _path_exists_or_is_link(target)
+) -> tuple[SymlinkSnapshot | RegularFileSnapshot | None, bool]:
+    captured = _capture_reconcile_target_snapshot(home, target)
+    regular = _regular_snapshot_from_reconcile(captured)
+    if regular is not None:
+        return regular, True
+    if captured.link_target is not None:
+        assert captured.parent_identity is not None
+        assert captured.link_identity is not None
+        return (
+            SymlinkSnapshot(
+                parent_identity=captured.parent_identity,
+                link_identity=captured.link_identity,
+                link_target=captured.link_target,
+            ),
+            True,
+        )
+    return None, captured.link_identity is not None
 
 
 def _symlink_snapshot_matches(
-    actual: SymlinkSnapshot | None,
+    actual: SymlinkSnapshot | RegularFileSnapshot | None,
     expected_parent_identity: tuple[int, int] | None,
     expected_identity: tuple[int, int] | None,
     expected_target: str | None,
 ) -> bool:
     return (
-        actual is not None
+        isinstance(actual, SymlinkSnapshot)
         and expected_parent_identity is not None
         and expected_identity is not None
         and expected_target is not None
@@ -16690,12 +35043,12 @@ def _symlink_snapshot_matches(
 
 
 def _symlink_snapshot_leaf_matches(
-    actual: SymlinkSnapshot | None,
+    actual: SymlinkSnapshot | RegularFileSnapshot | None,
     expected_identity: tuple[int, int] | None,
     expected_target: str | None,
 ) -> bool:
     return (
-        actual is not None
+        isinstance(actual, SymlinkSnapshot)
         and expected_identity is not None
         and expected_target is not None
         and actual.link_identity == expected_identity
@@ -16703,11 +35056,55 @@ def _symlink_snapshot_leaf_matches(
     )
 
 
+def _regular_snapshot_matches(
+    actual: SymlinkSnapshot | RegularFileSnapshot | None,
+    expected_parent_identity: tuple[int, int] | None,
+    expected: RegularFileSnapshot,
+    *,
+    expected_link_count: int,
+) -> bool:
+    return (
+        isinstance(actual, RegularFileSnapshot)
+        and expected_parent_identity is not None
+        and actual.parent_identity == expected_parent_identity
+        and actual.file_identity == expected.file_identity
+        and actual.sha256 == expected.sha256
+        and actual.size == expected.size
+        and actual.mode == expected.mode
+        and actual.uid == expected.uid
+        and _gid_matches_regular_file_access_policy(
+            actual.gid,
+            expected.gid,
+            expected.mode,
+        )
+        and actual.link_count == expected_link_count
+    )
+
+
+def _regular_snapshot_leaf_matches(
+    actual: SymlinkSnapshot | RegularFileSnapshot | None,
+    expected: RegularFileSnapshot,
+) -> bool:
+    return (
+        isinstance(actual, RegularFileSnapshot)
+        and actual.file_identity == expected.file_identity
+        and actual.sha256 == expected.sha256
+        and actual.size == expected.size
+        and actual.mode == expected.mode
+        and actual.uid == expected.uid
+        and _gid_matches_regular_file_access_policy(
+            actual.gid,
+            expected.gid,
+            expected.mode,
+        )
+    )
+
+
 def _restore_pending_record_before(
     home: Path,
     batch: PendingLinkBatch,
     record: PendingLinkRecord,
-    before_evidence: SymlinkSnapshot,
+    before_evidence: SymlinkSnapshot | RegularFileSnapshot,
 ) -> None:
     assert record.before_evidence is not None
     target = home / Path(*record.target.parts)
@@ -16715,9 +35112,28 @@ def _restore_pending_record_before(
         parent_identity=record.planned_snapshot.parent_identity,
         ancestor_identity=record.planned_snapshot.parent_identity,
     )
+    source = batch.batch_root / Path(*record.before_evidence.parts)
+    if isinstance(before_evidence, RegularFileSnapshot):
+        restored = _publish_regular_reconcile_hardlink_beneath(
+            home,
+            source,
+            target,
+            before_evidence,
+            expected_target,
+            {},
+            pending_batch=batch,
+            pending_record=record,
+            cleanup_phase="before",
+        )
+        if not _regular_snapshot_leaf_matches(
+            restored,
+            before_evidence,
+        ):
+            raise SyncError(f"pending preimage restoration changed: {record.target}")
+        return
     restored = _publish_symlink_hardlink_beneath(
         home,
-        batch.batch_root / Path(*record.before_evidence.parts),
+        source,
         target,
         before_evidence,
         expected_target,
@@ -16744,6 +35160,12 @@ def _managed_state_snapshot_exact(
         actual.file_identity == expected.file_identity
         and actual.mode == expected.mode
         and actual.payload == expected.payload
+        and actual.uid == expected.uid
+        and _gid_matches_regular_file_access_policy(
+            actual.gid,
+            expected.gid,
+            expected.mode,
+        )
     )
 
 
@@ -16818,7 +35240,7 @@ def _verify_pending_link_claims(
                 f"pending {phase}-state claim evidence changed: {claim.target}"
             )
         target = home / Path(*claim.target.parts)
-        target_snapshot, _target_exists = _pending_target_snapshot(home, target)
+        target_snapshot, target_exists = _pending_target_snapshot(home, target)
         if _symlink_snapshot_matches(
             target_snapshot,
             claim.parent_identity,
@@ -16849,6 +35271,7 @@ def _verify_pending_before_absences(
         for semantic in _pending_state_claim_semantics(
             home,
             batch.state_before_value,
+            metadata_version=batch.metadata_version,
         )
     }
     for record in batch.records:
@@ -16938,8 +35361,6 @@ def _verify_committed_pending_link_records(
             # The committed state deliberately relinquishes this path. Its later
             # user-owned contents are outside the synchronizer's claim.
             continue
-        target = home / Path(*record.target.parts)
-        target_snapshot, target_exists = _pending_target_snapshot(home, target)
         producing = record.action in {
             "create",
             "replace",
@@ -16951,21 +35372,36 @@ def _verify_committed_pending_link_records(
             "remove",
             "quarantine-remove",
         }
+        target = home / Path(*record.target.parts)
+        target_snapshot, target_exists = _pending_target_snapshot(home, target)
         if destructive and _pending_record_backup_snapshot(home, batch, record) is None:
             raise SyncError(f"committed pending backup is missing: {record.target}")
         if producing:
             evidence = _pending_record_evidence_snapshot(home, batch, record)
-            target_matches = _symlink_snapshot_matches(
-                target_snapshot,
-                record.planned_snapshot.parent_identity,
-                evidence.link_identity,
-                evidence.link_target,
-            )
-            if not target_matches and _symlink_snapshot_leaf_matches(
-                target_snapshot,
-                evidence.link_identity,
-                evidence.link_target,
-            ):
+            if isinstance(evidence, RegularFileSnapshot):
+                target_matches = _regular_snapshot_matches(
+                    target_snapshot,
+                    record.planned_snapshot.parent_identity,
+                    evidence,
+                    expected_link_count=evidence.link_count,
+                )
+                leaf_matches = _regular_snapshot_leaf_matches(
+                    target_snapshot,
+                    evidence,
+                )
+            else:
+                target_matches = _symlink_snapshot_matches(
+                    target_snapshot,
+                    record.planned_snapshot.parent_identity,
+                    evidence.link_identity,
+                    evidence.link_target,
+                )
+                leaf_matches = _symlink_snapshot_leaf_matches(
+                    target_snapshot,
+                    evidence.link_identity,
+                    evidence.link_target,
+                )
+            if not target_matches and leaf_matches:
                 raise SyncError(
                     f"committed pending target parent changed: {record.target}"
                 )
@@ -16982,17 +35418,30 @@ def _verify_committed_pending_link_records(
                 )
             continue
         before = _pending_record_before_evidence_snapshot(home, batch, record)
-        before_leaf_matches = _symlink_snapshot_leaf_matches(
-            target_snapshot,
-            before.link_identity,
-            before.link_target,
-        )
-        if _symlink_snapshot_matches(
-            target_snapshot,
-            record.planned_snapshot.parent_identity,
-            before.link_identity,
-            before.link_target,
-        ):
+        if isinstance(before, RegularFileSnapshot):
+            before_leaf_matches = _regular_snapshot_leaf_matches(
+                target_snapshot,
+                before,
+            )
+            before_matches = _regular_snapshot_matches(
+                target_snapshot,
+                record.planned_snapshot.parent_identity,
+                before,
+                expected_link_count=before.link_count,
+            )
+        else:
+            before_leaf_matches = _symlink_snapshot_leaf_matches(
+                target_snapshot,
+                before.link_identity,
+                before.link_target,
+            )
+            before_matches = _symlink_snapshot_matches(
+                target_snapshot,
+                record.planned_snapshot.parent_identity,
+                before.link_identity,
+                before.link_target,
+            )
+        if before_matches:
             raise SyncError(f"committed managed removal did not run: {record.target}")
         if before_leaf_matches:
             raise SyncError(
@@ -17002,6 +35451,104 @@ def _verify_committed_pending_link_records(
         # intentionally preserved.
 
 
+def _batch_has_regular_records(batch: PendingLinkBatch) -> bool:
+    return any(record.has_regular_authority() for record in batch.records)
+
+
+def _verify_final_regular_targets(
+    home: Path,
+    ticket: PendingBatchCleanupTicket,
+) -> None:
+    if ticket.version != 4:
+        return
+    _require_pending_terminal_regular_group_size_budget(
+        tuple(expected.size for expected in ticket.terminal_regular_targets),
+        phase=ticket.phase,
+    )
+    for _pass in range(3):
+        current_ticket = _read_pending_cleanup_ticket(
+            home,
+            ticket.path,
+            expected_ticket_identity=ticket.snapshot.file_identity,
+        )
+        if current_ticket is None or not _pending_cleanup_ticket_matches(
+            current_ticket,
+            ticket,
+        ):
+            raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
+        for expected in ticket.terminal_regular_targets:
+            target = home / Path(*expected.target.parts)
+            snapshot = _read_regular_file_snapshot_beneath(
+                home,
+                target,
+                require_managed_access=True,
+            )
+            if (
+                snapshot.parent_identity != expected.parent_identity
+                or snapshot.file_identity != expected.file_identity
+                or snapshot.sha256 != expected.sha256
+                or snapshot.size != expected.size
+                or snapshot.mode != expected.mode
+                or snapshot.uid != expected.uid
+                or snapshot.link_count != 1
+            ):
+                raise SyncError(
+                    f"final managed regular file changed: {expected.target}"
+                )
+    current_ticket = _read_pending_cleanup_ticket(
+        home,
+        ticket.path,
+        expected_ticket_identity=ticket.snapshot.file_identity,
+    )
+    if current_ticket is None or not _pending_cleanup_ticket_matches(
+        current_ticket,
+        ticket,
+    ):
+        raise SyncError(f"pending cleanup ticket changed: {ticket.batch_root.name}")
+
+
+def _pending_relinquishment_actions(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> list[ReconcileAction]:
+    return [
+        ReconcileAction(
+            action=record.action,
+            target=home / Path(*record.target.parts),
+            link_target="",
+            kind=record.kind,
+            planned_snapshot=record.planned_snapshot,
+        )
+        for record in batch.records
+        if record.action == PENDING_RELINQUISH_FOREIGN_ACTION
+    ]
+
+
+def _finalize_rolled_back_pending_batch(
+    home: Path,
+    batch: PendingLinkBatch,
+) -> None:
+    _retire_pending_staging_cleanup_authority(home, batch)
+    _verify_pending_link_phase(home, batch, "before")
+    relinquishments = _pending_relinquishment_actions(home, batch)
+    has_terminal_regular = bool(batch.terminal_regular_before)
+    _verify_managed_state_link_claims(
+        home,
+        batch.state_before_value,
+        relinquishments,
+        pending_batch=batch,
+    )
+    if has_terminal_regular:
+        _mark_pending_batch_rollback_cleanup_ready(home, batch)
+    _clear_pending_link_pointer(home, batch, phase="before")
+    if not has_terminal_regular:
+        return
+    if not _try_cleanup_finalized_pending_batch(home, batch):
+        raise SyncError(
+            "rolled-back pending regular-file evidence cleanup was deferred"
+        )
+
+
 def _recover_pending_link_transaction(
     home: Path,
     state: ManagedState,
@@ -17009,6 +35556,8 @@ def _recover_pending_link_transaction(
     *,
     dry_run: bool,
 ) -> tuple[ManagedState, ManagedStateFileSnapshot, bool]:
+    if not dry_run:
+        _recover_failed_move_isolation(home)
     batch = _load_pending_link_batch(home)
     if batch is None:
         return state, state_snapshot, False
@@ -17017,6 +35566,7 @@ def _recover_pending_link_transaction(
         # Validate the pointer without mutation and let the caller report that
         # recovery must precede any requested new work.
         return state, state_snapshot, True
+    _retire_pending_staging_cleanup_authority(home, batch)
 
     if committed:
         if (
@@ -17030,7 +35580,12 @@ def _recover_pending_link_transaction(
         _verify_committed_pending_link_records(home, batch)
         _mark_pending_batch_cleanup_ready(home, batch)
         _clear_pending_link_pointer(home, batch, phase="after")
-        _try_cleanup_committed_pending_batch(home, batch)
+        cleaned = _try_cleanup_finalized_pending_batch(home, batch)
+        if batch.terminal_regular_after:
+            if not cleaned:
+                raise SyncError(
+                    "committed pending regular-file evidence cleanup was deferred"
+                )
         return state, state_snapshot, True
 
     state, state_snapshot = _rollback_pending_state_to_before(
@@ -17038,6 +35593,17 @@ def _recover_pending_link_transaction(
         batch,
         state_snapshot,
     )
+    legacy_active_entry_index: (
+        _LegacyPendingRegularPublicationActiveEntryIndex | None
+    ) = None
+    if batch.metadata_version in {6, 7, 8, 9} and _batch_has_regular_records(batch):
+        # The immutable batch metadata defines all legitimate hard-link aliases;
+        # cache that authority once before any recovery mutation. Likewise, scan
+        # each legacy active-entry parent once under one batch-wide budget.
+        _pending_regular_alias_authority_index(home, batch)
+        legacy_active_entry_index = (
+            _build_legacy_pending_regular_publication_active_entry_index(home, batch)
+        )
     for record in reversed(batch.records):
         if record.action == PENDING_RELINQUISH_FOREIGN_ACTION:
             _verify_pending_record_bound_foreign_relinquishment(
@@ -17046,8 +35612,6 @@ def _recover_pending_link_transaction(
                 phase="rollback",
             )
             continue
-        target = home / Path(*record.target.parts)
-        target_snapshot, target_exists = _pending_target_snapshot(home, target)
         producing = record.action in {
             "create",
             "replace",
@@ -17059,6 +35623,25 @@ def _recover_pending_link_transaction(
             "remove",
             "quarantine-remove",
         }
+        if record.has_regular_authority():
+            if producing and record.is_regular():
+                _recover_pending_regular_publication_cleanup(
+                    home,
+                    batch,
+                    record,
+                    "produced",
+                    legacy_active_entry_index=legacy_active_entry_index,
+                )
+            if destructive and record.before_is_regular():
+                _recover_pending_regular_publication_cleanup(
+                    home,
+                    batch,
+                    record,
+                    "before",
+                    legacy_active_entry_index=legacy_active_entry_index,
+                )
+        target = home / Path(*record.target.parts)
+        target_snapshot, target_exists = _pending_target_snapshot(home, target)
         produced_evidence = (
             _pending_record_evidence_snapshot(home, batch, record)
             if producing
@@ -17071,40 +35654,71 @@ def _recover_pending_link_transaction(
         )
         if destructive:
             _pending_record_backup_snapshot(home, batch, record)
-        target_has_produced_leaf = (
-            produced_evidence is not None
-            and _symlink_snapshot_leaf_matches(
+        if isinstance(produced_evidence, RegularFileSnapshot):
+            target_has_produced_leaf = _regular_snapshot_leaf_matches(
+                target_snapshot,
+                produced_evidence,
+            )
+            target_is_produced = _regular_snapshot_matches(
+                target_snapshot,
+                record.planned_snapshot.parent_identity,
+                produced_evidence,
+                expected_link_count=produced_evidence.link_count,
+            )
+        elif isinstance(produced_evidence, SymlinkSnapshot):
+            target_has_produced_leaf = _symlink_snapshot_leaf_matches(
                 target_snapshot,
                 produced_evidence.link_identity,
                 produced_evidence.link_target,
             )
-        )
-        target_is_produced = (
-            produced_evidence is not None
-            and _symlink_snapshot_matches(
+            target_is_produced = _symlink_snapshot_matches(
                 target_snapshot,
                 record.planned_snapshot.parent_identity,
                 produced_evidence.link_identity,
                 produced_evidence.link_target,
             )
-        )
-        target_is_before = before_evidence is not None and _symlink_snapshot_matches(
-            target_snapshot,
-            record.planned_snapshot.parent_identity,
-            before_evidence.link_identity,
-            before_evidence.link_target,
-        )
+        else:
+            target_has_produced_leaf = False
+            target_is_produced = False
+        if isinstance(before_evidence, RegularFileSnapshot):
+            target_is_before = _regular_snapshot_matches(
+                target_snapshot,
+                record.planned_snapshot.parent_identity,
+                before_evidence,
+                expected_link_count=before_evidence.link_count,
+            )
+        elif isinstance(before_evidence, SymlinkSnapshot):
+            target_is_before = _symlink_snapshot_matches(
+                target_snapshot,
+                record.planned_snapshot.parent_identity,
+                before_evidence.link_identity,
+                before_evidence.link_target,
+            )
+        else:
+            target_is_before = False
         if target_has_produced_leaf and not target_is_produced:
             raise SyncError(f"pending produced target parent changed: {record.target}")
         if target_is_produced:
             assert target_snapshot is not None
             assert produced_evidence is not None
-            _remove_expected_symlink_beneath(
-                home,
-                target,
-                produced_evidence.link_target,
-                target_snapshot,
-            )
+            if isinstance(produced_evidence, RegularFileSnapshot):
+                assert isinstance(target_snapshot, RegularFileSnapshot)
+                _delete_pending_regular_publication_beneath(
+                    home,
+                    batch,
+                    record,
+                    target,
+                    target_snapshot,
+                    phase="produced",
+                )
+            else:
+                assert isinstance(target_snapshot, SymlinkSnapshot)
+                _remove_expected_symlink_beneath(
+                    home,
+                    target,
+                    produced_evidence.link_target,
+                    target_snapshot,
+                )
             target_snapshot = None
             target_exists = False
         if destructive:
@@ -17121,8 +35735,13 @@ def _recover_pending_link_transaction(
         if target_is_produced or not target_exists:
             continue
         if record.scope == "managed" and record.action == "create":
-            # The before-state never owned this path. Preserve a foreign occupant
-            # without adopting it into managed state.
+            if record.target in batch.state_before_value.links:
+                raise SyncError(
+                    "pending managed create absence changed during rollback: "
+                    f"{record.target}"
+                )
+            # A genuinely new path was not owned by the before-state. Preserve a
+            # foreign occupant without adopting it into managed state.
             continue
         if record.action == "retire-absent":
             raise SyncError(
@@ -17134,7 +35753,7 @@ def _recover_pending_link_transaction(
             f"were retained: {record.target}"
         )
 
-    _clear_pending_link_pointer(home, batch, phase="before")
+    _finalize_rolled_back_pending_batch(home, batch)
     state, state_snapshot = _load_managed_state_with_snapshot(home)
     return state, state_snapshot, True
 
@@ -17251,17 +35870,33 @@ def _apply_reconcile_actions(
         actions,
         required_replacements,
     )
+    for action in ordered_actions:
+        if (
+            action.planned_snapshot is not None
+            and _regular_snapshot_from_reconcile(action.planned_snapshot) is not None
+            and action.materialization != "regular"
+            and not _regular_to_symlink_reconcile_action_is_typed(action)
+        ):
+            raise SyncError(
+                f"regular-file preimage has a symlink action: {action.target}"
+            )
 
     if dry_run:
         if transaction is not None:
             raise SyncError("dry-run reconciliation cannot mutate a transaction")
         for action in ordered_actions:
+            object_kind = (
+                "regular file" if action.materialization == "regular" else "symlink"
+            )
             if action.action.endswith("remove"):
-                print(f"would {action.action} symlink {action.target}")
+                print(f"would {action.action} {object_kind} {action.target}")
             else:
-                print(
-                    f"would {action.action} symlink {action.target} -> {action.link_target}"
+                detail = (
+                    ""
+                    if action.materialization == "regular"
+                    else f" -> {action.link_target}"
                 )
+                print(f"would {action.action} {object_kind} {action.target}{detail}")
         return None
 
     missing_snapshots = [
@@ -17316,20 +35951,37 @@ def _apply_reconcile_actions(
                     == record.planned_snapshot.parent_identity
                     and not record.planned_snapshot.missing_parent_parts
                 )
-                if not parent_refresh_is_valid:
+                original_regular = (
+                    _regular_snapshot_from_reconcile(original_snapshot)
+                    if original_snapshot is not None
+                    else None
+                )
+                record_regular = _regular_snapshot_from_reconcile(
+                    record.planned_snapshot
+                )
+                regular_evidence_refresh_is_valid = (
+                    original_regular is not None
+                    and record_regular is not None
+                    and _regular_snapshot_matches(
+                        record_regular,
+                        original_regular.parent_identity,
+                        original_regular,
+                        expected_link_count=original_regular.link_count + 1,
+                    )
+                )
+                if not (parent_refresh_is_valid or regular_evidence_refresh_is_valid):
                     raise SyncError(
                         f"pending {pending_scope} planning snapshot changed: "
                         f"{action.target}"
                     )
-                action = replace(
-                    action,
-                    planned_snapshot=record.planned_snapshot,
-                )
+                action = replace(action, planned_snapshot=record.planned_snapshot)
             if (
                 record.target != relative_target
                 or record.action != action.action
                 or record.kind != action.kind
                 or record.planned_snapshot != action.planned_snapshot
+                or record.materialization != action.materialization
+                or record.removed_link_key != action.removed_link_key
                 or record.link_target
                 != (
                     action.link_target
@@ -17383,39 +36035,71 @@ def _apply_reconcile_actions(
                 ):
                     raise SyncError(f"pending create evidence changed: {action.target}")
             if pending_record is None:
-                created_snapshot = _create_symlink_beneath(
-                    home,
-                    action.target,
-                    action.link_target,
-                    action.kind,
-                    action.planned_snapshot,
-                    created_parent_identities,
-                )
+                if action.materialization == "regular":
+                    if action.regular_source is None:
+                        raise SyncError(
+                            f"managed regular-file action has no source: {action.target}"
+                        )
+                    created_snapshot = _create_regular_file_beneath(
+                        home,
+                        action.regular_source,
+                        action.target,
+                        action.planned_snapshot,
+                        created_parent_identities,
+                    )
+                else:
+                    created_snapshot = _create_symlink_beneath(
+                        home,
+                        action.target,
+                        action.link_target,
+                        action.kind,
+                        action.planned_snapshot,
+                        created_parent_identities,
+                    )
             else:
                 assert pending_record.stage is not None
                 stage = pending_batch.batch_root / Path(*pending_record.stage.parts)
-                stage_snapshot = _read_symlink_snapshot_beneath(home, stage)
                 evidence_snapshot = _pending_record_evidence_snapshot(
                     home,
                     pending_batch,
                     pending_record,
                 )
-                if (
-                    stage_snapshot.link_identity != evidence_snapshot.link_identity
-                    or stage_snapshot.link_target != evidence_snapshot.link_target
-                ):
-                    raise SyncError(
-                        f"pending create stage is not inode-bound: {action.target}"
-                    )
                 assert action.planned_snapshot is not None
-                created_snapshot = _publish_symlink_hardlink_beneath(
-                    home,
-                    stage,
-                    action.target,
-                    stage_snapshot,
-                    action.planned_snapshot,
-                    created_parent_identities,
-                )
+                if pending_record.is_regular():
+                    assert isinstance(evidence_snapshot, RegularFileSnapshot)
+                    stage_snapshot = _read_regular_file_snapshot_beneath(
+                        home,
+                        stage,
+                        require_managed_access=False,
+                    )
+                    created_snapshot = _publish_regular_reconcile_hardlink_beneath(
+                        home,
+                        stage,
+                        action.target,
+                        stage_snapshot,
+                        action.planned_snapshot,
+                        created_parent_identities,
+                        pending_batch=pending_batch,
+                        pending_record=pending_record,
+                    )
+                else:
+                    assert isinstance(evidence_snapshot, SymlinkSnapshot)
+                    stage_snapshot = _read_symlink_snapshot_beneath(home, stage)
+                    if (
+                        stage_snapshot.link_identity != evidence_snapshot.link_identity
+                        or stage_snapshot.link_target != evidence_snapshot.link_target
+                    ):
+                        raise SyncError(
+                            f"pending create stage is not inode-bound: {action.target}"
+                        )
+                    created_snapshot = _publish_symlink_hardlink_beneath(
+                        home,
+                        stage,
+                        action.target,
+                        stage_snapshot,
+                        action.planned_snapshot,
+                        created_parent_identities,
+                    )
             transaction.mutations.append(
                 ReconcileMutation(
                     action=action,
@@ -17423,8 +36107,18 @@ def _apply_reconcile_actions(
                 )
             )
             _verify_created_reconcile_mutation(home, transaction.mutations[-1])
-            print(f"created symlink {action.target} -> {action.link_target}")
-        _verify_reconcile_action_targets(home, create_actions)
+            if action.materialization == "regular":
+                print(f"created regular file {action.target}")
+            else:
+                print(f"created symlink {action.target} -> {action.link_target}")
+        if pending_batch is None:
+            _verify_reconcile_action_targets(home, create_actions)
+        else:
+            _verify_reconcile_action_targets(
+                home,
+                create_actions,
+                pending_batch=pending_batch,
+            )
 
         if destructive_actions and transaction.batch_root is None:
             transaction.batch_root = _quarantine_batch_root(
@@ -17441,7 +36135,11 @@ def _apply_reconcile_actions(
                 if _entry_target_path(home, entry) != action.target
             ]
             if prior_replacements:
-                _verify_required_replacement_targets(home, prior_replacements)
+                _verify_required_replacement_targets(
+                    home,
+                    prior_replacements,
+                    pending_batch=pending_batch,
+                )
             try:
                 relative_target = action.target.relative_to(home)
             except ValueError as error:
@@ -17480,8 +36178,15 @@ def _apply_reconcile_actions(
             transaction.mutations.append(mutation)
             _verify_reconcile_backup(home, action, backup)
             if prior_replacements:
-                _verify_required_replacement_targets(home, prior_replacements)
-            print(f"quarantined symlink {action.target} -> {backup}")
+                _verify_required_replacement_targets(
+                    home,
+                    prior_replacements,
+                    pending_batch=pending_batch,
+                )
+            object_kind = (
+                "regular file" if action.materialization == "regular" else "symlink"
+            )
+            print(f"quarantined {object_kind} {action.target} -> {backup}")
 
             if action.action in {"replace", "quarantine-replace"}:
                 replacement_plan = ReconcileTargetSnapshot(
@@ -17489,48 +36194,103 @@ def _apply_reconcile_actions(
                     ancestor_identity=action.planned_snapshot.parent_identity,
                 )
                 if pending_record is None:
-                    mutation.created_snapshot = _create_symlink_beneath(
-                        home,
-                        action.target,
-                        action.link_target,
-                        action.kind,
-                        replacement_plan,
-                        created_parent_identities,
-                    )
+                    if action.materialization == "regular":
+                        if action.regular_source is None:
+                            raise SyncError(
+                                "managed regular-file action has no source: "
+                                f"{action.target}"
+                            )
+                        mutation.created_snapshot = _create_regular_file_beneath(
+                            home,
+                            action.regular_source,
+                            action.target,
+                            replacement_plan,
+                            created_parent_identities,
+                        )
+                    else:
+                        mutation.created_snapshot = _create_symlink_beneath(
+                            home,
+                            action.target,
+                            action.link_target,
+                            action.kind,
+                            replacement_plan,
+                            created_parent_identities,
+                        )
                 else:
                     assert pending_record.stage is not None
                     stage = pending_batch.batch_root / Path(*pending_record.stage.parts)
-                    stage_snapshot = _read_symlink_snapshot_beneath(home, stage)
                     evidence_snapshot = _pending_record_evidence_snapshot(
                         home,
                         pending_batch,
                         pending_record,
                     )
-                    if (
-                        stage_snapshot.link_identity != evidence_snapshot.link_identity
-                        or stage_snapshot.link_target != evidence_snapshot.link_target
-                    ):
-                        raise SyncError(
-                            f"pending replacement stage changed: {action.target}"
+                    if pending_record.is_regular():
+                        assert isinstance(evidence_snapshot, RegularFileSnapshot)
+                        stage_snapshot = _read_regular_file_snapshot_beneath(
+                            home,
+                            stage,
+                            require_managed_access=False,
                         )
-                    mutation.created_snapshot = _publish_symlink_hardlink_beneath(
-                        home,
-                        stage,
-                        action.target,
-                        stage_snapshot,
-                        replacement_plan,
-                        created_parent_identities,
-                    )
+                        mutation.created_snapshot = (
+                            _publish_regular_reconcile_hardlink_beneath(
+                                home,
+                                stage,
+                                action.target,
+                                stage_snapshot,
+                                replacement_plan,
+                                created_parent_identities,
+                                pending_batch=pending_batch,
+                                pending_record=pending_record,
+                            )
+                        )
+                    else:
+                        assert isinstance(evidence_snapshot, SymlinkSnapshot)
+                        stage_snapshot = _read_symlink_snapshot_beneath(home, stage)
+                        if (
+                            stage_snapshot.link_identity
+                            != evidence_snapshot.link_identity
+                            or stage_snapshot.link_target
+                            != evidence_snapshot.link_target
+                        ):
+                            raise SyncError(
+                                f"pending replacement stage changed: {action.target}"
+                            )
+                        mutation.created_snapshot = _publish_symlink_hardlink_beneath(
+                            home,
+                            stage,
+                            action.target,
+                            stage_snapshot,
+                            replacement_plan,
+                            created_parent_identities,
+                        )
                 _verify_created_reconcile_mutation(home, mutation)
-                _verify_reconcile_action_targets(home, [action])
+                if pending_batch is None:
+                    _verify_reconcile_action_targets(home, [action])
+                else:
+                    _verify_reconcile_action_targets(
+                        home,
+                        [action],
+                        pending_batch=pending_batch,
+                    )
                 if replacements:
-                    _verify_required_replacement_targets(home, replacements)
-                print(f"replaced symlink {action.target} -> {action.link_target}")
+                    _verify_required_replacement_targets(
+                        home,
+                        replacements,
+                        pending_batch=pending_batch,
+                    )
+                if action.materialization == "regular":
+                    print(f"replaced regular file {action.target}")
+                else:
+                    print(f"replaced symlink {action.target} -> {action.link_target}")
             else:
-                print(f"removed stale symlink {action.target}")
+                print(f"removed stale {object_kind} {action.target}")
     except BaseException as error:
         try:
-            _rollback_reconcile_transaction(home, transaction)
+            _rollback_reconcile_transaction(
+                home,
+                transaction,
+                pending_batch=pending_batch,
+            )
         except SyncError as rollback_error:
             raise SyncError(
                 "reconciliation failed and link rollback was incomplete: "
@@ -17547,7 +36307,28 @@ def _verify_reconcile_backup(
     action: ReconcileAction,
     backup: Path,
 ) -> None:
-    if action.expected_link_target is None or action.planned_snapshot is None:
+    if action.planned_snapshot is None:
+        raise SyncError(f"destructive action has no expected target: {action.target}")
+    planned_regular = _regular_snapshot_from_reconcile(action.planned_snapshot)
+    if planned_regular is not None:
+        try:
+            backup_snapshot = _read_regular_file_snapshot_beneath(
+                home,
+                backup,
+                require_managed_access=False,
+            )
+        except (FileNotFoundError, OSError, SyncError) as error:
+            raise SyncError(f"reconciliation backup is missing: {backup}") from error
+        if (
+            not _regular_snapshot_leaf_matches(
+                backup_snapshot,
+                planned_regular,
+            )
+            or backup_snapshot.link_count != planned_regular.link_count
+        ):
+            raise SyncError(f"target changed after preflight: {action.target}")
+        return
+    if action.expected_link_target is None:
         raise SyncError(f"destructive action has no expected symlink: {action.target}")
     if (
         action.planned_snapshot.link_identity is None
@@ -17569,6 +36350,8 @@ def _verify_reconcile_backup(
 def _rollback_reconcile_transaction(
     home: Path,
     transaction: ReconcileTransaction | None,
+    *,
+    pending_batch: PendingLinkBatch | None = None,
 ) -> None:
     if transaction is None:
         return
@@ -17581,12 +36364,55 @@ def _rollback_reconcile_transaction(
                     raise SyncError(
                         f"changed target was left in place during rollback: {action.target}"
                     )
-                _remove_expected_symlink_beneath(
-                    home,
-                    action.target,
-                    action.link_target,
-                    mutation.created_snapshot,
-                )
+                if isinstance(mutation.created_snapshot, RegularFileSnapshot):
+                    if transaction.batch_root is None:
+                        _remove_expected_regular_file_beneath(
+                            home,
+                            action.target,
+                            mutation.created_snapshot,
+                        )
+                    elif pending_batch is None:
+                        _delete_exact_regular_publication_beneath(
+                            home,
+                            action.target,
+                            mutation.created_snapshot,
+                        )
+                    else:
+                        # A pending regular publication already has exact,
+                        # durable stage and evidence aliases. Quarantining the
+                        # target would create an unrecorded third alias and
+                        # defeat exact-alias recovery. Delete this one proven
+                        # publication leaf atomically instead.
+                        relative_target = PurePosixPath(
+                            *action.target.relative_to(home).parts
+                        )
+                        record = next(
+                            (
+                                candidate
+                                for candidate in pending_batch.records
+                                if candidate.target == relative_target
+                            ),
+                            None,
+                        )
+                        if record is None:
+                            raise SyncError(
+                                "pending regular rollback record is missing"
+                            )
+                        _delete_pending_regular_publication_beneath(
+                            home,
+                            pending_batch,
+                            record,
+                            action.target,
+                            mutation.created_snapshot,
+                            phase="produced",
+                        )
+                else:
+                    _remove_expected_symlink_beneath(
+                        home,
+                        action.target,
+                        action.link_target,
+                        mutation.created_snapshot,
+                    )
             if mutation.backup is None:
                 continue
 
@@ -17615,8 +36441,16 @@ def _rollback_reconcile_transaction(
                     "refusing to restore through changed target parent during "
                     f"rollback: {action.target.parent}"
                 )
-            assert action.expected_link_target is not None
-            backup_snapshot = _read_symlink_snapshot_beneath(home, backup)
+            planned_regular = _regular_snapshot_from_reconcile(action.planned_snapshot)
+            backup_snapshot = (
+                _read_regular_file_snapshot_beneath(
+                    home,
+                    backup,
+                    require_managed_access=False,
+                )
+                if planned_regular is not None
+                else _read_symlink_snapshot_beneath(home, backup)
+            )
             _atomic_move_beneath_home(
                 home,
                 backup,
@@ -17626,20 +36460,44 @@ def _rollback_reconcile_transaction(
                     link_identity=action.planned_snapshot.link_identity,
                     link_target=action.planned_snapshot.link_target,
                     ancestor_identity=backup_snapshot.parent_identity,
+                    regular_sha256=action.planned_snapshot.regular_sha256,
+                    regular_size=action.planned_snapshot.regular_size,
+                    regular_mode=action.planned_snapshot.regular_mode,
+                    regular_uid=action.planned_snapshot.regular_uid,
+                    regular_gid=action.planned_snapshot.regular_gid,
+                    regular_link_count=action.planned_snapshot.regular_link_count,
                 ),
                 action.planned_snapshot.parent_identity,
             )
-            restored_snapshot = _read_symlink_snapshot_beneath(home, action.target)
-            if (
-                restored_snapshot.parent_identity
-                != action.planned_snapshot.parent_identity
-                or restored_snapshot.link_identity
-                != action.planned_snapshot.link_identity
-                or restored_snapshot.link_target != action.planned_snapshot.link_target
-            ):
-                raise SyncError(
-                    f"restored symlink changed during rollback: {action.target}"
+            if planned_regular is not None:
+                restored_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    action.target,
+                    require_managed_access=True,
                 )
+                if not _regular_snapshot_matches(
+                    restored_snapshot,
+                    action.planned_snapshot.parent_identity,
+                    planned_regular,
+                    expected_link_count=planned_regular.link_count,
+                ):
+                    raise SyncError(
+                        "restored regular file changed during rollback: "
+                        f"{action.target}"
+                    )
+            else:
+                restored_snapshot = _read_symlink_snapshot_beneath(home, action.target)
+                if (
+                    restored_snapshot.parent_identity
+                    != action.planned_snapshot.parent_identity
+                    or restored_snapshot.link_identity
+                    != action.planned_snapshot.link_identity
+                    or restored_snapshot.link_target
+                    != action.planned_snapshot.link_target
+                ):
+                    raise SyncError(
+                        f"restored symlink changed during rollback: {action.target}"
+                    )
         except (OSError, SyncError) as error:
             errors.append(f"{action.target}: {error}")
 
@@ -17662,25 +36520,86 @@ def _verify_created_reconcile_mutation(
             f"reconciliation mutation has no created snapshot: {mutation.action.target}"
         )
     try:
-        actual_snapshot = _read_symlink_snapshot_beneath(
-            home,
-            mutation.action.target,
+        actual_snapshot = (
+            _read_regular_file_snapshot_beneath(
+                home,
+                mutation.action.target,
+                require_managed_access=False,
+            )
+            if isinstance(mutation.created_snapshot, RegularFileSnapshot)
+            else _read_symlink_snapshot_beneath(
+                home,
+                mutation.action.target,
+            )
         )
     except (FileNotFoundError, OSError, SyncError) as error:
         raise SyncError(
             f"created symlink changed during reconciliation: {mutation.action.target}"
         ) from error
-    if actual_snapshot != mutation.created_snapshot:
+    created_matches = (
+        _regular_snapshot_matches(
+            actual_snapshot,
+            mutation.created_snapshot.parent_identity,
+            mutation.created_snapshot,
+            expected_link_count=mutation.created_snapshot.link_count,
+        )
+        if isinstance(mutation.created_snapshot, RegularFileSnapshot)
+        else actual_snapshot == mutation.created_snapshot
+    )
+    if not created_matches:
         raise SyncError(
             f"created symlink changed during reconciliation: {mutation.action.target}"
+        )
+    if isinstance(actual_snapshot, RegularFileSnapshot) and (
+        actual_snapshot.mode != 0o600 or actual_snapshot.uid != os.geteuid()
+    ):
+        raise SyncError(
+            f"created regular-file access policy changed: {mutation.action.target}"
         )
 
 
 def _verify_reconcile_action_targets(
     home: Path,
     actions: list[ReconcileAction],
+    *,
+    pending_batch: PendingLinkBatch | None = None,
 ) -> None:
     for action in actions:
+        if action.materialization == "regular":
+            if action.regular_source is None:
+                raise SyncError(
+                    f"managed regular-file action has no source: {action.target}"
+                )
+            try:
+                actual = _read_regular_file_snapshot_beneath(
+                    home,
+                    action.target,
+                    require_managed_access=False,
+                )
+            except (FileNotFoundError, OSError, SyncError) as error:
+                raise SyncError(
+                    f"reconciled regular-file verification failed: {action.target}"
+                ) from error
+            try:
+                _verify_pending_regular_aliases(
+                    home,
+                    pending_batch,
+                    action.target,
+                    actual,
+                )
+            except SyncError as error:
+                raise SyncError(
+                    f"reconciled regular-file verification failed: {action.target}"
+                ) from error
+            if (
+                actual.sha256 != _regular_source_sha256(home, action.regular_source)
+                or actual.mode != 0o600
+                or actual.uid != os.geteuid()
+            ):
+                raise SyncError(
+                    f"reconciled regular-file verification failed: {action.target}"
+                )
+            continue
         try:
             actual_target = _read_symlink_beneath(home, action.target)
         except (FileNotFoundError, OSError, SyncError) as error:
@@ -17694,9 +36613,43 @@ def _verify_reconcile_action_targets(
 def _verify_required_replacement_targets(
     home: Path,
     required_replacements: list[LinkEntry],
+    *,
+    pending_batch: PendingLinkBatch | None = None,
 ) -> None:
     for entry in required_replacements:
         target = _entry_target_path(home, entry)
+        if _entry_materializes_regular_file(entry):
+            try:
+                snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    target,
+                    require_managed_access=False,
+                )
+                source = _entry_regular_source_path(home, entry)
+            except (FileNotFoundError, OSError, SyncError) as error:
+                raise SyncError(
+                    f"active replacement target changed before removal: {target}"
+                ) from error
+            try:
+                _verify_pending_regular_aliases(
+                    home,
+                    pending_batch,
+                    target,
+                    snapshot,
+                )
+            except SyncError as error:
+                raise SyncError(
+                    f"active replacement target changed before removal: {target}"
+                ) from error
+            if (
+                snapshot.sha256 != _regular_source_sha256(home, source)
+                or snapshot.mode != 0o600
+                or snapshot.uid != os.geteuid()
+            ):
+                raise SyncError(
+                    f"active replacement target changed before removal: {target}"
+                )
+            continue
         expected = _desired_link_target(home, entry)
         try:
             actual = _read_symlink_beneath(home, target)
@@ -17710,17 +36663,47 @@ def _verify_required_replacement_targets(
             )
 
 
-def _verify_desired_entries(home: Path, desired_entries: list[LinkEntry]) -> None:
+def _verify_desired_entries(
+    home: Path,
+    desired_entries: list[LinkEntry],
+    *,
+    pending_batch: PendingLinkBatch | None = None,
+) -> None:
     issues: list[str] = []
     for entry in desired_entries:
         target = _entry_target_path(home, entry)
-        desired = _desired_link_target(home, entry)
-        actual = _read_optional_symlink_target_beneath(home, target)
-        if actual == desired:
-            continue
+        if _entry_materializes_regular_file(entry):
+            try:
+                regular = _read_regular_file_snapshot_beneath(
+                    home,
+                    target,
+                    require_managed_access=False,
+                )
+                _verify_pending_regular_aliases(
+                    home,
+                    pending_batch,
+                    target,
+                    regular,
+                )
+                source = _entry_regular_source_path(home, entry)
+                if (
+                    regular.sha256 == _regular_source_sha256(home, source)
+                    and regular.mode == 0o600
+                    and regular.uid == os.geteuid()
+                ):
+                    continue
+            except (FileNotFoundError, OSError, SyncError):
+                pass
+        else:
+            desired = _desired_link_target(home, entry)
+            actual = _read_optional_symlink_target_beneath(home, target)
+            if actual == desired:
+                continue
         if _is_optional_desired_entry(entry):
             continue
-        if actual is None:
+        if _entry_materializes_regular_file(entry):
+            issues.append(f"managed regular file drift: {target}")
+        elif actual is None:
             issues.append(f"missing managed symlink: {target}")
         else:
             issues.append(f"managed symlink drift: {target}")
@@ -17735,6 +36718,8 @@ def _committed_state(
     desired_entries: list[LinkEntry],
     owner_shas: dict[str, str],
     managed_targets: set[PurePosixPath] | None = None,
+    *,
+    pending_batch: PendingLinkBatch | None = None,
 ) -> ManagedState:
     links: dict[PurePosixPath, ManagedLinkRecord] = {}
     for entry in desired_entries:
@@ -17745,14 +36730,50 @@ def _committed_state(
             continue
         target = _entry_target_path(home, entry)
         desired = _desired_link_target(home, entry)
-        actual = _read_optional_symlink_target_beneath(home, target)
-        if actual != desired:
-            if _is_optional_desired_entry(entry):
-                continue
-            issue = "missing" if actual is None else "drifted"
-            raise SyncError(
-                f"mandatory desired link {issue} before state commit: {target}"
-            )
+        if _entry_materializes_regular_file(entry):
+            regular_matches = False
+            try:
+                regular = _read_regular_file_snapshot_beneath(
+                    home,
+                    target,
+                    require_managed_access=False,
+                )
+                _verify_pending_regular_aliases(
+                    home,
+                    pending_batch,
+                    target,
+                    regular,
+                )
+                regular_matches = (
+                    regular.sha256
+                    == _regular_source_sha256(
+                        home,
+                        _entry_regular_source_path(
+                            home,
+                            entry,
+                            owner_shas,
+                        ),
+                    )
+                    and regular.mode == 0o600
+                    and regular.uid == os.geteuid()
+                )
+            except (FileNotFoundError, OSError, SyncError):
+                regular_matches = False
+            if not regular_matches:
+                if _is_optional_desired_entry(entry):
+                    continue
+                raise SyncError(
+                    f"mandatory desired regular file drifted before state commit: {target}"
+                )
+        else:
+            actual = _read_optional_symlink_target_beneath(home, target)
+            if actual != desired:
+                if _is_optional_desired_entry(entry):
+                    continue
+                issue = "missing" if actual is None else "drifted"
+                raise SyncError(
+                    f"mandatory desired link {issue} before state commit: {target}"
+                )
         links[entry.target] = ManagedLinkRecord(
             source=entry.source,
             target=entry.target,
@@ -17832,26 +36853,38 @@ def _verify_published_state_transaction(
 def _capture_managed_state_link_snapshots(
     home: Path,
     state: ManagedState,
-) -> dict[PurePosixPath, SymlinkSnapshot]:
-    snapshots: dict[PurePosixPath, SymlinkSnapshot] = {}
+) -> dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot]:
+    snapshots: dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot] = {}
     for relative_target, record in sorted(
         state.links.items(),
         key=lambda item: item[0].as_posix(),
     ):
         target = home / Path(*relative_target.parts)
-        snapshot = _read_optional_symlink_snapshot_beneath(home, target)
-        if snapshot is None:
-            continue
-        if snapshot.link_target == record.link_target:
-            snapshots[relative_target] = snapshot
+        if _record_materializes_regular_file(record):
+            try:
+                snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    target,
+                    require_managed_access=True,
+                )
+            except (FileNotFoundError, OSError, SyncError):
+                continue
+            if snapshot.sha256 == _regular_source_sha256(
+                home, _record_regular_source_path(home, record)
+            ):
+                snapshots[relative_target] = snapshot
+        else:
+            snapshot = _read_optional_symlink_snapshot_beneath(home, target)
+            if snapshot is not None and snapshot.link_target == record.link_target:
+                snapshots[relative_target] = snapshot
     return snapshots
 
 
 def _created_reconcile_link_snapshots(
     home: Path,
     transaction: ReconcileTransaction | None,
-) -> dict[PurePosixPath, SymlinkSnapshot]:
-    snapshots: dict[PurePosixPath, SymlinkSnapshot] = {}
+) -> dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot]:
+    snapshots: dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot] = {}
     if transaction is None:
         return snapshots
     for mutation in transaction.mutations:
@@ -17873,11 +36906,11 @@ def _created_reconcile_link_snapshots(
 def _trusted_managed_link_snapshots_for_state(
     home: Path,
     state: ManagedState,
-    baseline_snapshots: dict[PurePosixPath, SymlinkSnapshot],
+    baseline_snapshots: dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot],
     transaction: ReconcileTransaction | None,
-) -> dict[PurePosixPath, SymlinkSnapshot]:
+) -> dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot]:
     created_snapshots = _created_reconcile_link_snapshots(home, transaction)
-    snapshots: dict[PurePosixPath, SymlinkSnapshot] = {}
+    snapshots: dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot] = {}
     for relative_target, record in sorted(
         state.links.items(),
         key=lambda item: item[0].as_posix(),
@@ -17889,18 +36922,40 @@ def _trusted_managed_link_snapshots_for_state(
             raise SyncError(
                 f"managed link has no trusted identity snapshot: {relative_target}"
             )
-        if snapshot.link_target != record.link_target:
-            raise SyncError(
-                f"managed link target changed before publication: {relative_target}"
-            )
         target = home / Path(*relative_target.parts)
         try:
-            current_snapshot = _read_symlink_snapshot_beneath(home, target)
+            if _record_materializes_regular_file(record):
+                if not isinstance(snapshot, RegularFileSnapshot):
+                    raise SyncError(f"managed target type changed: {relative_target}")
+                current_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    target,
+                    require_managed_access=False,
+                )
+            else:
+                if not isinstance(snapshot, SymlinkSnapshot):
+                    raise SyncError(f"managed target type changed: {relative_target}")
+                if snapshot.link_target != record.link_target:
+                    raise SyncError(
+                        "managed link target changed before publication: "
+                        f"{relative_target}"
+                    )
+                current_snapshot = _read_symlink_snapshot_beneath(home, target)
         except (FileNotFoundError, OSError, SyncError) as error:
             raise SyncError(
                 f"managed link changed before publication: {relative_target}"
             ) from error
-        if current_snapshot != snapshot:
+        snapshot_matches = (
+            _regular_snapshot_matches(
+                current_snapshot,
+                snapshot.parent_identity,
+                snapshot,
+                expected_link_count=snapshot.link_count,
+            )
+            if isinstance(snapshot, RegularFileSnapshot)
+            else current_snapshot == snapshot
+        )
+        if not snapshot_matches:
             raise SyncError(
                 f"managed link changed before publication: {relative_target}"
             )
@@ -17911,7 +36966,7 @@ def _trusted_managed_link_snapshots_for_state(
 def _verify_managed_link_snapshots(
     home: Path,
     state: ManagedState,
-    snapshots: dict[PurePosixPath, SymlinkSnapshot],
+    snapshots: dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot],
 ) -> None:
     if set(snapshots) != set(state.links):
         raise SyncError("managed link snapshot targets changed after publication")
@@ -17920,19 +36975,41 @@ def _verify_managed_link_snapshots(
         key=lambda item: item[0].as_posix(),
     ):
         expected_snapshot = snapshots[relative_target]
-        if expected_snapshot.link_target != record.link_target:
-            raise SyncError(
-                f"managed link target changed after publication: {relative_target}"
-            )
         target = home / Path(*relative_target.parts)
         try:
-            current_snapshot = _read_symlink_snapshot_beneath(home, target)
+            if _record_materializes_regular_file(record):
+                if not isinstance(expected_snapshot, RegularFileSnapshot):
+                    raise SyncError(f"managed target type changed: {relative_target}")
+                current_snapshot = _read_regular_file_snapshot_beneath(
+                    home,
+                    target,
+                    require_managed_access=False,
+                )
+            else:
+                if not isinstance(expected_snapshot, SymlinkSnapshot):
+                    raise SyncError(f"managed target type changed: {relative_target}")
+                if expected_snapshot.link_target != record.link_target:
+                    raise SyncError(
+                        "managed link target changed after publication: "
+                        f"{relative_target}"
+                    )
+                current_snapshot = _read_symlink_snapshot_beneath(home, target)
         except (FileNotFoundError, OSError, SyncError) as error:
             raise SyncError(
                 f"managed link identity changed after release validation: "
                 f"{relative_target}"
             ) from error
-        if current_snapshot != expected_snapshot:
+        snapshot_matches = (
+            _regular_snapshot_matches(
+                current_snapshot,
+                expected_snapshot.parent_identity,
+                expected_snapshot,
+                expected_link_count=expected_snapshot.link_count,
+            )
+            if isinstance(expected_snapshot, RegularFileSnapshot)
+            else current_snapshot == expected_snapshot
+        )
+        if not snapshot_matches:
             raise SyncError(
                 f"managed link identity changed after release validation: "
                 f"{relative_target}"
@@ -17944,7 +37021,7 @@ def _verify_published_transaction_matches_desired(
     desired_entries: list[LinkEntry],
     expected_state: ManagedState,
     transaction: ManagedStateFileTransaction | None,
-    managed_link_snapshots: dict[PurePosixPath, SymlinkSnapshot],
+    managed_link_snapshots: dict[PurePosixPath, SymlinkSnapshot | RegularFileSnapshot],
 ) -> None:
     _verify_published_state_transaction(home, transaction)
     _verify_published_state_matches_desired(
@@ -18008,6 +37085,12 @@ def plan_link_actions(
     for entry in entries:
         target = _entry_target_path(home, entry)
         desired = _desired_link_target(home, entry)
+        regular_source = (
+            _entry_regular_source_path(home, entry)
+            if _entry_materializes_regular_file(entry)
+            else None
+        )
+        materialization = "regular" if regular_source is not None else "symlink"
         parent = target.parent
         public_entry = public_by_target.get(entry.target)
         if entry.owner != PUBLIC_OWNER:
@@ -18030,6 +37113,17 @@ def plan_link_actions(
             raise SyncError(f"link parent exists but is not a directory: {parent}")
         if _path_exists_or_is_link(target):
             if not target.is_symlink():
+                if regular_source is not None and target.is_file():
+                    snapshot = _read_regular_file_snapshot_beneath(
+                        home,
+                        target,
+                        require_managed_access=True,
+                    )
+                    if snapshot.sha256 == _regular_source_sha256(home, regular_source):
+                        continue
+                    raise SyncError(
+                        f"refusing to replace modified managed regular file: {target}"
+                    )
                 if (
                     entry.owner == PUBLIC_OWNER
                     and entry.target in OPTIONAL_PUBLIC_TARGETS
@@ -18037,7 +37131,7 @@ def plan_link_actions(
                     continue
                 raise SyncError(f"refusing to replace non-symlink target: {target}")
             existing = os.readlink(target)
-            if existing == desired:
+            if existing == desired and regular_source is None:
                 continue
             existing_owner = _link_managed_owner(home, target, entry_owners)
             if existing_owner is None:
@@ -18066,9 +37160,27 @@ def plan_link_actions(
                         f"target {target} is managed by {existing_owner}; "
                         f"manifest owner {entry.owner} must declare override=true"
                     )
-            actions.append(LinkAction("replace", target, desired, entry.kind))
+            actions.append(
+                LinkAction(
+                    "replace",
+                    target,
+                    desired,
+                    entry.kind,
+                    materialization=materialization,
+                    regular_source=regular_source,
+                )
+            )
         else:
-            actions.append(LinkAction("create", target, desired, entry.kind))
+            actions.append(
+                LinkAction(
+                    "create",
+                    target,
+                    desired,
+                    entry.kind,
+                    materialization=materialization,
+                    regular_source=regular_source,
+                )
+            )
     return actions
 
 
@@ -18090,6 +37202,26 @@ def apply_link_actions(actions: list[LinkAction], *, dry_run: bool) -> None:
         action.target.parent.mkdir(parents=True, exist_ok=True)
         if action.target.is_symlink():
             action.target.unlink()
+        if action.materialization == "regular":
+            if action.regular_source is None:
+                raise SyncError(
+                    f"managed regular-file action has no source: {action.target}"
+                )
+            payload = action.regular_source.read_bytes()
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            fd = os.open(action.target, flags, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "wb", closefd=True) as file:
+                    fd = -1
+                    file.write(payload)
+                    file.flush()
+                    os.fsync(file.fileno())
+            finally:
+                if fd >= 0:
+                    _close_fd_quietly(fd)
+            print(f"{action.action}d regular file {action.target}")
+            continue
         action.target.symlink_to(
             action.link_target,
             target_is_directory=action.kind in {"directory", "skill"},
@@ -18365,8 +37497,7 @@ def _release_identity_policy_error(
 ) -> SyncError:
     classification = "mismatch" if mismatch else "cannot be verified"
     return SyncError(
-        f"release identity access policy {classification}: "
-        f"{display_path}: {detail}",
+        f"release identity access policy {classification}: {display_path}: {detail}",
         code="current-release-unverifiable",
     )
 
@@ -18385,9 +37516,7 @@ def _effective_release_identity_owner_uid(
 def _release_identity_owner_uid_scope(
     expected_owner_uid: int | None,
 ) -> Iterator[None]:
-    normalized_owner_uid = (
-        expected_owner_uid if sys.platform == "darwin" else None
-    )
+    normalized_owner_uid = expected_owner_uid if sys.platform == "darwin" else None
     token = _RELEASE_IDENTITY_OWNER_UID.set(normalized_owner_uid)
     try:
         yield
@@ -18510,10 +37639,13 @@ def _darwin_extended_acl_entries(
 
             tag_type = ctypes.c_int()
             ctypes.set_errno(0)
-            if api.acl_get_tag_type(
-                entry_pointer,
-                ctypes.byref(tag_type),
-            ) != 0:
+            if (
+                api.acl_get_tag_type(
+                    entry_pointer,
+                    ctypes.byref(tag_type),
+                )
+                != 0
+            ):
                 error_number = ctypes.get_errno()
                 raise _release_identity_policy_error(
                     display_path,
@@ -18560,8 +37692,7 @@ def _darwin_extended_acl_entries(
                         ):
                             raise _release_identity_policy_error(
                                 display_path,
-                                "acl_free qualifier failed with errno "
-                                f"{error_number}",
+                                f"acl_free qualifier failed with errno {error_number}",
                                 mismatch=False,
                             )
             entries.append((tag_type.value, qualifier))
@@ -18704,8 +37835,7 @@ def _require_release_identity_fd_access_policy(
         if pre_metadata.st_uid != expected_owner_uid:
             raise _release_identity_policy_error(
                 display_path,
-                "owner UID "
-                f"{pre_metadata.st_uid} != expected UID {expected_owner_uid}",
+                f"owner UID {pre_metadata.st_uid} != expected UID {expected_owner_uid}",
                 mismatch=True,
             )
         pre_mode = stat.S_IMODE(pre_metadata.st_mode)
@@ -18733,8 +37863,7 @@ def _require_release_identity_fd_access_policy(
                 mismatch=False,
             ) from error
         if any(
-            tag_type == _DARWIN_ACL_EXTENDED_ALLOW
-            for tag_type, _qualifier in entries
+            tag_type == _DARWIN_ACL_EXTENDED_ALLOW for tag_type, _qualifier in entries
         ):
             try:
                 owner_uuid = _darwin_owner_uuid(
@@ -18978,12 +38107,9 @@ def _require_release_source_unchanged(
     if _release_source_matches(snapshot, metadata):
         return snapshot
     if not (
-        ignore_ctime
-        and _release_source_matches(snapshot, metadata, ignore_ctime=True)
+        ignore_ctime and _release_source_matches(snapshot, metadata, ignore_ctime=True)
     ):
-        raise SyncError(
-            f"release source changed during {operation}: {display_path}"
-        )
+        raise SyncError(f"release source changed during {operation}: {display_path}")
     # ctime is only a revalidation trigger. Directory entry content is bound by
     # exact immediate-member identities; a regular file with ctime-only drift
     # must be rehashed from the same bound FD before safe metadata churn is
@@ -19026,9 +38152,7 @@ def _require_release_stage_source_unchanged(
 ) -> tuple[_ReleaseSourceSnapshot, bool]:
     exact_match = _release_source_matches(snapshot, metadata)
     if rehash_used and stat.S_ISREG(snapshot.mode) and not exact_match:
-        raise SyncError(
-            f"release source changed during {operation}: {display_path}"
-        )
+        raise SyncError(f"release source changed during {operation}: {display_path}")
     updated_snapshot = _require_release_source_unchanged(
         snapshot,
         metadata,
@@ -19158,9 +38282,7 @@ def _rehash_release_source_file_content(
         capture_payload=False,
     )
     if observed_identity != snapshot.content_identity:
-        raise SyncError(
-            f"release source changed during {operation}: {display_path}"
-        )
+        raise SyncError(f"release source changed during {operation}: {display_path}")
     terminal_metadata = (
         _require_release_identity_fd_access_policy(
             file_descriptor,
@@ -19170,14 +38292,15 @@ def _rehash_release_source_file_content(
         if expected_owner_uid is not None
         else os.fstat(file_descriptor)
     )
-    if not _release_source_matches(
-        snapshot,
-        terminal_metadata,
-        ignore_ctime=True,
-    ) or terminal_metadata.st_ctime_ns != revalidation_metadata.st_ctime_ns:
-        raise SyncError(
-            f"release source changed during {operation}: {display_path}"
+    if (
+        not _release_source_matches(
+            snapshot,
+            terminal_metadata,
+            ignore_ctime=True,
         )
+        or terminal_metadata.st_ctime_ns != revalidation_metadata.st_ctime_ns
+    ):
+        raise SyncError(f"release source changed during {operation}: {display_path}")
     return terminal_metadata
 
 
@@ -19361,9 +38484,7 @@ def _release_tree_identity_and_captured_files_from_directory_fd(
     expected_owner_uid: int | None = None,
     capture_limits: dict[PurePosixPath, int],
 ) -> tuple[ReleaseTreeIdentity, dict[PurePosixPath, bytes]]:
-    expected_owner_uid = _effective_release_identity_owner_uid(
-        expected_owner_uid
-    )
+    expected_owner_uid = _effective_release_identity_owner_uid(expected_owner_uid)
     with _release_identity_owner_uid_scope(expected_owner_uid):
         (
             manifest_payload,
@@ -19401,9 +38522,7 @@ def _release_tree_identity_from_directory_fd(
     require_sanitized_modes: bool = False,
     expected_owner_uid: int | None = None,
 ) -> ReleaseTreeIdentity:
-    expected_owner_uid = _effective_release_identity_owner_uid(
-        expected_owner_uid
-    )
+    expected_owner_uid = _effective_release_identity_owner_uid(expected_owner_uid)
     with _release_identity_owner_uid_scope(expected_owner_uid):
         identity, _captured_files = (
             _release_tree_identity_and_captured_files_from_directory_fd(
@@ -19683,9 +38802,7 @@ def _release_tree_snapshot_from_directory_fd(
     dict[PurePosixPath, bytes],
 ]:
     """Capture one normalized release-tree identity without following symlinks."""
-    expected_owner_uid = _effective_release_identity_owner_uid(
-        expected_owner_uid
-    )
+    expected_owner_uid = _effective_release_identity_owner_uid(expected_owner_uid)
     digest = hashlib.sha256(b"codex-personal-sync-release-tree-v1\0")
     manifest_relative = PurePosixPath(MANIFEST_RELATIVE_PATH.as_posix())
     manifest_payload: bytes | None = None
@@ -20004,31 +39121,24 @@ def _release_tree_snapshot_from_directory_fd(
                 directory_fd,
                 maximum_entries=len(names),
                 overflow_message=(
-                    "release tree directory changed while hashing: "
-                    f"{display_directory}"
+                    f"release tree directory changed while hashing: {display_directory}"
                 ),
             )
             if stable_names != names:
                 raise SyncError(
-                    "release tree directory changed while hashing: "
-                    f"{display_directory}"
+                    f"release tree directory changed while hashing: {display_directory}"
                 )
             _require_release_directory_members_unchanged(
                 directory_fd,
                 relative_root,
                 names,
                 source_snapshots,
-                (
-                    "release tree directory changed while hashing: "
-                    f"{display_directory}"
-                ),
+                (f"release tree directory changed while hashing: {display_directory}"),
             )
-            stable_directory_metadata = (
-                _require_release_identity_fd_access_policy(
-                    directory_fd,
-                    display_directory,
-                    expected_owner_uid,
-                )
+            stable_directory_metadata = _require_release_identity_fd_access_policy(
+                directory_fd,
+                display_directory,
+                expected_owner_uid,
             )
             if not _release_source_matches(
                 directory_snapshot,
@@ -20356,8 +39466,7 @@ def _verify_release_source_snapshot(
             if metadata.st_uid != expected_owner_uid:
                 raise _release_identity_policy_error(
                     display_path,
-                    f"owner UID {metadata.st_uid} != expected UID "
-                    f"{expected_owner_uid}",
+                    f"owner UID {metadata.st_uid} != expected UID {expected_owner_uid}",
                     mismatch=True,
                 )
             parent_fd = -1
@@ -20413,12 +39522,10 @@ def _verify_release_source_snapshot(
                     )
                     if current_names != expected_names:
                         raise SyncError(changed_message)
-                terminal_opened_metadata = (
-                    _require_release_identity_fd_access_policy(
-                        entry_fd,
-                        display_path,
-                        expected_owner_uid,
-                    )
+                terminal_opened_metadata = _require_release_identity_fd_access_policy(
+                    entry_fd,
+                    display_path,
+                    expected_owner_uid,
                 )
                 (
                     snapshot,
@@ -20441,20 +39548,17 @@ def _verify_release_source_snapshot(
                     )
                     if terminal_names != expected_names:
                         raise SyncError(changed_message)
-                    stable_opened_metadata = (
-                        _require_release_identity_fd_access_policy(
-                            entry_fd,
-                            display_path,
-                            expected_owner_uid,
-                        )
+                    stable_opened_metadata = _require_release_identity_fd_access_policy(
+                        entry_fd,
+                        display_path,
+                        expected_owner_uid,
                     )
                     if not _release_source_matches(
                         snapshot,
                         stable_opened_metadata,
                     ):
                         raise SyncError(
-                            f"release source changed during {operation}: "
-                            f"{display_path}"
+                            f"release source changed during {operation}: {display_path}"
                         )
                 terminal_named_metadata = (
                     os.fstat(entry_fd)
@@ -20495,8 +39599,7 @@ def _verify_release_source_snapshot(
             snapshot = source_snapshots[relative_path]
             display_path = display_root / Path(*relative_path.parts)
             changed_message = (
-                f"release source directory changed during {operation}: "
-                f"{display_path}"
+                f"release source directory changed during {operation}: {display_path}"
             )
             parent_fd = -1
             entry_fd = -1
@@ -20539,12 +39642,10 @@ def _verify_release_source_snapshot(
                     source_snapshots,
                     changed_message,
                 )
-                stable_opened_metadata = (
-                    _require_release_identity_fd_access_policy(
-                        entry_fd,
-                        display_path,
-                        expected_owner_uid,
-                    )
+                stable_opened_metadata = _require_release_identity_fd_access_policy(
+                    entry_fd,
+                    display_path,
+                    expected_owner_uid,
                 )
                 if not _release_source_matches(
                     snapshot,
@@ -21194,12 +40295,20 @@ def _switch_current(
     print(f"switched {current} -> releases/{sha}")
 
 
-def _installed_manifests(home: Path) -> dict[str, ManifestData]:
+def _installed_manifests(
+    home: Path,
+    *,
+    manifest_cache: dict[tuple[str, str], ManifestData | None] | None = None,
+) -> dict[str, ManifestData]:
     manifests: dict[str, ManifestData] = {}
     for owner in sorted(_known_owners(home)):
         if _current_sha(home, owner) is None:
             continue
-        manifests[owner] = _current_manifest_data(home, owner)
+        manifests[owner] = _current_manifest_data(
+            home,
+            owner,
+            manifest_cache=manifest_cache,
+        )
     return manifests
 
 
@@ -21332,9 +40441,7 @@ def _install_release_strict_ancestor_paths(
         release_root = binding.releases_root / binding.sha
         parts = _directory_parts_beneath(home, release_root)
         if len(parts) < 2 or parts[-2:] != ("releases", binding.sha):
-            raise SyncError(
-                f"install release path mismatch for owner {binding.owner}"
-            )
+            raise SyncError(f"install release path mismatch for owner {binding.owner}")
         current_path = home
         for part in parts[:-2]:
             current_path /= part
@@ -21713,35 +40820,77 @@ def _resolve_install_release_expectations(
     return resolved
 
 
-def _preflight_pending_recovery(home: Path, *, dry_run: bool) -> bool:
+def _preflight_pending_recovery(
+    home: Path,
+    *,
+    dry_run: bool,
+    cleanup_budget: PendingCleanupActionBudget | None = None,
+) -> bool:
     home = home.expanduser()
-    observed_retention_transaction = _recover_release_retention_transaction(
+    _require_no_pending_unresolved_ticket_representations(home)
+    action_budget = cleanup_budget or PendingCleanupActionBudget(
+        MAX_PENDING_CLEANUP_BATCHES_PER_RUN
+    )
+    observed_failed_move_isolation = _recover_failed_move_isolation(
         home,
         dry_run=True,
     )
-    loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
-    (
-        _loaded_state,
-        _initial_state_snapshot,
-        observed_pending_transaction,
-    ) = _recover_pending_link_transaction(
-        home,
-        loaded_state,
-        initial_state_snapshot,
-        dry_run=True,
-    )
-    if not observed_retention_transaction and not observed_pending_transaction:
+    observed_retention_transaction = None
+    observed_cleanup_ready_batch = False
+    observed_pending_transaction = False
+    if not observed_failed_move_isolation:
+        observed_retention_transaction = _recover_release_retention_transaction(
+            home,
+            dry_run=True,
+        )
+        observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(
+            home,
+            allow_v8_control_recovery=not dry_run,
+        )
+        loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
+        (
+            _loaded_state,
+            _initial_state_snapshot,
+            observed_pending_transaction,
+        ) = _recover_pending_link_transaction(
+            home,
+            loaded_state,
+            initial_state_snapshot,
+            dry_run=True,
+        )
+    if (
+        not observed_failed_move_isolation
+        and not observed_retention_transaction
+        and not observed_pending_transaction
+        and not observed_cleanup_ready_batch
+    ):
         return False
     if dry_run:
+        if observed_failed_move_isolation:
+            print("would recover failed move isolation under the install lock")
+            return True
         if observed_pending_transaction:
             print(
                 "would recover pending personal sync transaction under the install lock"
             )
+        if observed_cleanup_ready_batch:
+            print(
+                "would clean a finalized or interrupted pending transaction under "
+                "the install lock"
+            )
         return True
     with installation_lock(home):
+        recovered_failed_move_isolation = _recover_failed_move_isolation(
+            home,
+            dry_run=False,
+        )
         recovered_retention_transaction = _recover_release_retention_transaction(
             home,
             dry_run=False,
+        )
+        cleaned_pending_batches = _cleanup_ready_pending_batches(
+            home,
+            budget=action_budget,
         )
         loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
         (
@@ -21755,7 +40904,10 @@ def _preflight_pending_recovery(home: Path, *, dry_run: bool) -> bool:
             dry_run=False,
         )
     return bool(
-        recovered_retention_transaction is not None or recovered_pending_transaction
+        recovered_failed_move_isolation
+        or recovered_retention_transaction is not None
+        or recovered_pending_transaction
+        or cleaned_pending_batches
     )
 
 
@@ -21774,9 +40926,14 @@ def _install_release_set_unlocked(
     dry_run: bool,
     allow_cross_owner: bool,
     preflight_only: bool = False,
+    cleanup_budget: PendingCleanupActionBudget | None = None,
 ) -> None:
     releases = _normalize_install_releases(releases)
     home = home.expanduser()
+    _require_no_pending_unresolved_ticket_representations(home)
+    action_budget = cleanup_budget or PendingCleanupActionBudget(
+        MAX_PENDING_CLEANUP_BATCHES_PER_RUN
+    )
     expected_owner_uid = os.geteuid() if sys.platform == "darwin" else None
     recovered_retention_transaction = _recover_release_retention_transaction(
         home,
@@ -21784,6 +40941,19 @@ def _install_release_set_unlocked(
     )
     if recovered_retention_transaction and (dry_run or preflight_only):
         return
+    observed_cleanup_ready_batch = _pending_cleanup_ready_batch_is_observed(
+        home,
+        allow_v8_control_recovery=not (dry_run or preflight_only),
+    )
+    if observed_cleanup_ready_batch and (dry_run or preflight_only):
+        if not preflight_only:
+            print(
+                "would clean a finalized or interrupted pending transaction under "
+                "the install lock"
+            )
+        return
+    if not dry_run and not preflight_only:
+        _cleanup_ready_pending_batches(home, budget=action_budget)
     loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
     (
         loaded_state,
@@ -21801,13 +40971,13 @@ def _install_release_set_unlocked(
                 "would recover pending personal sync transaction under the install lock"
             )
         return
+    if not dry_run and not preflight_only:
+        _require_no_pending_terminal_mutation_authority(home)
     install_owners = set(loaded_state.owners)
     install_owners.update(
         manifest.owner for _source_root, _sha, manifest, _source_expectation in releases
     )
     _known_owners(home, install_owners)
-    if not dry_run and not preflight_only:
-        _try_cleanup_ready_pending_batches(home)
     _verify_managed_state_current_owner_claims(home, loaded_state)
     current_manifests = _installed_manifests(home)
     next_manifests = dict(current_manifests)
@@ -21816,6 +40986,12 @@ def _install_release_set_unlocked(
     incoming_shas = {
         manifest.owner: sha
         for _source_root, sha, manifest, _source_expectation in releases
+    }
+    incoming_regular_sources = {
+        (entry.owner, entry.target): source_root / Path(*entry.source.parts)
+        for source_root, _sha, manifest, _source_expectation in releases
+        for entry in manifest.entries
+        if _entry_materializes_regular_file(entry)
     }
     _validate_install_target_portability(current_manifests, next_manifests)
     releases = _resolve_install_release_expectations(releases)
@@ -21877,6 +41053,8 @@ def _install_release_set_unlocked(
         state,
         allow_cross_owner=allow_cross_owner,
         allow_unledgered_removed_links=bootstrap_history,
+        owner_shas=expected_next_shas,
+        incoming_regular_sources=incoming_regular_sources,
     )
     _verify_managed_state_link_claims(home, state, actions)
     link_actions = [
@@ -22157,9 +41335,13 @@ def _install_release_set_unlocked(
             batch_root=pending_batch.batch_root,
             transaction=link_transaction,
         )
-        _verify_desired_entries(home, desired_entries)
+        _verify_desired_entries(home, desired_entries, pending_batch=pending_batch)
         for manifest in overlay_manifests:
-            issues = _collect_overlay_issues(home, manifest.owner)
+            issues = _collect_overlay_issues(
+                home,
+                manifest.owner,
+                pending_batch=pending_batch,
+            )
             if issues:
                 for issue in issues:
                     print(f"overlay issue: {issue}")
@@ -22178,6 +41360,7 @@ def _install_release_set_unlocked(
             desired_entries,
             owner_shas,
             managed_targets,
+            pending_batch=pending_batch,
         )
         if next_state != planned_next_state:
             raise SyncError("observed managed state differs from the pending plan")
@@ -22205,7 +41388,7 @@ def _install_release_set_unlocked(
             phase="during final managed-state validation",
             verify_current=True,
         )
-        _verify_desired_entries(home, desired_entries)
+        _verify_desired_entries(home, desired_entries, pending_batch=pending_batch)
         _verify_managed_link_snapshots(home, next_state, managed_link_snapshots)
         state_transaction = _prepare_pending_managed_state_transaction(
             home,
@@ -22230,7 +41413,7 @@ def _install_release_set_unlocked(
             phase="during final managed-state validation",
             verify_current=True,
         )
-        _verify_desired_entries(home, desired_entries)
+        _verify_desired_entries(home, desired_entries, pending_batch=pending_batch)
         _verify_managed_link_snapshots(home, next_state, managed_link_snapshots)
         _write_managed_state(home, next_state, state_transaction)
         _verify_published_state_transaction(home, state_transaction)
@@ -22252,7 +41435,7 @@ def _install_release_set_unlocked(
             phase="after managed-state publication",
             verify_current=True,
         )
-        _verify_desired_entries(home, desired_entries)
+        _verify_desired_entries(home, desired_entries, pending_batch=pending_batch)
         _verify_managed_link_snapshots(home, next_state, managed_link_snapshots)
         _verify_committed_pending_link_records(home, pending_batch)
         _verify_published_state_transaction(home, state_transaction)
@@ -22267,9 +41450,7 @@ def _install_release_set_unlocked(
         _mark_pending_batch_cleanup_ready(home, pending_batch)
         _clear_pending_link_pointer(home, pending_batch, phase="after")
     except BaseException as error:
-        _close_install_release_directory_chains(
-            install_release_directory_chains
-        )
+        _close_install_release_directory_chains(install_release_directory_chains)
         install_release_directory_chains = None
         if (
             not state_committed
@@ -22297,7 +41478,11 @@ def _install_release_set_unlocked(
         except (OSError, SyncError) as rollback_error:
             rollback_errors.append(f"state: {rollback_error}")
         try:
-            _rollback_reconcile_transaction(home, link_transaction)
+            _rollback_reconcile_transaction(
+                home,
+                link_transaction,
+                pending_batch=pending_batch,
+            )
         except (OSError, SyncError) as rollback_error:
             rollback_errors.append(f"links: {rollback_error}")
         try:
@@ -22310,9 +41495,11 @@ def _install_release_set_unlocked(
             and not rollback_errors
         ):
             try:
-                _clear_pending_link_pointer(home, pending_batch, phase="before")
+                _finalize_rolled_back_pending_batch(home, pending_batch)
             except (OSError, SyncError) as rollback_error:
-                rollback_errors.append(f"pending pointer: {rollback_error}")
+                rollback_errors.append(
+                    f"pending rollback finalization: {rollback_error}"
+                )
         if rollback_errors:
             _close_install_release_bindings(held_bindings)
             raise SyncError(
@@ -22326,11 +41513,12 @@ def _install_release_set_unlocked(
         _commit_reconcile_transaction(link_transaction)
         _commit_reconcile_transaction(current_transaction)
         assert pending_batch is not None
-        _try_cleanup_committed_pending_batch(home, pending_batch)
+        cleaned = _try_cleanup_finalized_pending_batch(home, pending_batch)
+        if pending_batch.terminal_regular_after:
+            if not cleaned:
+                raise SyncError("committed regular-file evidence cleanup was deferred")
     finally:
-        _close_install_release_directory_chains(
-            install_release_directory_chains
-        )
+        _close_install_release_directory_chains(install_release_directory_chains)
         _close_install_release_bindings(held_bindings)
     if not actions:
         print("all managed symlinks already point at current")
@@ -22343,10 +41531,21 @@ def install_release_tree(
     *,
     dry_run: bool,
     release_expectation: ReleaseTreeExpectation | None = None,
+    cleanup_budget: PendingCleanupActionBudget | None = None,
 ) -> None:
     sha = _validate_release_sha(sha)
     home = home.expanduser()
-    if _preflight_pending_recovery(home, dry_run=dry_run) and dry_run:
+    action_budget = cleanup_budget or PendingCleanupActionBudget(
+        MAX_PENDING_CLEANUP_BATCHES_PER_RUN
+    )
+    if (
+        _preflight_pending_recovery(
+            home,
+            dry_run=dry_run,
+            cleanup_budget=action_budget,
+        )
+        and dry_run
+    ):
         return
     if release_expectation is None:
         release_expectation = _source_release_identity(source_root, None)
@@ -22364,6 +41563,7 @@ def install_release_tree(
             releases,
             dry_run=True,
             allow_cross_owner=manifest.owner != PUBLIC_OWNER,
+            cleanup_budget=action_budget,
         )
         return
     _install_release_set_unlocked(
@@ -22372,6 +41572,7 @@ def install_release_tree(
         dry_run=True,
         allow_cross_owner=manifest.owner != PUBLIC_OWNER,
         preflight_only=True,
+        cleanup_budget=action_budget,
     )
     with installation_lock(home):
         _install_release_set_unlocked(
@@ -22379,6 +41580,7 @@ def install_release_tree(
             releases,
             dry_run=False,
             allow_cross_owner=manifest.owner != PUBLIC_OWNER,
+            cleanup_budget=action_budget,
         )
 
 
@@ -22436,9 +41638,7 @@ def _stage_release_tree_for_install_with_owner_access_policy(
     *,
     expected_owner_uid: int | None,
 ) -> InstallReleaseBinding:
-    normalized_owner_uid = (
-        expected_owner_uid if sys.platform == "darwin" else None
-    )
+    normalized_owner_uid = expected_owner_uid if sys.platform == "darwin" else None
     token = _INSTALL_RELEASE_OWNER_UID.set(normalized_owner_uid)
     try:
         return _stage_release_tree_for_install(
@@ -23872,7 +43072,15 @@ def _download_and_extract_release_with_deadline(
 
 def install_from_github(repo: str, home: Path, *, dry_run: bool) -> None:
     home = home.expanduser()
-    if _preflight_pending_recovery(home, dry_run=dry_run) and dry_run:
+    cleanup_budget = PendingCleanupActionBudget(MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
+    if (
+        _preflight_pending_recovery(
+            home,
+            dry_run=dry_run,
+            cleanup_budget=cleanup_budget,
+        )
+        and dry_run
+    ):
         return
     with temporary_archive_workspace(prefix="codex-personal-sync.") as workspace:
         temp_dir = workspace.path
@@ -23887,6 +43095,7 @@ def install_from_github(repo: str, home: Path, *, dry_run: bool) -> None:
             release.assets.sha,
             dry_run=dry_run,
             release_expectation=release.release_expectation,
+            cleanup_budget=cleanup_budget,
         )
 
 
@@ -23925,7 +43134,15 @@ def install_private_from_github(
     dry_run: bool,
 ) -> None:
     home = home.expanduser()
-    if _preflight_pending_recovery(home, dry_run=dry_run) and dry_run:
+    cleanup_budget = PendingCleanupActionBudget(MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
+    if (
+        _preflight_pending_recovery(
+            home,
+            dry_run=dry_run,
+            cleanup_budget=cleanup_budget,
+        )
+        and dry_run
+    ):
         return
     owner = _validate_owner(owner)
     if owner == PUBLIC_OWNER:
@@ -23984,6 +43201,7 @@ def install_private_from_github(
                 releases,
                 dry_run=True,
                 allow_cross_owner=True,
+                cleanup_budget=cleanup_budget,
             )
             return
 
@@ -23993,6 +43211,7 @@ def install_private_from_github(
                 releases,
                 dry_run=False,
                 allow_cross_owner=True,
+                cleanup_budget=cleanup_budget,
             )
         print(
             "private layered install ok: "
@@ -24022,9 +43241,7 @@ def _current_sha(
                 current_parent,
                 expected_owner_uid,
             )
-            current_parent_fd = os.dup(
-                directory_bindings[-1].file_descriptor
-            )
+            current_parent_fd = os.dup(directory_bindings[-1].file_descriptor)
     except FileNotFoundError:
         _close_release_identity_directory_bindings(directory_bindings)
         return None
@@ -24101,12 +43318,10 @@ def _current_sha(
                     releases_root,
                     expected_owner_uid,
                 )
-                opened_release_metadata = (
-                    _require_release_identity_fd_access_policy(
-                        release_fd,
-                        release_dir,
-                        expected_owner_uid,
-                    )
+                opened_release_metadata = _require_release_identity_fd_access_policy(
+                    release_fd,
+                    release_dir,
+                    expected_owner_uid,
                 )
                 releases_identity = (
                     releases_metadata.st_dev,
@@ -24147,31 +43362,22 @@ def _current_sha(
         if not _bound_directory_matches(home, current_parent, current_parent_fd):
             raise SyncError(f"current pointer parent changed: {current_parent}")
         if expected_owner_uid is not None:
-            terminal_releases_metadata = (
-                _require_release_identity_fd_access_policy(
-                    releases_fd,
-                    releases_root,
-                    expected_owner_uid,
-                )
+            terminal_releases_metadata = _require_release_identity_fd_access_policy(
+                releases_fd,
+                releases_root,
+                expected_owner_uid,
             )
-            terminal_release_metadata = (
-                _require_release_identity_fd_access_policy(
-                    release_fd,
-                    release_dir,
-                    expected_owner_uid,
-                )
+            terminal_release_metadata = _require_release_identity_fd_access_policy(
+                release_fd,
+                release_dir,
+                expected_owner_uid,
             )
-            if (
-                releases_identity
-                != (
-                    terminal_releases_metadata.st_dev,
-                    terminal_releases_metadata.st_ino,
-                )
-                or release_identity
-                != (
-                    terminal_release_metadata.st_dev,
-                    terminal_release_metadata.st_ino,
-                )
+            if releases_identity != (
+                terminal_releases_metadata.st_dev,
+                terminal_releases_metadata.st_ino,
+            ) or release_identity != (
+                terminal_release_metadata.st_dev,
+                terminal_release_metadata.st_ino,
             ):
                 raise _release_identity_policy_error(
                     release_dir,
@@ -24201,6 +43407,33 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> bool:
     home = home.expanduser()
     owner = _validate_owner(owner)
     manifest_cache: dict[tuple[str, str], ManifestData | None] = {}
+    pending_authority_issues: list[str] = []
+    if not _pending_link_pointer_is_absent(home):
+        pending_authority_issues.append("active pending transaction must be recovered")
+    elif (
+        unresolved_ticket_representation := (
+            _pending_cleanup_unresolved_ticket_representation_issue(home)
+        )
+    ) is not None:
+        batch_name, member_name = unresolved_ticket_representation
+        pending_authority_issues.append(
+            "pending cleanup ticket representation must be reconciled before new "
+            f"mutation: {batch_name}: {member_name}"
+        )
+    elif (
+        unresolved_allocation_representation := (
+            _pending_quarantine_unresolved_allocation_representation_issue(home)
+        )
+    ) is not None:
+        batch_name, member_name = unresolved_allocation_representation
+        pending_authority_issues.append(
+            "pending quarantine allocation representation must be reconciled "
+            f"before new mutation: {batch_name}: {member_name}"
+        )
+    elif _pending_cleanup_ready_batch_is_observed(home):
+        pending_authority_issues.append(
+            "finalized or interrupted pending transaction must be cleaned"
+        )
     sha = _current_sha(home, owner)
     if sha is None:
         skill_issues = audit_active_skills(
@@ -24208,25 +43441,62 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> bool:
             manifest_cache=manifest_cache,
         )
         print(f"{owner} is not installed under {_display_path(home)}")
+        if pending_authority_issues:
+            print(f"managed link state drift: {len(pending_authority_issues)} issue(s)")
+            for issue in pending_authority_issues:
+                print(f"- {issue}")
         _print_doctor_issues(skill_issues)
         return False
     release_root = _releases_root(home, owner) / sha
+    if pending_authority_issues:
+        print(f"current owner: {owner}")
+        print(f"current release: {sha}")
+        print(f"release root: {release_root}")
+        print(f"managed link state drift: {len(pending_authority_issues)} issue(s)")
+        for issue in pending_authority_issues:
+            print(f"- {issue}")
+        skill_issues = audit_active_skills(
+            home,
+            manifest_cache=manifest_cache,
+        )
+        _print_doctor_issues(skill_issues)
+        return False
     entries = _load_installed_manifest_data(
         home,
         owner,
         sha,
         manifest_cache=manifest_cache,
     ).entries
-    public_entries = (
-        _current_manifest_data(
+    checked_entries = entries
+    checked_owners = {owner}
+    if owner == PUBLIC_OWNER:
+        installed_manifests = _installed_manifests(
+            home,
+            manifest_cache=manifest_cache,
+        )
+        overlays = [
+            manifest
+            for installed_owner, manifest in sorted(installed_manifests.items())
+            if installed_owner != PUBLIC_OWNER
+        ]
+        if overlays:
+            checked_entries = _combine_entries(entries, overlays)
+            checked_owners.update(manifest.owner for manifest in overlays)
+            public_entries = entries
+        else:
+            public_entries = None
+    else:
+        public_entries = _current_manifest_data(
             home,
             PUBLIC_OWNER,
             manifest_cache=manifest_cache,
         ).entries
-        if any(entry.owner != PUBLIC_OWNER for entry in entries)
-        else None
+    checked_targets = {entry.target for entry in checked_entries}
+    actions = plan_link_actions(
+        home,
+        checked_entries,
+        public_entries=public_entries,
     )
-    actions = plan_link_actions(home, entries, public_entries=public_entries)
     stale_removals = plan_stale_current_link_removals(
         home,
         entries,
@@ -24255,15 +43525,75 @@ def status(home: Path, owner: str = PUBLIC_OWNER) -> bool:
         _print_doctor_issues(skill_issues)
         return False
     state = _load_managed_state(home, manifest_cache=manifest_cache)
-    state_issues: list[str] = []
-    if state.owners.get(owner) != sha:
-        state_issues.append(
-            f"release mismatch: state={state.owners.get(owner)}, current={sha}"
+    state_issues = list(pending_authority_issues)
+    if owner == PUBLIC_OWNER:
+        checked_owners.update(state.owners)
+    checked_owner_shas: dict[str, str | None] = {}
+    for checked_owner in sorted(checked_owners):
+        checked_sha = _current_sha(home, checked_owner)
+        checked_owner_shas[checked_owner] = checked_sha
+        if state.owners.get(checked_owner) != checked_sha:
+            state_issues.append(
+                "release mismatch: "
+                f"owner={checked_owner}, state={state.owners.get(checked_owner)}, "
+                f"current={checked_sha}"
+            )
+    for entry in checked_entries:
+        if not _entry_materializes_regular_file(entry) or _is_optional_desired_entry(
+            entry
+        ):
+            continue
+        record = state.links.get(entry.target)
+        checked_sha = checked_owner_shas.get(entry.owner)
+        if record is None:
+            state_issues.append(
+                "regular file is missing its managed state claim: "
+                f"{_entry_target_path(home, entry)}"
+            )
+            continue
+        if checked_sha is None:
+            continue
+        expected_record = ManagedLinkRecord(
+            source=entry.source,
+            target=entry.target,
+            kind=entry.kind,
+            owner=entry.owner,
+            link_target=_desired_link_target(home, entry),
+            release_sha=checked_sha,
         )
+        if record != expected_record:
+            state_issues.append(
+                f"regular file winner claim conflict: {_entry_target_path(home, entry)}"
+            )
     for record in state.links.values():
-        if record.owner != owner:
+        if record.target not in checked_targets:
             continue
         target = home / Path(*record.target.parts)
+        if _record_materializes_regular_file(record):
+            try:
+                actual_snapshot = _capture_reconcile_target_snapshot(home, target)
+            except (OSError, SyncError) as error:
+                raise SyncError(
+                    "managed regular target could not be read during status "
+                    f"validation: {target}"
+                ) from error
+            if actual_snapshot.link_identity is None:
+                state_issues.append(f"regular file missing: {target}")
+                continue
+            actual_regular = _regular_snapshot_from_reconcile(actual_snapshot)
+            if actual_regular is None:
+                state_issues.append(f"regular file type mismatch: {target}")
+                continue
+            if not _regular_snapshot_has_managed_access(actual_regular):
+                state_issues.append(f"regular file access policy mismatch: {target}")
+                continue
+            expected_source = _record_regular_source_path(home, record)
+            if actual_regular.sha256 != _regular_source_sha256(
+                home,
+                expected_source,
+            ):
+                state_issues.append(f"regular file content mismatch: {target}")
+            continue
         try:
             actual_target = _read_optional_symlink_target_beneath(home, target)
         except OSError as error:
@@ -24370,6 +43700,7 @@ def _resolve_release_for_rollback(
 
 def rollback(home: Path, to_sha: str | None, owner: str = PUBLIC_OWNER) -> None:
     home = home.expanduser()
+    cleanup_budget = PendingCleanupActionBudget(MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
     with installation_lock(home):
         _recover_release_retention_transaction(home, dry_run=False)
         loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
@@ -24404,6 +43735,7 @@ def rollback(home: Path, to_sha: str | None, owner: str = PUBLIC_OWNER) -> None:
             [(release_root, sha, manifest, release_expectation)],
             dry_run=False,
             allow_cross_owner=False,
+            cleanup_budget=cleanup_budget,
         )
 
 
@@ -25251,6 +44583,8 @@ def _delete_quarantined_release(
             _directory_mount_identity(release_fd),
             [MAX_PENDING_CLEANUP_ENTRIES],
             depth=0,
+            directory_expected_mode=None,
+            regular_file_expected_mode=None,
         )
         isolated = os.stat(
             active_name,
@@ -25647,6 +44981,8 @@ def _recover_release_retention_transaction(
     *,
     dry_run: bool,
 ) -> ReleaseRetentionRecoveryOutcome | None:
+    if not dry_run:
+        _recover_failed_move_isolation(home)
     transaction = _load_release_retention_transaction(home)
     if transaction is None:
         return None
@@ -26119,7 +45455,12 @@ def _overlay_scan_parents(
     return parents
 
 
-def _collect_overlay_issues(home: Path, owner: str) -> list[str]:
+def _collect_overlay_issues(
+    home: Path,
+    owner: str,
+    *,
+    pending_batch: PendingLinkBatch | None = None,
+) -> list[str]:
     owner = _validate_owner(owner)
     if owner == PUBLIC_OWNER:
         raise SyncError("overlay owner must not be public")
@@ -26136,6 +45477,73 @@ def _collect_overlay_issues(home: Path, owner: str) -> list[str]:
     known_owners = {owner, PUBLIC_OWNER}
     for entry in overlay_entries:
         target = _entry_target_path(home, entry)
+        if _entry_materializes_regular_file(entry):
+            try:
+                snapshot = _capture_reconcile_target_snapshot(
+                    home,
+                    target,
+                    require_managed_parent_access=True,
+                )
+            except (OSError, SyncError) as error:
+                issues.append(
+                    f"overlay regular-file validation failed: {target}: {error}"
+                )
+            else:
+                regular = _regular_snapshot_from_reconcile(snapshot)
+                if snapshot.link_identity is None:
+                    issues.append(f"missing overlay regular file: {target}")
+                elif regular is None:
+                    issues.append(f"overlay regular-file type mismatch: {target}")
+                else:
+                    try:
+                        _verify_pending_regular_aliases(
+                            home,
+                            pending_batch,
+                            target,
+                            regular,
+                        )
+                    except SyncError as error:
+                        issues.append(
+                            "overlay regular-file alias validation failed: "
+                            f"{target}: {error}"
+                        )
+                    else:
+                        if regular.mode != 0o600 or regular.uid != os.geteuid():
+                            issues.append(
+                                f"overlay regular-file access policy mismatch: {target}"
+                            )
+                        else:
+                            try:
+                                source = _entry_regular_source_path(home, entry)
+                                expected_sha256 = _regular_source_sha256(home, source)
+                            except (OSError, SyncError) as error:
+                                issues.append(
+                                    "overlay regular-file source validation failed: "
+                                    f"{target}: {error}"
+                                )
+                            else:
+                                if regular.sha256 != expected_sha256:
+                                    issues.append(
+                                        "overlay regular-file content mismatch: "
+                                        f"{target}"
+                                    )
+            public_entry = public_by_target.get(entry.target)
+            if (
+                public_entry is not None
+                and not entry.override
+                and entry.target not in OPTIONAL_PUBLIC_TARGETS
+            ):
+                issues.append(
+                    "target also exists in public manifest but lacks "
+                    f"override=true: {target}"
+                )
+            if (
+                public_entry is None
+                and entry.override
+                and entry.target not in OPTIONAL_PUBLIC_TARGETS
+            ):
+                issues.append(f"override target has no public base target: {target}")
+            continue
         live_target = _read_optional_symlink_target_beneath(home, target)
         if live_target is None:
             issues.append(f"missing overlay symlink: {target}")
@@ -26196,29 +45604,46 @@ def verify_overlay(home: Path, owner: str) -> None:
     home = home.expanduser()
     issues = _collect_overlay_issues(home, owner)
     state_path = _state_path(home)
+    current_sha = _current_sha(home, owner)
+    overlay_entries = current_release_entries(home, owner)
+    state: ManagedState | None = None
     if _path_exists_or_is_link(state_path):
         state = _load_managed_state(home)
-        current_sha = _current_sha(home, owner)
         if state.owners.get(owner) != current_sha:
             issues.append(
                 f"managed link state release mismatch for {owner}: "
                 f"state={state.owners.get(owner)}, current={current_sha}"
             )
-        for entry in current_release_entries(home, owner):
-            record = state.links.get(entry.target)
-            expected_record = ManagedLinkRecord(
-                source=entry.source,
-                target=entry.target,
-                kind=entry.kind,
-                owner=owner,
-                link_target=_desired_link_target(home, entry),
-                release_sha=current_sha,
-            )
-            if record is not None and record != expected_record:
+    for entry in overlay_entries:
+        record = state.links.get(entry.target) if state is not None else None
+        if state is None and (
+            not _entry_materializes_regular_file(entry)
+            or _is_optional_desired_entry(entry)
+        ):
+            continue
+        if current_sha is None:
+            continue
+        expected_record = ManagedLinkRecord(
+            source=entry.source,
+            target=entry.target,
+            kind=entry.kind,
+            owner=owner,
+            link_target=_desired_link_target(home, entry),
+            release_sha=current_sha,
+        )
+        if record is None:
+            if _entry_materializes_regular_file(
+                entry
+            ) and not _is_optional_desired_entry(entry):
                 issues.append(
-                    f"managed link state has a conflicting overlay target: "
+                    f"managed link state has a missing overlay regular claim: "
                     f"{_entry_target_path(home, entry)}"
                 )
+        elif record != expected_record:
+            issues.append(
+                f"managed link state has a conflicting overlay target: "
+                f"{_entry_target_path(home, entry)}"
+            )
     if issues:
         for issue in issues:
             print(f"overlay issue: {issue}")
@@ -26231,8 +45656,16 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
     owner = _validate_owner(owner)
     if owner == PUBLIC_OWNER:
         raise SyncError("refusing to uninstall public as an overlay")
+    cleanup_budget = PendingCleanupActionBudget(MAX_PENDING_CLEANUP_BATCHES_PER_RUN)
 
     def apply_uninstall() -> None:
+        _require_no_pending_unresolved_ticket_representations(home)
+        if dry_run and _pending_cleanup_ready_batch_is_observed(home):
+            print(
+                "would clean a finalized or interrupted pending transaction under "
+                "the install lock"
+            )
+            return
         loaded_state, initial_state_snapshot = _load_managed_state_with_snapshot(home)
         (
             loaded_state,
@@ -26250,7 +45683,8 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
             )
             return
         if not dry_run:
-            _try_cleanup_ready_pending_batches(home)
+            _cleanup_ready_pending_batches(home, budget=cleanup_budget)
+            _require_no_pending_terminal_mutation_authority(home)
         _verify_managed_state_current_owner_claims(home, loaded_state)
         # Uncommitted recovery returns the exact restored before-state snapshot.
         # If that state was absent, plan this uninstall like a clean legacy retry
@@ -26516,9 +45950,17 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
                 raise SyncError(
                     f"missing current pointer changed during overlay uninstall: {current}"
                 )
-            _verify_desired_entries(home, desired_entries)
+            _verify_desired_entries(
+                home,
+                desired_entries,
+                pending_batch=pending_batch,
+            )
             for manifest in overlay_manifests:
-                issues = _collect_overlay_issues(home, manifest.owner)
+                issues = _collect_overlay_issues(
+                    home,
+                    manifest.owner,
+                    pending_batch=pending_batch,
+                )
                 if issues:
                     for issue in issues:
                         print(f"overlay issue: {issue}")
@@ -26538,6 +45980,7 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
                 desired_entries,
                 owner_shas,
                 managed_targets,
+                pending_batch=pending_batch,
             )
             if next_state != planned_next_state:
                 raise SyncError(
@@ -26561,7 +46004,11 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
                 phase="during final overlay uninstall state validation",
                 verify_current=False,
             )
-            _verify_desired_entries(home, desired_entries)
+            _verify_desired_entries(
+                home,
+                desired_entries,
+                pending_batch=pending_batch,
+            )
             _verify_managed_link_snapshots(
                 home,
                 next_state,
@@ -26584,7 +46031,11 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
                 phase="during final overlay uninstall state validation",
                 verify_current=False,
             )
-            _verify_desired_entries(home, desired_entries)
+            _verify_desired_entries(
+                home,
+                desired_entries,
+                pending_batch=pending_batch,
+            )
             _verify_managed_link_snapshots(
                 home,
                 next_state,
@@ -26604,7 +46055,11 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
                 phase="after overlay uninstall managed-state publication",
                 verify_current=False,
             )
-            _verify_desired_entries(home, desired_entries)
+            _verify_desired_entries(
+                home,
+                desired_entries,
+                pending_batch=pending_batch,
+            )
             _verify_managed_link_snapshots(
                 home,
                 next_state,
@@ -26666,7 +46121,11 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
             except (OSError, SyncError) as rollback_error:
                 rollback_errors.append(f"current: {rollback_error}")
             try:
-                _rollback_reconcile_transaction(home, link_transaction)
+                _rollback_reconcile_transaction(
+                    home,
+                    link_transaction,
+                    pending_batch=pending_batch,
+                )
             except (OSError, SyncError) as rollback_error:
                 rollback_errors.append(f"links: {rollback_error}")
             try:
@@ -26698,9 +46157,11 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
                 and not rollback_errors
             ):
                 try:
-                    _clear_pending_link_pointer(home, pending_batch, phase="before")
+                    _finalize_rolled_back_pending_batch(home, pending_batch)
                 except (OSError, SyncError) as rollback_error:
-                    rollback_errors.append(f"pending pointer: {rollback_error}")
+                    rollback_errors.append(
+                        f"pending rollback finalization: {rollback_error}"
+                    )
             if rollback_errors:
                 _close_install_release_bindings(held_bindings)
                 raise SyncError(
@@ -26714,7 +46175,12 @@ def uninstall_overlay(home: Path, owner: str, *, dry_run: bool) -> None:
             _commit_reconcile_transaction(current_transaction)
             _commit_reconcile_transaction(link_transaction)
             assert pending_batch is not None
-            _try_cleanup_committed_pending_batch(home, pending_batch)
+            cleaned = _try_cleanup_finalized_pending_batch(home, pending_batch)
+            if pending_batch.terminal_regular_after:
+                if not cleaned:
+                    raise SyncError(
+                        "committed regular-file evidence cleanup was deferred"
+                    )
         finally:
             _close_install_release_bindings(held_bindings)
         if not actions:
@@ -26766,8 +46232,7 @@ def _scheduler_runner_is_usable(runner: Path) -> bool:
     if (
         _managed_state_metadata_snapshot(lexical)
         != _managed_state_metadata_snapshot(lexical_after)
-        or _managed_state_metadata_snapshot(target)
-        != _managed_state_metadata_snapshot(target_after)
+        or not _regular_stat_metadata_matches(target_after, target)
         or link_target != link_target_after
         or stat.S_ISDIR(lexical.st_mode)
         or not stat.S_ISREG(target.st_mode)
@@ -27015,10 +46480,9 @@ def _read_scheduler_regular_file(path: Path, maximum_bytes: int) -> bytes:
     try:
         file_fd = os.open(path.name, flags, dir_fd=parent_fd)
         opened = os.fstat(file_fd)
-        expected = _managed_state_metadata_snapshot(named)
         if (
             not stat.S_ISREG(opened.st_mode)
-            or _managed_state_metadata_snapshot(opened) != expected
+            or not _regular_stat_metadata_matches(opened, named)
             or not _archive_path_matches_fd(path.parent, parent_fd)
         ):
             raise SyncError(f"scheduler config changed before read: {path}")
@@ -27059,8 +46523,8 @@ def _read_scheduler_regular_file(path: Path, maximum_bytes: int) -> bytes:
             follow_symlinks=False,
         )
         if (
-            _managed_state_metadata_snapshot(after) != expected
-            or _managed_state_metadata_snapshot(current) != expected
+            not _regular_stat_metadata_matches(after, named)
+            or not _regular_stat_metadata_matches(current, named)
             or not _archive_path_matches_fd(path.parent, parent_fd)
         ):
             raise SyncError(f"scheduler config changed during read: {path}")
@@ -28749,7 +48213,6 @@ def _revalidate_launchd_activation_binding(
         expected.file_type,
         expected.mode,
         expected.uid,
-        expected.gid,
     )
 
     def validate_metadata(metadata: os.stat_result) -> None:
@@ -28763,8 +48226,17 @@ def _revalidate_launchd_activation_binding(
             stat.S_IFMT(metadata.st_mode),
             stat.S_IMODE(metadata.st_mode),
             metadata.st_uid,
-            metadata.st_gid,
         ) != expected_access:
+            raise _launchd_activation_failure(
+                binding,
+                boundary,
+                "access policy changed",
+            )
+        if not _gid_matches_regular_file_access_policy(
+            metadata.st_gid,
+            expected.gid,
+            expected.mode,
+        ):
             raise _launchd_activation_failure(
                 binding,
                 boundary,
@@ -29912,7 +49384,7 @@ def _revalidate_published_systemd_pair(
             Path,
             int,
             ManagedStateFileSnapshot,
-            tuple[int, int, int, int, int, int, int],
+            os.stat_result,
         ]
     ] = []
     try:
@@ -29949,15 +49421,6 @@ def _revalidate_published_systemd_pair(
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_NONBLOCK", 0)
         for path, bound in zip((service_path, timer_path), expected):
-            expected_metadata = (
-                bound.file_identity[0],
-                bound.file_identity[1],
-                bound.file_type,
-                bound.mode,
-                bound.uid,
-                bound.gid,
-                bound.size,
-            )
             named = os.stat(
                 path.name,
                 dir_fd=parent_fd,
@@ -29965,17 +49428,15 @@ def _revalidate_published_systemd_pair(
             )
             file_fd = os.open(path.name, flags, dir_fd=parent_fd)
             opened_metadata = os.fstat(file_fd)
-            if (
-                _managed_state_metadata_snapshot(named) != expected_metadata
-                or _managed_state_metadata_snapshot(opened_metadata)
-                != expected_metadata
-            ):
+            if not _regular_stat_matches_managed_state_file_snapshot(
+                named, bound
+            ) or not _regular_stat_metadata_matches(opened_metadata, named):
                 _close_fd_quietly(file_fd)
                 raise SyncError(
                     "published systemd scheduler service/timer pair changed "
                     "before daemon activation"
                 )
-            opened.append((path, file_fd, bound, expected_metadata))
+            opened.append((path, file_fd, bound, named))
             payload = _read_managed_state_bytes(
                 file_fd,
                 path,
@@ -29986,17 +49447,16 @@ def _revalidate_published_systemd_pair(
                     "published systemd scheduler service/timer pair changed "
                     "before daemon activation"
                 )
-        for path, file_fd, bound, expected_metadata in opened:
+        for path, file_fd, bound, baseline_metadata in opened:
             os.lseek(file_fd, 0, os.SEEK_SET)
             confirmed_payload = _read_managed_state_bytes(
                 file_fd,
                 path,
                 max(bound.size or 0, 1),
             )
-            if (
-                confirmed_payload != bound.payload
-                or _managed_state_metadata_snapshot(os.fstat(file_fd))
-                != expected_metadata
+            if confirmed_payload != bound.payload or not _regular_stat_metadata_matches(
+                os.fstat(file_fd),
+                baseline_metadata,
             ):
                 raise SyncError(
                     "published systemd scheduler service/timer pair changed "
@@ -30005,16 +49465,17 @@ def _revalidate_published_systemd_pair(
         # Both descriptors have now been reread. Revalidate both canonical
         # names only after that shared read phase, then recheck both
         # descriptors once more before accepting the pair.
-        for path, file_fd, _bound, expected_metadata in opened:
+        for path, file_fd, _bound, baseline_metadata in opened:
             named = os.stat(
                 path.name,
                 dir_fd=parent_fd,
                 follow_symlinks=False,
             )
-            if (
-                _managed_state_metadata_snapshot(named) != expected_metadata
-                or _managed_state_metadata_snapshot(os.fstat(file_fd))
-                != expected_metadata
+            if not _regular_stat_metadata_matches(
+                named, baseline_metadata
+            ) or not _regular_stat_metadata_matches(
+                os.fstat(file_fd),
+                baseline_metadata,
             ):
                 raise SyncError(
                     "published systemd scheduler service/timer pair changed "
@@ -30065,7 +49526,11 @@ def _scheduler_file_logical_state_matches(
         and actual.file_type == expected.file_type
         and actual.size == expected.size
         and actual.uid == expected.uid
-        and actual.gid == expected.gid
+        and _gid_matches_regular_file_access_policy(
+            actual.gid,
+            expected.gid,
+            expected.mode,
+        )
     )
 
 
@@ -30088,19 +49553,9 @@ def _open_scheduler_recovery_binding(
         )
         file_fd = os.open(path.name, flags, dir_fd=parent_fd)
         opened = os.fstat(file_fd)
-        expected_metadata = (
-            expected.file_identity[0],
-            expected.file_identity[1],
-            expected.file_type,
-            expected.mode,
-            expected.uid,
-            expected.gid,
-            expected.size,
-        )
-        if (
-            _managed_state_metadata_snapshot(named) != expected_metadata
-            or _managed_state_metadata_snapshot(opened) != expected_metadata
-        ):
+        if not _regular_stat_matches_managed_state_file_snapshot(
+            named, expected
+        ) or not _regular_stat_metadata_matches(opened, named):
             raise SyncError(f"scheduler recovery evidence changed: {path}")
         payload = _read_managed_state_bytes(
             file_fd,
@@ -30116,7 +49571,7 @@ def _open_scheduler_recovery_binding(
         if (
             payload != expected.payload
             or confirmed_payload != expected.payload
-            or _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected_metadata
+            or not _regular_stat_metadata_matches(os.fstat(file_fd), named)
         ):
             raise SyncError(f"scheduler recovery evidence changed: {path}")
         return file_fd
@@ -30139,15 +49594,6 @@ def _scheduler_recovery_binding_matches(
         or expected.parent_identity is None
     ):
         return False
-    expected_metadata = (
-        expected.file_identity[0],
-        expected.file_identity[1],
-        expected.file_type,
-        expected.mode,
-        expected.uid,
-        expected.gid,
-        expected.size,
-    )
     try:
         if expected.parent_identity != _directory_identity(
             parent_fd
@@ -30158,9 +49604,12 @@ def _scheduler_recovery_binding_matches(
             dir_fd=parent_fd,
             follow_symlinks=False,
         )
-        if _managed_state_metadata_snapshot(named_before) != expected_metadata:
+        if not _regular_stat_matches_managed_state_file_snapshot(
+            named_before,
+            expected,
+        ):
             return False
-        if _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected_metadata:
+        if not _regular_stat_metadata_matches(os.fstat(file_fd), named_before):
             return False
         os.lseek(file_fd, 0, os.SEEK_SET)
         payload = _read_managed_state_bytes(
@@ -30182,8 +49631,8 @@ def _scheduler_recovery_binding_matches(
         return (
             payload == expected.payload
             and confirmed_payload == expected.payload
-            and _managed_state_metadata_snapshot(os.fstat(file_fd)) == expected_metadata
-            and _managed_state_metadata_snapshot(named_after) == expected_metadata
+            and _regular_stat_metadata_matches(os.fstat(file_fd), named_before)
+            and _regular_stat_metadata_matches(named_after, named_before)
             and expected.parent_identity == _directory_identity(parent_fd)
             and _bound_directory_matches(home, path.parent, parent_fd)
         )
@@ -33306,7 +52755,6 @@ def _read_bound_skill_manifest(
         return None
     if named.st_uid != os.geteuid() or stat.S_IMODE(named.st_mode) & 0o022:
         return None
-    expected = _managed_state_metadata_snapshot(named)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
@@ -33317,7 +52765,7 @@ def _read_bound_skill_manifest(
             flags,
             dir_fd=directory_fd,
         )
-        if _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected:
+        if not _regular_stat_metadata_matches(os.fstat(file_fd), named):
             raise SyncError(f"skill manifest changed before read: {manifest}")
 
         def read_once() -> bytes:
@@ -33344,10 +52792,9 @@ def _read_bound_skill_manifest(
             dir_fd=directory_fd,
             follow_symlinks=False,
         )
-        if (
-            _managed_state_metadata_snapshot(os.fstat(file_fd)) != expected
-            or _managed_state_metadata_snapshot(current) != expected
-        ):
+        if not _regular_stat_metadata_matches(
+            os.fstat(file_fd), named
+        ) or not _regular_stat_metadata_matches(current, named):
             raise SyncError(f"skill manifest changed during read: {manifest}")
         return payload
     except OSError as error:
@@ -34832,11 +54279,7 @@ def release_identities(
             "release identity state is unavailable",
             code="current-release-unverifiable",
         ) from error
-    expected_owners = (
-        {PUBLIC_OWNER, owner}
-        if mode == "private"
-        else {PUBLIC_OWNER}
-    )
+    expected_owners = {PUBLIC_OWNER, owner} if mode == "private" else {PUBLIC_OWNER}
     if set(releases) != expected_owners:
         raise SyncError(
             "active release identity owner set is incomplete",
@@ -38611,8 +58054,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 for release_owner, identity in payload["release_trees"].items():
                     print(
-                        f"{release_owner} {identity['sha']} "
-                        f"{identity['tree_sha256']}"
+                        f"{release_owner} {identity['sha']} {identity['tree_sha256']}"
                     )
         elif args.command == "uninstall-overlay":
             uninstall_overlay(Path(args.home), args.owner, dry_run=args.dry_run)
