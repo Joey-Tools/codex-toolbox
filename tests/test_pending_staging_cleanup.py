@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -490,6 +491,52 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertEqual(ticket.version, version)
         return ticket
 
+    def test_terminal_empty_proof_capacity_is_preflighted_before_cleanup_mutation(
+        self,
+    ) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=4)
+        original_batch_identity = (
+            ticket.batch_root.stat().st_dev,
+            ticket.batch_root.stat().st_ino,
+        )
+        original_members = tuple(sorted(path.name for path in ticket.batch_root.iterdir()))
+        isolated_root = ticket.batch_root.with_name(
+            MODULE._pending_cleanup_isolated_batch_name(ticket.batch_root.name)
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_cleanup_empty_proof_payload",
+                side_effect=MODULE.SyncError(
+                    "pending cleanup empty proof exceeds the size limit"
+                ),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                wraps=MODULE._remove_pending_batch_directory_contents,
+            ) as remove_contents,
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup empty proof exceeds the size limit",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertEqual(
+            (ticket.batch_root.stat().st_dev, ticket.batch_root.stat().st_ino),
+            original_batch_identity,
+        )
+        self.assertEqual(
+            tuple(sorted(path.name for path in ticket.batch_root.iterdir())),
+            original_members,
+        )
+        self.assertFalse(os.path.lexists(isolated_root))
+        remove_contents.assert_not_called()
+
     def _stage_legacy_symlink_pointer(self, metadata_version: int):
         legacy_home = self.root / f"legacy-home-v{metadata_version}"
         first_release = self.root / f"legacy-first-v{metadata_version}"
@@ -632,6 +679,105 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertEqual(self.target.read_text(encoding="utf-8"), 'name = "next"\n')
         self.assertEqual(self.target.stat().st_nlink, 1)
         self.assertFalse(marker_batches[0].exists())
+
+    def test_staging_cleanup_rechecks_marker_authority_before_walker_mutation(
+        self,
+    ) -> None:
+        for replacement in (False, True):
+            with self.subTest(replacement=replacement):
+                ticket = self._publish_legacy_cleanup_ticket(version=3)
+                marker = ticket.batch_root / Path(
+                    *MODULE.PENDING_STATE_STAGING_MARKER.parts
+                )
+                original = marker.read_bytes()
+                if replacement:
+                    marker.unlink()
+                    marker.write_bytes(b"replaced staging marker\n")
+                else:
+                    marker.write_bytes(b"rewritten staging marker\n")
+                marker.chmod(0o600)
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "pending staging cleanup marker changed",
+                ):
+                    MODULE._remove_cleanup_ready_batch(self.home, ticket)
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+                self.assertNotEqual(marker.read_bytes(), original)
+
+    def test_staging_marker_consumption_receipt_recovers_after_unlink_crash(
+        self,
+    ) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=3)
+        real_unlink = MODULE.os.unlink
+        crashed = False
+        receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+
+        def unlink_then_crash(path, *args, **kwargs):
+            nonlocal crashed
+            real_unlink(path, *args, **kwargs)
+            if (
+                not crashed
+                and isinstance(path, str)
+                and path.startswith(MODULE.PENDING_CLEANUP_ACTIVE_ENTRY_PREFIX)
+                and receipt_path.is_file()
+            ):
+                crashed = True
+                raise SystemExit("injected staging marker unlink crash")
+
+        with (
+            mock.patch.object(MODULE.os, "unlink", side_effect=unlink_then_crash),
+            self.assertRaisesRegex(
+                SystemExit,
+                "injected staging marker unlink crash",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(crashed)
+        self.assertTrue(receipt_path.is_file())
+        receipt = MODULE._read_pending_cleanup_terminal_validation(
+            self.home,
+            ticket,
+            (ticket.batch_root.parent.stat().st_dev, ticket.batch_root.parent.stat().st_ino),
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        authority = MODULE._parse_pending_terminal_validation_authority(
+            self.home,
+            ticket,
+            (ticket.batch_root.parent.stat().st_dev, ticket.batch_root.parent.stat().st_ino),
+            receipt,
+        )
+        self.assertIsNotNone(authority)
+        assert authority is not None
+        self.assertIsNotNone(authority.staging_marker)
+        self.assertTrue(MODULE._cleanup_ready_pending_batches(self.home))
+        self.assertFalse(ticket.batch_root.exists())
+
+    def test_staging_marker_missing_before_first_mutation_is_retained(self) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=3)
+        marker = ticket.batch_root / Path(*MODULE.PENDING_STATE_STAGING_MARKER.parts)
+        marker.unlink()
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending staging cleanup marker changed",
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertFalse(
+            MODULE._pending_cleanup_terminal_validation_path(
+                self.home,
+                ticket.batch_root.name,
+            ).exists()
+        )
 
     def test_no_ticket_batch_with_symlinked_marker_parent_fails_closed(self) -> None:
         batch_root = MODULE._quarantine_batch_root(self.home, [])
@@ -812,7 +958,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
 
-        self.assertIn("missing without an exact empty proof", stdout.getvalue())
+        self.assertIn("still has a batch root", stdout.getvalue())
         self.assertTrue(ticket.path.is_file())
         self.assertTrue(moved_batch.is_dir())
         self.assertEqual(self.target.stat().st_nlink, 2)
@@ -856,6 +1002,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             expected,
             *,
             label: str,
+            **kwargs: object,
         ) -> None:
             if label == "pending staging cleanup marker":
                 raise MODULE.SyncError("injected staging marker retention")
@@ -865,6 +1012,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 parent_fd,
                 expected,
                 label=label,
+                **kwargs,
             )
 
         with (
@@ -911,6 +1059,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             expected,
             *,
             label: str,
+            **kwargs: object,
         ) -> None:
             if path == ticket.path:
                 retained = next(MODULE._retained_pending_cleanup_names(path))
@@ -928,6 +1077,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 parent_fd,
                 expected,
                 label=label,
+                **kwargs,
             )
 
         with (
@@ -979,6 +1129,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             expected,
             *,
             label: str,
+            **kwargs: object,
         ) -> None:
             if path == temp_path:
                 retained = next(MODULE._retained_pending_cleanup_names(path))
@@ -990,7 +1141,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 )
                 os.fsync(parent_fd)
                 raise SystemExit("injected temp tombstone crash")
-            real_delete(home, path, parent_fd, expected, label=label)
+            real_delete(home, path, parent_fd, expected, label=label, **kwargs)
 
         with (
             mock.patch.object(
@@ -1081,6 +1232,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     def crash_after_rmdir(
                         _home: Path,
                         _ticket: MODULE.PendingBatchCleanupTicket,
+                        **_kwargs: object,
                     ) -> None:
                         self.assertTrue(proof_path.is_file())
                         proof_path.unlink()
@@ -1121,6 +1273,80 @@ class PendingStagingCleanupTests(unittest.TestCase):
                         self.assertTrue(ticket.path.is_file())
                 finally:
                     self.home = original_home
+
+    def test_legacy_empty_proof_retirement_rechecks_recreated_batch_root(self) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=1)
+        quarantine_root = (
+            MODULE._personal_sync_root(self.home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        quarantine_root_identity = (
+            quarantine_root.stat().st_dev,
+            quarantine_root.stat().st_ino,
+        )
+        MODULE._publish_pending_cleanup_empty_proof(
+            self.home,
+            ticket,
+            quarantine_root_identity,
+        )
+        shutil.rmtree(ticket.batch_root)
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            self.home,
+            ticket.batch_root.name,
+        )
+        real_delete_proof = MODULE._delete_pending_cleanup_empty_proof
+
+        def recreate_batch_root_then_delete(*args: object, **kwargs: object) -> None:
+            ticket.batch_root.mkdir(mode=0o700)
+            real_delete_proof(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_delete_pending_cleanup_empty_proof",
+                side_effect=recreate_batch_root_then_delete,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup empty proof still has a batch root",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(proof_path.is_file())
+
+    def test_legacy_no_proof_retirement_rechecks_recreated_batch_root(self) -> None:
+        ticket = self._publish_legacy_cleanup_ticket(version=1)
+        shutil.rmtree(ticket.batch_root)
+        real_delete_ticket = MODULE._delete_pending_cleanup_ticket
+        recreated = False
+
+        def recreate_batch_root_then_delete(
+            home: Path,
+            current_ticket: MODULE.PendingBatchCleanupTicket,
+            **kwargs: object,
+        ) -> None:
+            nonlocal recreated
+            ticket.batch_root.mkdir(mode=0o700)
+            recreated = True
+            real_delete_ticket(home, current_ticket, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_delete_pending_cleanup_ticket",
+                side_effect=recreate_batch_root_then_delete,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup empty proof still has a batch root",
+            ),
+        ):
+            MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+        self.assertTrue(recreated)
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(ticket.path.is_file())
 
     def test_partial_canonical_cleanup_authority_is_never_overwritten(self) -> None:
         for version, label in ((2, "rollback"), (3, "staging")):
@@ -1943,7 +2169,10 @@ class PendingStagingCleanupTests(unittest.TestCase):
             install(self.next_release, self.home, SHA_B)
 
         terminal_ticket = self._only_cleanup_ticket()
-        self.assertEqual(terminal_ticket.version, 4)
+        self.assertEqual(
+            terminal_ticket.version,
+            MODULE.PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
         index_root = MODULE._pending_cleanup_index_path(self.home)
         deferred_tickets = {}
         for index in range(MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN):
@@ -1997,7 +2226,10 @@ class PendingStagingCleanupTests(unittest.TestCase):
             self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
             self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
 
-        verify.assert_called_once()
+        # The terminal group is revalidated at proof publication, the bound
+        # batch-root rmdir boundary, and both final control-retirement
+        # callback boundaries (before and after descriptor/content checks).
+        self.assertEqual(verify.call_count, 4)
         self.assertFalse(retained_cursor.exists())
         self.assertFalse(terminal_ticket.path.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
@@ -2062,7 +2294,10 @@ class PendingStagingCleanupTests(unittest.TestCase):
             install(self.next_release, self.home, SHA_B)
 
         ticket = self._only_cleanup_ticket()
-        self.assertEqual(ticket.version, 4)
+        self.assertEqual(
+            ticket.version,
+            MODULE.PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
         retained_ticket = ticket.path.with_name(
             next(MODULE._retained_pending_cleanup_names(ticket.path))
         )
@@ -2086,7 +2321,10 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 MODULE.MAX_PENDING_CLEANUP_BATCHES_PER_RUN,
             )
 
-        verify.assert_called_once()
+        # The terminal group is revalidated at proof publication, the bound
+        # batch-root rmdir boundary, and both final control-retirement
+        # callback boundaries (before and after descriptor/content checks).
+        self.assertEqual(verify.call_count, 4)
         self.assertFalse(ticket.path.exists())
         self.assertFalse(retained_ticket.exists())
         self.assertEqual(self.target.stat().st_nlink, 1)
@@ -2253,6 +2491,14 @@ class PendingStagingCleanupTests(unittest.TestCase):
         orphan_path = index_root / f"{orphan_batch}.empty-proof"
         orphan_path.write_bytes(b"orphan proof\n")
         proof = mock.Mock()
+        proof_authority = mock.Mock(
+            version=3,
+            batch_name=orphan_batch,
+            source_ticket_version=4,
+            terminal_regular_targets=(),
+            allocation_control=None,
+            allocation_join_metadata=None,
+        )
 
         def isolate(
             _home: Path,
@@ -2262,6 +2508,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             *,
             label: str,
             mutation_revalidator=None,
+            **kwargs: object,
         ) -> None:
             self.assertEqual(path, orphan_path)
             self.assertIn(orphan_batch, label)
@@ -2279,6 +2526,15 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 "_read_orphan_pending_cleanup_empty_proof",
                 return_value=proof,
             ) as read_proof,
+            mock.patch.object(
+                MODULE,
+                "_parse_pending_cleanup_empty_proof_authority",
+                return_value=proof_authority,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_require_pending_cleanup_proof_batch_roots_absent",
+            ),
             mock.patch.object(
                 MODULE,
                 "_isolate_and_delete_pending_cleanup_file",
@@ -3293,6 +3549,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     label: str,
                     maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
                     mutation_revalidator=None,
+                    **kwargs: object,
                 ) -> None:
                     nonlocal mutated_identity, mutated_payload
                     if path == temp_path and mutated_identity is None:
@@ -3329,6 +3586,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                         label=label,
                         maximum_bytes=maximum_bytes,
                         mutation_revalidator=mutation_revalidator,
+                        **kwargs,
                     )
 
                 with (
@@ -3402,6 +3660,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
             label: str,
             maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
             mutation_revalidator=None,
+            **kwargs: object,
         ) -> None:
             nonlocal disappeared
             if path == temp_path and not disappeared:
@@ -3415,6 +3674,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 label=label,
                 maximum_bytes=maximum_bytes,
                 mutation_revalidator=mutation_revalidator,
+                **kwargs,
             )
 
         with (
@@ -5013,6 +5273,75 @@ class PendingStagingCleanupTests(unittest.TestCase):
             )
         )
 
+    def test_v6_final_private_unlink_rechecks_quarantine_parent_policy(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v6-final-private-parent-policy"
+        install(self.first_release, case_home, SHA_A)
+        case_target = case_home / ROLE_TARGET
+        expected = MODULE._read_regular_file_snapshot_beneath(
+            case_home,
+            case_target,
+            require_managed_access=False,
+        )
+        with (
+            self._receiptless_cleanup_crash_patch("alias-private"),
+            self.assertRaisesRegex(SystemExit, "after private isolation"),
+        ):
+            MODULE._delete_exact_regular_publication_without_pending_receipt(
+                case_home,
+                case_target,
+                expected,
+            )
+
+        ticket = self._only_cleanup_ticket_for_home(case_home)
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home) / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        original_mode = stat.S_IMODE(quarantine_root.stat().st_mode)
+        checks = 0
+        drifted = False
+        real_require = MODULE._require_release_identity_fd_access_policy
+
+        def weaken_quarantine_parent_after_private_revalidation(
+            file_descriptor: int,
+            display_path: Path,
+            expected_owner_uid: int,
+        ):
+            nonlocal checks, drifted
+            result = real_require(
+                file_descriptor,
+                display_path,
+                expected_owner_uid,
+            )
+            if ".delete-" in display_path.name:
+                checks += 1
+                if checks >= 3 and not drifted:
+                    quarantine_root.chmod(0o755)
+                    drifted = True
+            return result
+
+        try:
+            with mock.patch.object(
+                MODULE,
+                "_require_release_identity_fd_access_policy",
+                side_effect=weaken_quarantine_parent_after_private_revalidation,
+            ), self.assertRaisesRegex(MODULE.SyncError, "mode 0755 != 0700"):
+                MODULE._cleanup_ready_pending_batches(case_home)
+        finally:
+            quarantine_root.chmod(original_mode)
+
+        self.assertTrue(drifted)
+        self.assertGreaterEqual(checks, 3)
+        self.assertTrue(ticket.path.is_file())
+        self.assertIsNotNone(
+            MODULE._read_pending_cleanup_terminal_validation(
+                case_home,
+                ticket,
+                ticket.quarantine_root_identity,
+            )
+        )
+
     def test_v6_ephemeral_cleanup_recovers_final_private_tombstone(self) -> None:
         case_home = self.root / "ephemeral-v6-final-private-crash"
         install(self.first_release, case_home, SHA_A)
@@ -5253,9 +5582,10 @@ class PendingStagingCleanupTests(unittest.TestCase):
             nonlocal retained_ticket, deleted_ticket
             retained_name = next(MODULE._retained_pending_cleanup_names(ticket.path))
             retained_ticket = ticket.path.with_name(retained_name)
-            os.link(ticket.path, retained_ticket)
-            real_delete_ticket(home, ticket)
+            retained_ticket.write_bytes(ticket.snapshot.payload or b"")
+            retained_ticket.chmod(0o600)
             deleted_ticket = ticket
+            real_delete_ticket(home, ticket)
 
         with (
             mock.patch.object(
@@ -5307,9 +5637,10 @@ class PendingStagingCleanupTests(unittest.TestCase):
             nonlocal malformed_ticket, deleted_ticket
             retained_name = next(MODULE._retained_pending_cleanup_names(ticket.path))
             malformed_ticket = ticket.path.with_name(retained_name + ".extra")
-            os.link(ticket.path, malformed_ticket)
-            real_delete_ticket(home, ticket)
+            malformed_ticket.write_bytes(ticket.snapshot.payload or b"")
+            malformed_ticket.chmod(0o600)
             deleted_ticket = ticket
+            real_delete_ticket(home, ticket)
 
         with (
             mock.patch.object(
@@ -5336,7 +5667,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertTrue(malformed_ticket.is_file())
         self.assertEqual(malformed_ticket.read_bytes(), deleted_ticket.snapshot.payload)
 
-        self.assertEqual(
+        self.assertNotEqual(
             (malformed_ticket.stat().st_dev, malformed_ticket.stat().st_ino),
             deleted_ticket.snapshot.file_identity,
         )
@@ -5359,7 +5690,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
         self.assertTrue(malformed_ticket.is_file())
         self.assertEqual(malformed_ticket.read_bytes(), deleted_ticket.snapshot.payload)
 
-    def test_v5_v7_empty_proof_survives_ticket_representation_after_delete(
+    def test_v5_v7_empty_proof_rejects_ticket_representation_residue(
         self,
     ) -> None:
         for version, representation_kind in ((5, "retained"), (7, "suffixed")):
@@ -5409,14 +5740,14 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 if representation_kind == "suffixed":
                     retained_name += ".extra"
                 representation = ticket.path.with_name(retained_name)
-                ticket_payload = ticket.snapshot.payload
                 real_delete_ticket = MODULE._delete_pending_cleanup_ticket
                 represented = False
 
                 def represent_then_delete(home: Path, current_ticket) -> None:
                     nonlocal represented
                     if current_ticket.path == ticket.path and not represented:
-                        os.link(current_ticket.path, representation)
+                        representation.write_bytes(current_ticket.snapshot.payload or b"")
+                        representation.chmod(0o600)
                         represented = True
                     real_delete_ticket(home, current_ticket)
 
@@ -5437,25 +5768,393 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 self.assertFalse(ticket.path.exists())
                 self.assertFalse(ticket.batch_root.exists())
                 self.assertTrue(representation.is_file())
-                self.assertEqual(representation.read_bytes(), ticket_payload)
                 self.assertTrue(proof_path.is_file())
 
-                if representation_kind == "retained":
-                    self.assertEqual(
-                        MODULE._cleanup_ready_pending_batches(case_home),
-                        1,
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "pending cleanup",
+                ):
+                    MODULE._cleanup_ready_pending_batches(case_home)
+                self.assertTrue(proof_path.is_file())
+
+    def test_v5_no_allocation_empty_proof_uses_v3_orphan_authority(self) -> None:
+        case_home = self.root / "ephemeral-v5-no-allocation-v3-proof"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(case_home, case_home / ROLE_TARGET)
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            case_home,
+            ticket.batch_root.name,
+        )
+
+        # This models a legacy v5 ticket whose private-use control has already
+        # been retired.  Preserve the published proof to exercise its orphan
+        # recovery boundary independently of the normal final deletion.
+        with mock.patch.object(
+            MODULE,
+            "_delete_pending_cleanup_empty_proof",
+            return_value=None,
+        ):
+            self.assertTrue(MODULE._remove_cleanup_ready_batch(case_home, ticket))
+
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertTrue(proof_path.is_file())
+        authority = MODULE._parse_pending_cleanup_empty_proof_authority(
+            proof_path,
+            proof_path.read_bytes(),
+        )
+        self.assertEqual(authority.version, 3)
+        self.assertEqual(authority.source_ticket_version, 5)
+        self.assertEqual(authority.terminal_regular_targets, ())
+        self.assertIsNone(authority.allocation_control)
+        self.assertIsNone(authority.allocation_join_metadata)
+
+        self.assertEqual(
+            MODULE._cleanup_orphan_pending_cleanup_empty_proofs(case_home),
+            1,
+        )
+        self.assertFalse(proof_path.exists())
+
+    def test_orphan_empty_proof_blocks_mutation_after_cleanup_budget_exhaustion(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v5-orphan-proof-mutation-fence"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(case_home, case_home / ROLE_TARGET)
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            case_home,
+            ticket.batch_root.name,
+        )
+        with mock.patch.object(
+            MODULE,
+            "_delete_pending_cleanup_empty_proof",
+            return_value=None,
+        ):
+            self.assertTrue(MODULE._remove_cleanup_ready_batch(case_home, ticket))
+
+        exhausted_budget = MODULE.PendingCleanupActionBudget(0)
+        self.assertEqual(
+            MODULE._cleanup_ready_pending_batches(
+                case_home,
+                budget=exhausted_budget,
+            ),
+            0,
+        )
+        self.assertTrue(proof_path.is_file())
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "empty-proof authority must be reconciled",
+        ):
+            MODULE._require_no_pending_terminal_mutation_authority(case_home)
+
+        retained_path = proof_path.with_name(
+            next(MODULE._retained_pending_cleanup_names(proof_path))
+        )
+        proof_path.rename(retained_path)
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "retained pending cleanup authority must be reconciled",
+        ):
+            MODULE._require_no_pending_terminal_mutation_authority(case_home)
+
+        self.assertFalse(proof_path.exists())
+        self.assertTrue(retained_path.is_file())
+
+    def test_empty_proof_publish_temps_do_not_block_mutation(self) -> None:
+        case_home = self.root / "empty-proof-publish-temp-mutation-fence"
+        install(self.first_release, case_home, SHA_A)
+        index_root = MODULE._pending_cleanup_index_path(case_home)
+        index_fd = MODULE._open_or_create_directory_beneath(
+            case_home,
+            index_root,
+            mode=0o700,
+        )
+        MODULE._close_fd_quietly(index_fd)
+        temp_path = index_root / (
+            "20260911T000000Z-1-0"
+            + MODULE.PENDING_CLEANUP_EMPTY_PROOF_SUFFIX
+            + MODULE.PENDING_ATOMIC_PUBLICATION_TEMP_SUFFIX
+        )
+        temp_path.write_bytes(b"unpublished empty-proof staging bytes\n")
+        temp_path.chmod(0o600)
+
+        MODULE._require_no_pending_terminal_mutation_authority(case_home)
+
+        retained_temp = temp_path.with_name(
+            next(MODULE._retained_pending_cleanup_names(temp_path))
+        )
+        temp_path.rename(retained_temp)
+        MODULE._require_no_pending_terminal_mutation_authority(case_home)
+
+        self.assertFalse(temp_path.exists())
+        self.assertTrue(retained_temp.is_file())
+
+    def test_orphan_v3_proof_final_root_snapshot_rejects_recreated_roots(
+        self,
+    ) -> None:
+        for representation in ("canonical", "isolated"):
+            with self.subTest(representation=representation):
+                case_home = self.root / f"ephemeral-v5-proof-root-{representation}"
+                install(self.first_release, case_home, SHA_A)
+                ticket = self._make_v5_empty_ticket(
+                    case_home,
+                    case_home / ROLE_TARGET,
+                )
+                proof_path = MODULE._pending_cleanup_empty_proof_path(
+                    case_home,
+                    ticket.batch_root.name,
+                )
+                with mock.patch.object(
+                    MODULE,
+                    "_delete_pending_cleanup_empty_proof",
+                    return_value=None,
+                ):
+                    self.assertTrue(
+                        MODULE._remove_cleanup_ready_batch(case_home, ticket)
                     )
-                    self.assertFalse(representation.exists())
-                    self.assertFalse(proof_path.exists())
-                else:
-                    with self.assertRaisesRegex(
+
+                authority = MODULE._parse_pending_cleanup_empty_proof_authority(
+                    proof_path,
+                    proof_path.read_bytes(),
+                )
+                quarantine_root = (
+                    MODULE._personal_sync_root(case_home)
+                    / MODULE.QUARANTINE_RELATIVE_PATH
+                )
+                recreated_root = (
+                    ticket.batch_root
+                    if representation == "canonical"
+                    else ticket.batch_root.with_name(authority.isolated_name)
+                )
+                real_policy = MODULE._require_pending_cleanup_fd_access_policy
+                policy_calls = 0
+                injected = False
+
+                def recreate_root_after_final_policy(
+                    file_descriptor: int,
+                    display_path: Path,
+                    *,
+                    expected_mode: int,
+                ):
+                    nonlocal policy_calls, injected
+                    result = real_policy(
+                        file_descriptor,
+                        display_path,
+                        expected_mode=expected_mode,
+                    )
+                    self.assertEqual(display_path, quarantine_root)
+                    policy_calls += 1
+                    if policy_calls == 2:
+                        recreated_root.mkdir(mode=0o700)
+                        protected = recreated_root / "foreign"
+                        protected.write_bytes(b"foreign batch evidence\n")
+                        protected.chmod(0o600)
+                        injected = True
+                    return result
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_require_pending_cleanup_fd_access_policy",
+                        side_effect=recreate_root_after_final_policy,
+                    ),
+                    self.assertRaisesRegex(
                         MODULE.SyncError,
-                        "ticket representation",
-                    ):
-                        MODULE._cleanup_ready_pending_batches(case_home)
-                    self.assertTrue(representation.is_file())
-                    self.assertEqual(representation.read_bytes(), ticket_payload)
-                    self.assertTrue(proof_path.is_file())
+                        "empty proof still has a batch root",
+                    ),
+                ):
+                    MODULE._require_pending_cleanup_proof_batch_roots_absent(
+                        case_home,
+                        authority,
+                    )
+
+                self.assertTrue(injected)
+                self.assertEqual(policy_calls, 2)
+                self.assertTrue(recreated_root.is_dir())
+                self.assertEqual(
+                    (recreated_root / "foreign").read_bytes(),
+                    b"foreign batch evidence\n",
+                )
+
+    def test_orphan_v3_proof_rejects_nonempty_root_renamed_to_unknown_name(
+        self,
+    ) -> None:
+        case_home = self.root / "ephemeral-v5-proof-renamed-root"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(
+            case_home,
+            case_home / ROLE_TARGET,
+        )
+        quarantine_root = ticket.batch_root.parent
+        quarantine_root_identity = (
+            quarantine_root.stat().st_dev,
+            quarantine_root.stat().st_ino,
+        )
+        authority = MODULE._pending_cleanup_empty_proof_authority_from_ticket(
+            ticket,
+            quarantine_root_identity,
+        )
+        renamed_root = quarantine_root / "renamed-root-with-live-content"
+        ticket.batch_root.rename(renamed_root)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "empty proof still has a batch root",
+        ):
+            MODULE._require_pending_cleanup_proof_batch_roots_absent(
+                case_home,
+                authority,
+            )
+
+        self.assertTrue((renamed_root / "metadata.json").is_file())
+        self.assertEqual(
+            (renamed_root.stat().st_dev, renamed_root.stat().st_ino),
+            ticket.batch_root_identity,
+        )
+
+    def test_pending_staging_marker_reader_rejects_external_hardlink(self) -> None:
+        case_home = self.root / "staging-marker-hardlink"
+        case_home.mkdir()
+        quarantine_root = (
+            MODULE._personal_sync_root(case_home)
+            / MODULE.QUARANTINE_RELATIVE_PATH
+        )
+        state_root = quarantine_root / "20260911T000000Z-1-9" / "pending" / "state"
+        state_root.mkdir(parents=True, mode=0o700)
+        for path in (quarantine_root, state_root.parent, state_root):
+            path.chmod(0o700)
+        batch_root = state_root.parent.parent
+        batch_identity = (batch_root.stat().st_dev, batch_root.stat().st_ino)
+        marker_path = state_root / MODULE.PENDING_STATE_STAGING_MARKER.name
+        MODULE._publish_atomic_exclusive_internal_file(
+            case_home,
+            marker_path,
+            MODULE._pending_staging_marker_payload(batch_root, batch_identity),
+        )
+        alias = state_root / "marker-alias"
+        os.link(marker_path, alias)
+
+        with self.assertRaisesRegex(MODULE.SyncError, "unauthorized hard-link alias"):
+            MODULE._pending_staging_marker_snapshot(
+                case_home,
+                batch_root,
+                batch_identity,
+            )
+
+    def test_pending_ephemeral_metadata_reader_rejects_external_hardlink(self) -> None:
+        case_home = self.root / "ephemeral-metadata-hardlink"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(
+            case_home,
+            case_home / ROLE_TARGET,
+        )
+        metadata_path = ticket.batch_root / "metadata.json"
+        alias = ticket.batch_root / "metadata-alias"
+        os.link(metadata_path, alias)
+        batch_fd = MODULE._open_directory_beneath(case_home, ticket.batch_root)
+        try:
+            with self.assertRaisesRegex(
+                MODULE.SyncError,
+                "unauthorized hard-link alias",
+            ):
+                MODULE._read_pending_ephemeral_metadata_snapshot(
+                    case_home,
+                    ticket,
+                    ticket.batch_root,
+                    batch_fd,
+                    "metadata.json",
+                )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+
+    def test_pending_regular_staging_guard_delete_rejects_external_hardlink(
+        self,
+    ) -> None:
+        case_home = self.root / "regular-staging-guard-hardlink"
+        case_home.mkdir()
+        guard_path = case_home / "staging-publication.guard"
+        guard = MODULE._write_exclusive_internal_file(
+            case_home,
+            guard_path,
+            b"staging publication guard\n",
+        )
+        alias = case_home / "staging-publication.guard.alias"
+        os.link(guard_path, alias)
+
+        with self.assertRaisesRegex(MODULE.SyncError, "unauthorized hard-link alias"):
+            MODULE._delete_pending_regular_staging_publication_guard(
+                case_home,
+                guard_path,
+                guard,
+            )
+
+        self.assertTrue(guard_path.is_file())
+        self.assertTrue(alias.is_file())
+
+    def test_orphan_v3_proof_final_unlink_rechecks_batch_root_absence(self) -> None:
+        case_home = self.root / "ephemeral-v5-orphan-proof-batch-replay"
+        install(self.first_release, case_home, SHA_A)
+        ticket = self._make_v5_empty_ticket(case_home, case_home / ROLE_TARGET)
+        proof_path = MODULE._pending_cleanup_empty_proof_path(
+            case_home,
+            ticket.batch_root.name,
+        )
+        with mock.patch.object(
+            MODULE,
+            "_delete_pending_cleanup_empty_proof",
+            return_value=None,
+        ):
+            self.assertTrue(MODULE._remove_cleanup_ready_batch(case_home, ticket))
+
+        foreign_batch = ticket.batch_root
+        real_require = MODULE._require_pending_cleanup_proof_batch_roots_absent
+        injected = False
+
+        def replay_batch_at_final_proof_unlink(home: Path, authority) -> None:
+            nonlocal injected
+            retained_proofs = tuple(
+                proof_path.parent.glob(
+                    f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{proof_path.name}-*"
+                )
+            )
+            if (
+                not injected
+                and not proof_path.exists()
+                and len(retained_proofs) == 1
+            ):
+                foreign_batch.mkdir(mode=0o700)
+                protected = foreign_batch / "foreign"
+                protected.write_bytes(b"foreign batch evidence\n")
+                protected.chmod(0o600)
+                injected = True
+            real_require(home, authority)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_pending_cleanup_proof_batch_roots_absent",
+                side_effect=replay_batch_at_final_proof_unlink,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "empty proof still has a batch root",
+            ),
+        ):
+            MODULE._cleanup_orphan_pending_cleanup_empty_proofs(case_home)
+
+        self.assertTrue(injected)
+        self.assertTrue(foreign_batch.is_dir())
+        self.assertEqual(
+            (foreign_batch / "foreign").read_bytes(),
+            b"foreign batch evidence\n",
+        )
+        self.assertFalse(proof_path.exists())
+        retained_proofs = tuple(
+            proof_path.parent.glob(
+                f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}{proof_path.name}-*"
+            )
+        )
+        self.assertEqual(len(retained_proofs), 1)
 
     def test_v7_empty_proof_final_unlink_rechecks_ticket_representations(
         self,
@@ -5546,8 +6245,150 @@ class PendingStagingCleanupTests(unittest.TestCase):
             MODULE._pending_cleanup_empty_proof_payload(
                 ticket,
                 ticket.quarantine_root_identity,
+                joined_allocation=MODULE._read_joined_quarantine_allocation_for_cleanup(
+                    case_home,
+                    ticket,
+                ),
             ),
         )
+
+    def test_v7_orphan_proof_final_unlink_rechecks_allocation_authority(
+        self,
+    ) -> None:
+        for mutation_kind in ("same-inode-content", "replacement"):
+            with self.subTest(mutation_kind=mutation_kind):
+                case_home = self.root / (
+                    f"ephemeral-v7-orphan-proof-{mutation_kind}"
+                )
+                case_home.mkdir()
+                allocation = MODULE._quarantine_batch_root(
+                    case_home,
+                    [],
+                    retain_binding=True,
+                    retain_scaffold_binding=True,
+                )
+                self.assertIsInstance(
+                    allocation,
+                    MODULE.EphemeralQuarantineBatchAllocation,
+                )
+                assert isinstance(
+                    allocation,
+                    MODULE.EphemeralQuarantineBatchAllocation,
+                )
+                ticket = (
+                    MODULE._publish_pending_ephemeral_quarantine_scaffold_cleanup_ticket(
+                        case_home,
+                        allocation.binding,
+                    )
+                )
+                allocation.revoke_reclaim()
+                allocation.close()
+                proof_path = MODULE._pending_cleanup_empty_proof_path(
+                    case_home,
+                    ticket.batch_root.name,
+                )
+                allocation_path = MODULE._pending_quarantine_allocation_path(
+                    case_home,
+                    ticket.batch_root.name,
+                )
+
+                # Preserve both controls to model the crash window after batch
+                # and ticket retirement but before orphan-proof deletion.
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_delete_pending_cleanup_empty_proof",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_retire_joined_quarantine_allocation",
+                        return_value=None,
+                    ),
+                ):
+                    self.assertTrue(
+                        MODULE._remove_cleanup_ready_batch(case_home, ticket)
+                    )
+
+                authority = MODULE._parse_pending_cleanup_empty_proof_authority(
+                    proof_path,
+                    proof_path.read_bytes(),
+                )
+                self.assertEqual(authority.version, 3)
+                self.assertEqual(authority.source_ticket_version, 7)
+                self.assertIsNotNone(authority.allocation_control)
+                self.assertIsNotNone(authority.allocation_join_metadata)
+                original_payload = allocation_path.read_bytes()
+                original_identity = (
+                    allocation_path.stat().st_dev,
+                    allocation_path.stat().st_ino,
+                )
+                real_require = MODULE._require_orphan_v3_empty_proof_allocation_join
+                boundary_checks = 0
+
+                def mutate_allocation_at_final_proof_unlink(
+                    home: Path,
+                    current_authority,
+                    index_root: Path,
+                    index_fd: int,
+                ) -> None:
+                    nonlocal boundary_checks
+                    boundary_checks += 1
+                    if boundary_checks == 3:
+                        if mutation_kind == "same-inode-content":
+                            changed_payload = (
+                                bytes([original_payload[0] ^ 1])
+                                + original_payload[1:]
+                            )
+                            with allocation_path.open("r+b") as handle:
+                                handle.write(changed_payload)
+                                handle.truncate()
+                                handle.flush()
+                                os.fsync(handle.fileno())
+                            self.assertEqual(
+                                (
+                                    allocation_path.stat().st_dev,
+                                    allocation_path.stat().st_ino,
+                                ),
+                                original_identity,
+                            )
+                        else:
+                            original_fd = os.open(allocation_path, os.O_RDONLY)
+                            try:
+                                allocation_path.unlink()
+                                allocation_path.write_bytes(original_payload)
+                                allocation_path.chmod(0o600)
+                            finally:
+                                os.close(original_fd)
+                            self.assertNotEqual(
+                                (
+                                    allocation_path.stat().st_dev,
+                                    allocation_path.stat().st_ino,
+                                ),
+                                original_identity,
+                            )
+                    real_require(home, current_authority, index_root, index_fd)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_require_orphan_v3_empty_proof_allocation_join",
+                        side_effect=mutate_allocation_at_final_proof_unlink,
+                    ),
+                    self.assertRaises(MODULE.SyncError),
+                ):
+                    MODULE._cleanup_orphan_pending_cleanup_empty_proofs(case_home)
+
+                self.assertEqual(boundary_checks, 3)
+                self.assertFalse(proof_path.exists())
+                retained_proofs = tuple(
+                    proof_path.parent.glob(
+                        f"{MODULE.PENDING_CLEANUP_RETAINED_PREFIX}"
+                        f"{proof_path.name}-*"
+                    )
+                )
+                self.assertEqual(len(retained_proofs), 1)
+                self.assertTrue(allocation_path.is_file())
 
     def test_orphan_empty_proof_final_unlink_rechecks_ticket_representations(
         self,
@@ -5583,16 +6424,13 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     case_home,
                     ticket.batch_root.name,
                 )
+                # Preserve the bytes without creating an unrecorded alias of
+                # the live control file.  The replay alias is injected only
+                # after the ticket has been retired, at the final proof
+                # boundary, which keeps this race reachable under nlink==1.
                 hold_path = case_home / "preserved-ticket-bytes"
-                os.link(ticket.path, hold_path)
-                self.assertEqual(
-                    (hold_path.stat().st_dev, hold_path.stat().st_ino),
-                    ticket.snapshot.file_identity,
-                )
-                # Preserve an orphan proof deliberately.  Production retires
-                # the joined v8 allocation only after that proof is deleted;
-                # suspend the matching final step here so this fixture models
-                # the crash window without weakening the v8-only control gate.
+                hold_path.write_bytes(ticket.snapshot.payload or b"")
+                hold_path.chmod(0o600)
                 with (
                     mock.patch.object(
                         MODULE,
@@ -5612,6 +6450,13 @@ class PendingStagingCleanupTests(unittest.TestCase):
                 self.assertFalse(ticket.path.exists())
                 self.assertFalse(ticket.batch_root.exists())
                 self.assertTrue(proof_path.is_file())
+                self.assertEqual(
+                    MODULE._parse_pending_cleanup_empty_proof_authority(
+                        proof_path,
+                        proof_path.read_bytes(),
+                    ).version,
+                    3,
+                )
                 if representation_kind == "canonical":
                     replay_path = ticket.path
                 else:
@@ -5661,10 +6506,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
 
                 self.assertTrue(injected)
                 self.assertTrue(replay_path.is_file())
-                self.assertEqual(
-                    (replay_path.stat().st_dev, replay_path.stat().st_ino),
-                    ticket.snapshot.file_identity,
-                )
+                self.assertEqual(replay_path.read_bytes(), ticket.snapshot.payload)
                 self.assertFalse(proof_path.exists())
                 retained_proofs = tuple(
                     proof_path.parent.glob(
@@ -5677,13 +6519,16 @@ class PendingStagingCleanupTests(unittest.TestCase):
                     MODULE._pending_cleanup_empty_proof_payload(
                         ticket,
                         ticket.quarantine_root_identity,
+                        joined_allocation=MODULE._read_joined_quarantine_allocation_for_cleanup(
+                            case_home,
+                            ticket,
+                        ),
                     ),
                 )
 
-                hold_path.unlink()
-                self.assertEqual(MODULE._cleanup_ready_pending_batches(case_home), 1)
-                self.assertFalse(replay_path.exists())
-                self.assertFalse(retained_proofs[0].exists())
+                # The proof and replay representation remain for manual
+                # reconciliation because the replay bytes do not carry the
+                # original control inode identity.
 
     def test_v6_cleanup_closes_public_parent_when_quarantine_open_fails(
         self,
@@ -5864,7 +6709,11 @@ class PendingStagingCleanupTests(unittest.TestCase):
         ):
             MODULE._cleanup_ready_pending_batches(case_home)
 
-        self.assertEqual(index_policy_checks, 3)
+        # The cleanup helper now rechecks the bound parent policy around the
+        # isolation and unlink boundaries.  The injected replay still occurs
+        # at the third admission; later parent-policy checks are part of the
+        # same fail-closed boundary and are intentionally not counted exactly.
+        self.assertGreaterEqual(index_policy_checks, 3)
         self.assertFalse(ticket_path.exists())
         self.assertEqual(
             retained_ticket_temp.read_bytes(),
