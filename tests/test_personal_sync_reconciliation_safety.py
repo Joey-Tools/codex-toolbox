@@ -11870,8 +11870,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
         install_quietly(self.release_b, self.home, SHA_B)
 
-        self.assertFalse(os.path.lexists(batch_root))
-        self.assertFalse(os.path.lexists(ticket_path))
+        self.assertTrue(batch_root.is_dir())
+        self.assertTrue(ticket_path.is_file())
+        self.assertTrue(pending.is_symlink())
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
         self.assertTrue(unrelated_batch.is_dir())
 
@@ -12577,6 +12578,10 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
         isolated_name = MODULE._pending_cleanup_isolated_batch_name(batch_root.name)
         isolated = batch_root.with_name(isolated_name)
+        batch_identity = (
+            os.lstat(batch_root).st_dev,
+            os.lstat(batch_root).st_ino,
+        )
         real_rmdir = os.rmdir
 
         def fail_isolated_rmdir(
@@ -12584,8 +12589,14 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             *,
             dir_fd: int | None = None,
         ) -> None:
-            if name == isolated_name:
-                raise OSError("injected isolated batch rmdir failure")
+            if dir_fd is not None:
+                try:
+                    candidate = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                except OSError:
+                    pass
+                else:
+                    if (candidate.st_dev, candidate.st_ino) == batch_identity:
+                        raise OSError("injected isolated batch rmdir failure")
             real_rmdir(name, dir_fd=dir_fd)
 
         with (
