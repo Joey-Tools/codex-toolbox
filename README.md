@@ -127,3 +127,5 @@ untracked files, source paths with symlink ancestors, Git submodule `gitlink`
 entries, and nested `.git` metadata. Runtime installs do not assume a Git
 checkout; local preservation decisions come from the validated ledger,
 installed Release manifests, and explicit removal history.
+
+<!-- Temporary post-cutover v2 gate canary; close this pull request unmerged after the cohort audit. -->
