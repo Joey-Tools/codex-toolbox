@@ -3,7 +3,7 @@ id: 20260918-cgt001
 title: Codex Review Gate v2 Handoff
 status: completed
 created: 2026-09-18
-updated: 2026-09-27
+updated: 2026-10-01
 branch: codex/organization-v2-handoff
 pr:
 supersedes: []
@@ -19,6 +19,7 @@ superseded_by:
 ## Current State
 
 - `codex/github-review-gate` is produced by the canonical pull-request verifier using `JoeyTeng/codex-review-gate-action@v2`.
+- The verifier explicitly grants `actions: read` so v2 can inspect Actions workflow-run evidence.
 - The controller provides bot-comment and manual-dispatch recovery entry points without changing organization rulesets.
 - The v1 `codex/review-gate` legacy bridge has been removed; this repository now exposes only the v2 review-gate control plane.
 - CODEOWNERS protects the workflow control plane under `@JoeyTeng` ownership.
