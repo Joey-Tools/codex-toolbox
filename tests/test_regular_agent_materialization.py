@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
+import errno
 import importlib.util
 import io
 import json
@@ -155,6 +157,13 @@ def downgrade_pending_state_evidence_metadata(
     payload: dict[str, object],
     version: int,
 ) -> None:
+    if version < 11:
+        for field in ("terminal_regular_before", "terminal_regular_after"):
+            raw_targets = payload.get(field, [])
+            assert isinstance(raw_targets, list)
+            for raw_target in raw_targets:
+                assert isinstance(raw_target, dict)
+                raw_target.pop("link_count", None)
     if version >= 9:
         return
     for field in ("state_before", "state_after", "commit_evidence"):
@@ -234,6 +243,93 @@ def write_pending_metadata_payload(
         json.dumps(payload, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def write_legacy_v4_terminal_ticket(
+    home: Path,
+    batch: MODULE.PendingLinkBatch,
+    *,
+    phase: str,
+    ticket_batch: MODULE.PendingLinkBatch | None = None,
+) -> None:
+    marker = (
+        MODULE._pending_commit_marker_snapshot(home, batch)
+        if phase == "after"
+        else MODULE._publish_pending_rollback_marker(home, batch)
+    )
+    assert marker is not None
+    ticket_path = MODULE._pending_cleanup_ticket_path(home, batch.batch_root.name)
+    ticket_path.write_bytes(
+        MODULE._pending_terminal_cleanup_ticket_payload(
+            home,
+            ticket_batch if ticket_batch is not None else batch,
+            marker,
+            phase=phase,
+        )
+    )
+    ticket_path.chmod(0o600)
+
+
+def write_legacy_v8_terminal_ticket(
+    home: Path,
+    batch: MODULE.PendingLinkBatch,
+    *,
+    phase: str,
+    ticket_batch: MODULE.PendingLinkBatch,
+) -> Path:
+    marker = (
+        MODULE._pending_commit_marker_snapshot(home, batch)
+        if phase == "after"
+        else MODULE._publish_pending_rollback_marker(home, batch)
+    )
+    assert marker is not None
+    ticket_path = MODULE._pending_cleanup_ticket_path(home, batch.batch_root.name)
+    ticket_path.write_bytes(
+        MODULE._pending_terminal_cleanup_ticket_payload(
+            home,
+            replace(ticket_batch, metadata_version=11),
+            marker,
+            phase=phase,
+        )
+    )
+    ticket_path.chmod(0o600)
+    return ticket_path
+
+
+def write_legacy_generic_terminal_ticket(
+    home: Path,
+    batch: MODULE.PendingLinkBatch,
+    *,
+    phase: str,
+) -> None:
+    marker = (
+        MODULE._pending_commit_marker_snapshot(home, batch)
+        if phase == "after"
+        else MODULE._publish_pending_rollback_marker(home, batch)
+    )
+    assert marker is not None
+    assert marker.parent_identity is not None
+    assert marker.file_identity is not None
+    assert marker.payload is not None
+    ticket_path = MODULE._pending_cleanup_ticket_path(home, batch.batch_root.name)
+    payload = (
+        MODULE._pending_cleanup_ticket_payload(
+            batch.batch_root,
+            batch.batch_root_identity,
+            marker.parent_identity,
+            marker.file_identity,
+            marker.mode,
+            MODULE.hashlib.sha256(marker.payload).hexdigest(),
+        )
+        if phase == "after"
+        else MODULE._pending_rollback_cleanup_ticket_payload(
+            batch.batch_root,
+            batch.batch_root_identity,
+            marker,
+        )
+    )
+    ticket_path.write_bytes(payload)
+    ticket_path.chmod(0o600)
 
 
 def status_is_unhealthy(home: Path) -> bool:
@@ -2204,6 +2300,113 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertEqual(parsed.metadata_version, version)
         return parsed
 
+    def _prepare_pointerless_generic_v1_ticket(
+        self,
+        release_name: str,
+    ) -> MODULE.PendingBatchCleanupTicket:
+        symlink_release = self.root / release_name
+        write_release(symlink_release)
+        with (
+            mock.patch.object(
+                MODULE,
+                "_try_cleanup_finalized_pending_batch",
+                side_effect=MODULE.SyncError("injected pointerless cleanup crash"),
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "pointerless cleanup crash"),
+        ):
+            install(symlink_release, self.home, SHA_A)
+        ticket_path = next(MODULE._pending_cleanup_index_path(self.home).glob("*.json"))
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, 1)
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
+        return ticket
+
+    def _prepare_pointerless_generic_v2_ticket(
+        self,
+        release_name: str,
+    ) -> MODULE.PendingBatchCleanupTicket:
+        symlink_release = self.root / release_name
+        write_release(symlink_release)
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_pending_commit_marker",
+                side_effect=MODULE.SyncError("injected precommit crash"),
+            ),
+            mock.patch.object(
+                MODULE,
+                "_rollback_reconcile_transaction",
+                side_effect=MODULE.SyncError("injected hard rollback crash"),
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "rollback was incomplete"),
+        ):
+            install(symlink_release, self.home, SHA_A)
+        batch = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        write_legacy_generic_terminal_ticket(self.home, batch, phase="before")
+        os.unlink(MODULE._pending_link_pointer_path(self.home))
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            batch.batch_root.name,
+        )
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, 2)
+        return ticket
+
+    def _isolate_pending_root_as_cleanup_walker(
+        self,
+        ticket: MODULE.PendingBatchCleanupTicket,
+    ) -> Path:
+        batch_fd = MODULE._open_directory_beneath(self.home, ticket.batch_root)
+        try:
+            batch_identity = MODULE._directory_identity(batch_fd)
+            pending = os.stat("pending", dir_fd=batch_fd, follow_symlinks=False)
+            planned = MODULE._pending_cleanup_entry_plan(pending)
+            active_name, active = MODULE._isolate_pending_cleanup_entry(
+                batch_fd,
+                "pending",
+                batch_identity,
+                planned,
+                relative_parts=(),
+            )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+        self.assertEqual(MODULE._pending_cleanup_entry_plan(active), planned)
+        self.assertEqual(
+            MODULE._pending_cleanup_active_entry_binding(active_name, batch_identity),
+            (planned, "pending"),
+        )
+        return ticket.batch_root / active_name
+
+    def _prepare_pointerless_legacy_generic_regular_ticket(
+        self,
+        *,
+        phase: str,
+    ) -> MODULE.PendingBatchCleanupTicket:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / f"pointerless-generic-{phase}-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        if phase == "after":
+            MODULE._publish_pending_commit_marker(self.home, parsed)
+        write_legacy_generic_terminal_ticket(self.home, parsed, phase=phase)
+        os.unlink(MODULE._pending_link_pointer_path(self.home))
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            parsed.batch_root.name,
+        )
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, 1 if phase == "after" else 2)
+        return ticket
+
     def _downgrade_durable_pending_regular_metadata(
         self,
         batch: MODULE.PendingLinkBatch,
@@ -2257,6 +2460,1488 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         self.assertTrue(active.is_file())
         return active
 
+    def _prepare_v6_existing_v8_terminal_ticket(
+        self,
+        *,
+        phase: str,
+    ) -> tuple[MODULE.PendingLinkBatch, Path, PurePosixPath]:
+        secondary_target = PurePosixPath("agents/security-reviewer.toml")
+        append_regular_link(
+            self.release,
+            target=secondary_target.as_posix(),
+            source="personal_codex/agents/security-reviewer.toml",
+            payload='name = "security-reviewer"\n',
+        )
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / f"v6-existing-v8-{phase}-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        append_regular_link(
+            next_release,
+            target=secondary_target.as_posix(),
+            source="personal_codex/agents/security-reviewer.toml",
+            payload='name = "security-reviewer"\n',
+        )
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        if phase == "after":
+            MODULE._publish_pending_commit_marker(self.home, parsed)
+        cleanup_batch = MODULE._legacy_terminal_cleanup_batch_for_phase(
+            self.home,
+            parsed,
+            phase=phase,
+        )
+        ticket_path = write_legacy_v8_terminal_ticket(
+            self.home,
+            parsed,
+            phase=phase,
+            ticket_batch=cleanup_batch,
+        )
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, MODULE.PENDING_TERMINAL_CLEANUP_TICKET_VERSION)
+        self.assertEqual(
+            {target.target for target in ticket.terminal_regular_targets},
+            {ROLE_TARGET, secondary_target},
+        )
+        return parsed, ticket_path, secondary_target
+
+    def test_v6_committed_terminal_ticket_remains_v4_across_retry(self) -> None:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / "v6-committed-retry-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        MODULE._publish_pending_commit_marker(self.home, parsed)
+        write_legacy_v4_terminal_ticket(
+            self.home,
+            parsed,
+            phase="after",
+            ticket_batch=MODULE._legacy_terminal_cleanup_batch_for_phase(
+                self.home,
+                parsed,
+                phase="after",
+            ),
+        )
+
+        MODULE._mark_pending_batch_cleanup_ready(self.home, parsed)
+        MODULE._mark_pending_batch_cleanup_ready(self.home, parsed)
+
+        ticket = MODULE._read_pending_cleanup_ticket(
+            self.home,
+            MODULE._pending_cleanup_ticket_path(
+                self.home,
+                parsed.batch_root.name,
+            ),
+        )
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(
+            ticket.version,
+            MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
+
+    def test_v6_rollback_terminal_ticket_remains_v4_across_retry(self) -> None:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / "v6-rollback-retry-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        write_legacy_v4_terminal_ticket(
+            self.home,
+            parsed,
+            phase="before",
+            ticket_batch=MODULE._legacy_terminal_cleanup_batch_for_phase(
+                self.home,
+                parsed,
+                phase="before",
+            ),
+        )
+
+        MODULE._mark_pending_batch_rollback_cleanup_ready(self.home, parsed)
+        MODULE._mark_pending_batch_rollback_cleanup_ready(self.home, parsed)
+
+        ticket = MODULE._read_pending_cleanup_ticket(
+            self.home,
+            MODULE._pending_cleanup_ticket_path(
+                self.home,
+                parsed.batch_root.name,
+            ),
+        )
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(
+            ticket.version,
+            MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
+
+    def test_v6_existing_v8_committed_ticket_reuses_exact_authority(self) -> None:
+        parsed, ticket_path, secondary_target = (
+            self._prepare_v6_existing_v8_terminal_ticket(phase="after")
+        )
+        original_payload = ticket_path.read_bytes()
+        original_identity = (ticket_path.stat().st_dev, ticket_path.stat().st_ino)
+
+        MODULE._mark_pending_batch_cleanup_ready(self.home, parsed)
+        MODULE._mark_pending_batch_cleanup_ready(self.home, parsed)
+
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, MODULE.PENDING_TERMINAL_CLEANUP_TICKET_VERSION)
+        self.assertEqual(ticket_path.read_bytes(), original_payload)
+        self.assertEqual(
+            (ticket_path.stat().st_dev, ticket_path.stat().st_ino),
+            original_identity,
+        )
+        self.assertTrue((self.home / ROLE_TARGET).is_file())
+        self.assertTrue((self.home / secondary_target).is_file())
+
+    def test_v6_existing_v8_rollback_ticket_reuses_exact_authority(self) -> None:
+        parsed, ticket_path, secondary_target = (
+            self._prepare_v6_existing_v8_terminal_ticket(phase="before")
+        )
+        original_payload = ticket_path.read_bytes()
+        original_identity = (ticket_path.stat().st_dev, ticket_path.stat().st_ino)
+
+        MODULE._mark_pending_batch_rollback_cleanup_ready(self.home, parsed)
+        MODULE._mark_pending_batch_rollback_cleanup_ready(self.home, parsed)
+
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, MODULE.PENDING_TERMINAL_CLEANUP_TICKET_VERSION)
+        self.assertEqual(ticket_path.read_bytes(), original_payload)
+        self.assertEqual(
+            (ticket_path.stat().st_dev, ticket_path.stat().st_ino),
+            original_identity,
+        )
+        self.assertTrue((self.home / ROLE_TARGET).is_file())
+        self.assertTrue((self.home / secondary_target).is_file())
+
+    def test_v6_existing_v8_ticket_omitting_unchanged_target_fails_closed(
+        self,
+    ) -> None:
+        parsed, ticket_path, secondary_target = (
+            self._prepare_v6_existing_v8_terminal_ticket(phase="after")
+        )
+        payload = json.loads(ticket_path.read_text(encoding="utf-8"))
+        targets = payload["terminal_regular_targets"]
+        assert isinstance(targets, list)
+        payload["terminal_regular_targets"] = [
+            target
+            for target in targets
+            if target["target"] != secondary_target.as_posix()
+        ]
+        ticket_path.write_bytes(
+            MODULE._bounded_json_document(
+                payload,
+                max_bytes=MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+                overflow_error="pending cleanup ticket exceeds the size limit",
+            )
+        )
+        ticket_path.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "does not bind the complete terminal regular group",
+        ):
+            MODULE._mark_pending_batch_cleanup_ready(self.home, parsed)
+
+        self.assertTrue(ticket_path.is_file())
+        self.assertTrue(parsed.batch_root.is_dir())
+        self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
+
+    def test_v6_committed_generic_v1_ticket_requires_manual_recovery(self) -> None:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / "v6-committed-generic-retry-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        MODULE._publish_pending_commit_marker(self.home, parsed)
+        write_legacy_generic_terminal_ticket(self.home, parsed, phase="after")
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "manual recovery is required",
+        ):
+            MODULE._mark_pending_batch_cleanup_ready(self.home, parsed)
+
+        ticket = MODULE._read_pending_cleanup_ticket(
+            self.home,
+            MODULE._pending_cleanup_ticket_path(
+                self.home,
+                parsed.batch_root.name,
+            ),
+        )
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, 1)
+        self.assertEqual(ticket.terminal_regular_targets, ())
+        self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
+
+    def test_pointerless_v6_generic_v1_ticket_requires_manual_recovery(
+        self,
+    ) -> None:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / "v6-pointerless-generic-retry-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        real_clear = MODULE._clear_pending_link_pointer
+
+        def retain_committed_pointer(
+            home: Path,
+            batch: MODULE.PendingLinkBatch,
+            *,
+            phase: str = "before",
+        ) -> None:
+            if phase == "after":
+                raise MODULE.SyncError("injected committed pointer retention")
+            real_clear(home, batch, phase=phase)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_clear_pending_link_pointer",
+                side_effect=retain_committed_pointer,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed managed state but finalization failed",
+            ),
+        ):
+            install(next_release, self.home, SHA_B)
+        batch = MODULE._load_pending_link_batch(self.home)
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        write_legacy_generic_terminal_ticket(self.home, parsed, phase="after")
+        MODULE._clear_pending_link_pointer(self.home, parsed, phase="after")
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular-file validation was retained",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            parsed.batch_root.name,
+        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
+        self.assertTrue(ticket_path.is_file())
+        self.assertTrue(parsed.batch_root.is_dir())
+
+    def test_v6_rollback_generic_v2_ticket_requires_manual_recovery(self) -> None:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / "v6-rollback-generic-retry-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        write_legacy_generic_terminal_ticket(self.home, parsed, phase="before")
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "manual recovery is required",
+        ):
+            MODULE._mark_pending_batch_rollback_cleanup_ready(self.home, parsed)
+
+        ticket = MODULE._read_pending_cleanup_ticket(
+            self.home,
+            MODULE._pending_cleanup_ticket_path(
+                self.home,
+                parsed.batch_root.name,
+            ),
+        )
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, 2)
+        self.assertEqual(ticket.terminal_regular_targets, ())
+        self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
+
+    def test_pointerless_v6_generic_v2_ticket_requires_manual_recovery(
+        self,
+    ) -> None:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / "v6-pointerless-generic-rollback-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        write_legacy_generic_terminal_ticket(self.home, parsed, phase="before")
+        # Model the old writer's crash after its durable pointer-clear boundary.
+        # The scanner only receives the pointerless ticket/batch representation.
+        os.unlink(MODULE._pending_link_pointer_path(self.home))
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular-file validation was retained",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            parsed.batch_root.name,
+        )
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
+        self.assertTrue(ticket_path.is_file())
+        self.assertTrue(parsed.batch_root.is_dir())
+
+    def test_pointerless_generic_ticket_without_terminal_regulars_is_cleaned(
+        self,
+    ) -> None:
+        symlink_release = self.root / "pointerless-generic-symlink-release"
+        write_release(symlink_release)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_try_cleanup_finalized_pending_batch",
+                side_effect=MODULE.SyncError("injected pointerless cleanup crash"),
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "pointerless cleanup crash"),
+        ):
+            install(symlink_release, self.home, SHA_A)
+
+        ticket_paths = list(
+            MODULE._pending_cleanup_index_path(self.home).glob("*.json")
+        )
+        self.assertEqual(len(ticket_paths), 1)
+        self.assertFalse(os.path.lexists(MODULE._pending_link_pointer_path(self.home)))
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertFalse(ticket_paths[0].exists())
+        self.assertEqual(
+            list(MODULE._pending_cleanup_index_path(self.home).glob("*.json")),
+            [],
+        )
+
+    def test_legacy_generic_retry_restores_active_pending_root(self) -> None:
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-active-pending-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"active-pending-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"active-pending-v{version}-release"
+                    )
+                )
+                metadata_path = (
+                    ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                )
+                active_pending = self._isolate_pending_root_as_cleanup_walker(ticket)
+
+                self.assertTrue(metadata_path.is_file())
+                self.assertFalse((ticket.batch_root / "pending").exists())
+                self.assertTrue(active_pending.is_dir())
+
+                self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+                MODULE._require_no_pending_terminal_mutation_authority(self.home)
+
+                self.assertFalse(ticket.path.exists())
+                self.assertFalse(ticket.batch_root.exists())
+                followup_release = self.root / f"active-pending-v{version}-followup"
+                write_release(followup_release)
+                install(followup_release, self.home, SHA_B)
+
+    def test_legacy_generic_mutation_gate_restores_active_pending_root(self) -> None:
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-active-gate-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"active-gate-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"active-gate-v{version}-release"
+                    )
+                )
+                active_pending = self._isolate_pending_root_as_cleanup_walker(ticket)
+                metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                metadata_before = metadata_path.read_bytes()
+                metadata_identity = (
+                    metadata_path.stat().st_dev,
+                    metadata_path.stat().st_ino,
+                )
+                pending_tree_before = {
+                    path.relative_to(active_pending): (
+                        os.lstat(path).st_dev,
+                        os.lstat(path).st_ino,
+                        stat.S_IFMT(os.lstat(path).st_mode),
+                        os.lstat(path).st_size,
+                    )
+                    for path in active_pending.rglob("*")
+                }
+
+                MODULE._require_no_pending_terminal_mutation_authority(self.home)
+
+                self.assertFalse(active_pending.exists())
+                restored_pending = ticket.batch_root / "pending"
+                self.assertTrue(restored_pending.is_dir())
+                self.assertTrue(ticket.path.is_file())
+                self.assertEqual(metadata_path.read_bytes(), metadata_before)
+                self.assertEqual(
+                    (metadata_path.stat().st_dev, metadata_path.stat().st_ino),
+                    metadata_identity,
+                )
+                self.assertEqual(
+                    {
+                        path.relative_to(restored_pending): (
+                            os.lstat(path).st_dev,
+                            os.lstat(path).st_ino,
+                            stat.S_IFMT(os.lstat(path).st_mode),
+                            os.lstat(path).st_size,
+                        )
+                        for path in restored_pending.rglob("*")
+                    },
+                    pending_tree_before,
+                )
+                self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+    def test_legacy_generic_retry_after_partial_cleanup_uses_validation_receipt(
+        self,
+    ) -> None:
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-partial-generic-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"partial-generic-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"partial-generic-v{version}-release"
+                    )
+                )
+                marker_relative = (
+                    MODULE.PENDING_STATE_COMMIT_MARKER
+                    if version == 1
+                    else MODULE.PENDING_STATE_ROLLBACK_MARKER
+                )
+                marker_path = ticket.batch_root / Path(*marker_relative.parts)
+
+                def consume_marker_then_crash(*args: object, **kwargs: object) -> None:
+                    marker_path.unlink()
+                    raise RuntimeError("injected cleanup crash after evidence deletion")
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_remove_pending_batch_directory_contents",
+                        side_effect=consume_marker_then_crash,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "cleanup crash"),
+                ):
+                    MODULE._cleanup_ready_pending_batches(self.home)
+
+                quarantine_fd = MODULE._open_directory_beneath(
+                    self.home,
+                    ticket.batch_root.parent,
+                )
+                try:
+                    quarantine_identity = MODULE._directory_identity(quarantine_fd)
+                finally:
+                    MODULE._close_fd_quietly(quarantine_fd)
+                self.assertFalse(marker_path.exists())
+                self.assertIsNotNone(
+                    MODULE._read_pending_cleanup_terminal_validation(
+                        self.home,
+                        ticket,
+                        quarantine_identity,
+                    )
+                )
+                self.assertTrue(ticket.path.is_file())
+
+                # The mutation gate follows the same durable receipt path;
+                # it must not rerun the legacy parser after the marker has
+                # been consumed by the interrupted cleanup walker.
+                MODULE._require_no_pending_terminal_mutation_authority(self.home)
+
+                self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+                self.assertFalse(ticket.path.exists())
+                self.assertFalse(ticket.batch_root.exists())
+
+    def test_legacy_generic_validation_receipt_retains_unknown_post_crash_entry(
+        self,
+    ) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "generic-receipt-unknown-entry-release"
+        )
+
+        def crash_after_validation(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("injected cleanup crash after validation")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=crash_after_validation,
+            ),
+            self.assertRaisesRegex(RuntimeError, "cleanup crash"),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        unknown = ticket.batch_root / "pending" / "foreign-after-validation"
+        unknown.write_bytes(b"foreign")
+        unknown.chmod(0o600)
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+        self.assertIn("unknown entry", stdout.getvalue())
+        self.assertTrue(unknown.is_file())
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_legacy_generic_validation_receipt_retains_rebuilt_known_marker(
+        self,
+    ) -> None:
+        """A consumed authorized name cannot authorize a later replacement."""
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-rebuilt-generic-marker-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"rebuilt-generic-marker-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"rebuilt-generic-marker-v{version}-release"
+                    )
+                )
+                marker_relative = (
+                    MODULE.PENDING_STATE_COMMIT_MARKER
+                    if version == 1
+                    else MODULE.PENDING_STATE_ROLLBACK_MARKER
+                )
+                marker_path = ticket.batch_root / Path(*marker_relative.parts)
+
+                def consume_marker_then_crash(*args: object, **kwargs: object) -> None:
+                    marker_path.unlink()
+                    raise RuntimeError("injected cleanup crash after evidence deletion")
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_remove_pending_batch_directory_contents",
+                        side_effect=consume_marker_then_crash,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "cleanup crash"),
+                ):
+                    MODULE._cleanup_ready_pending_batches(self.home)
+
+                marker_path.write_bytes(b"foreign-rebuilt-marker")
+                marker_path.chmod(0o600)
+                marker_identity = (
+                    os.lstat(marker_path).st_dev,
+                    os.lstat(marker_path).st_ino,
+                )
+
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+                self.assertIn("receipt-bound entry changed", stdout.getvalue())
+                self.assertTrue(marker_path.is_file())
+                self.assertEqual(
+                    (os.lstat(marker_path).st_dev, os.lstat(marker_path).st_ino),
+                    marker_identity,
+                )
+                self.assertEqual(marker_path.read_bytes(), b"foreign-rebuilt-marker")
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "receipt-bound entry changed",
+                ):
+                    MODULE._require_no_pending_terminal_mutation_authority(self.home)
+
+    def test_legacy_generic_receipt_rejects_commit_evidence_external_hardlink(
+        self,
+    ) -> None:
+        for phase in ("after", "before"):
+            with self.subTest(phase=phase):
+                self.home = self.root / f"home-generic-evidence-hardlink-{phase}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"generic-evidence-hardlink-{phase}-release"
+                    )
+                    if phase == "after"
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"generic-evidence-hardlink-{phase}-release"
+                    )
+                )
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_remove_pending_batch_directory_contents",
+                        side_effect=SystemExit("injected crash after receipt"),
+                    ),
+                    self.assertRaisesRegex(SystemExit, "after receipt"),
+                ):
+                    MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+                evidence = ticket.batch_root / Path(
+                    *MODULE.PENDING_STATE_COMMIT_EVIDENCE.parts
+                )
+                foreign = self.root / f"foreign-commit-evidence-{phase}"
+                os.link(evidence, foreign)
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    self.assertEqual(
+                        MODULE._cleanup_ready_pending_batches(self.home),
+                        0,
+                    )
+                self.assertIn(
+                    "pending terminal validation namespace authority changed",
+                    stdout.getvalue(),
+                )
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+                self.assertTrue(foreign.is_file())
+
+    def test_legacy_generic_marker_replacement_before_receipt_is_retained(
+        self,
+    ) -> None:
+        """The parser-to-ledger handoff must not publish replacement authority."""
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-marker-handoff-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"marker-handoff-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"marker-handoff-v{version}-release"
+                    )
+                )
+                marker_relative = (
+                    MODULE.PENDING_STATE_COMMIT_MARKER
+                    if version == 1
+                    else MODULE.PENDING_STATE_ROLLBACK_MARKER
+                )
+                marker_path = ticket.batch_root / Path(*marker_relative.parts)
+                original_entries = (
+                    MODULE._legacy_generic_cleanup_entries_from_identity_ledger
+                )
+
+                def replace_marker_after_capture(
+                    *args: object,
+                    **kwargs: object,
+                ) -> tuple[MODULE.LegacyGenericCleanupEntryAuthority, ...]:
+                    entries = original_entries(*args, **kwargs)
+                    marker_path.unlink()
+                    marker_path.write_bytes(b"foreign-marker-after-ledger")
+                    marker_path.chmod(0o600)
+                    return entries
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_legacy_generic_cleanup_entries_from_identity_ledger",
+                        side_effect=replace_marker_after_capture,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "manual recovery is required",
+                    ),
+                ):
+                    MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+                receipt_path = MODULE._pending_cleanup_terminal_validation_path(
+                    self.home,
+                    ticket.batch_root.name,
+                )
+                self.assertFalse(receipt_path.exists())
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+                self.assertEqual(marker_path.read_bytes(), b"foreign-marker-after-ledger")
+
+    def test_legacy_generic_metadata_rewrite_after_receipt_is_not_deleted(
+        self,
+    ) -> None:
+        """A receipt does not authorize a same-inode metadata rewrite."""
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-metadata-rewrite-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"metadata-rewrite-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"metadata-rewrite-v{version}-release"
+                    )
+                )
+                metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                metadata_identity = (
+                    metadata_path.stat().st_dev,
+                    metadata_path.stat().st_ino,
+                )
+                original_payload = metadata_path.read_bytes()
+                original_publish = MODULE._publish_pending_cleanup_terminal_validation
+
+                def rewrite_metadata_after_receipt(
+                    *args: object,
+                    **kwargs: object,
+                ) -> MODULE.ManagedStateFileSnapshot:
+                    receipt = original_publish(*args, **kwargs)
+                    replacement = bytes(
+                        [original_payload[0] ^ 1]
+                    ) + original_payload[1:]
+                    with metadata_path.open("r+b") as stream:
+                        stream.write(replacement)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    return receipt
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_publish_pending_cleanup_terminal_validation",
+                        side_effect=rewrite_metadata_after_receipt,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "validation metadata changed",
+                    ),
+                ):
+                    MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+                self.assertTrue(metadata_path.is_file())
+                self.assertEqual(
+                    (metadata_path.stat().st_dev, metadata_path.stat().st_ino),
+                    metadata_identity,
+                )
+                self.assertNotEqual(metadata_path.read_bytes(), original_payload)
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_legacy_generic_metadata_rewrite_blocks_noncontrol_mutation(
+        self,
+    ) -> None:
+        """Semantic control drift blocks every subsequent walker action."""
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.home = self.root / f"home-metadata-global-fence-v{version}"
+                ticket = (
+                    self._prepare_pointerless_generic_v1_ticket(
+                        f"metadata-global-fence-v{version}-release"
+                    )
+                    if version == 1
+                    else self._prepare_pointerless_generic_v2_ticket(
+                        f"metadata-global-fence-v{version}-release"
+                    )
+                )
+                metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                metadata_identity = (
+                    metadata_path.stat().st_dev,
+                    metadata_path.stat().st_ino,
+                )
+                original_payload = metadata_path.read_bytes()
+
+                def rewrite_before_noncontrol_mutation(
+                    *_args: object,
+                    **kwargs: object,
+                ) -> None:
+                    mutation_revalidator = kwargs.get("mutation_revalidator")
+                    self.assertIsNotNone(mutation_revalidator)
+                    replacement = bytes(
+                        [original_payload[0] ^ 1]
+                    ) + original_payload[1:]
+                    with metadata_path.open("r+b") as stream:
+                        stream.write(replacement)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    assert mutation_revalidator is not None
+                    mutation_revalidator(
+                        PurePosixPath("pending") / "first-noncontrol-entry",
+                        "before_isolate",
+                    )
+                    raise AssertionError("legacy mutation fence did not fail closed")
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_remove_pending_batch_directory_contents",
+                        side_effect=rewrite_before_noncontrol_mutation,
+                    ),
+                    self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "validation metadata changed",
+                    ),
+                ):
+                    MODULE._remove_cleanup_ready_batch(self.home, ticket)
+
+                self.assertTrue(metadata_path.is_file())
+                self.assertEqual(
+                    (metadata_path.stat().st_dev, metadata_path.stat().st_ino),
+                    metadata_identity,
+                )
+                self.assertNotEqual(metadata_path.read_bytes(), original_payload)
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_legacy_generic_owner_only_metadata_gid_churn_is_accepted(
+        self,
+    ) -> None:
+        """A 0600 regular file does not gain access through its GID."""
+        alternate_gids = [gid for gid in os.getgroups() if gid != os.getegid()]
+        if not alternate_gids:
+            self.skipTest("the current user has no alternate supplementary GID")
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "generic-owner-only-gid-churn-release"
+        )
+
+        def crash_after_validation(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("injected cleanup crash after validation")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=crash_after_validation,
+            ),
+            self.assertRaisesRegex(RuntimeError, "cleanup crash"),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        os.chown(metadata_path, -1, alternate_gids[0])
+        self.assertEqual(stat.S_IMODE(metadata_path.stat().st_mode), 0o600)
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+
+    def test_legacy_generic_receipt_mutation_gate_keeps_active_mismatch_read_only(
+        self,
+    ) -> None:
+        """Only the cleanup walker may retain a mismatched active regular file."""
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "generic-receipt-read-only-active-mismatch-release"
+        )
+
+        def crash_after_validation(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("injected cleanup crash after validation")
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_remove_pending_batch_directory_contents",
+                side_effect=crash_after_validation,
+            ),
+            self.assertRaisesRegex(RuntimeError, "cleanup crash"),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        metadata = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        original_metadata = metadata.read_bytes()
+        batch_fd = MODULE._open_directory_beneath(self.home, ticket.batch_root)
+        try:
+            batch_identity = MODULE._directory_identity(batch_fd)
+            planned = MODULE._pending_cleanup_entry_plan(
+                os.stat(metadata.name, dir_fd=batch_fd, follow_symlinks=False)
+            )
+            active_name, _active = MODULE._isolate_pending_cleanup_entry(
+                batch_fd,
+                metadata.name,
+                batch_identity,
+                planned,
+                relative_parts=(),
+            )
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+        active = ticket.batch_root / active_name
+        expected = self.root / "generic-receipt-original-metadata"
+        active.rename(expected)
+        active.write_bytes(b"foreign")
+        active.chmod(0o600)
+        foreign_identity = (active.stat().st_dev, active.stat().st_ino)
+
+        with self.assertRaisesRegex(MODULE.SyncError, "active entry changed"):
+            MODULE._require_no_pending_terminal_mutation_authority(self.home)
+
+        self.assertEqual(active.read_bytes(), b"foreign")
+        self.assertEqual((active.stat().st_dev, active.stat().st_ino), foreign_identity)
+        self.assertEqual(expected.read_bytes(), original_metadata)
+        self.assertEqual(
+            list(ticket.batch_root.glob(f"{MODULE.PENDING_CLEANUP_RETAINED_ENTRY_PREFIX}*")),
+            [],
+        )
+        self.assertTrue(ticket.path.is_file())
+
+    def test_active_pending_restore_preserves_legacy_terminal_fence(self) -> None:
+        for phase in ("after", "before"):
+            with self.subTest(phase=phase):
+                self.home = self.root / f"home-active-terminal-{phase}"
+                ticket = self._prepare_pointerless_legacy_generic_regular_ticket(
+                    phase=phase
+                )
+                active_pending = self._isolate_pending_root_as_cleanup_walker(ticket)
+
+                with self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "complete terminal regular hard-link group",
+                ):
+                    MODULE._cleanup_ready_pending_batches(self.home)
+
+                self.assertFalse(active_pending.exists())
+                self.assertTrue((ticket.batch_root / "pending").is_dir())
+                self.assertTrue(ticket.path.is_file())
+
+    def test_missing_pending_without_v2_token_remains_blocking(self) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "missing-pending-without-token-release"
+        )
+        pending_root = ticket.batch_root / "pending"
+        unbound_root = ticket.batch_root / "unbound-pending"
+        os.rename(pending_root, unbound_root)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular-file validation was retained",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertFalse(pending_root.exists())
+        self.assertTrue(unbound_root.is_dir())
+        self.assertTrue(ticket.path.is_file())
+
+    def test_multiple_active_pending_tokens_remain_blocking(self) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "multiple-active-pending-release"
+        )
+        first_active = self._isolate_pending_root_as_cleanup_walker(ticket)
+        batch_fd = MODULE._open_directory_beneath(self.home, ticket.batch_root)
+        try:
+            batch_identity = MODULE._directory_identity(batch_fd)
+            os.mkdir("second-pending", mode=0o700, dir_fd=batch_fd)
+            second = os.stat(
+                "second-pending",
+                dir_fd=batch_fd,
+                follow_symlinks=False,
+            )
+            second_plan = MODULE._pending_cleanup_entry_plan(second)
+            second_name = MODULE._pending_cleanup_active_entry_name(
+                batch_fd,
+                batch_identity,
+                second_plan,
+                "pending",
+            )
+            MODULE._rename_noreplace_at(
+                batch_fd,
+                "second-pending",
+                batch_fd,
+                second_name,
+            )
+            os.fsync(batch_fd)
+        finally:
+            MODULE._close_fd_quietly(batch_fd)
+        second_active = ticket.batch_root / second_name
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular-file validation was retained",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertFalse((ticket.batch_root / "pending").exists())
+        self.assertTrue(first_active.is_dir())
+        self.assertTrue(second_active.is_dir())
+        self.assertTrue(ticket.path.is_file())
+
+    def test_replaced_active_pending_token_remains_blocking(self) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "replaced-active-pending-release"
+        )
+        active_pending = self._isolate_pending_root_as_cleanup_walker(ticket)
+        displaced_pending = ticket.batch_root / "displaced-pending"
+        os.rename(active_pending, displaced_pending)
+        active_pending.mkdir(mode=0o700)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular-file validation was retained",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertFalse((ticket.batch_root / "pending").exists())
+        self.assertTrue(active_pending.is_dir())
+        self.assertTrue(displaced_pending.is_dir())
+        self.assertTrue(ticket.path.is_file())
+
+    def test_pointerless_generic_ticket_with_missing_marker_is_retained(
+        self,
+    ) -> None:
+        symlink_release = self.root / "pointerless-generic-missing-marker-release"
+        write_release(symlink_release)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_try_cleanup_finalized_pending_batch",
+                side_effect=MODULE.SyncError("injected pointerless cleanup crash"),
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "pointerless cleanup crash"),
+        ):
+            install(symlink_release, self.home, SHA_A)
+
+        ticket_path = next(MODULE._pending_cleanup_index_path(self.home).glob("*.json"))
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_path)
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        marker_path = ticket.batch_root / Path(
+            *MODULE.PENDING_STATE_COMMIT_MARKER.parts
+        )
+        os.unlink(marker_path)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal regular-file validation was retained",
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertTrue(ticket_path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_pointerless_generic_metadata_read_failure_is_retained(self) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "pointerless-generic-metadata-read-release"
+        )
+        real_read = MODULE._read_managed_state_file_snapshot
+        metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+
+        def fail_metadata_read(
+            home: Path,
+            path: Path,
+            parent_fd: int,
+            **kwargs: object,
+        ) -> MODULE.ManagedStateFileSnapshot:
+            if path == metadata_path:
+                raise OSError("injected metadata read failure")
+            return real_read(home, path, parent_fd, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_read_managed_state_file_snapshot",
+                side_effect=fail_metadata_read,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal regular-file validation was retained",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_pointerless_generic_metadata_access_failure_is_retained(self) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "pointerless-generic-metadata-access-release"
+        )
+        real_require = MODULE._require_pending_cleanup_file_snapshot_access_policy
+        metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+
+        def fail_metadata_access(
+            home: Path,
+            path: Path,
+            parent_fd: int,
+            snapshot: MODULE.ManagedStateFileSnapshot,
+        ) -> None:
+            if path == metadata_path:
+                raise MODULE.SyncError("injected metadata ACL revalidation failure")
+            real_require(home, path, parent_fd, snapshot)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_pending_cleanup_file_snapshot_access_policy",
+                side_effect=fail_metadata_access,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal regular-file validation was retained",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_pointerless_generic_batch_revalidation_failures_are_retained(
+        self,
+    ) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "pointerless-generic-batch-revalidation-release"
+        )
+        real_bound = MODULE._bound_directory_matches
+
+        def fail_batch_binding(home: Path, path: Path, directory_fd: int) -> bool:
+            if path == ticket.batch_root:
+                return False
+            return real_bound(home, path, directory_fd)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_bound_directory_matches",
+                side_effect=fail_batch_binding,
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 0)
+
+        self.assertIn("batch root changed: binding mismatch", stdout.getvalue())
+
+        real_access = MODULE._require_pending_cleanup_fd_access_policy
+
+        def fail_batch_access(
+            file_descriptor: int,
+            display_path: Path,
+            *,
+            expected_mode: int,
+        ) -> os.stat_result:
+            if display_path == ticket.batch_root:
+                raise OSError("injected batch access-policy revalidation failure")
+            return real_access(
+                file_descriptor,
+                display_path,
+                expected_mode=expected_mode,
+            )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_require_pending_cleanup_fd_access_policy",
+                side_effect=fail_batch_access,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal regular-file validation was retained",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_pointerless_v2_marker_revalidation_failure_blocks_install(self) -> None:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / "pointerless-v2-marker-failure-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        write_legacy_generic_terminal_ticket(self.home, parsed, phase="before")
+        os.unlink(MODULE._pending_link_pointer_path(self.home))
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            parsed.batch_root.name,
+        )
+        state_path = MODULE._state_path(self.home)
+        state_before = state_path.read_bytes()
+
+        for error in (
+            OSError("injected marker metadata read failure"),
+            MODULE.SyncError("injected marker identity revalidation failure"),
+        ):
+            with (
+                self.subTest(error=type(error).__name__),
+                mock.patch.object(
+                    MODULE,
+                    "_pending_rollback_marker_snapshot",
+                    side_effect=error,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SyncError,
+                    "pending terminal regular-file validation was retained",
+                ),
+            ):
+                MODULE._cleanup_ready_pending_batches(self.home)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_pending_rollback_marker_snapshot",
+                side_effect=MODULE.SyncError(
+                    "injected marker access-policy revalidation failure"
+                ),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal regular-file validation was retained",
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self.assertTrue(ticket_path.is_file())
+        self.assertTrue(parsed.batch_root.is_dir())
+
+    def test_zero_cleanup_budget_reclassifies_canonical_legacy_authority(
+        self,
+    ) -> None:
+        for phase, invalidate_marker, expected_error in (
+            ("after", False, "complete terminal regular hard-link group"),
+            ("before", True, "manual recovery is required"),
+        ):
+            with self.subTest(phase=phase):
+                self.home = self.root / f"home-zero-budget-{phase}"
+                ticket = self._prepare_pointerless_legacy_generic_regular_ticket(
+                    phase=phase
+                )
+                if invalidate_marker:
+                    assert ticket.marker_path is not None
+                    os.unlink(ticket.batch_root / Path(*ticket.marker_path.parts))
+                stage = mock.Mock(
+                    side_effect=AssertionError("mutation staging must not start")
+                )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_stage_release_tree_for_install",
+                        stage,
+                    ),
+                    self.assertRaisesRegex(MODULE.SyncError, expected_error),
+                ):
+                    MODULE.install_release_tree(
+                        self.release,
+                        self.home,
+                        SHA_A,
+                        dry_run=False,
+                        cleanup_budget=MODULE.PendingCleanupActionBudget(0),
+                    )
+
+                stage.assert_not_called()
+                self.assertTrue(ticket.path.is_file())
+                self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_mutation_gate_preserves_legacy_foreign_batch_exemption(
+        self,
+    ) -> None:
+        ticket = self._prepare_pointerless_legacy_generic_regular_ticket(
+            phase="before"
+        )
+        real_bound = MODULE._bound_directory_matches
+
+        def classify_ticket_batch_as_foreign(
+            home: Path,
+            path: Path,
+            directory_fd: int,
+        ) -> bool:
+            if path == ticket.batch_root:
+                return False
+            return real_bound(home, path, directory_fd)
+
+        with mock.patch.object(
+            MODULE,
+            "_bound_directory_matches",
+            side_effect=classify_ticket_batch_as_foreign,
+        ):
+            MODULE._require_no_pending_terminal_mutation_authority(self.home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_pointerless_generic_schema_rejection_keeps_compatible_cleanup(
+        self,
+    ) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "pointerless-generic-schema-rejection-release"
+        )
+        metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        payload["version"] = 3
+        metadata_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        metadata_path.chmod(0o600)
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+
+    def test_pointerless_generic_malformed_metadata_requires_manual_recovery(
+        self,
+    ) -> None:
+        malformed_payloads = (
+            ("truncated", b'{"version":'),
+            ("missing-version", b"{}"),
+            ("null-version", b'{"version":null}'),
+            ("boolean-version", b'{"version":true}'),
+            ("string-version", b'{"version":"11"}'),
+            ("float-version", b'{"version":11.0}'),
+            ("supported-missing-fields", b'{"version":11}'),
+            ("unsupported-missing-batch", b'{"version":12}'),
+            ("unsupported-null-batch", b'{"version":12,"batch":null}'),
+            (
+                "nonpositive-version",
+                b'{"version":0,"batch":"20260919T000000Z-1-1"}',
+            ),
+        )
+        for ticket_version in (1, 2):
+            for payload_name, malformed_payload in malformed_payloads:
+                with self.subTest(
+                    ticket_version=ticket_version,
+                    payload_name=payload_name,
+                ):
+                    self.home = self.root / (
+                        "home-pointerless-generic-malformed-"
+                        f"v{ticket_version}-{payload_name}"
+                    )
+                    release_name = (
+                        "pointerless-generic-malformed-"
+                        f"v{ticket_version}-{payload_name}-release"
+                    )
+                    ticket = (
+                        self._prepare_pointerless_generic_v1_ticket(release_name)
+                        if ticket_version == 1
+                        else self._prepare_pointerless_generic_v2_ticket(release_name)
+                    )
+                    metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+                    metadata_path.write_bytes(malformed_payload)
+                    metadata_path.chmod(0o600)
+
+                    self.assertEqual(
+                        MODULE._cleanup_ready_pending_batches(self.home),
+                        0,
+                    )
+
+                    self.assertTrue(ticket.path.is_file())
+                    self.assertTrue(ticket.batch_root.is_dir())
+                    self.assertEqual(metadata_path.read_bytes(), malformed_payload)
+
+    def test_pointerless_generic_missing_metadata_keeps_compatible_cleanup(
+        self,
+    ) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "pointerless-generic-missing-metadata-release"
+        )
+        metadata_path = ticket.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        metadata_path.unlink()
+
+        self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+
+    def test_pointerless_generic_external_parser_enotdir_is_blocking(self) -> None:
+        ticket = self._prepare_pointerless_generic_v1_ticket(
+            "pointerless-generic-external-enotdir-release"
+        )
+        with (
+            mock.patch.object(
+                MODULE,
+                "_parse_pending_link_batch",
+                side_effect=NotADirectoryError(
+                    errno.ENOTDIR,
+                    "injected external release path failure",
+                    "external-release",
+                ),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal regular-file validation was retained",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+
+    def test_v6_terminal_ticket_creates_a_missing_cleanup_index(self) -> None:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / "v6-missing-index-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        MODULE._publish_pending_commit_marker(self.home, parsed)
+        cleanup_index = MODULE._pending_cleanup_index_path(self.home)
+        if cleanup_index.exists():
+            shutil.rmtree(cleanup_index)
+
+        MODULE._mark_pending_batch_cleanup_ready(self.home, parsed)
+
+        ticket = MODULE._read_pending_cleanup_ticket(
+            self.home,
+            MODULE._pending_cleanup_ticket_path(
+                self.home,
+                parsed.batch_root.name,
+            ),
+        )
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(
+            ticket.version,
+            MODULE.LEGACY_PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
+
+    def test_v6_terminal_ticket_reuse_rejects_retained_representation(self) -> None:
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / "v6-retained-ticket-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        parsed = self._downgrade_pending_regular_metadata(batch, 6)
+        MODULE._publish_pending_commit_marker(self.home, parsed)
+        write_legacy_v4_terminal_ticket(self.home, parsed, phase="after")
+        ticket_path = MODULE._pending_cleanup_ticket_path(
+            self.home,
+            parsed.batch_root.name,
+        )
+        retained = ticket_path.with_name(
+            next(MODULE._retained_pending_cleanup_names(ticket_path))
+        )
+        os.link(ticket_path, retained)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "retained evidence must be recovered",
+        ):
+            MODULE._mark_pending_batch_cleanup_ready(self.home, parsed)
+
+        self.assertTrue(ticket_path.is_file())
+        self.assertTrue(retained.is_file())
+
+    def test_v11_unchanged_terminal_target_rejects_non_writer_link_count(
+        self,
+    ) -> None:
+        secondary_target = "agents/security-reviewer.toml"
+        append_regular_link(
+            self.release,
+            target=secondary_target,
+            source="personal_codex/agents/security-reviewer.toml",
+            payload='name = "security-reviewer"\n',
+        )
+        install(self.release, self.home, SHA_A)
+        next_release = self.root / "unchanged-link-count-release"
+        write_release(next_release, role_payload='name = "updated"\n')
+        append_regular_link(
+            next_release,
+            target=secondary_target,
+            source="personal_codex/agents/security-reviewer.toml",
+            payload='name = "security-reviewer"\n',
+        )
+        batch = self._interrupt_uncommitted_regular_publication(next_release, SHA_B)
+        metadata_path = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        for field in ("terminal_regular_before", "terminal_regular_after"):
+            targets = payload[field]
+            assert isinstance(targets, list)
+            unchanged = next(
+                target for target in targets if target["target"] == secondary_target
+            )
+            unchanged["link_count"] = 2
+        write_pending_metadata_payload(batch, payload)
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "unchanged regular terminal hard-link authority changed",
+        ):
+            MODULE._load_pending_link_batch(self.home)
+
     def test_regular_to_symlink_precommit_recovery_restores_exact_regular_file(
         self,
     ) -> None:
@@ -2273,7 +3958,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         record = next(
             candidate for candidate in batch.records if candidate.target == ROLE_TARGET
         )
-        self.assertEqual(batch.metadata_version, 10)
+        self.assertEqual(batch.metadata_version, 11)
         self.assertTrue(record.before_is_regular())
         self.assertFalse(record.is_regular())
         self.assertEqual(record.action, "quarantine-replace")
@@ -3007,6 +4692,75 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
                         expected.file_identity,
                     )
                     self.assertEqual(stat.S_IMODE(drifted_path.stat().st_mode), 0o640)
+
+    def test_final_private_deletion_rechecks_parent_policy_immediately_before_unlink(
+        self,
+    ) -> None:
+        self.home = self.root / "home-final-delete-parent-policy"
+        batch = self._interrupt_regular_publication_cleanup(self.release, SHA_A)
+        record, _active = self._assert_active_publication_journal(batch)
+        journal = MODULE._read_pending_regular_publication_cleanup(
+            self.home,
+            batch,
+            record,
+            "produced",
+        )
+        assert journal is not None
+        cleanup = batch.batch_root / "pending" / "cleanup"
+        original_mode = stat.S_IMODE(cleanup.stat().st_mode)
+        reads = 0
+        drifted = False
+        real_read = MODULE._read_managed_state_bytes
+
+        def drift_after_final_content_revalidation(
+            file_descriptor: int,
+            path: Path,
+            maximum_bytes: int = MODULE.MAX_MANAGED_STATE_BYTES,
+        ) -> bytes:
+            nonlocal reads, drifted
+            payload = real_read(file_descriptor, path, maximum_bytes)
+            if (
+                path.parent == cleanup
+                and MODULE._pending_regular_publication_private_deletion_alias_base(
+                    path.name
+                )
+                is not None
+            ):
+                reads += 1
+                if reads >= 4 and not drifted:
+                    cleanup.chmod(0o755)
+                    drifted = True
+            return payload
+
+        try:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_read_managed_state_bytes",
+                    side_effect=drift_after_final_content_revalidation,
+                ),
+                self.assertRaisesRegex(MODULE.SyncError, "mode 0755 != 0700"),
+            ):
+                MODULE._recover_pending_regular_publication_cleanup(
+                    self.home,
+                    batch,
+                    record,
+                    "produced",
+                )
+        finally:
+            cleanup.chmod(original_mode)
+
+        self.assertTrue(drifted)
+        self.assertGreaterEqual(reads, 4)
+        self.assertTrue(
+            any(
+                MODULE._pending_regular_publication_private_deletion_alias_base(
+                    child.name
+                )
+                is not None
+                for child in cleanup.iterdir()
+            )
+        )
 
     def test_private_authority_anchor_rejects_v2_journal_replay(self) -> None:
         for public_name in ("canonical", "active"):
@@ -5073,6 +6827,7 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
         metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata.read_text(encoding="utf-8"))
         payload["version"] = 9
+        downgrade_pending_state_evidence_metadata(payload, 9)
         records = payload["records"]
         assert isinstance(records, list)
         for raw_record in records:
@@ -6181,6 +7936,69 @@ class RegularAgentPendingRecoveryTests(unittest.TestCase):
 
         self.assertTrue(drifted)
 
+    def test_terminal_cleanup_rejects_foreign_hardlink_before_deleting_batch(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_try_cleanup_finalized_pending_batch",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "committed regular-file evidence cleanup was deferred",
+            ),
+        ):
+            install(self.release, self.home, SHA_A)
+
+        ticket_paths = list(
+            MODULE._pending_cleanup_index_path(self.home).glob("*.json")
+        )
+        self.assertEqual(len(ticket_paths), 1)
+        ticket = MODULE._read_pending_cleanup_ticket(self.home, ticket_paths[0])
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(
+            ticket.version,
+            MODULE.PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
+        self.assertEqual(len(ticket.terminal_regular_targets), 1)
+        expectation = ticket.terminal_regular_targets[0]
+        self.assertIsNotNone(expectation.link_count)
+        target = self.home / ROLE_TARGET
+        self.assertEqual(target.stat().st_nlink, expectation.link_count)
+
+        foreign_alias = self.root / "foreign-reviewer-alias.toml"
+        os.link(target, foreign_alias)
+        recovery_alias = (
+            ticket.batch_root / MODULE._pending_terminal_recovery_alias_name(0)
+        )
+
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending terminal regular-file validation was retained.*"
+                "unauthorized hard-link alias",
+            ),
+        ):
+            MODULE._cleanup_ready_pending_batches(self.home)
+
+        self.assertTrue(ticket.path.is_file())
+        self.assertTrue(ticket.batch_root.is_dir())
+        self.assertTrue(target.is_file())
+        self.assertTrue(foreign_alias.is_file())
+        self.assertFalse(recovery_alias.exists())
+
+        foreign_alias.unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(MODULE._cleanup_ready_pending_batches(self.home), 1)
+
+        self.assertFalse(ticket.path.exists())
+        self.assertFalse(ticket.batch_root.exists())
+        self.assertEqual(target.stat().st_nlink, 1)
+
 
 class PendingMetadataCompatibilityTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -6190,6 +8008,60 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def _deep_regular_rollback_capacity(
+        self,
+        count: int,
+    ) -> tuple[MODULE.PendingLinkCapacityPlan, MODULE.ManagedState]:
+        links: dict[PurePosixPath, MODULE.ManagedLinkRecord] = {}
+        actions: list[MODULE.ReconcileAction] = []
+        for index in range(count):
+            target = PurePosixPath(
+                f"target-{index:04d}",
+                *("d" for _unused in range(62)),
+                "agent.toml",
+            )
+            self.assertEqual(len(target.parts), MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)
+            links[target] = MODULE.ManagedLinkRecord(
+                source=PurePosixPath("personal_codex/agents/reviewer.toml"),
+                target=target,
+                kind="file",
+                owner=MODULE.PUBLIC_OWNER,
+                link_target="releases/" + SHA_A,
+                release_sha=SHA_A,
+            )
+            actions.append(
+                MODULE.ReconcileAction(
+                    action="remove",
+                    target=self.home / Path(*target.parts),
+                    link_target="",
+                    kind="file",
+                    planned_snapshot=MODULE.ReconcileTargetSnapshot(
+                        parent_identity=(1, index + 1),
+                        link_identity=(2, index + 1),
+                        ancestor_identity=(1, index + 1),
+                        regular_sha256="a" * 64,
+                        regular_size=1,
+                        regular_mode=0o600,
+                        regular_uid=os.geteuid(),
+                        regular_gid=os.getegid(),
+                        regular_link_count=1,
+                    ),
+                    materialization="regular",
+                )
+            )
+        action_tuple = tuple(actions)
+        return (
+            MODULE.PendingLinkCapacityPlan(
+                ordered_groups=(("managed", action_tuple),),
+                flattened_actions=action_tuple,
+                retired_absence_specs=(),
+            ),
+            MODULE.ManagedState(
+                owners={MODULE.PUBLIC_OWNER: SHA_A},
+                links=links,
+            ),
+        )
 
     def test_projected_planned_snapshot_covers_every_v6_field(self) -> None:
         target = self.home / ROLE_TARGET
@@ -6295,6 +8167,153 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             [item["target"] for item in projected["terminal_regular_after"]],
             [ROLE_TARGET.as_posix()],
         )
+
+    def test_v3_empty_proof_uses_terminal_capacity_for_full_target_groups(
+        self,
+    ) -> None:
+        batch_name = "20260911T000000Z-1-01"
+        authority = MODULE.PendingCleanupEmptyProofAuthority(
+            version=3,
+            batch_name=batch_name,
+            batch_root_identity=(1, 2),
+            quarantine_root_identity=(3, 4),
+            isolated_name=MODULE._pending_cleanup_isolated_batch_name(batch_name),
+            ticket_identity=(5, 6),
+            ticket_sha256="a" * 64,
+            terminal_regular_targets=tuple(
+                MODULE.PendingRegularTargetExpectation(
+                    target=PurePosixPath("skills", f"x{index:04d}"),
+                    parent_identity=(7, index + 1),
+                    file_identity=(8, index + 1),
+                    sha256="b" * 64,
+                    size=1,
+                    mode=0o600,
+                    uid=os.geteuid(),
+                    link_count=None,
+                )
+                for index in range(13)
+            ),
+            source_ticket_version=MODULE.PENDING_TERMINAL_CLEANUP_TICKET_VERSION,
+        )
+
+        payload = MODULE._pending_cleanup_empty_proof_payload_from_authority(
+            authority
+        )
+
+        self.assertGreater(len(payload), MODULE.MAX_PENDING_CLEANUP_TICKET_BYTES)
+        self.assertLessEqual(
+            len(payload),
+            MODULE.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+        )
+        self.assertEqual(
+            MODULE._parse_pending_cleanup_empty_proof_authority(
+                Path(batch_name + MODULE.PENDING_CLEANUP_EMPTY_PROOF_SUFFIX),
+                payload,
+            ),
+            authority,
+        )
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending cleanup empty proof exceeds the size limit",
+        ):
+            MODULE._pending_cleanup_empty_proof_payload_from_authority(
+                replace(authority, version=2, source_ticket_version=None)
+            )
+
+    def test_metadata_capacity_preflights_projected_empty_proof(self) -> None:
+        state = MODULE.ManagedState(
+            owners={MODULE.PUBLIC_OWNER: SHA_A},
+            links={
+                ROLE_TARGET: MODULE.ManagedLinkRecord(
+                    source=PurePosixPath("personal_codex/agents/reviewer.toml"),
+                    target=ROLE_TARGET,
+                    kind="file",
+                    owner=MODULE.PUBLIC_OWNER,
+                    link_target="releases/" + SHA_A,
+                    release_sha=SHA_A,
+                )
+            },
+        )
+        capacity = MODULE.PendingLinkCapacityPlan(
+            ordered_groups=(),
+            flattened_actions=(),
+            retired_absence_specs=(),
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_validate_pending_terminal_validation_receipt_capacity",
+            ),
+            mock.patch.object(
+                MODULE,
+                "MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES",
+                1,
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "pending cleanup empty proof exceeds the size limit",
+            ),
+        ):
+            MODULE._validate_pending_link_metadata_capacity(
+                self.home,
+                capacity,
+                MODULE.ManagedStateFileSnapshot(exists=True),
+                state,
+                state,
+                state,
+            )
+
+    def test_rollback_terminal_receipt_directory_capacity_boundary(self) -> None:
+        # With the shortest distinct depth-64 paths in this fixture, 1,263 is
+        # the last complete v3 receipt below 16 MiB; the next target crosses
+        # the byte boundary before the directory-count boundary.
+        accepted_count = 1_263
+        accepted_capacity, accepted_state = self._deep_regular_rollback_capacity(
+            accepted_count
+        )
+
+        MODULE._validate_pending_terminal_validation_receipt_capacity(
+            self.home,
+            accepted_capacity,
+            accepted_state,
+            phase="before",
+        )
+
+        oversized_capacity, oversized_state = self._deep_regular_rollback_capacity(
+            accepted_count + 1
+        )
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal validation receipt exceeds the size limit",
+        ):
+            MODULE._validate_pending_terminal_validation_receipt_capacity(
+                self.home,
+                oversized_capacity,
+                oversized_state,
+                phase="before",
+            )
+
+        per_target_directories = MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH - 1
+        fixed_directories = 3
+        directory_overflow_count = (
+            MODULE.MAX_PENDING_TERMINAL_VALIDATION_DIRECTORIES - fixed_directories
+        ) // per_target_directories + 1
+        rejected_capacity, rejected_state = self._deep_regular_rollback_capacity(
+            directory_overflow_count
+        )
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "pending terminal validation directories exceed the limit",
+        ):
+            MODULE._validate_pending_link_metadata_capacity(
+                self.home,
+                rejected_capacity,
+                MODULE.ManagedStateFileSnapshot(exists=True),
+                rejected_state,
+                rejected_state,
+                MODULE.ManagedState(owners={}, links={}),
+            )
 
     def test_manifest_transition_capacity_counts_terminal_regular_arrays(self) -> None:
         profile = MODULE._manifest_transition_capacity_profile(
@@ -6629,6 +8648,7 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             size=10,
             mode=0o600,
             uid=os.geteuid(),
+            link_count=None,
         )
         ticket = MODULE.PendingBatchCleanupTicket(
             version=4,
@@ -6666,6 +8686,11 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             ),
             mock.patch.object(
                 MODULE,
+                "_require_pending_cleanup_ticket_link_authority",
+                return_value=1,
+            ),
+            mock.patch.object(
+                MODULE,
                 "_read_regular_file_snapshot_beneath",
                 return_value=target_snapshot,
             ),
@@ -6678,6 +8703,11 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
                 MODULE,
                 "_read_pending_cleanup_ticket",
                 return_value=changed_ticket,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_require_pending_cleanup_ticket_link_authority",
+                return_value=1,
             ),
             self.assertRaisesRegex(MODULE.SyncError, "cleanup ticket changed"),
         ):
@@ -6959,6 +8989,11 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
                 self.assertEqual(parsed.metadata_version, 6)
                 self.assertEqual(parsed_record.regular_gid, legacy_gid)
                 self.assertEqual(target.stat().st_gid, alternate_gid)
+                write_legacy_v4_terminal_ticket(
+                    self.home,
+                    parsed,
+                    phase="after",
+                )
 
                 install(release, self.home, sha)
 
@@ -7144,6 +9179,15 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
             [item["target"] for item in metadata["terminal_regular_after"]],
             [ROLE_TARGET.as_posix(), secondary_target.as_posix()],
         )
+        self.assertTrue(
+            all(
+                isinstance(item["link_count"], int)
+                and not isinstance(item["link_count"], bool)
+                and item["link_count"] >= 1
+                for field in ("terminal_regular_before", "terminal_regular_after")
+                for item in metadata[field]
+            )
+        )
         self.assertEqual(
             tuple(item.target for item in batch.terminal_regular_before),
             (ROLE_TARGET,),
@@ -7161,7 +9205,7 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
         self.assertNotIn(ROLE_TARGET, acted_regular_targets)
         self.assertIn(secondary_target, acted_regular_targets)
 
-    def test_v6_action_scoped_metadata_recovers_unchanged_regular_target(
+    def test_v6_action_scoped_v4_ticket_is_retained_with_unchanged_target(
         self,
     ) -> None:
         initial = self.root / "initial-release"
@@ -7193,19 +9237,29 @@ class PendingMetadataCompatibilityTests(unittest.TestCase):
                 and record.action in {"create", "replace", "quarantine-replace"}
             },
         )
-
-        install(next_release, self.home, SHA_B)
-
-        self.assertEqual(
-            (self.home / ROLE_TARGET).read_text(encoding="utf-8"),
-            'name = "reviewer"\n',
+        write_legacy_v4_terminal_ticket(
+            self.home,
+            parsed,
+            phase="after",
         )
-        self.assertEqual(
-            (self.home / "agents" / "security-reviewer.toml").read_text(
-                encoding="utf-8"
+
+        with self.assertRaisesRegex(
+            MODULE.SyncError,
+            "does not bind the complete terminal regular group",
+        ):
+            MODULE._mark_pending_batch_cleanup_ready(self.home, parsed)
+
+        ticket = MODULE._read_pending_cleanup_ticket(
+            self.home,
+            MODULE._pending_cleanup_ticket_path(
+                self.home,
+                parsed.batch_root.name,
             ),
-            'name = "security-reviewer"\n',
         )
+        self.assertIsNotNone(ticket)
+        assert ticket is not None
+        self.assertEqual(ticket.version, 4)
+        self.assertTrue(MODULE._pending_link_pointer_path(self.home).is_file())
 
 
 class PendingRegularSourceEvidenceCacheTests(unittest.TestCase):
