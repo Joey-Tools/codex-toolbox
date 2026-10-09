@@ -497,7 +497,7 @@ class SyncManifestChangeTests(unittest.TestCase):
             trailing_newline=True,
         )
 
-        self.assertEqual(payload["version"], 10)
+        self.assertEqual(payload["version"], 11)
         self.assertEqual(
             len(os.fsencode(runtime._MAX_PENDING_LINK_TARGET)),
             runtime.MAX_RECONCILE_LINK_TARGET_BYTES,
@@ -650,8 +650,8 @@ class SyncManifestChangeTests(unittest.TestCase):
             )
             captured = []
 
-            def capture(payload, **_kwargs):
-                captured.append(payload)
+            def capture(payload, **kwargs):
+                captured.append((payload, kwargs))
                 return b""
 
             with mock.patch.object(
@@ -667,10 +667,51 @@ class SyncManifestChangeTests(unittest.TestCase):
                     state_before,
                     current.state,
                 )
-            self.assertEqual(len(captured), 1)
+            metadata = []
+            empty_proofs = []
+            for payload, kwargs in captured:
+                error = kwargs["overflow_error"]
+                if error == "pending link transaction metadata exceeds the size limit":
+                    self.assertEqual(payload["version"], 11)
+                    self.assertEqual(
+                        kwargs["max_bytes"], runtime.MAX_MANAGED_STATE_BYTES
+                    )
+                    metadata.append(payload)
+                elif error == "pending cleanup empty proof exceeds the size limit":
+                    self.assertEqual(payload["version"], 3)
+                    self.assertEqual(payload["source_ticket_version"], 8)
+                    self.assertEqual(
+                        kwargs["max_bytes"],
+                        runtime.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+                    )
+                    self.assertLessEqual(
+                        runtime._projected_json_size(payload, trailing_newline=True),
+                        kwargs["max_bytes"],
+                    )
+                    empty_proofs.append(payload)
+                else:
+                    self.assertEqual(
+                        error,
+                        "pending terminal validation receipt exceeds the size limit",
+                    )
+                    self.assertEqual(payload["phase"], "terminal-validation")
+                    self.assertEqual(
+                        payload["version"],
+                        runtime.PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
+                    )
+                    self.assertEqual(
+                        kwargs["max_bytes"],
+                        runtime.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+                    )
+                    self.assertLessEqual(
+                        runtime._projected_json_size(payload, trailing_newline=True),
+                        kwargs["max_bytes"],
+                    )
+            self.assertEqual(len(metadata), 1)
+            self.assertEqual(len(empty_proofs), 2)
             return len(
                 (
-                    json.dumps(captured[0], indent=2, sort_keys=False)
+                    json.dumps(metadata[0], indent=2, sort_keys=False)
                     + "\n"
                 ).encode("utf-8")
             )

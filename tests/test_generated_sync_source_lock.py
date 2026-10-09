@@ -163,7 +163,7 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
             "rules_contract_version": 1,
             "hash_algorithm": "sha256",
             "canonical_repository": "Joey-Tools/codex-personal-sync",
-            "canonical_commit": "b78febccb199c38c48cf9a3bd49f151723524e9d",
+            "canonical_commit": VERIFIER.EXPECTED_CANONICAL_COMMIT,
             "mirror": "toolbox",
             "mirror_repository": "Joey-Tools/codex-toolbox",
             "mapping_digest": "",
@@ -285,6 +285,14 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
 
     def test_rejects_canonical_commit_drift(self) -> None:
         self.receipt["canonical_commit"] = "0" * 40
+        expected = self.write_receipt()
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "canonical_commit"):
+            self.verify(expected)
+
+    def test_rejects_previous_canonical_commit_with_matching_receipt_digest(
+        self,
+    ) -> None:
+        self.receipt["canonical_commit"] = "b78febccb199c38c48cf9a3bd49f151723524e9d"
         expected = self.write_receipt()
         with self.assertRaisesRegex(VERIFIER.VerificationError, "canonical_commit"):
             self.verify(expected)

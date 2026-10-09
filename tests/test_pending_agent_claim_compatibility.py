@@ -246,6 +246,10 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
         metadata = batch.batch_root / MODULE.PENDING_LINK_METADATA_NAME
         payload = json.loads(metadata.read_text(encoding="utf-8"))
         payload["version"] = version
+        if version < 11:
+            for field in ("terminal_regular_before", "terminal_regular_after"):
+                for raw_target in payload.get(field, []):
+                    raw_target.pop("link_count", None)
         if version < 10:
             for raw_record in payload["records"]:
                 raw_record.pop("before_materialization", None)
@@ -507,17 +511,37 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
                 parsed = MODULE._load_pending_link_batch(home)
                 self.assertIsNotNone(parsed)
                 state, snapshot = MODULE._load_managed_state_with_snapshot(home)
-                with contextlib.redirect_stdout(io.StringIO()):
-                    _state, _snapshot, recovered = (
+                if committed:
+                    # The current writer may have already published a v8
+                    # terminal ticket before this historical metadata rewrite.
+                    # Its pointer/metadata authority must not be silently
+                    # rebound to the rewritten bytes; retain the ticket for
+                    # guided manual recovery instead of accepting mutated
+                    # cleanup authority.
+                    with (
+                        contextlib.redirect_stdout(io.StringIO()),
+                        self.assertRaisesRegex(
+                            MODULE.SyncError,
+                            "committed pending regular-file evidence cleanup was deferred",
+                        ),
+                    ):
                         MODULE._recover_pending_link_transaction(
                             home,
                             state,
                             snapshot,
                             dry_run=False,
                         )
-                    )
-
-                self.assertTrue(recovered)
+                else:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        _state, _snapshot, recovered = (
+                            MODULE._recover_pending_link_transaction(
+                                home,
+                                state,
+                                snapshot,
+                                dry_run=False,
+                            )
+                        )
+                    self.assertTrue(recovered)
                 self.assertFalse(
                     os.path.lexists(MODULE._pending_link_pointer_path(home))
                 )
@@ -1015,6 +1039,7 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             legacy_symlink=False,
             sha=SHA_B,
         )
+        self._downgrade_metadata(batch, 10)
 
         with mock.patch.object(
             MODULE,
@@ -1024,7 +1049,17 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             parsed = MODULE._load_pending_link_batch(home)
 
         self.assertIsNotNone(parsed)
+        assert parsed is not None
         self.assertEqual(parsed.metadata_version, 10)
+        self.assertTrue(
+            all(
+                target.link_count is None
+                for target in (
+                    *parsed.terminal_regular_before,
+                    *parsed.terminal_regular_after,
+                )
+            )
+        )
         self.assertEqual(
             sum(
                 record.before_is_regular() and not record.is_regular()
@@ -1275,22 +1310,34 @@ class PendingAgentClaimCompatibilityTests(unittest.TestCase):
             (),
             phase="after",
         )
+        batch_name = "20261008T000000Z-123-456"
+        ticket_path = MODULE._pending_cleanup_ticket_path(home, batch_name)
+        MODULE._ensure_safe_internal_directory(
+            home,
+            ticket_path.parent,
+            create=True,
+        )
+        ticket_path.write_bytes(b"ticket\n")
+        ticket_path.chmod(0o600)
+        ticket_parent_fd = MODULE._open_directory_beneath(home, ticket_path.parent)
+        try:
+            ticket_snapshot = MODULE._read_managed_state_file_snapshot(
+                home,
+                ticket_path,
+                ticket_parent_fd,
+            )
+        finally:
+            MODULE._close_fd_quietly(ticket_parent_fd)
         ticket = MODULE.PendingBatchCleanupTicket(
             version=4,
             phase="after",
-            path=self.root / "terminal-budget-ticket.json",
-            snapshot=MODULE.ManagedStateFileSnapshot(
-                exists=True,
-                payload=b"ticket\n",
-                mode=0o600,
-                parent_identity=(0, 1),
-                file_identity=(1, 2),
-                file_type=stat.S_IFREG,
-                size=7,
-                uid=os.geteuid(),
-                gid=os.getegid(),
+            path=ticket_path,
+            snapshot=ticket_snapshot,
+            batch_root=(
+                MODULE._personal_sync_root(home)
+                / MODULE.QUARANTINE_RELATIVE_PATH
+                / batch_name
             ),
-            batch_root=self.root / "terminal-budget-batch",
             batch_root_identity=(3, 4),
             marker_path=PurePosixPath("pending/state/commit.json"),
             marker_parent_identity=(5, 6),
