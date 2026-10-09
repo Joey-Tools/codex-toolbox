@@ -13,7 +13,9 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "validate_sync_manifest_changes.py"
-SPEC = importlib.util.spec_from_file_location("validate_sync_manifest_changes", SCRIPT_PATH)
+SPEC = importlib.util.spec_from_file_location(
+    "validate_sync_manifest_changes", SCRIPT_PATH
+)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC is not None
 assert SPEC.loader is not None
@@ -96,9 +98,7 @@ class SyncManifestChangeTests(unittest.TestCase):
             MODULE.validate_manifest_change(previous, current)
 
         previous = manifest("old-one", "old-two", "old-three")
-        current["removed_links"].append(
-            removed("old-three", "remove-old-three")
-        )
+        current["removed_links"].append(removed("old-three", "remove-old-three"))
         with (
             mock.patch.object(MODULE, "MAX_PENDING_LINK_RECORDS", 5),
             self.assertRaisesRegex(
@@ -113,9 +113,7 @@ class SyncManifestChangeTests(unittest.TestCase):
         previous = manifest(*skills)
         current = manifest(
             *skills,
-            removed_links=[
-                removed(skill, f"replace-{skill}") for skill in skills
-            ],
+            removed_links=[removed(skill, f"replace-{skill}") for skill in skills],
         )
         for skill, entry in zip(skills, current["links"]):
             entry["source"] = f"personal_codex/skills/replacement-{skill}"
@@ -126,9 +124,7 @@ class SyncManifestChangeTests(unittest.TestCase):
     def test_manifest_transition_byte_capacity_has_exact_boundary(self) -> None:
         previous = MODULE._manifest_model(manifest("skill"))
         current_raw = manifest("skill")
-        current_raw["links"][0]["source"] = (
-            "personal_codex/skills/replacement-skill"
-        )
+        current_raw["links"][0]["source"] = "personal_codex/skills/replacement-skill"
         current = MODULE._manifest_model(current_raw)
         runtime = MODULE._sync_runtime_module()
         projected_size = runtime._manifest_transition_metadata_size(
@@ -189,9 +185,8 @@ class SyncManifestChangeTests(unittest.TestCase):
         short_history = removed("short", "remove-short", legacy=True)
         short_history["target"] = target
         long_history = removed("long", "remove-long", legacy=True)
-        long_history["source"] = (
-            "personal_codex/skills/"
-            + "/".join(["long-component"] * 32)
+        long_history["source"] = "personal_codex/skills/" + "/".join(
+            ["long-component"] * 32
         )
         long_history["target"] = target
         runtime = MODULE._sync_runtime_module()
@@ -200,9 +195,7 @@ class SyncManifestChangeTests(unittest.TestCase):
             removed_links: list[dict[str, object]],
         ):
             return MODULE._transition_capacity_profile(
-                MODULE._manifest_model(
-                    manifest("current", removed_links=removed_links)
-                )
+                MODULE._manifest_model(manifest("current", removed_links=removed_links))
             )
 
         no_history = profile_for([])
@@ -252,8 +245,7 @@ class SyncManifestChangeTests(unittest.TestCase):
         base_item = {"index": 0, "nested": {"value": "value"}}
         count = 101
         items = [
-            {"index": index, "nested": {"value": "value"}}
-            for index in range(count)
+            {"index": index, "nested": {"value": "value"}} for index in range(count)
         ]
         empty_size = runtime._projected_json_size(
             {"items": []},
@@ -331,9 +323,7 @@ class SyncManifestChangeTests(unittest.TestCase):
             records = []
             record_actions = {}
             for scope, action in actions:
-                target = runtime.PurePosixPath(
-                    *action.target.relative_to(home).parts
-                )
+                target = runtime.PurePosixPath(*action.target.relative_to(home).parts)
                 record_actions[(scope, target)] = action.action
                 records.append(
                     runtime._projected_pending_record_payload(
@@ -449,9 +439,7 @@ class SyncManifestChangeTests(unittest.TestCase):
         records = []
         record_actions = {}
         for scope, action in actions:
-            target = runtime.PurePosixPath(
-                *action.target.relative_to(home).parts
-            )
+            target = runtime.PurePosixPath(*action.target.relative_to(home).parts)
             record_actions[(scope, target)] = action.action
             records.append(
                 runtime._projected_pending_record_payload(
@@ -479,12 +467,8 @@ class SyncManifestChangeTests(unittest.TestCase):
                 state_after,
                 record_actions,
             ),
-            releases_before=runtime._projected_pending_release_payloads(
-                profile.state
-            ),
-            releases_after=runtime._projected_pending_release_payloads(
-                state_after
-            ),
+            releases_before=runtime._projected_pending_release_payloads(profile.state),
+            releases_after=runtime._projected_pending_release_payloads(state_after),
             terminal_regular_before=runtime._projected_pending_terminal_regular_payloads(
                 profile.state
             ),
@@ -497,7 +481,7 @@ class SyncManifestChangeTests(unittest.TestCase):
             trailing_newline=True,
         )
 
-        self.assertEqual(payload["version"], 10)
+        self.assertEqual(payload["version"], 11)
         self.assertEqual(
             len(os.fsencode(runtime._MAX_PENDING_LINK_TARGET)),
             runtime.MAX_RECONCILE_LINK_TARGET_BYTES,
@@ -650,8 +634,8 @@ class SyncManifestChangeTests(unittest.TestCase):
             )
             captured = []
 
-            def capture(payload, **_kwargs):
-                captured.append(payload)
+            def capture(payload, **kwargs):
+                captured.append((payload, kwargs))
                 return b""
 
             with mock.patch.object(
@@ -667,12 +651,52 @@ class SyncManifestChangeTests(unittest.TestCase):
                     state_before,
                     current.state,
                 )
-            self.assertEqual(len(captured), 1)
+            metadata = []
+            empty_proofs = []
+            for payload, kwargs in captured:
+                error = kwargs["overflow_error"]
+                if error == "pending link transaction metadata exceeds the size limit":
+                    self.assertEqual(payload["version"], 11)
+                    self.assertEqual(
+                        kwargs["max_bytes"], runtime.MAX_MANAGED_STATE_BYTES
+                    )
+                    metadata.append(payload)
+                elif error == "pending cleanup empty proof exceeds the size limit":
+                    self.assertEqual(payload["version"], 3)
+                    self.assertEqual(payload["source_ticket_version"], 8)
+                    self.assertEqual(
+                        kwargs["max_bytes"],
+                        runtime.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+                    )
+                    self.assertLessEqual(
+                        runtime._projected_json_size(payload, trailing_newline=True),
+                        kwargs["max_bytes"],
+                    )
+                    empty_proofs.append(payload)
+                else:
+                    self.assertEqual(
+                        error,
+                        "pending terminal validation receipt exceeds the size limit",
+                    )
+                    self.assertEqual(payload["phase"], "terminal-validation")
+                    self.assertEqual(
+                        payload["version"],
+                        runtime.PENDING_CLEANUP_TERMINAL_VALIDATION_VERSION,
+                    )
+                    self.assertEqual(
+                        kwargs["max_bytes"],
+                        runtime.MAX_PENDING_TERMINAL_CLEANUP_TICKET_BYTES,
+                    )
+                    self.assertLessEqual(
+                        runtime._projected_json_size(payload, trailing_newline=True),
+                        kwargs["max_bytes"],
+                    )
+            self.assertEqual(len(metadata), 1)
+            self.assertEqual(len(empty_proofs), 2)
             return len(
-                (
-                    json.dumps(captured[0], indent=2, sort_keys=False)
-                    + "\n"
-                ).encode("utf-8")
+                (json.dumps(metadata[0], indent=2, sort_keys=False) + "\n").encode(
+                    "utf-8"
+                )
             )
 
         canonical_actions = [
@@ -744,7 +768,9 @@ class SyncManifestChangeTests(unittest.TestCase):
         previous = manifest("keep", "retired")
         current = manifest("keep")
 
-        with self.assertRaisesRegex(MODULE.ValidationError, "requires one new matching"):
+        with self.assertRaisesRegex(
+            MODULE.ValidationError, "requires one new matching"
+        ):
             MODULE.validate_manifest_change(previous, current)
 
     def test_accepts_matching_removed_link(self) -> None:
@@ -809,9 +835,12 @@ class SyncManifestChangeTests(unittest.TestCase):
         )
 
         for previous, current in cases:
-            with self.subTest(previous=previous, current=current), self.assertRaisesRegex(
-                MODULE.ValidationError,
-                "unsupported field",
+            with (
+                self.subTest(previous=previous, current=current),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    "unsupported field",
+                ),
             ):
                 MODULE.validate_manifest_change(previous, current)
 
@@ -839,7 +868,9 @@ class SyncManifestChangeTests(unittest.TestCase):
         previous = manifest("keep", "retired", removed_links=[old])
         current = manifest("keep", removed_links=[old])
 
-        with self.assertRaisesRegex(MODULE.ValidationError, "requires one new matching"):
+        with self.assertRaisesRegex(
+            MODULE.ValidationError, "requires one new matching"
+        ):
             MODULE.validate_manifest_change(previous, current)
 
     def test_replacement_target_must_be_safe(self) -> None:
@@ -900,15 +931,11 @@ class SyncManifestChangeTests(unittest.TestCase):
     def test_replacement_retirement_owner_respects_component_limit(self) -> None:
         boundary_owner = "o" * MODULE.MAX_OWNER_COMPONENT_BYTES
         retirement = removed("replacement", "remove-replacement")
-        retirement["retires_replacements"] = [
-            f"{boundary_owner}:rename-retired"
-        ]
+        retirement["retires_replacements"] = [f"{boundary_owner}:rename-retired"]
         MODULE._manifest_model(manifest("keep", removed_links=[retirement]))
 
         overflow_owner = boundary_owner + "o"
-        retirement["retires_replacements"] = [
-            f"{overflow_owner}:rename-retired"
-        ]
+        retirement["retires_replacements"] = [f"{overflow_owner}:rename-retired"]
         with self.assertRaisesRegex(
             MODULE.ValidationError,
             f"{MODULE.MAX_OWNER_COMPONENT_BYTES} UTF-8 bytes",
@@ -949,9 +976,12 @@ class SyncManifestChangeTests(unittest.TestCase):
         )
 
         for label, removed_links in cases:
-            with self.subTest(cycle=label), self.assertRaisesRegex(
-                MODULE.ValidationError,
-                "replacement retirement cycle",
+            with (
+                self.subTest(cycle=label),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    "replacement retirement cycle",
+                ),
             ):
                 MODULE._manifest_model(manifest("keep", removed_links=removed_links))
 
@@ -1097,9 +1127,12 @@ class SyncManifestChangeTests(unittest.TestCase):
         invalid.append(("public manifest links", public_override))
 
         for message, current in invalid:
-            with self.subTest(message=message), self.assertRaisesRegex(
-                MODULE.ValidationError,
-                message,
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    message,
+                ),
             ):
                 MODULE._manifest_model(current)
 
@@ -1131,17 +1164,11 @@ class SyncManifestChangeTests(unittest.TestCase):
     def test_manifest_enforces_active_managed_link_target_byte_limit(self) -> None:
         owner = "o" * MODULE.MAX_OWNER_COMPONENT_BYTES
         target = "/".join(["t"] * MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)
-        removed_target = "/".join(
-            ["r"] * MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH
-        )
+        removed_target = "/".join(["r"] * MODULE.MAX_MANIFEST_TARGET_PATH_DEPTH)
         source_at_limit = "/".join(["s" * 181, "s" * 181, "s" * 183])
         source_over_limit = "/".join(["s" * 181, "s" * 181, "s" * 184])
-        unicode_source_at_limit = "/".join(
-            ["é" * 127, "é" * 127, "é" * 18 + "s"]
-        )
-        unicode_source_over_limit = "/".join(
-            ["é" * 127, "é" * 127, "é" * 18 + "ss"]
-        )
+        unicode_source_at_limit = "/".join(["é" * 127, "é" * 127, "é" * 18 + "s"])
+        unicode_source_over_limit = "/".join(["é" * 127, "é" * 127, "é" * 18 + "ss"])
         payload: dict[str, object] = {
             "version": 1,
             "owner": owner,
@@ -1233,9 +1260,12 @@ class SyncManifestChangeTests(unittest.TestCase):
         for base_release in invalid_objects:
             current = manifest("keep")
             current["base_release"] = base_release
-            with self.subTest(base_release=base_release), self.assertRaisesRegex(
-                MODULE.ValidationError,
-                "base_release must be an object",
+            with (
+                self.subTest(base_release=base_release),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    "base_release must be an object",
+                ),
             ):
                 MODULE._manifest_model(current)
 
@@ -1266,9 +1296,12 @@ class SyncManifestChangeTests(unittest.TestCase):
         for repository in invalid_repositories:
             current = manifest("keep")
             current["base_release"] = {"repo": repository}
-            with self.subTest(repository=repository), self.assertRaisesRegex(
-                MODULE.ValidationError,
-                "base_release.repo must be an owner/repo string",
+            with (
+                self.subTest(repository=repository),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    "base_release.repo must be an owner/repo string",
+                ),
             ):
                 MODULE._manifest_model(current)
 
@@ -1284,9 +1317,12 @@ class SyncManifestChangeTests(unittest.TestCase):
         for sha in invalid_shas:
             current = manifest("keep")
             current["base_release"] = {"sha": sha}
-            with self.subTest(sha=sha), self.assertRaisesRegex(
-                MODULE.ValidationError,
-                "base_release.sha must be a 40-character lowercase hex SHA",
+            with (
+                self.subTest(sha=sha),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    "base_release.sha must be a 40-character lowercase hex SHA",
+                ),
             ):
                 MODULE._manifest_model(current)
 
@@ -1357,9 +1393,12 @@ class SyncManifestChangeTests(unittest.TestCase):
         cases.append(("reference_only path", missing_reference, path_kinds))
 
         for message, current, kinds in cases:
-            with self.subTest(message=message), self.assertRaisesRegex(
-                MODULE.ValidationError,
-                message,
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    message,
+                ),
             ):
                 MODULE._manifest_model(
                     current,
@@ -1370,9 +1409,7 @@ class SyncManifestChangeTests(unittest.TestCase):
     def test_manifest_rejects_sync_internal_targets(self) -> None:
         for internal_root in ("personal-sync", "Personal-Sync"):
             active = manifest("keep")
-            active["links"][0]["target"] = (
-                f"{internal_root}/state/managed-links.json"
-            )
+            active["links"][0]["target"] = f"{internal_root}/state/managed-links.json"
             removed_entry = removed("orphan", "remove-orphan", legacy=True)
             removed_entry["target"] = f"{internal_root}/quarantine/old-link"
             removed_manifest = manifest("keep", removed_links=[removed_entry])
@@ -1421,17 +1458,18 @@ class SyncManifestChangeTests(unittest.TestCase):
                 ("removed", removed_manifest),
                 ("replacement", replacement_manifest),
             ):
-                with self.subTest(target=target, field=label), self.assertRaisesRegex(
-                    MODULE.ValidationError,
-                    "sync pending transaction path",
+                with (
+                    self.subTest(target=target, field=label),
+                    self.assertRaisesRegex(
+                        MODULE.ValidationError,
+                        "sync pending transaction path",
+                    ),
                 ):
                     MODULE._manifest_model(current)
 
     def test_nested_pending_transaction_name_is_not_reserved(self) -> None:
         current = manifest("keep")
-        current["links"][0]["target"] = (
-            "nested/.personal-sync-pending-transaction.json"
-        )
+        current["links"][0]["target"] = "nested/.personal-sync-pending-transaction.json"
 
         MODULE._manifest_model(current)
 
@@ -1541,11 +1579,12 @@ class SyncManifestChangeTests(unittest.TestCase):
                 removals.append(entry)
             current = manifest("active", removed_links=removals)
 
-            with self.subTest(
-                historical_targets=historical_targets
-            ), self.assertRaisesRegex(
-                MODULE.ValidationError,
-                "historical manifest targets must not overlap",
+            with (
+                self.subTest(historical_targets=historical_targets),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    "historical manifest targets must not overlap",
+                ),
             ):
                 MODULE._manifest_model(current)
 
@@ -1585,9 +1624,7 @@ class SyncManifestChangeTests(unittest.TestCase):
             MODULE._manifest_model(current)
 
     def test_hierarchy_change_check_normalizes_each_target_once(self) -> None:
-        removed_targets = {
-            f"item-{index:04d}/leaf" for index in range(0, 500, 2)
-        }
+        removed_targets = {f"item-{index:04d}/leaf" for index in range(0, 500, 2)}
         added_targets = {f"item-{index:04d}" for index in range(1, 500, 2)}
         original = MODULE._portable_target_key
         slice_count = 0
@@ -1625,11 +1662,7 @@ class SyncManifestChangeTests(unittest.TestCase):
 
     def test_non_overlap_check_only_compares_adjacent_target_keys(self) -> None:
         targets = {
-            (
-                f"item-{index:04d}/leaf"
-                if index % 2 == 0
-                else f"item-{index:04d}"
-            )
+            (f"item-{index:04d}/leaf" if index % 2 == 0 else f"item-{index:04d}")
             for index in range(500)
         }
         original = MODULE._portable_target_key
@@ -1765,7 +1798,9 @@ class SyncManifestChangeTests(unittest.TestCase):
 
     def test_package_builder_preserves_removed_links_metadata(self) -> None:
         builder_path = REPO_ROOT / "scripts" / "build_personal_codex_package.py"
-        spec = importlib.util.spec_from_file_location("build_personal_codex_package", builder_path)
+        spec = importlib.util.spec_from_file_location(
+            "build_personal_codex_package", builder_path
+        )
         builder = importlib.util.module_from_spec(spec)
         assert spec is not None
         assert spec.loader is not None
@@ -2292,9 +2327,12 @@ class ManifestGitTreeSourceTests(unittest.TestCase):
                 "kind": "file",
             }
             self.write_manifest(current)
-            with self.subTest(source=source), self.assertRaisesRegex(
-                MODULE.ValidationError,
-                message,
+            with (
+                self.subTest(source=source),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError,
+                    message,
+                ),
             ):
                 MODULE.main(
                     [
@@ -2377,11 +2415,7 @@ class ManifestGitTreeSourceTests(unittest.TestCase):
         self,
     ) -> None:
         commit = "a" * 40
-        record = (
-            b"100644 blob "
-            + b"b" * 40
-            + b"\tpayload/file.txt\0"
-        )
+        record = b"100644 blob " + b"b" * 40 + b"\tpayload/file.txt\0"
         result = subprocess.CompletedProcess(
             args=["git", "ls-tree"],
             returncode=0,
@@ -2389,13 +2423,16 @@ class ManifestGitTreeSourceTests(unittest.TestCase):
             stderr=b"",
         )
 
-        with mock.patch.object(
-            MODULE,
-            "_bounded_git_output",
-            return_value=result,
-        ), self.assertRaisesRegex(
-            MODULE.ValidationError,
-            "duplicate tree path-kind entry",
+        with (
+            mock.patch.object(
+                MODULE,
+                "_bounded_git_output",
+                return_value=result,
+            ),
+            self.assertRaisesRegex(
+                MODULE.ValidationError,
+                "duplicate tree path-kind entry",
+            ),
         ):
             MODULE._git_tree_path_kind_resolver(self.repo, commit)
 
@@ -2418,7 +2455,9 @@ class ManifestSizeBoundTests(unittest.TestCase):
             manifest_path = root / "--manifest.json"
             manifest_path.write_bytes(b" " * (MODULE.MAX_RELEASE_MANIFEST_BYTES + 1))
             subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-            subprocess.run(["git", "add", "--", "--manifest.json"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "add", "--", "--manifest.json"], cwd=root, check=True
+            )
             subprocess.run(
                 [
                     "git",
@@ -2497,13 +2536,7 @@ class ManifestSerializationSafetyTests(unittest.TestCase):
 
     def test_deep_raw_json_is_reported_as_validation_error(self) -> None:
         depth = sys.getrecursionlimit() + 10
-        payload = (
-            b'{"version":1,"nested":'
-            + b"[" * depth
-            + b"0"
-            + b"]" * depth
-            + b"}"
-        )
+        payload = b'{"version":1,"nested":' + b"[" * depth + b"0" + b"]" * depth + b"}"
 
         with self.assertRaisesRegex(
             MODULE.ValidationError,
@@ -2512,11 +2545,7 @@ class ManifestSerializationSafetyTests(unittest.TestCase):
             MODULE._parse_manifest_bytes(payload, "manifest")
 
     def test_oversized_integer_is_reported_as_validation_error(self) -> None:
-        payload = (
-            b'{"version":'
-            + b"9" * (MODULE.MAX_JSON_INTEGER_DIGITS + 1)
-            + b"}"
-        )
+        payload = b'{"version":' + b"9" * (MODULE.MAX_JSON_INTEGER_DIGITS + 1) + b"}"
 
         with self.assertRaisesRegex(MODULE.ValidationError, "invalid JSON"):
             MODULE._parse_manifest_bytes(payload, "manifest")
@@ -2524,11 +2553,7 @@ class ManifestSerializationSafetyTests(unittest.TestCase):
     def test_rejects_nonstandard_constants_in_raw_manifests(self) -> None:
         for constant in (b"NaN", b"Infinity", b"-Infinity"):
             with self.subTest(constant=constant.decode("ascii")):
-                payload = (
-                    b'{"version":1,"unknown":'
-                    + constant
-                    + b',"links":[]}'
-                )
+                payload = b'{"version":1,"unknown":' + constant + b',"links":[]}'
 
                 with self.assertRaisesRegex(
                     MODULE.ValidationError,
@@ -2562,9 +2587,12 @@ class ManifestDescriptorSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             missing_root = Path(raw) / "missing-validator-repo"
             for unsafe in ("../manifest.json", "/tmp/manifest.json", "."):
-                with self.subTest(path=unsafe), self.assertRaisesRegex(
-                    MODULE.ValidationError,
-                    "safe relative path",
+                with (
+                    self.subTest(path=unsafe),
+                    self.assertRaisesRegex(
+                        MODULE.ValidationError,
+                        "safe relative path",
+                    ),
                 ):
                     MODULE.main(
                         [
@@ -2587,9 +2615,12 @@ class ManifestDescriptorSafetyTests(unittest.TestCase):
             (root / "leaf.json").symlink_to(outside / "manifest.json")
 
             for relative in ("linked/manifest.json", "leaf.json"):
-                with self.subTest(path=relative), self.assertRaisesRegex(
-                    MODULE.ValidationError,
-                    "failed to read manifest safely",
+                with (
+                    self.subTest(path=relative),
+                    self.assertRaisesRegex(
+                        MODULE.ValidationError,
+                        "failed to read manifest safely",
+                    ),
                 ):
                     MODULE.main(
                         [
@@ -2638,7 +2669,9 @@ class ManifestDescriptorSafetyTests(unittest.TestCase):
 
             with (
                 mock.patch.object(MODULE.os, "read", side_effect=replacing_read),
-                self.assertRaisesRegex(MODULE.ValidationError, "changed while being read"),
+                self.assertRaisesRegex(
+                    MODULE.ValidationError, "changed while being read"
+                ),
             ):
                 MODULE._load_json(root, Path("manifest.json"))
 

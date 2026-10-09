@@ -11375,17 +11375,20 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         self,
     ) -> None:
         self._stage_crash_batch()
+        real_installation_lock = MODULE.installation_lock
 
         @contextlib.contextmanager
         def clear_pending_before_lock(_home: Path) -> Iterator[None]:
-            state, state_snapshot = MODULE._load_managed_state_with_snapshot(self.home)
-            MODULE._recover_pending_link_transaction(
-                self.home,
-                state,
-                state_snapshot,
-                dry_run=False,
-            )
-            yield
+            with real_installation_lock(_home):
+                state, state_snapshot = MODULE._load_managed_state_with_snapshot(self.home)
+                MODULE._recover_pending_link_transaction(
+                    self.home,
+                    state,
+                    state_snapshot,
+                    dry_run=False,
+                )
+            with real_installation_lock(_home):
+                yield
 
         with mock.patch.object(
             MODULE,
@@ -11406,25 +11409,28 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         MODULE._state_path(first_home).unlink()
         legacy_target = first_home / "skills" / "public-base"
         self.assertTrue(legacy_target.is_symlink())
+        real_installation_lock = MODULE.installation_lock
 
         @contextlib.contextmanager
         def stage_pending_before_lock(_home: Path) -> Iterator[None]:
-            state, state_snapshot = MODULE._load_managed_state_with_snapshot(first_home)
-            self.assertFalse(state_snapshot.exists)
-            self.assertFalse(
-                os.path.lexists(MODULE._pending_link_pointer_path(first_home))
-            )
-            batch = MODULE._stage_pending_link_batch(
-                first_home,
-                [],
-                [],
-                {},
-                state_snapshot,
-                state,
-                state,
-            )
-            MODULE._publish_pending_link_pointer(first_home, batch)
-            yield
+            with real_installation_lock(_home):
+                state, state_snapshot = MODULE._load_managed_state_with_snapshot(first_home)
+                self.assertFalse(state_snapshot.exists)
+                self.assertFalse(
+                    os.path.lexists(MODULE._pending_link_pointer_path(first_home))
+                )
+                batch = MODULE._stage_pending_link_batch(
+                    first_home,
+                    [],
+                    [],
+                    {},
+                    state_snapshot,
+                    state,
+                    state,
+                )
+                MODULE._publish_pending_link_pointer(first_home, batch)
+            with real_installation_lock(_home):
+                yield
 
         with mock.patch.object(
             MODULE,
@@ -11870,8 +11876,9 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
 
         install_quietly(self.release_b, self.home, SHA_B)
 
-        self.assertFalse(os.path.lexists(batch_root))
-        self.assertFalse(os.path.lexists(ticket_path))
+        self.assertTrue(batch_root.is_dir())
+        self.assertTrue(ticket_path.is_file())
+        self.assertTrue(pending.is_symlink())
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
         self.assertTrue(unrelated_batch.is_dir())
 
@@ -12577,6 +12584,10 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
         batch_root, ticket_path, _output = self._install_with_deferred_cleanup()
         isolated_name = MODULE._pending_cleanup_isolated_batch_name(batch_root.name)
         isolated = batch_root.with_name(isolated_name)
+        batch_identity = (
+            os.lstat(batch_root).st_dev,
+            os.lstat(batch_root).st_ino,
+        )
         real_rmdir = os.rmdir
 
         def fail_isolated_rmdir(
@@ -12584,8 +12595,14 @@ class PendingLinkTransactionSafetyTests(unittest.TestCase):
             *,
             dir_fd: int | None = None,
         ) -> None:
-            if name == isolated_name:
-                raise OSError("injected isolated batch rmdir failure")
+            if dir_fd is not None:
+                try:
+                    candidate = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                except OSError:
+                    pass
+                else:
+                    if (candidate.st_dev, candidate.st_ino) == batch_identity:
+                        raise OSError("injected isolated batch rmdir failure")
             real_rmdir(name, dir_fd=dir_fd)
 
         with (

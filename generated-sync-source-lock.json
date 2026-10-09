@@ -1,11 +1,11 @@
 {
-  "canonical_commit": "b78febccb199c38c48cf9a3bd49f151723524e9d",
+  "canonical_commit": "110f2df02ee6388835d1eb6635e09e7f838658fb",
   "canonical_repository": "Joey-Tools/codex-personal-sync",
   "file_set_digest": "defbefa4d2b0c016b9ca3cbdeb49ab6c9cf708562039b7f939398ebe2047958d",
   "files": [
     {
       "mode": "0755",
-      "sha256": "70fd66ff3b631730e67ab1de8fedc189641778e230b48fd8222debd3f11596ac",
+      "sha256": "25f6bc5f616e466bbe076a8464d6e83b24f55a5f3c5296c6be52a73a1fd6fe62",
       "source_name": "engine",
       "source_path": "scripts/codex_personal_sync.py",
       "target_path": "scripts/codex_personal_sync.py"
@@ -26,14 +26,14 @@
     },
     {
       "mode": "0644",
-      "sha256": "43008c65c647e9a0957f4870d3f2be6510d38899dfdb15561c6dd8249ad0fb67",
+      "sha256": "2fd7fc714bec8c877b9e5d339b98d78fb3309800d6cbdbc1615e06772b85f5e3",
       "source_name": "pending_agent_claim_compatibility_tests",
       "source_path": "tests/test_pending_agent_claim_compatibility.py",
       "target_path": "tests/test_pending_agent_claim_compatibility.py"
     },
     {
       "mode": "0644",
-      "sha256": "0a2a70b4f54301695087c0a616ee10765ffbea7c0898badab451127939c466ee",
+      "sha256": "cd9a07c0a5043a47195711dc9300d8683d8313efa4fa7fe4f66971ae1ba14b0f",
       "source_name": "pending_staging_cleanup_tests",
       "source_path": "tests/test_pending_staging_cleanup.py",
       "target_path": "tests/test_pending_staging_cleanup.py"
@@ -47,21 +47,21 @@
     },
     {
       "mode": "0644",
-      "sha256": "f562d2bdf51c17f1aee1c680ae31b5c41873f10e4cbee8519eac5392a9583176",
+      "sha256": "11a8566b60cc522452156516309474a2dba32fa0c7381808d492d66a7a3ff945",
       "source_name": "reconciliation_safety_tests",
       "source_path": "tests/test_personal_sync_reconciliation_safety.py",
       "target_path": "tests/test_personal_sync_reconciliation_safety.py"
     },
     {
       "mode": "0644",
-      "sha256": "19d57d52314d7c2d1163bec42ae5cf8eeaedb1685e30f8201a76d0b836a42aef",
+      "sha256": "656cb4fc1b27f3ba5b4848532ddb5234faff182c944a2807cc74194144209f8a",
       "source_name": "regular_agent_materialization_tests",
       "source_path": "tests/test_regular_agent_materialization.py",
       "target_path": "tests/test_regular_agent_materialization.py"
     },
     {
       "mode": "0644",
-      "sha256": "5e9de1e1a5c6e12d735551762a57be961ec3e8e09c95adf34932830a4d447e78",
+      "sha256": "12b7c6d9836202ac4c2f2dbe6ebaa544c576e86e299d9a5be2272641eafbe09b",
       "source_name": "regular_overlay_uninstall_status_regressions_tests",
       "source_path": "tests/test_regular_overlay_uninstall_status_regressions.py",
       "target_path": "tests/test_regular_overlay_uninstall_status_regressions.py"
@@ -88,5 +88,5 @@
   "mirror_repository": "Joey-Tools/codex-toolbox",
   "receipt_version": 1,
   "rules_contract_version": 1,
-  "tree_digest": "9af3a0ffed65a435e06459f95aaed453e734adca8059db333890ae77eccdf5c3"
+  "tree_digest": "6ae6d215c418b74e75827cef151057819cce8641f63369a369b8f1fb7e4feaba"
 }
