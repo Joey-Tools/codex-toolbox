@@ -93,7 +93,10 @@ MAX_RELEASE_MANIFEST_HISTORY_BYTES = 64 * 1024 * 1024
 MAX_COMPLETE_RELEASES = 256
 MAX_RELEASE_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_RELEASE_CHECKSUM_BYTES = 64 * 1024
-MAX_RELEASE_ARCHIVE_TOTAL_BYTES = 256 * 1024 * 1024
+# Complete private history already exceeds 256 MiB (188 archives, 259 MiB).
+# Keep a finite 1 GiB compressed ceiling with headroom for recent ~4.3 MiB
+# archives under the independent 256-release and 4 GiB expanded-scan limits.
+MAX_RELEASE_ARCHIVE_TOTAL_BYTES = 1024 * 1024 * 1024
 MAX_RELEASE_CHECKSUM_TOTAL_BYTES = 16 * 1024 * 1024
 # This hard ceiling spans both streaming archive passes for every unique asset
 # pair. At MAX_COMPLETE_RELEASES it budgets 16 MiB per pair on average without
