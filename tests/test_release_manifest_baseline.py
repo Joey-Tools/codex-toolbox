@@ -1611,6 +1611,50 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
                 MODULE._complete_release_identities("owner/repo", "token")
             self.archive_manifest_reader.assert_not_called()
 
+    def test_release_metadata_accepts_current_history_volume(self) -> None:
+        # Reproduce the observed aggregate with synthetic metadata only. This
+        # preflight test does not claim that real historical archives were read.
+        observed_count = 188
+        observed_total = 271_793_148
+        quotient, remainder = divmod(observed_total, observed_count)
+        releases = [
+            complete_release(
+                f"{index + 1:02x}" * 20,
+                archive_size=quotient + (index < remainder),
+            )
+            for index in range(observed_count)
+        ]
+        with mock.patch.object(MODULE, "_iter_github_releases", return_value=releases):
+            identities = MODULE._complete_release_identities("owner/repo", "token")
+
+        self.assertEqual(len(identities), observed_count)
+        self.assertEqual(sum(item.archive_size for item in identities), observed_total)
+        self.archive_manifest_reader.assert_not_called()
+
+    def test_release_metadata_compressed_history_budget_is_finite_and_inclusive(
+        self,
+    ) -> None:
+        expected_limit = 1024 * 1024 * 1024
+        self.assertEqual(MODULE.MAX_RELEASE_ARCHIVE_TOTAL_BYTES, expected_limit)
+        releases = [
+            complete_release(
+                f"{index + 1:02x}" * 20,
+                archive_size=MODULE.MAX_RELEASE_ARCHIVE_BYTES,
+            )
+            for index in range(16)
+        ]
+        with mock.patch.object(MODULE, "_iter_github_releases", return_value=releases):
+            identities = MODULE._complete_release_identities("owner/repo", "token")
+        self.assertEqual(sum(item.archive_size for item in identities), expected_limit)
+
+        overflow = releases + [complete_release("ff" * 20, archive_size=1)]
+        with (
+            mock.patch.object(MODULE, "_iter_github_releases", return_value=overflow),
+            self.assertRaisesRegex(MODULE.ValidationError, "compressed byte total"),
+        ):
+            MODULE._complete_release_identities("owner/repo", "token")
+        self.archive_manifest_reader.assert_not_called()
+
     def test_release_baseline_accepts_verified_release_history(self) -> None:
         self.write_manifest(manifest("keep"))
         baseline_sha = self.commit("Add manifest")
