@@ -8422,6 +8422,13 @@ class SchedulerDoctorFixtureTests(unittest.TestCase):
 
 class SchedulerDoctorTests(unittest.TestCase):
     def setUp(self) -> None:
+        # These offline fixtures test scheduling/state, not native credentials.
+        # Exact-account transport is covered independently by the engine suite.
+        self.account_patch = mock.patch.object(
+            MODULE, "_scheduled_github_account", side_effect=contextlib.nullcontext
+        )
+        self.account_patch.start()
+        self.addCleanup(self.account_patch.stop)
         self.tmpdir = _scheduler_doctor_test_temporary_directory()
         self.addCleanup(self.tmpdir.cleanup)
         self.root = Path(os.path.realpath(self.tmpdir.name))
@@ -10365,6 +10372,30 @@ class SchedulerDoctorTests(unittest.TestCase):
                     report = MODULE.scheduler_report(self.home, "macos")
 
                 self.assertEqual(report.migration_needed, expected_migration)
+
+    def test_run_scheduled_account_failure_is_recorded_before_install(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_scheduled_github_account",
+                side_effect=MODULE.SyncError(
+                    "account missing", code="gh-account-unavailable"
+                ),
+            ),
+            mock.patch.object(MODULE, "install_from_github") as install,
+            self.assertRaises(MODULE.SyncError),
+        ):
+            MODULE.run_scheduled(
+                self.home,
+                "owner/public-sync",
+                mode="public",
+                base_repo="owner/ignored",
+                owner="private",
+            )
+        install.assert_not_called()
+        state = MODULE._read_scheduler_runtime_state(self.home)
+        self.assertFalse(state["success"])
+        self.assertEqual(state["failure_code"], "gh-account-unavailable")
 
     def test_run_scheduled_persists_success_state(self) -> None:
         with (

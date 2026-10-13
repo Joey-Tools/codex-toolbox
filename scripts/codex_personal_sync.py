@@ -302,6 +302,36 @@ MAX_MANIFEST_ACTIVE_LINKS = min(MAX_PENDING_LINK_RECORDS, MAX_PENDING_LINK_CLAIM
 DEFAULT_RELEASE_REPO_ENV = "CODEX_PERSONAL_SYNC_DEFAULT_REPO"
 DEFAULT_BASE_RELEASE_REPO_ENV = "CODEX_PERSONAL_SYNC_BASE_REPO"
 DEFAULT_PUBLIC_RELEASE_REPO = "Joey-Tools/codex-toolbox"
+SCHEDULED_GITHUB_LOGIN = "JoeyTeng-Codex"
+SCHEDULED_GITHUB_USER_ID = 263204028
+MAX_GH_TOKEN_BYTES = 4096
+GH_AUTH_ENVIRONMENT_KEYS = frozenset(
+    {
+        "GH_CONFIG_DIR",
+        "GH_HOST",
+        "GH_PATH",
+        "GH_REPO",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_DEBUG",
+        "DEBUG",
+        "GH_FORCE_TTY",
+        "GH_PAGER",
+        "PAGER",
+        "GH_MDWIDTH",
+        "GLAMOUR_STYLE",
+        "NO_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "GH_COLOR_LABELS",
+        "GH_ACCESSIBLE_COLORS",
+        "GH_ACCESSIBLE_PROMPTER",
+        "GH_SPINNER_DISABLED",
+        "GH_TELEMETRY",
+    }
+)
 PUBLIC_OWNER = "public"
 OPTIONAL_PUBLIC_TARGETS = frozenset({PurePosixPath("AGENTS.md")})
 SYNC_INTERNAL_TARGET = PurePosixPath("personal-sync")
@@ -9297,6 +9327,11 @@ _ACTIVE_SCHEDULER_ATTEMPT: ContextVar[SchedulerAttemptGuard | None] = ContextVar
 )
 _GH_OPERATION_DEADLINE: ContextVar[float | None] = ContextVar(
     "gh_operation_deadline",
+    default=None,
+)
+
+_SCHEDULED_GH_TOKEN: ContextVar[str | None] = ContextVar(
+    "scheduled_gh_token",
     default=None,
 )
 
@@ -55412,6 +55447,146 @@ def _run_bounded_gh_process(
     label: str,
     stdout_sink: Callable[[bytes], None] | None = None,
     stdout_overflow_message: str | None = None,
+    env: dict[str, str] | None = None,
+) -> _GhProcessResult:
+    credential = _SCHEDULED_GH_TOKEN.get()
+    if credential is not None:
+        # All sync API calls are core github.com operations, never aliases,
+        # extensions, auth mutations, or a caller-selected host/environment.
+        if (
+            env is not None
+            or len(args) < 2
+            or args[0] != "api"
+            or not (args[1] == "user" or args[1].startswith("repos/"))
+            or ":" in args[1]
+        ):
+            raise SyncError("scheduled gh command is outside the API contract")
+        if any(argument == "-h" or argument.startswith("--hostname") for argument in args):
+            raise SyncError("scheduled gh command must not override its host")
+        env = _github_account_environment()
+        env["GH_HOST"] = "github.com"
+        env["GH_TOKEN"] = credential
+        args = [*args, "--hostname", "github.com"]
+    try:
+        result = _run_bounded_gh_process_impl(
+            args,
+            deadline=deadline,
+            stdout_limit=stdout_limit,
+            stderr_limit=stderr_limit,
+            label=label,
+            stdout_sink=stdout_sink,
+            stdout_overflow_message=stdout_overflow_message,
+            env=env,
+        )
+    except SyncError as error:
+        if credential is None:
+            raise
+        raise SyncError(
+            str(error).replace(credential, "[redacted]"), code=error.code
+        ) from None
+    if credential is not None:
+        secret = credential.encode("ascii")
+        if secret in result.stdout:
+            raise SyncError("scheduled gh stdout exposed its credential")
+        result = replace(result, stderr=result.stderr.replace(secret, b"[redacted]"))
+    return result
+
+
+def _github_account_environment() -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in GH_AUTH_ENVIRONMENT_KEYS
+    }
+    env["GH_PROMPT_DISABLED"] = "1"
+    env["GH_NO_UPDATE_NOTIFIER"] = "1"
+    env["GH_NO_EXTENSION_UPDATE_NOTIFIER"] = "1"
+    env["GH_TELEMETRY"] = "false"
+    return env
+
+
+@contextlib.contextmanager
+def _scheduled_github_account():
+    # Use the native global account pool. Do not persist, export to the parent
+    # environment, switch the active account, or fall back to that account.
+    with _gh_operation_deadline() as deadline:
+        try:
+            resolved = _run_bounded_gh_process(
+                [
+                    "auth",
+                    "token",
+                    "--hostname",
+                    "github.com",
+                    "--user",
+                    SCHEDULED_GITHUB_LOGIN,
+                ],
+                deadline=deadline,
+                stdout_limit=MAX_GH_TOKEN_BYTES,
+                stderr_limit=MAX_GH_STDERR_BYTES,
+                label="scheduled GitHub account lookup",
+                env=_github_account_environment(),
+            )
+        except SyncError:
+            raise SyncError(
+                "scheduled GitHub account lookup failed", code="gh-account-unavailable"
+            ) from None
+        raw = resolved.stdout
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
+        if raw.endswith(b"\r"):
+            raw = raw[:-1]
+        if (
+            resolved.returncode != 0
+            or not raw
+            or any(byte < 33 or byte > 126 for byte in raw)
+        ):
+            raise SyncError(
+                "scheduled GitHub account token is unavailable or invalid",
+                code="gh-account-unavailable",
+            )
+        credential = raw.decode("ascii")
+        binding = _SCHEDULED_GH_TOKEN.set(credential)
+        try:
+            try:
+                identity = _run_gh_json(["api", "user"])
+            except SyncError:
+                raise SyncError(
+                    "scheduled GitHub account identity could not be verified",
+                    code="gh-account-unverifiable",
+                ) from None
+            if (
+                not isinstance(identity, dict)
+                or identity.get("login") != SCHEDULED_GITHUB_LOGIN
+                or type(identity.get("id")) is not int
+                or identity["id"] != SCHEDULED_GITHUB_USER_ID
+            ):
+                raise SyncError(
+                    "scheduled GitHub account identity does not match the configured account",
+                    code="gh-account-mismatch",
+                )
+        except BaseException:
+            _SCHEDULED_GH_TOKEN.reset(binding)
+            raise
+    try:
+        yield
+    except SyncError as error:
+        raise SyncError(
+            str(error).replace(credential, "[redacted]"), code=error.code
+        ) from None
+    finally:
+        _SCHEDULED_GH_TOKEN.reset(binding)
+
+
+def _run_bounded_gh_process_impl(
+    args: list[str],
+    *,
+    deadline: float,
+    stdout_limit: int,
+    stderr_limit: int,
+    label: str,
+    stdout_sink: Callable[[bytes], None] | None = None,
+    stdout_overflow_message: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> _GhProcessResult:
     if stdout_limit < 0 or stderr_limit < 0:
         raise SyncError("gh process output limits must be nonnegative")
@@ -55425,6 +55600,7 @@ def _run_bounded_gh_process(
             ["gh", *args],
             deadline=deadline,
             process_label=label,
+            env=env,
             unavailable_code="gh-command-unavailable",
             unavailable_message=(
                 "GitHub CLI `gh` is not available; install it or make sure it is "
@@ -67490,16 +67666,17 @@ def run_scheduled(
     try:
         guard_token = _ACTIVE_SCHEDULER_ATTEMPT.set(guard)
         try:
-            if mode == "public":
-                install_from_github(repo, home, dry_run=False)
-            else:
-                install_private_from_github(
-                    repo,
-                    home,
-                    base_repo=base_repo,
-                    owner=owner,
-                    dry_run=False,
-                )
+            with _scheduled_github_account():
+                if mode == "public":
+                    install_from_github(repo, home, dry_run=False)
+                else:
+                    install_private_from_github(
+                        repo,
+                        home,
+                        base_repo=base_repo,
+                        owner=owner,
+                        dry_run=False,
+                    )
         finally:
             _ACTIVE_SCHEDULER_ATTEMPT.reset(guard_token)
         release_trees = _capture_scheduler_release_trees(
