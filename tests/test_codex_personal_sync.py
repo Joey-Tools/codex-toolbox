@@ -14401,5 +14401,341 @@ while True:
         )
 
 
+class ScheduledGithubAccountTests(unittest.TestCase):
+    # Catalog joey-private-v3: access-a is selected, access-b is ambient.
+    selected_token = "codex_synth_v1_access_a"
+    ambient_token = "codex_synth_v1_access_b"
+
+    def resolved(self, *, identity=None):
+        if identity is None:
+            identity = {"login": "JoeyTeng-Codex", "id": 263204028}
+        return [
+            MODULE._GhProcessResult(0, (self.selected_token + "\n").encode(), b""),
+            MODULE._GhProcessResult(0, json.dumps(identity).encode(), b""),
+        ]
+
+    def test_exact_account_ignores_ambient_auth_and_does_not_switch(self) -> None:
+        ambient = {key: self.ambient_token for key in MODULE.GH_AUTH_ENVIRONMENT_KEYS}
+        ambient["GH_PROMPT_DISABLED"] = "0"
+        with (
+            mock.patch.dict(MODULE.os.environ, ambient),
+            mock.patch.object(
+                MODULE, "_run_bounded_gh_process_impl", side_effect=self.resolved()
+            ) as run,
+        ):
+            before = dict(MODULE.os.environ)
+            with MODULE._scheduled_github_account():
+                self.assertEqual(MODULE._SCHEDULED_GH_TOKEN.get(), self.selected_token)
+            self.assertEqual(dict(MODULE.os.environ), before)
+        self.assertIsNone(MODULE._SCHEDULED_GH_TOKEN.get())
+        lookup, identity = run.call_args_list
+        self.assertEqual(
+            lookup.args[0],
+            ["auth", "token", "--hostname", "github.com", "--user", "JoeyTeng-Codex"],
+        )
+        self.assertTrue(
+            (MODULE.GH_AUTH_ENVIRONMENT_KEYS - {"GH_TELEMETRY"}).isdisjoint(
+                lookup.kwargs["env"]
+            )
+        )
+        self.assertEqual(lookup.kwargs["env"]["GH_PROMPT_DISABLED"], "1")
+        self.assertEqual(identity.args[0], ["api", "user", "--hostname", "github.com"])
+        self.assertEqual(identity.kwargs["env"]["GH_TOKEN"], self.selected_token)
+        self.assertEqual(identity.kwargs["env"]["GH_HOST"], "github.com")
+        self.assertTrue(
+            (MODULE.GH_AUTH_ENVIRONMENT_KEYS - {"GH_TOKEN", "GH_HOST", "GH_TELEMETRY"}).isdisjoint(
+                identity.kwargs["env"]
+            )
+        )
+        self.assertEqual(lookup.kwargs["deadline"], identity.kwargs["deadline"])
+        self.assertEqual(lookup.kwargs["stdout_limit"], MODULE.MAX_GH_TOKEN_BYTES)
+
+    def test_documented_output_and_debug_overrides_cannot_reach_scheduled_children(self) -> None:
+        overrides = {
+            "DEBUG": "true",
+            "GH_DEBUG": "api",
+            "GH_FORCE_TTY": "80",
+            "GH_PAGER": "fixture-pager",
+            "PAGER": "fixture-pager",
+            "GH_MDWIDTH": "40",
+            "GLAMOUR_STYLE": "dark",
+            "NO_COLOR": "1",
+            "CLICOLOR": "1",
+            "CLICOLOR_FORCE": "1",
+            "GH_COLOR_LABELS": "1",
+            "GH_ACCESSIBLE_COLORS": "1",
+            "GH_ACCESSIBLE_PROMPTER": "1",
+            "GH_SPINNER_DISABLED": "1",
+            "GH_TELEMETRY": "log",
+            "GH_NO_UPDATE_NOTIFIER": "0",
+            "GH_NO_EXTENSION_UPDATE_NOTIFIER": "0",
+        }
+        with (
+            mock.patch.dict(MODULE.os.environ, overrides),
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_gh_process_impl",
+                side_effect=[*self.resolved(), MODULE._GhProcessResult(0, b"[]", b"")],
+            ) as run,
+        ):
+            before = dict(MODULE.os.environ)
+            with MODULE._scheduled_github_account():
+                self.assertEqual(MODULE._run_gh_json(["api", "repos/owner/repo/releases"]), [])
+            self.assertEqual(dict(MODULE.os.environ), before)
+        self.assertEqual(run.call_count, 3)
+        forced = {
+            "GH_TELEMETRY": "false",
+            "GH_NO_UPDATE_NOTIFIER": "1",
+            "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
+        }
+        for call in run.call_args_list:
+            environment = call.kwargs["env"]
+            self.assertTrue((overrides.keys() - forced.keys()).isdisjoint(environment))
+            for key, value in forced.items():
+                self.assertEqual(environment[key], value)
+
+    def test_standard_global_pool_roots_are_preserved_for_scheduled_children(self) -> None:
+        # Mocked child calls only: no alternate real HOME or account pool is created.
+        roots = {"HOME": "/fixture/native-home", "XDG_CONFIG_HOME": "/fixture/global-config"}
+        with (
+            mock.patch.dict(MODULE.os.environ, roots | {"GH_CONFIG_DIR": "/fixture/isolated-config"}),
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_gh_process_impl",
+                side_effect=[*self.resolved(), MODULE._GhProcessResult(0, b"[]", b"")],
+            ) as run,
+        ):
+            before = dict(MODULE.os.environ)
+            with MODULE._scheduled_github_account():
+                self.assertEqual(MODULE._run_gh_json(["api", "repos/owner/repo/releases"]), [])
+            self.assertEqual(dict(MODULE.os.environ), before)
+        self.assertEqual(run.call_count, 3)
+        for call in run.call_args_list:
+            environment = call.kwargs["env"]
+            self.assertNotIn("GH_CONFIG_DIR", environment)
+            for key, value in roots.items():
+                self.assertEqual(environment[key], value)
+        self.assertEqual(run.call_args_list[0].args[0][-2:], ["--user", "JoeyTeng-Codex"])
+        self.assertEqual(run.call_args_list[1].args[0], ["api", "user", "--hostname", "github.com"])
+        self.assertEqual(run.call_args_list[2].kwargs["env"]["GH_TOKEN"], self.selected_token)
+        self.assertIsNone(MODULE._SCHEDULED_GH_TOKEN.get())
+
+    def test_missing_or_invalid_token_never_uses_active_account(self) -> None:
+        for raw, status in [
+            (b"", 0),
+            (b"\n", 0),
+            (b"one two", 0),
+            (b"one\ntwo", 0),
+            (b"\xff", 0),
+            (self.selected_token.encode(), 1),
+        ]:
+            with (
+                self.subTest(raw=raw, status=status),
+                mock.patch.object(
+                    MODULE,
+                    "_run_bounded_gh_process_impl",
+                    return_value=MODULE._GhProcessResult(
+                        status, raw, self.selected_token.encode()
+                    ),
+                ) as run,
+            ):
+                with self.assertRaises(MODULE.SyncError) as raised:
+                    with MODULE._scheduled_github_account():
+                        self.fail("invalid token admitted")
+                self.assertEqual(raised.exception.code, "gh-account-unavailable")
+                self.assertNotIn(self.selected_token, str(raised.exception))
+                run.assert_called_once()
+                self.assertIsNone(MODULE._SCHEDULED_GH_TOKEN.get())
+
+    def test_lookup_failure_redacts_all_transport_detail(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_gh_process_impl",
+                side_effect=MODULE.SyncError(
+                    self.selected_token, code="gh-output-limit"
+                ),
+            ),
+            self.assertRaises(MODULE.SyncError) as raised,
+        ):
+            with MODULE._scheduled_github_account():
+                self.fail("lookup failure admitted")
+        self.assertEqual(raised.exception.code, "gh-account-unavailable")
+        self.assertNotIn(self.selected_token, str(raised.exception))
+        self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_account_identity_requires_exact_login_and_numeric_id(self) -> None:
+        for identity in [
+            {"login": "hoteng_cisco", "id": 263204028},
+            {"login": "JoeyTeng-Codex", "id": 12524680},
+            {"login": "JoeyTeng-Codex", "id": "263204028"},
+            {"login": "JoeyTeng-Codex", "id": True},
+            [],
+        ]:
+            with (
+                self.subTest(identity=identity),
+                mock.patch.object(
+                    MODULE,
+                    "_run_bounded_gh_process_impl",
+                    side_effect=self.resolved(identity=identity),
+                ),
+                self.assertRaises(MODULE.SyncError) as raised,
+            ):
+                with MODULE._scheduled_github_account():
+                    self.fail("wrong account admitted")
+            self.assertEqual(raised.exception.code, "gh-account-mismatch")
+            self.assertIsNone(MODULE._SCHEDULED_GH_TOKEN.get())
+
+    def test_unverifiable_identity_is_not_a_mismatch_or_success(self) -> None:
+        for result in [
+            MODULE._GhProcessResult(1, b"", self.selected_token.encode()),
+            MODULE._GhProcessResult(0, b"not-json", b""),
+        ]:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_run_bounded_gh_process_impl",
+                    side_effect=[self.resolved()[0], result],
+                ),
+                self.assertRaises(MODULE.SyncError) as raised,
+            ):
+                with MODULE._scheduled_github_account():
+                    self.fail("unverified account admitted")
+            self.assertEqual(raised.exception.code, "gh-account-unverifiable")
+            self.assertNotIn(self.selected_token, str(raised.exception))
+            self.assertIsNone(MODULE._SCHEDULED_GH_TOKEN.get())
+
+    def test_install_failure_redacts_token_and_clears_binding(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE, "_run_bounded_gh_process_impl", side_effect=self.resolved()
+            ),
+            self.assertRaises(MODULE.SyncError) as raised,
+        ):
+            with MODULE._scheduled_github_account():
+                raise MODULE.SyncError(self.selected_token, code="installation-failed")
+        self.assertEqual(raised.exception.code, "installation-failed")
+        self.assertEqual(str(raised.exception), "[redacted]")
+        self.assertTrue(raised.exception.__suppress_context__)
+        self.assertIsNone(MODULE._SCHEDULED_GH_TOKEN.get())
+
+    def test_scoped_metadata_stderr_and_transport_failure_are_redacted(self) -> None:
+        for result in [
+            MODULE._GhProcessResult(1, b"", self.selected_token.encode()),
+            MODULE.SyncError(self.selected_token, code="gh-timeout"),
+        ]:
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_run_bounded_gh_process_impl",
+                    side_effect=[*self.resolved(), result],
+                ),
+                self.assertRaises(MODULE.SyncError) as raised,
+            ):
+                with MODULE._scheduled_github_account():
+                    MODULE._run_gh_json(["api", "repos/owner/repo/releases"])
+            self.assertNotIn(self.selected_token, str(raised.exception))
+            self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_scoped_stdout_credential_is_rejected_before_json_parsing(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_run_bounded_gh_process_impl",
+                side_effect=[
+                    *self.resolved(),
+                    MODULE._GhProcessResult(0, self.selected_token.encode(), b""),
+                ],
+            ),
+            self.assertRaisesRegex(MODULE.SyncError, "stdout exposed"),
+        ):
+            with MODULE._scheduled_github_account():
+                MODULE._run_gh_json(["api", "repos/owner/repo/releases"])
+
+    def test_scoped_commands_reject_alias_auth_and_host_override(self) -> None:
+        with mock.patch.object(
+            MODULE, "_run_bounded_gh_process_impl", side_effect=self.resolved()
+        ) as run:
+            with MODULE._scheduled_github_account():
+                for args in [
+                    ["extension", "run", "other"],
+                    ["auth", "switch"],
+                    ["api", "user", "--hostname", "other"],
+                    ["api", "user", "--hostname=other"],
+                    ["api", "https://other.example/user"],
+                ]:
+                    with self.subTest(args=args), self.assertRaises(MODULE.SyncError):
+                        MODULE._run_gh_process(args)
+                with self.assertRaises(MODULE.SyncError):
+                    MODULE._run_bounded_gh_process(
+                        ["api", "user"],
+                        deadline=time.monotonic() + 1,
+                        stdout_limit=100,
+                        stderr_limit=100,
+                        label="test",
+                        env={},
+                    )
+            self.assertEqual(run.call_count, 2)
+
+    def test_manual_gh_calls_keep_their_existing_environment_behavior(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "_run_bounded_gh_process_impl",
+            return_value=MODULE._GhProcessResult(0, b"{}", b""),
+        ) as run:
+            MODULE._run_gh_json(["api", "user"])
+        self.assertEqual(run.call_args.args[0], ["api", "user"])
+        self.assertIsNone(run.call_args.kwargs["env"])
+
+    def test_native_child_receives_only_selected_token_for_metadata_and_asset(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="scheduled-gh-test.") as root:
+            executable = Path(root) / "gh"
+            executable.write_text(
+                "#!" + sys.executable + "\n"
+                "import json, os, sys\n"
+                "args = sys.argv[1:]\n"
+                "assert not any(k in os.environ for k in ['DEBUG','GH_DEBUG','GH_FORCE_TTY','GH_PAGER','PAGER','GH_MDWIDTH','GLAMOUR_STYLE','NO_COLOR','CLICOLOR','CLICOLOR_FORCE','GH_COLOR_LABELS','GH_ACCESSIBLE_COLORS','GH_ACCESSIBLE_PROMPTER','GH_SPINNER_DISABLED'])\n"
+                "assert os.environ['GH_TELEMETRY'] == 'false'\n"
+                "assert os.environ['GH_NO_UPDATE_NOTIFIER'] == '1' and os.environ['GH_NO_EXTENSION_UPDATE_NOTIFIER'] == '1'\n"
+                "if args == ['auth','token','--hostname','github.com','--user','JoeyTeng-Codex']:\n"
+                "    assert not any(k in os.environ for k in ['GH_CONFIG_DIR','GH_HOST','GH_PATH','GH_REPO','GH_TOKEN','GITHUB_TOKEN','GH_ENTERPRISE_TOKEN','GITHUB_ENTERPRISE_TOKEN','GH_DEBUG'])\n"
+                "    print(os.environ['GH_FIXTURE_SELECTED'])\n"
+                "else:\n"
+                "    assert args[-2:] == ['--hostname','github.com']\n"
+                "    assert os.environ['GH_TOKEN'] == os.environ['GH_FIXTURE_SELECTED']\n"
+                "    assert os.environ['GH_HOST'] == 'github.com'\n"
+                "    assert 'GITHUB_TOKEN' not in os.environ and 'GH_DEBUG' not in os.environ\n"
+                "    if args[1] == 'user': print(json.dumps({'login':'JoeyTeng-Codex','id':263204028}))\n"
+                "    else: sys.stdout.buffer.write(b'verified-asset')\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            ambient = {
+                key: self.ambient_token for key in MODULE.GH_AUTH_ENVIRONMENT_KEYS
+            }
+            ambient.update(
+                PATH=root + os.pathsep + os.environ.get("PATH", ""),
+                GH_FIXTURE_SELECTED=self.selected_token,
+            )
+            chunks = []
+            with mock.patch.dict(MODULE.os.environ, ambient):
+                before = dict(MODULE.os.environ)
+                with MODULE._scheduled_github_account():
+                    result = MODULE._run_bounded_gh_process(
+                        ["api", "repos/owner/repo/releases/assets/1"],
+                        deadline=time.monotonic() + 10,
+                        stdout_limit=1024,
+                        stderr_limit=1024,
+                        label="test asset",
+                        stdout_sink=chunks.append,
+                    )
+                self.assertEqual(dict(MODULE.os.environ), before)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(b"".join(chunks), b"verified-asset")
+            self.assertIsNone(MODULE._SCHEDULED_GH_TOKEN.get())
+
+
 if __name__ == "__main__":
     unittest.main()
