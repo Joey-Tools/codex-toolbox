@@ -69,6 +69,7 @@ MAX_PLANNED_WORKTREES = 250_000
 MAX_GIT_PATHSPEC_ARG_BYTES = 64 * 1024
 MAX_GIT_PATHSPECS_PER_BATCH = 1024
 MAX_GIT_PATHSPEC_BATCHES = 4096
+MAX_CHECKOUT_PAYLOAD_HASH_BATCH = 32
 MAX_GITMODULES_FILE_BYTES = 4 * 1024 * 1024
 MAX_GITMODULES_RETAINED_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_CONFIG_BYTES = 4 * 1024 * 1024
@@ -570,6 +571,34 @@ class CheckoutPayloadEntryReceipt:
     fingerprint: FsFingerprint
     size: int
     content_sha256: str
+
+
+@dataclass
+class PendingCheckoutPayloadHash:
+    relative_parts: tuple[str, ...]
+    expected_object_id: str
+    raw_bytes: bool
+    descriptor: int
+    snapshot_directory: DirectoryEntryLease
+    snapshot_inventory: Optional[DirectoryExactInventoryLease]
+    snapshot_digest: DescriptorBoundDigestFileLease
+    target_descriptor: int
+    live_descriptor: int
+    parent_descriptor: int
+    leaf: bytes
+    parent_chain: tuple[FsFingerprint, ...]
+    named_fingerprint: FsFingerprint
+    opened_fingerprint: FsFingerprint
+    first_content_sha256: str
+    size: int
+
+
+@dataclass
+class CheckoutPayloadSnapshotBatch:
+    directory: DirectoryEntryLease
+    directory_path: Path
+    cleanup: ExitStack = dataclass_field(repr=False, compare=False)
+    names: list[str] = dataclass_field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -2987,6 +3016,7 @@ def run_bounded_bytes(
     directory_absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...] = (),
     file_content_leases: tuple[DescriptorBoundFileLease, ...] = (),
     digest_file_leases: tuple[DescriptorBoundDigestFileLease, ...] = (),
+    inherited_payload_descriptors: tuple[int, ...] = (),
     file_size_limit_bytes: Optional[int] = None,
     executable_snapshot_receipt: Optional[ExecutableSnapshotReceipt] = None,
     git_runtime_receipt: Optional[GitRuntime] = None,
@@ -3022,6 +3052,22 @@ def run_bounded_bytes(
         raise PlanError("descriptor-anchored Git writes require a POSIX runtime")
     if (file_content_leases or digest_file_leases) and not hasattr(os, "pread"):
         raise PlanError("descriptor-bound control-file exec gates require POSIX pread")
+    if len(set(inherited_payload_descriptors)) != len(inherited_payload_descriptors):
+        raise PlanError("inherited payload descriptors contain duplicates")
+    leased_digest_descriptors = {
+        lease.descriptor for lease in digest_file_leases
+    }
+    for descriptor in inherited_payload_descriptors:
+        try:
+            descriptor_stat = os.fstat(descriptor)
+        except OSError as exc:
+            raise PlanError("inherited payload descriptor is not open") from exc
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise PlanError("inherited payload descriptor is not a regular file")
+        if descriptor not in leased_digest_descriptors:
+            raise PlanError(
+                "inherited payload descriptor has no matching digest-file lease"
+            )
     if file_size_limit_bytes is not None and (
         file_size_limit_bytes <= 0 or resource is None
     ):
@@ -3573,6 +3619,7 @@ def run_bounded_bytes(
     if executable_lease is not None:
         inherited_descriptors.add(executable_lease.parent_descriptor)
         inherited_descriptors.add(executable_lease.descriptor)
+    inherited_descriptors.update(inherited_payload_descriptors)
 
     signal_lease = SignalOwnershipLease()
     try:
@@ -3857,6 +3904,7 @@ def read_git_bounded(
     directory_absent_entry_leases: tuple[DirectoryAbsentEntryLease, ...] = (),
     file_content_leases: tuple[DescriptorBoundFileLease, ...] = (),
     digest_file_leases: tuple[DescriptorBoundDigestFileLease, ...] = (),
+    inherited_payload_descriptors: tuple[int, ...] = (),
     file_size_limit_bytes: Optional[int] = None,
 ) -> subprocess.CompletedProcess[bytes]:
     return run_bounded_bytes(
@@ -3876,6 +3924,7 @@ def read_git_bounded(
         directory_absent_entry_leases=directory_absent_entry_leases,
         file_content_leases=file_content_leases,
         digest_file_leases=digest_file_leases,
+        inherited_payload_descriptors=inherited_payload_descriptors,
         file_size_limit_bytes=file_size_limit_bytes,
     )
 
@@ -16697,6 +16746,200 @@ def checkout_payload_blob_id(
     return os.fsdecode(object_id)
 
 
+def checkout_payload_attribute_profiles(
+    checkout_view: CheckoutExecutionView,
+    target_sha: str,
+    entries: tuple[CheckoutTreeEntry, ...],
+) -> dict[tuple[str, ...], tuple[tuple[bytes, bytes], ...]]:
+    """Resolve all target-tree attributes once and retain each complete profile."""
+    if not entries:
+        return {}
+    encoded_paths = bytearray()
+    expected_paths: set[bytes] = set()
+    for tree_entry in entries:
+        raw_path = os.fsencode("/".join(tree_entry.relative_parts))
+        if b"\0" in raw_path:
+            raise PlanError("checkout payload path contains an invalid NUL byte")
+        if len(encoded_paths) + len(raw_path) + 1 > GIT_INPUT_LIMIT_BYTES:
+            raise PlanError("checkout payload attribute query exceeds its input limit")
+        encoded_paths.extend(raw_path)
+        encoded_paths.append(0)
+        expected_paths.add(raw_path)
+    result = read_checkout_execution_view_git(
+        checkout_view,
+        [
+            *source_object_repo_args(checkout_view.common_git_dir),
+            "check-attr",
+            f"--source={target_sha}",
+            "-z",
+            "--stdin",
+            "--all",
+        ],
+        input_bytes=bytes(encoded_paths),
+    )
+    records = bounded_records(
+        result.stdout,
+        "checkout payload attribute profiles",
+        maximum_records=MAX_CHECKOUT_PATHS * 96,
+    )
+    if len(records) % 3:
+        raise PlanError("checkout payload attribute profile result has an invalid shape")
+    profiles: dict[tuple[str, ...], list[tuple[bytes, bytes]]] = {
+        entry.relative_parts: [] for entry in entries
+    }
+    seen: set[tuple[bytes, bytes]] = set()
+    for offset in range(0, len(records), 3):
+        raw_path, attribute, value = records[offset : offset + 3]
+        if raw_path not in expected_paths:
+            raise PlanError("checkout payload attribute profile named an unknown path")
+        relative_parts = tuple(os.fsdecode(part) for part in raw_path.split(b"/"))
+        if relative_parts not in profiles or not attribute:
+            raise PlanError("checkout payload attribute profile has an invalid path")
+        key = (raw_path, attribute)
+        if key in seen:
+            raise PlanError("checkout payload attribute profile repeated an attribute")
+        seen.add(key)
+        profiles[relative_parts].append((attribute, value))
+    return {
+        relative_parts: tuple(sorted(values))
+        for relative_parts, values in profiles.items()
+    }
+
+
+def checkout_payload_blob_ids(
+    checkout_view: CheckoutExecutionView,
+    target_sha: str,
+    pending_hashes: tuple[PendingCheckoutPayloadHash, ...],
+    *,
+    deadline: float,
+) -> tuple[str, ...]:
+    """Hash one bounded same-attribute group through held snapshot descriptors."""
+    if not pending_hashes or len(pending_hashes) > MAX_CHECKOUT_PAYLOAD_HASH_BATCH:
+        raise PlanError("checkout payload hash batch has an invalid size")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise PlanError("checkout payload validation exceeded its shared deadline")
+    representative = "/".join(pending_hashes[0].relative_parts)
+    raw_bytes = pending_hashes[0].raw_bytes
+    if any(item.raw_bytes != raw_bytes for item in pending_hashes):
+        raise PlanError("checkout payload hash batch mixes raw and filtered inputs")
+    args = [
+        *source_object_repo_args(checkout_view.common_git_dir),
+        "hash-object",
+    ]
+    args.append("--no-filters" if raw_bytes else f"--path={representative}")
+    args.extend(("--", *(f"/dev/fd/{item.descriptor}" for item in pending_hashes)))
+    snapshot_directories = (pending_hashes[0].snapshot_directory,)
+    snapshot_inventory = pending_hashes[0].snapshot_inventory
+    if snapshot_inventory is None or any(
+        item.snapshot_directory is not snapshot_directories[0]
+        or item.snapshot_inventory is not snapshot_inventory
+        for item in pending_hashes
+    ):
+        raise PlanError("checkout payload batch has inconsistent snapshot leases")
+    snapshot_digests = tuple(item.snapshot_digest for item in pending_hashes)
+    try:
+        for item in pending_hashes:
+            if item.descriptor != item.snapshot_digest.descriptor:
+                raise PlanError(
+                    "checkout payload descriptor does not match its digest lease"
+                )
+            os.lseek(item.descriptor, 0, os.SEEK_SET)
+    except OSError as exc:
+        raise PlanError("cannot rewind a held checkout payload snapshot") from exc
+    result = read_git_bounded(
+        args,
+        stdout_limit=66 * len(pending_hashes),
+        timeout_seconds=remaining,
+        extra_env=checkout_execution_environment(checkout_view, target_sha),
+        directory_identity_leases=checkout_view.directory_leases + snapshot_directories,
+        directory_exact_inventory_leases=(
+            checkout_view.exact_inventory_leases + (snapshot_inventory,)
+        ),
+        directory_absent_entry_leases=checkout_view.absent_entry_leases,
+        file_content_leases=checkout_view.file_leases,
+        digest_file_leases=checkout_view.digest_file_leases + snapshot_digests,
+        inherited_payload_descriptors=tuple(
+            item.descriptor for item in pending_hashes
+        ),
+    )
+    object_ids = result.stdout.splitlines()
+    if len(object_ids) != len(pending_hashes) or any(
+        not re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", object_id)
+        for object_id in object_ids
+    ):
+        raise PlanError("checkout payload hash-object returned invalid object ids")
+    for item in pending_hashes:
+        revalidate_descriptor_bound_digest_file_lease(item.snapshot_digest)
+        revalidate_pending_checkout_payload_live_file(item, deadline)
+    revalidate_directory_exact_inventory_lease(snapshot_inventory)
+    return tuple(os.fsdecode(object_id) for object_id in object_ids)
+
+
+def revalidate_pending_checkout_payload_live_file(
+    pending: PendingCheckoutPayloadHash,
+    deadline: float,
+) -> None:
+    second_digest = read_checkout_payload_file_digest(
+        pending.live_descriptor,
+        pending.size,
+        "checkout payload",
+        deadline,
+    )
+    after = fingerprint_from_stat(os.fstat(pending.live_descriptor))
+    entry_after = fingerprint_from_stat(
+        os.stat(
+            pending.leaf,
+            dir_fd=pending.parent_descriptor,
+            follow_symlinks=False,
+        )
+    )
+    if (
+        pending.opened_fingerprint != after
+        or pending.opened_fingerprint != entry_after
+        or pending.first_content_sha256 != second_digest
+    ):
+        raise PlanError("checkout payload object, policy, or bytes changed")
+    if not os.access(
+        os.fsdecode(os.path.join(*pending.relative_parts)),
+        os.R_OK,
+        dir_fd=pending.target_descriptor,
+        effective_ids=True,
+        follow_symlinks=False,
+    ):
+        raise PlanError("checkout payload access policy denies reading the file")
+    revalidate_checkout_payload_parent(
+        pending.target_descriptor,
+        pending.relative_parts,
+        pending.parent_chain,
+    )
+    final_named = fingerprint_from_stat(
+        os.stat(
+            pending.leaf,
+            dir_fd=pending.parent_descriptor,
+            follow_symlinks=False,
+        )
+    )
+    if final_named != pending.named_fingerprint:
+        raise PlanError("checkout payload path changed during final revalidation")
+
+
+def raw_git_blob_object_id(content: bytes, expected_object_id: str) -> str:
+    """Hash a raw blob header and content without reopening the object pack."""
+    if len(expected_object_id) == 40:
+        digest = hashlib.sha1()
+    elif len(expected_object_id) == 64:
+        digest = hashlib.sha256()
+    else:
+        raise PlanError("checkout payload uses an unsupported object format")
+    digest.update(f"blob {len(content)}\0".encode("ascii"))
+    digest.update(content)
+    observed = digest.hexdigest()
+    if observed != expected_object_id:
+        raise PlanError("checkout symlink payload does not match target blob")
+    return observed
+
+
 def read_checkout_payload_file_digest(
     descriptor: int,
     expected_size: int,
@@ -16729,6 +16972,9 @@ def capture_checkout_payload_entry(
     filemode: bool,
     symlinks: bool,
     deadline: float,
+    pending_hashes: Optional[list[PendingCheckoutPayloadHash]] = None,
+    snapshot_batch: Optional[CheckoutPayloadSnapshotBatch] = None,
+    maximum_payload_size: int = MAX_CHECKOUT_LOGICAL_BYTES,
 ) -> CheckoutPayloadEntryReceipt:
     """Bind one tracked checkout payload to its target blob.
 
@@ -16747,6 +16993,9 @@ def capture_checkout_payload_entry(
     )
     leaf = os.fsencode(tree_entry.relative_parts[-1])
     descriptor = -1
+    pending_snapshot: Optional[
+        tuple[DirectoryEntryLease, DescriptorBoundDigestFileLease]
+    ] = None
     try:
         named = fingerprint_from_stat(
             os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
@@ -16759,30 +17008,17 @@ def capture_checkout_payload_entry(
             first_link = os.fsencode(os.readlink(leaf, dir_fd=parent_descriptor))
             if len(first_link) != tree_entry.size:
                 raise PlanError("checkout symlink payload size does not match target")
+            if len(first_link) > maximum_payload_size:
+                raise PlanError("observed checkout payload exceeds its logical-size safety limit")
             if time.monotonic() >= deadline:
                 raise PlanError("checkout payload validation exceeded its shared deadline")
-            object_input = tempfile.TemporaryFile()
-            try:
-                object_input.write(first_link)
-                object_input.seek(0)
-                object_id = checkout_payload_blob_id(
-                    checkout_view,
-                    target_sha,
-                    tree_entry.relative_parts,
-                    object_input,
-                    raw_bytes=True,
-                    deadline=deadline,
-                )
-            finally:
-                object_input.close()
             second_link = os.fsencode(os.readlink(leaf, dir_fd=parent_descriptor))
             after = fingerprint_from_stat(
                 os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
             )
             if first_link != second_link or named != after:
                 raise PlanError("checkout symlink payload changed during validation")
-            if object_id != tree_entry.object_id:
-                raise PlanError("checkout symlink payload does not match target blob")
+            raw_git_blob_object_id(first_link, tree_entry.object_id)
             content_digest = hashlib.sha256(first_link).hexdigest()
             size = len(first_link)
         else:
@@ -16804,7 +17040,7 @@ def capture_checkout_payload_entry(
                 if executable != (tree_entry.mode == "100755"):
                     raise PlanError("checkout payload executable mode does not match target")
             size = os.fstat(descriptor).st_size
-            if size < 0 or size > MAX_CHECKOUT_LOGICAL_BYTES:
+            if size < 0 or size > maximum_payload_size:
                 raise PlanError("checkout payload exceeds its size safety limit")
             if not os.access(
                 os.fsdecode(os.path.join(*tree_entry.relative_parts)),
@@ -16816,21 +17052,29 @@ def capture_checkout_payload_entry(
                 raise PlanError("checkout payload access policy denies reading the file")
             # Git must hash the exact bounded bytes observed from the selected
             # worktree read, not a second read from a mutable live descriptor.
-            # The owner-private snapshot is content-digested and descriptor-bound
-            # through the same exec gate used for checkout-view control files.
-            snapshot_guard = OwnerPrivateTemporaryDirectory(
-                prefix="submodule-worktree-payload-input."
-            )
-            with ExitStack() as snapshot_cleanup:
-                snapshot_cleanup.callback(snapshot_guard.cleanup)
+            if pending_hashes is not None and snapshot_batch is None:
+                raise PlanError("checkout payload batch has no private snapshot directory")
+            snapshot_guard: Optional[OwnerPrivateTemporaryDirectory] = None
+            if snapshot_batch is None:
+                snapshot_guard = OwnerPrivateTemporaryDirectory(
+                    prefix="submodule-worktree-payload-input."
+                )
                 snapshot_directory = capture_directory_entry_lease(
                     Path(snapshot_guard.name),
                     os.R_OK | os.X_OK,
                     "checkout payload input snapshot directory",
                     parent_mode=os.R_OK | os.X_OK,
                 )
-                snapshot_cleanup.callback(snapshot_directory.close)
+                snapshot_directory_path = Path(snapshot_guard.name)
                 snapshot_name = "payload"
+            else:
+                snapshot_directory = snapshot_batch.directory
+                snapshot_directory_path = snapshot_batch.directory_path
+                snapshot_name = f"payload-{len(snapshot_batch.names):02d}"
+            with ExitStack() as snapshot_cleanup:
+                if snapshot_guard is not None:
+                    snapshot_cleanup.callback(snapshot_guard.cleanup)
+                    snapshot_cleanup.callback(snapshot_directory.close)
                 snapshot_descriptor = os.open(
                     snapshot_name,
                     os.O_WRONLY
@@ -16881,17 +17125,21 @@ def capture_checkout_payload_entry(
                 os.fchmod(snapshot_descriptor, 0o400)
                 os.fsync(snapshot_descriptor)
                 close_snapshot_writer()
-                snapshot_inventory = capture_directory_exact_inventory_lease(
-                    snapshot_directory,
-                    (snapshot_name,),
-                    "checkout payload input snapshot inventory",
+                snapshot_inventory = (
+                    capture_directory_exact_inventory_lease(
+                        snapshot_directory,
+                        (snapshot_name,),
+                        "checkout payload input snapshot inventory",
+                    )
+                    if snapshot_batch is None
+                    else None
                 )
                 snapshot_read_descriptor, snapshot_binding, snapshot_content = (
                     open_bound_regular_file_at(
                         snapshot_directory.descriptor,
                         snapshot_name,
-                        Path(snapshot_guard.name) / snapshot_name,
-                        maximum_bytes=MAX_CHECKOUT_LOGICAL_BYTES,
+                        snapshot_directory_path / snapshot_name,
+                        maximum_bytes=maximum_payload_size,
                         mode=os.R_OK,
                         purpose="checkout payload input snapshot",
                         retain_content=False,
@@ -16915,38 +17163,103 @@ def capture_checkout_payload_entry(
                     raise PlanError(
                         "checkout payload input snapshot differs from captured bytes"
                     )
-                input_stream = os.fdopen(os.dup(snapshot_read_descriptor), "rb")
-                snapshot_cleanup.callback(input_stream.close)
-                object_id = checkout_payload_blob_id(
-                    checkout_view,
-                    target_sha,
-                    tree_entry.relative_parts,
-                    input_stream,
-                    raw_bytes=tree_entry.mode == "120000",
-                    deadline=deadline,
-                    snapshot_directory_lease=snapshot_directory,
-                    snapshot_inventory_lease=snapshot_inventory,
-                    snapshot_digest_lease=snapshot_digest_lease,
-                )
+                if pending_hashes is None:
+                    assert snapshot_inventory is not None
+                    input_stream = os.fdopen(os.dup(snapshot_read_descriptor), "rb")
+                    snapshot_cleanup.callback(input_stream.close)
+                    object_id = checkout_payload_blob_id(
+                        checkout_view,
+                        target_sha,
+                        tree_entry.relative_parts,
+                        input_stream,
+                        raw_bytes=tree_entry.mode == "120000",
+                        deadline=deadline,
+                        snapshot_directory_lease=snapshot_directory,
+                        snapshot_inventory_lease=snapshot_inventory,
+                        snapshot_digest_lease=snapshot_digest_lease,
+                    )
+                else:
+                    assert snapshot_batch is not None
+                    snapshot_batch.names.append(snapshot_name)
+                    cleanup = snapshot_cleanup.pop_all()
+                    snapshot_batch.cleanup.callback(cleanup.close)
+                    pending_snapshot = (snapshot_directory, snapshot_digest_lease)
                 revalidate_descriptor_bound_digest_file_lease(
                     snapshot_digest_lease
                 )
-                revalidate_directory_exact_inventory_lease(snapshot_inventory)
-            second_digest = read_checkout_payload_file_digest(
-                descriptor,
-                size,
-                "checkout payload",
-                deadline,
+                if snapshot_inventory is not None:
+                    revalidate_directory_exact_inventory_lease(snapshot_inventory)
+            if pending_hashes is None:
+                second_digest = read_checkout_payload_file_digest(
+                    descriptor,
+                    size,
+                    "checkout payload",
+                    deadline,
+                )
+                after = fingerprint_from_stat(os.fstat(descriptor))
+                entry_after = fingerprint_from_stat(
+                    os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
+                )
+                if (
+                    opened != after
+                    or opened != entry_after
+                    or first_digest != second_digest
+                ):
+                    raise PlanError("checkout payload object, policy, or bytes changed")
+                if object_id != tree_entry.object_id:
+                    raise PlanError("checkout payload bytes do not match target blob")
+                if not os.access(
+                    os.fsdecode(os.path.join(*tree_entry.relative_parts)),
+                    os.R_OK,
+                    dir_fd=target_descriptor,
+                    effective_ids=True,
+                    follow_symlinks=False,
+                ):
+                    raise PlanError(
+                        "checkout payload access policy denies reading the file"
+                    )
+                content_digest = second_digest
+            else:
+                if snapshot_batch is None or pending_snapshot is None:
+                    raise PlanError("checkout payload snapshot batch is incomplete")
+                content_digest = first_digest
+                snapshot_directory, snapshot_digest_lease = pending_snapshot
+                pending_hashes.append(
+                    PendingCheckoutPayloadHash(
+                        relative_parts=tree_entry.relative_parts,
+                        expected_object_id=tree_entry.object_id,
+                        raw_bytes=tree_entry.mode == "120000",
+                        descriptor=snapshot_digest_lease.descriptor,
+                        snapshot_directory=snapshot_directory,
+                        snapshot_inventory=None,
+                        snapshot_digest=snapshot_digest_lease,
+                        target_descriptor=target_descriptor,
+                        live_descriptor=descriptor,
+                        parent_descriptor=parent_descriptor,
+                        leaf=leaf,
+                        parent_chain=parent_chain,
+                        named_fingerprint=named,
+                        opened_fingerprint=opened,
+                        first_content_sha256=first_digest,
+                        size=size,
+                    )
+                )
+                snapshot_batch.cleanup.callback(os.close, descriptor)
+                snapshot_batch.cleanup.callback(os.close, parent_descriptor)
+                descriptor = -1
+                parent_descriptor = -1
+        if pending_hashes is None:
+            revalidate_checkout_payload_parent(
+                target_descriptor,
+                tree_entry.relative_parts,
+                parent_chain,
             )
-            after = fingerprint_from_stat(os.fstat(descriptor))
-            entry_after = fingerprint_from_stat(
+            final_named = fingerprint_from_stat(
                 os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
             )
-            if opened != after or opened != entry_after or first_digest != second_digest:
-                raise PlanError("checkout payload object, policy, or bytes changed")
-            if object_id != tree_entry.object_id:
-                raise PlanError("checkout payload bytes do not match target blob")
-            if not os.access(
+            if final_named != named:
+                raise PlanError("checkout payload path changed during final revalidation")
+            if named.kind == stat.S_IFREG and not os.access(
                 os.fsdecode(os.path.join(*tree_entry.relative_parts)),
                 os.R_OK,
                 dir_fd=target_descriptor,
@@ -16954,25 +17267,6 @@ def capture_checkout_payload_entry(
                 follow_symlinks=False,
             ):
                 raise PlanError("checkout payload access policy denies reading the file")
-            content_digest = second_digest
-        revalidate_checkout_payload_parent(
-            target_descriptor,
-            tree_entry.relative_parts,
-            parent_chain,
-        )
-        final_named = fingerprint_from_stat(
-            os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
-        )
-        if final_named != named:
-            raise PlanError("checkout payload path changed during final revalidation")
-        if named.kind == stat.S_IFREG and not os.access(
-            os.fsdecode(os.path.join(*tree_entry.relative_parts)),
-            os.R_OK,
-            dir_fd=target_descriptor,
-            effective_ids=True,
-            follow_symlinks=False,
-        ):
-            raise PlanError("checkout payload access policy denies reading the file")
         return CheckoutPayloadEntryReceipt(
             relative_parts=tree_entry.relative_parts,
             mode=tree_entry.mode,
@@ -16995,7 +17289,8 @@ def capture_checkout_payload_entry(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        os.close(parent_descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
 
 
 def capture_checkout_payload_receipt(
@@ -17008,18 +17303,124 @@ def capture_checkout_payload_receipt(
     entries = target_tree_checkout_entries(checkout_view, entry.sha)
     filemode = checkout_file_mode_enabled(checkout_view)
     symlinks = checkout_symlinks_enabled(checkout_view)
+    attribute_profiles = checkout_payload_attribute_profiles(
+        checkout_view,
+        entry.sha,
+        entries,
+    )
+    grouped_entries: dict[
+        tuple[bool, tuple[tuple[bytes, bytes], ...]], list[CheckoutTreeEntry]
+    ] = {}
+    captured_logical_bytes = 0
+    for tree_entry in entries:
+        uses_native_symlink = tree_entry.mode == "120000" and symlinks
+        raw_bytes = tree_entry.mode == "120000" and not symlinks
+        if uses_native_symlink:
+            continue
+        key = (raw_bytes, attribute_profiles[tree_entry.relative_parts])
+        grouped_entries.setdefault(key, []).append(tree_entry)
+    captured_receipts: dict[tuple[str, ...], CheckoutPayloadEntryReceipt] = {}
+    for (_raw_bytes, _profile), group in grouped_entries.items():
+        for offset in range(0, len(group), MAX_CHECKOUT_PAYLOAD_HASH_BATCH):
+            batch_entries = group[
+                offset : offset + MAX_CHECKOUT_PAYLOAD_HASH_BATCH
+            ]
+            pending_hashes: list[PendingCheckoutPayloadHash] = []
+            with ExitStack() as batch_cleanup:
+                snapshot_guard = OwnerPrivateTemporaryDirectory(
+                    prefix="submodule-worktree-payload-batch."
+                )
+                batch_cleanup.callback(snapshot_guard.cleanup)
+                snapshot_directory = capture_directory_entry_lease(
+                    Path(snapshot_guard.name),
+                    os.R_OK | os.X_OK,
+                    "checkout payload input snapshot directory",
+                    parent_mode=os.R_OK | os.X_OK,
+                )
+                batch_cleanup.callback(snapshot_directory.close)
+                snapshot_batch = CheckoutPayloadSnapshotBatch(
+                    directory=snapshot_directory,
+                    directory_path=Path(snapshot_guard.name),
+                    cleanup=batch_cleanup,
+                )
+                staged_receipts: list[CheckoutPayloadEntryReceipt] = []
+                for tree_entry in batch_entries:
+                    receipt = capture_checkout_payload_entry(
+                        target_descriptor,
+                        checkout_view,
+                        entry.sha,
+                        tree_entry,
+                        filemode=filemode,
+                        symlinks=symlinks,
+                        deadline=deadline,
+                        pending_hashes=pending_hashes,
+                        snapshot_batch=snapshot_batch,
+                        maximum_payload_size=(
+                            MAX_CHECKOUT_LOGICAL_BYTES - captured_logical_bytes
+                        ),
+                    )
+                    captured_logical_bytes += receipt.size
+                    if captured_logical_bytes > MAX_CHECKOUT_LOGICAL_BYTES:
+                        raise PlanError(
+                            "observed checkout payload exceeds the "
+                            f"{MAX_CHECKOUT_LOGICAL_BYTES}-byte logical-size safety limit"
+                        )
+                    staged_receipts.append(receipt)
+                if pending_hashes:
+                    snapshot_inventory = capture_directory_exact_inventory_lease(
+                        snapshot_directory,
+                        tuple(snapshot_batch.names),
+                        "checkout payload input snapshot inventory",
+                    )
+                    for pending in pending_hashes:
+                        pending.snapshot_inventory = snapshot_inventory
+                    observed_ids = checkout_payload_blob_ids(
+                        checkout_view,
+                        entry.sha,
+                        tuple(pending_hashes),
+                        deadline=deadline,
+                    )
+                    if len(staged_receipts) != len(pending_hashes):
+                        raise PlanError("checkout payload batch receipt count changed")
+                    for pending, observed_id, receipt in zip(
+                        pending_hashes,
+                        observed_ids,
+                        staged_receipts,
+                    ):
+                        if observed_id != pending.expected_object_id:
+                            raise PlanError(
+                                "checkout payload bytes do not match target blob"
+                            )
+                        captured_receipts[receipt.relative_parts] = receipt
+                else:
+                    for receipt in staged_receipts:
+                        captured_receipts[receipt.relative_parts] = receipt
+
+    # Native symlinks are small raw blobs; verify their Git object header locally.
+    for tree_entry in entries:
+        if tree_entry.mode == "120000" and symlinks:
+            captured_receipts[tree_entry.relative_parts] = capture_checkout_payload_entry(
+                target_descriptor,
+                checkout_view,
+                entry.sha,
+                tree_entry,
+                filemode=filemode,
+                symlinks=symlinks,
+                deadline=deadline,
+                maximum_payload_size=(
+                    MAX_CHECKOUT_LOGICAL_BYTES - captured_logical_bytes
+                ),
+            )
+            captured_logical_bytes += captured_receipts[tree_entry.relative_parts].size
+            if captured_logical_bytes > MAX_CHECKOUT_LOGICAL_BYTES:
+                raise PlanError(
+                    "observed checkout payload exceeds the "
+                    f"{MAX_CHECKOUT_LOGICAL_BYTES}-byte logical-size safety limit"
+                )
     digest = hashlib.sha256()
     logical_bytes = 0
     for tree_entry in entries:
-        receipt = capture_checkout_payload_entry(
-            target_descriptor,
-            checkout_view,
-            entry.sha,
-            tree_entry,
-            filemode=filemode,
-            symlinks=symlinks,
-            deadline=deadline,
-        )
+        receipt = captured_receipts[tree_entry.relative_parts]
         logical_bytes += receipt.size
         if logical_bytes > MAX_CHECKOUT_LOGICAL_BYTES:
             raise PlanError(

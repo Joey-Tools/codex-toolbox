@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 import unittest
 import zlib
@@ -210,6 +211,60 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             str(self.remote),
             str(self.root / "named-standard"),
         )
+
+    def test_bounded_git_rejects_inherited_payload_without_digest_lease(self) -> None:
+        payload = self.root / "unleased-payload"
+        payload.write_bytes(b"fixture\n")
+        descriptor = os.open(payload, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            with self.assertRaisesRegex(
+                MODULE.PlanError,
+                "no matching digest-file lease",
+            ):
+                MODULE.run_bounded_bytes(
+                    ["git", "--version"],
+                    inherited_payload_descriptors=(descriptor,),
+                )
+        finally:
+            os.close(descriptor)
+
+    def test_hash_object_fd_argv_uses_held_snapshot_after_name_replacement(self) -> None:
+        snapshot_directory = self.root / "held-fd-snapshot"
+        snapshot_directory.mkdir()
+        snapshot_path = snapshot_directory / "payload"
+        original_content = b"captured bytes\r\n"
+        replacement_content = b"replacement bytes\n"
+        snapshot_path.write_bytes(original_content)
+        descriptor = os.open(snapshot_path, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            snapshot_path.unlink()
+            snapshot_path.write_bytes(replacement_content)
+            expected = subprocess.run(
+                ["git", "hash-object", "--path=README.md", "--stdin"],
+                cwd=self.remote,
+                input=original_content,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).stdout.strip()
+            observed = subprocess.run(
+                [
+                    "git",
+                    "hash-object",
+                    "--path=README.md",
+                    "--",
+                    f"/dev/fd/{descriptor}",
+                ],
+                cwd=self.remote,
+                pass_fds=(descriptor,),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).stdout.strip()
+            self.assertEqual(observed, expected)
+            self.assertNotEqual(snapshot_path.read_bytes(), original_content)
+        finally:
+            os.close(descriptor)
 
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
@@ -7854,11 +7909,23 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         (self.remote / "crlf.txt").write_bytes(b"line\n")
         (self.remote / "ident.txt").write_bytes(b"$Id$\n")
         (self.remote / "utf16.txt").write_bytes("encoded line\n".encode("utf-16le"))
+        newline_name = "line\nbreak.txt"
+        (self.remote / newline_name).write_bytes(b"newline path payload\r\n")
         executable = self.remote / "executable.sh"
         executable.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
         executable.chmod(0o755)
         (self.remote / "link").symlink_to("README.md")
-        run_git(self.remote, "add", ".gitattributes", "crlf.txt", "ident.txt", "utf16.txt", "executable.sh", "link")
+        run_git(
+            self.remote,
+            "add",
+            ".gitattributes",
+            "crlf.txt",
+            "ident.txt",
+            "utf16.txt",
+            newline_name,
+            "executable.sh",
+            "link",
+        )
         run_git(self.remote, "commit", "-m", "add built-in checkout conversions")
         target_sha = run_git(self.remote, "rev-parse", "HEAD")
         self.fetch_source(self.named_source_git_dir)
@@ -7881,6 +7948,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             (true_target / "utf16.txt").read_bytes(),
             "encoded line\n".encode("utf-16le"),
         )
+        self.assertEqual((true_target / newline_name).read_bytes(), b"newline path payload\r\n")
         self.assertNotEqual(
             (true_target / "utf16.txt").stat().st_size,
             int(run_git(self.remote, "cat-file", "-s", f"{target_sha}:utf16.txt")),
@@ -7919,6 +7987,282 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         self.assertEqual((false_target / "link").read_bytes(), b"README.md")
         self.assertFalse((false_target / "executable.sh").stat().st_mode & 0o111)
         false_plan.close()
+
+    def test_checkout_payload_batch_preserves_path_specific_auto_text_context(self) -> None:
+        paths = ("legacy/lf.txt", "legacy/crlf.txt")
+        run_git(self.remote, "config", "core.autocrlf", "false")
+        (self.remote / "legacy").mkdir()
+        (self.remote / paths[0]).write_bytes(b"legacy LF line\n")
+        (self.remote / paths[1]).write_bytes(b"legacy CRLF line\r\n")
+        run_git(self.remote, "add", *paths)
+        run_git(self.remote, "commit", "-m", "record legacy mixed-EOL blobs")
+        legacy_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+        initial_plan, target_super, target = self.build_single_checkout_plan(
+            "payload-auto-text-profile",
+            legacy_sha,
+        )
+        with redirect_stdout(io.StringIO()):
+            MODULE.apply_sync_plan(initial_plan)
+        initial_plan.close()
+
+        (self.remote / ".gitattributes").write_text(
+            "legacy/*.txt text=auto\n",
+            encoding="ascii",
+        )
+        run_git(self.remote, "add", ".gitattributes")
+        run_git(self.remote, "commit", "-m", "apply auto text to legacy blobs")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        blob_contents = [
+            subprocess.run(
+                ["git", "cat-file", "blob", f"{target_sha}:{path}"],
+                cwd=self.remote,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).stdout
+            for path in paths
+        ]
+        self.assertIn(b"\r\n", blob_contents[1])
+        self.assertNotIn(b"\r\n", blob_contents[0])
+        profiles = [
+            run_git(self.remote, "check-attr", "text", "--", path)
+            .strip()
+            .rsplit(": ", 1)[-1]
+            for path in paths
+        ]
+        self.assertEqual(profiles, ["auto", "auto"])
+        self.fetch_source(self.named_source_git_dir)
+        run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "config",
+            "core.autocrlf",
+            "true",
+        )
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule("custom-lib", "lib", str(self.remote)),
+                    target_sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        self.addCleanup(plan.close)
+        # The plan's dry-run admission must see the old checkout without an
+        # untracked path that the target commit will add. The payload-layer
+        # probe below then installs the exact target attributes bytes.
+        (target / ".gitattributes").write_bytes(b"legacy/*.txt text=auto\n")
+        managed_preflight, checkout_view = self.capture_managed_preflight_resources(
+            self.named_source_git_dir,
+            target,
+            "lib",
+            (legacy_sha, target_sha),
+        )
+        target_descriptor = managed_preflight.target_descriptor
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "checkout payload bytes do not match target blob",
+        ):
+            MODULE.capture_checkout_payload_receipt(
+                plan.entries[0],
+                checkout_view,
+                target_descriptor,
+            )
+
+        # Normalize the target blobs while preserving the managed checkout's
+        # older mixed-EOL index. The two paths still have identical attributes,
+        # but stock path-specific stdin hashes must match their FD batch.
+        for path in paths:
+            (self.remote / path).write_bytes(
+                (self.remote / path).read_bytes().replace(b"\r\n", b"\n")
+            )
+        run_git(self.remote, "add", *paths)
+        run_git(self.remote, "commit", "-m", "normalize auto-text target blobs")
+        normalized_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+        normalized_entry = replace(plan.entries[0], sha=normalized_sha)
+        normalized_preflight, normalized_view = self.capture_managed_preflight_resources(
+            self.named_source_git_dir,
+            target,
+            "lib",
+            (legacy_sha, normalized_sha),
+        )
+        self.assertEqual(
+            normalized_preflight.index_entry_count,
+            managed_preflight.index_entry_count,
+        )
+        normalized_receipt = MODULE.capture_checkout_payload_receipt(
+            normalized_entry,
+            normalized_view,
+            normalized_preflight.target_descriptor,
+        )
+        self.assertEqual(normalized_receipt.entry_count, len(paths) + 2)
+
+        stock_ids: list[str] = []
+        for path in paths:
+            working_bytes = (target / path).read_bytes()
+            stock_hash = subprocess.run(
+                [
+                    "git",
+                    f"--git-dir={normalized_view.common_git_dir}",
+                    "hash-object",
+                    f"--path={path}",
+                    "--stdin",
+                ],
+                cwd=target,
+                input=working_bytes,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={
+                    **os.environ,
+                    **MODULE.checkout_execution_environment(
+                        normalized_view,
+                        normalized_sha,
+                    ),
+                },
+            ).stdout.decode("ascii").strip()
+            target_blob = run_git(
+                self.remote,
+                "rev-parse",
+                f"{normalized_sha}:{path}",
+            )
+            self.assertEqual(stock_hash, target_blob)
+            stock_ids.append(stock_hash)
+        self.assertEqual(len(set(stock_ids)), len(paths))
+
+    def test_checkout_payload_pack_reads_scale_by_bounded_batches(self) -> None:
+        for index in range(12):
+            payload = hashlib.shake_256(f"batch-cost-{index}".encode()).digest(131072)
+            (self.remote / f"bulk-{index:02d}.bin").write_bytes(payload)
+        for index in range(32):
+            (self.remote / f"tiny-{index:02d}.bin").write_bytes(
+                f"tiny fixture {index}\n".encode()
+            )
+        tracked_paths = sorted(
+            path.name
+            for path in self.remote.iterdir()
+            if path.is_file() and path.name != ".git"
+        )
+        run_git(self.remote, "add", *tracked_paths)
+        run_git(self.remote, "commit", "-m", "add bounded payload batch fixture")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+        plan, _target_super, target = self.build_single_checkout_plan(
+            "payload-batch-cost",
+            target_sha,
+        )
+        with redirect_stdout(io.StringIO()):
+            MODULE.apply_sync_plan(plan)
+        managed_preflight, checkout_view = self.capture_managed_preflight_resources(
+            self.named_source_git_dir,
+            target,
+            "lib",
+            (target_sha,),
+        )
+        del managed_preflight
+        pack_leases = [
+            lease
+            for lease in checkout_view.digest_file_leases
+            if lease.binding.purpose.startswith("isolated checkout object pack")
+        ]
+        self.assertEqual(len(pack_leases), 1)
+        self.assertGreaterEqual(pack_leases[0].binding.size, 1_000_000)
+        pack_digest_passes = 0
+        original_revalidate = MODULE.revalidate_descriptor_bound_digest_file_lease
+
+        def count_pack_digest_passes(
+            lease: MODULE.DescriptorBoundDigestFileLease,
+        ) -> None:
+            nonlocal pack_digest_passes
+            if lease.binding.purpose.startswith("isolated checkout object pack"):
+                pack_digest_passes += 1
+            original_revalidate(lease)
+
+        target_descriptor = os.open(
+            target,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+        try:
+            with mock.patch.object(
+                MODULE,
+                "revalidate_descriptor_bound_digest_file_lease",
+                side_effect=count_pack_digest_passes,
+            ):
+                receipt = MODULE.capture_checkout_payload_receipt(
+                    plan.entries[0],
+                    checkout_view,
+                    target_descriptor,
+                )
+        finally:
+            os.close(target_descriptor)
+        self.assertEqual(receipt.entry_count, 45)
+        # Fixed view/attribute probes plus two 32-FD batches stay far below
+        # one full pack digest per file. Child pre-exec checks remain enabled.
+        self.assertLessEqual(pack_digest_passes, 20)
+        plan.close()
+
+    def test_new_checkout_payload_supports_non_utf8_path_bytes(self) -> None:
+        relative_name = os.fsdecode(b"non-utf8-\xff.txt")
+        payload = self.remote / relative_name
+        ascii_control = self.remote / "non-utf8-control.txt"
+        ascii_control.write_bytes(b"filesystem accepts ASCII filenames\n")
+        try:
+            payload.write_bytes(b"byte-preserving checkout path\n")
+        except OSError as exc:
+            if (
+                sys.platform == "darwin"
+                and exc.errno in (errno.EINVAL, errno.EILSEQ, errno.EPERM)
+                and ascii_control.is_file()
+            ):
+                self.skipTest("macOS filesystem rejects non-UTF-8 filenames")
+            raise
+        ascii_control.unlink()
+        run_git(self.remote, "add", "--", relative_name)
+        run_git(self.remote, "commit", "-m", "add non-UTF-8 path bytes")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+        plan, _target_super, target = self.build_single_checkout_plan(
+            "payload-non-utf8-path",
+            target_sha,
+        )
+        with redirect_stdout(io.StringIO()):
+            MODULE.apply_sync_plan(plan)
+        self.assertEqual(
+            (target / relative_name).read_bytes(),
+            b"byte-preserving checkout path\n",
+        )
+        plan.close()
+
+    def test_raw_git_blob_object_id_supports_sha1_and_sha256(self) -> None:
+        content = b"raw symlink target\n"
+        for algorithm in (hashlib.sha1, hashlib.sha256):
+            expected = algorithm(
+                b"blob " + str(len(content)).encode("ascii") + b"\0" + content
+            ).hexdigest()
+            with self.subTest(algorithm=algorithm.__name__):
+                self.assertEqual(
+                    MODULE.raw_git_blob_object_id(content, expected),
+                    expected,
+                )
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "does not match target blob",
+                ):
+                    MODULE.raw_git_blob_object_id(content, "0" * len(expected))
+        with self.assertRaisesRegex(
+            MODULE.PlanError,
+            "unsupported object format",
+        ):
+            MODULE.raw_git_blob_object_id(content, "0" * 39)
 
     def test_checkout_payload_filemode_uses_owner_execute_bit_only(self) -> None:
         executable = self.remote / "owner-executable.sh"
@@ -8045,29 +8389,31 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         persistent_bad = bytearray(expected_bytes)
         persistent_bad[0] ^= 1
         persistent_bad_bytes = bytes(persistent_bad)
-        expected_oid = run_git(
-            self.remote,
-            "rev-parse",
-            f"{self.sha}:README.md",
-        )
         observed_inputs: list[bytes] = []
 
+        original_read_git_bounded = MODULE.read_git_bounded
+
         def transient_expected_input(
-            _checkout_view: MODULE.CheckoutExecutionView,
-            _target_sha: str,
-            _relative_parts: tuple[str, ...],
-            input_stream: io.BufferedIOBase,
-            **_kwargs: object,
-        ) -> str:
-            # Reproduce a same-UID ABA around stdin consumption: the live path
-            # contains bad bytes before and after this call, but expected bytes
-            # exist only while the hash command reads its input stream.
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            descriptors = kwargs.get("inherited_payload_descriptors")
+            if "hash-object" not in args or not descriptors:
+                return original_read_git_bounded(args, **kwargs)
+            # Expected bytes exist only while Git consumes the held snapshot FD.
+            # The live path is restored before the production post-read check.
             payload.write_bytes(expected_bytes)
-            input_stream.seek(0)
-            consumed = input_stream.read()
-            observed_inputs.append(consumed)
-            payload.write_bytes(persistent_bad_bytes)
-            return expected_oid if consumed == expected_bytes else "0" * len(expected_oid)
+            try:
+                result = original_read_git_bounded(args, **kwargs)
+                observed_inputs.extend(
+                    consumed
+                    for descriptor in descriptors
+                    if (consumed := os.pread(descriptor, len(persistent_bad_bytes), 0))
+                    == persistent_bad_bytes
+                )
+            finally:
+                payload.write_bytes(persistent_bad_bytes)
+            return result
 
         original_run = MODULE.run_git_at_directory_descriptor
 
@@ -8088,7 +8434,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         ):
             with mock.patch.object(
                 MODULE,
-                "checkout_payload_blob_id",
+                "read_git_bounded",
                 side_effect=transient_expected_input,
             ):
                 with redirect_stdout(io.StringIO()):

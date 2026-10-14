@@ -112,18 +112,33 @@ bounded streamed bytes and SHA-256 protect content. Timestamps and ordinary
 directory child churn are not mutation signals. Missing, unreadable, unsafe-type,
 replaced, and content-mismatched paths remain distinct failures.
 
-Regular-file bytes are copied to a leased owner-private snapshot. Stock Git hashes
-those exact captured bytes using the target's verified attribute/configuration
-view, admitting built-in text/EOL, ident, and working-tree-encoding conversions
-without executing custom filters. Physical checkout size need not equal logical
-blob size. Symlink blobs use raw link-target bytes, including Git's regular-file
-representation when `core.symlinks=false`. Executable mode follows the owner
+Regular-file bytes are copied to leased owner-private snapshots. Paths with the
+same complete resolved attribute profile are hashed in bounded groups of held
+snapshot descriptors, with one representative logical path selecting that
+profile. Git reads inherited descriptor aliases, not mutable worktree or staging
+leaf names. Every batch retains full private-pack identity/content/access and
+inventory checks; pack validation runs per bounded batch rather than per file.
+This still has batch/profile-dependent cost and the same finite deadline, not a
+claim of constant-cost validation for every repository. The verified target's
+attribute/configuration view admits built-in text/EOL, ident, and working-tree-
+encoding conversions without executing custom filters. Physical checkout size
+need not equal logical blob size. Symlink blobs use raw link-target bytes,
+including Git's regular-file representation when `core.symlinks=false`.
+Executable mode follows the owner
 execute bit when `core.filemode=true`; false preserves Git's platform semantics.
 Gitlinks are validated by their child checkout, not treated as parent file blobs.
 
-Each proof pass retains only a count, observed-byte total, and aggregate digest,
-not a descriptor per tracked path. Existing path-count and logical-byte limits
-apply, observed physical bytes are capped independently, and streamed validation
+Stock `hash-object` normalization remains authoritative. A historical blob that
+was not renormalized after enabling automatic text conversion can remain clean
+to index-aware Git status while hashing to a different normalized blob. This
+helper rejects that mismatch; it does not bypass encoding or normalization
+checks merely because the physical bytes equal a raw target blob.
+
+Each proof pass retains a count, observed-byte total, and aggregate digest;
+snapshot and source-file descriptors are held only for the fixed-size active
+batch, never one descriptor per path for the entire tree. Existing path-count
+and logical-byte limits apply, observed physical bytes are capped independently,
+and streamed validation
 checks the shared deadline. Final validation repeats the proof before publishing
 the checkout receipt. These are point-in-time object/content/policy checks: the
 private snapshot, exec gates, and repeated checks do not prevent every malicious
