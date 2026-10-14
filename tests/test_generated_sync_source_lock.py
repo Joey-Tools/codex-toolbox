@@ -137,6 +137,23 @@ def refresh_digests(receipt: dict) -> None:
     receipt["tree_digest"] = digest(tree)
 
 
+class RepositoryGeneratedSyncPinTests(unittest.TestCase):
+    def test_repository_snapshot_passes_with_default_consumer_pins(self) -> None:
+        # Exercise the production defaults, not a fixture-supplied digest that
+        # could conceal a generated receipt advancing without its consumer pins.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            snapshot_root = Path(temporary_directory).resolve()
+            snapshot_root.chmod(0o700)
+            VERIFIER.verify_generated_mirror(
+                REPO_ROOT,
+                snapshot_root=snapshot_root,
+            )
+            self.assertEqual(
+                (snapshot_root / VERIFIER.RECEIPT_PATH).read_bytes(),
+                (REPO_ROOT / VERIFIER.RECEIPT_PATH).read_bytes(),
+            )
+
+
 class GeneratedSyncSourceLockTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -292,10 +309,18 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
     def test_rejects_previous_canonical_commit_with_matching_receipt_digest(
         self,
     ) -> None:
-        self.receipt["canonical_commit"] = "b78febccb199c38c48cf9a3bd49f151723524e9d"
-        expected = self.write_receipt()
-        with self.assertRaisesRegex(VERIFIER.VerificationError, "canonical_commit"):
-            self.verify(expected)
+        previous_commits = (
+            "b78febccb199c38c48cf9a3bd49f151723524e9d",
+            "110f2df02ee6388835d1eb6635e09e7f838658fb",
+        )
+        for previous_commit in previous_commits:
+            with self.subTest(previous_commit=previous_commit):
+                self.receipt["canonical_commit"] = previous_commit
+                expected = self.write_receipt()
+                with self.assertRaisesRegex(
+                    VERIFIER.VerificationError, "canonical_commit"
+                ):
+                    self.verify(expected)
 
     def test_rejects_canonical_repository_and_mirror_identity_drift(self) -> None:
         changed_values = (
