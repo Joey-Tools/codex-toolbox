@@ -101,6 +101,34 @@ Important details:
 - For nested submodules, read `.gitmodules` and gitlink SHAs from the parent source repo at the target commit.
 - Passing `--work-tree` is useful when a source `.git/modules/<path>` repo exists but its original `core.worktree` points at a deleted worktree.
 
+## Checkout Payload Proof
+
+The final index proof and working-tree payload proof are separate. Git exit zero,
+HEAD, and a valid target index never substitute for actual tracked file content.
+Payload traversal starts at the retained target directory and opens each ancestor
+and regular file without following symlinks. Device/inode/type bind the selected
+object; owner/group/mode plus effective read access protect its access policy;
+bounded streamed bytes and SHA-256 protect content. Timestamps and ordinary
+directory child churn are not mutation signals. Missing, unreadable, unsafe-type,
+replaced, and content-mismatched paths remain distinct failures.
+
+Regular-file bytes are copied to a leased owner-private snapshot. Stock Git hashes
+those exact captured bytes using the target's verified attribute/configuration
+view, admitting built-in text/EOL, ident, and working-tree-encoding conversions
+without executing custom filters. Physical checkout size need not equal logical
+blob size. Symlink blobs use raw link-target bytes, including Git's regular-file
+representation when `core.symlinks=false`. Executable mode follows the owner
+execute bit when `core.filemode=true`; false preserves Git's platform semantics.
+Gitlinks are validated by their child checkout, not treated as parent file blobs.
+
+Each proof pass retains only a count, observed-byte total, and aggregate digest,
+not a descriptor per tracked path. Existing path-count and logical-byte limits
+apply, observed physical bytes are capped independently, and streamed validation
+checks the shared deadline. Final validation repeats the proof before publishing
+the checkout receipt. These are point-in-time object/content/policy checks: the
+private snapshot, exec gates, and repeated checks do not prevent every malicious
+same-UID write after a final check or make stock Git consumption atomic.
+
 ## Failure Modes
 
 ### Missing Source Repo

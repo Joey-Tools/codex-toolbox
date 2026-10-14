@@ -615,6 +615,37 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             "origin",
         )
 
+    def build_single_checkout_plan(
+        self,
+        name: str,
+        sha: str,
+        *,
+        submodule_path: str = "lib",
+    ) -> tuple[MODULE.SyncPlan, Path, Path]:
+        target_super = self.root / name
+        target_super.mkdir()
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule(
+                        "custom-lib",
+                        submodule_path,
+                        str(self.remote),
+                    ),
+                    sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        self.addCleanup(plan.close)
+        return plan, target_super, target_super / submodule_path
+
     def make_shallow_install_receipt(
         self,
         *,
@@ -7564,7 +7595,12 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
         ) -> subprocess.CompletedProcess[bytes]:
             nonlocal live_path_queries
             nonlocal private_path_queries
-            if "ls-tree" in args and "-r" in args and "--full-tree" in args:
+            if (
+                "ls-tree" in args
+                and "-r" in args
+                and "-t" not in args
+                and "--full-tree" in args
+            ):
                 git_dir = next(
                     (value for value in args if value.startswith("--git-dir=")),
                     "",
@@ -7719,6 +7755,403 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
             ),
             registry_before,
         )
+
+    def test_new_checkout_rejects_success_with_target_index_but_missing_payload(
+        self,
+    ) -> None:
+        (self.remote / "PAYLOAD.md").write_text("tracked target bytes\n", encoding="utf-8")
+        run_git(self.remote, "add", "PAYLOAD.md")
+        run_git(self.remote, "commit", "-m", "add checkout payload")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+
+        peer = self.root / "valid-target-index-peer"
+        self.add_managed_worktree(self.named_source_git_dir, peer, target_sha)
+        peer_admin = MODULE.gitdir_file_target(peer)
+        self.assertIsNotNone(peer_admin)
+        assert peer_admin is not None
+        valid_target_index = (peer_admin / "index").read_bytes()
+
+        target_super = self.root / "missing-payload-target"
+        target_super.mkdir()
+        target = target_super / "lib"
+        plan = MODULE.build_sync_plan(
+            root=target_super,
+            common_git_dir=self.named_common_git_dir,
+            source_superproject=None,
+            planned_modules=[
+                (
+                    MODULE.Submodule("custom-lib", "lib", str(self.remote)),
+                    target_sha,
+                )
+            ],
+            depth=1,
+            recursive=False,
+            force_replace_empty=False,
+            fetch_missing=False,
+        )
+        self.addCleanup(plan.close)
+        registry_before = run_git(
+            self.root,
+            f"--git-dir={self.named_source_git_dir}",
+            "worktree",
+            "list",
+            "--porcelain",
+        )
+        original_run = MODULE.run_git_at_directory_descriptor
+        fake_checkout_succeeded = False
+
+        def succeed_without_checkout_payload(
+            args: list[str],
+            directory_descriptor: int,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal fake_checkout_succeeded
+            if "checkout" in args:
+                admin_arg = next(
+                    value for value in args if value.startswith("--git-dir=")
+                )
+                admin_index = Path(admin_arg.removeprefix("--git-dir=")) / "index"
+                self.assertFalse(admin_index.exists())
+                admin_index.write_bytes(valid_target_index)
+                fake_checkout_succeeded = True
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return original_run(args, directory_descriptor, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "run_git_at_directory_descriptor",
+            side_effect=succeed_without_checkout_payload,
+        ):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    MODULE.PlanError,
+                    "tracked checkout payload is missing",
+                ):
+                    MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(fake_checkout_succeeded)
+        self.assertFalse((target / "PAYLOAD.md").exists())
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            run_git(
+                self.root,
+                f"--git-dir={self.named_source_git_dir}",
+                "worktree",
+                "list",
+                "--porcelain",
+            ),
+            registry_before,
+        )
+
+    def test_new_checkout_payload_accepts_builtin_conversions_and_modes(self) -> None:
+        (self.remote / ".gitattributes").write_text(
+            "crlf.txt text eol=crlf\n"
+            "ident.txt ident\n"
+            "utf16.txt working-tree-encoding=UTF-16LE\n",
+            encoding="ascii",
+        )
+        (self.remote / "crlf.txt").write_bytes(b"line\n")
+        (self.remote / "ident.txt").write_bytes(b"$Id$\n")
+        (self.remote / "utf16.txt").write_bytes("encoded line\n".encode("utf-16le"))
+        executable = self.remote / "executable.sh"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        executable.chmod(0o755)
+        (self.remote / "link").symlink_to("README.md")
+        run_git(self.remote, "add", ".gitattributes", "crlf.txt", "ident.txt", "utf16.txt", "executable.sh", "link")
+        run_git(self.remote, "commit", "-m", "add built-in checkout conversions")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        self.fetch_source(self.named_source_git_dir)
+
+        run_git(self.root, f"--git-dir={self.named_source_git_dir}", "config", "core.filemode", "true")
+        run_git(self.root, f"--git-dir={self.named_source_git_dir}", "config", "core.symlinks", "true")
+        true_plan, _true_super, true_target = self.build_single_checkout_plan(
+            "payload-modes-true",
+            target_sha,
+        )
+        with redirect_stdout(io.StringIO()):
+            MODULE.apply_sync_plan(true_plan)
+        self.assertEqual((true_target / "crlf.txt").read_bytes(), b"line\r\n")
+        self.assertNotEqual(
+            (true_target / "crlf.txt").stat().st_size,
+            int(run_git(self.remote, "cat-file", "-s", f"{target_sha}:crlf.txt")),
+        )
+        self.assertRegex((true_target / "ident.txt").read_bytes(), rb"\$Id: [0-9a-f]+ \$\n")
+        self.assertEqual(
+            (true_target / "utf16.txt").read_bytes(),
+            "encoded line\n".encode("utf-16le"),
+        )
+        self.assertNotEqual(
+            (true_target / "utf16.txt").stat().st_size,
+            int(run_git(self.remote, "cat-file", "-s", f"{target_sha}:utf16.txt")),
+        )
+        self.assertTrue((true_target / "executable.sh").stat().st_mode & 0o111)
+        self.assertTrue((true_target / "link").is_symlink())
+        true_plan.close()
+
+        run_git(self.root, f"--git-dir={self.named_source_git_dir}", "config", "core.filemode", "false")
+        run_git(self.root, f"--git-dir={self.named_source_git_dir}", "config", "core.symlinks", "false")
+        false_plan, _false_super, false_target = self.build_single_checkout_plan(
+            "payload-modes-false",
+            target_sha,
+        )
+        original_run = MODULE.run_git_at_directory_descriptor
+
+        def checkout_then_clear_executable_mode(
+            args: list[str],
+            directory_descriptor: int,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            result = original_run(args, directory_descriptor, **kwargs)
+            if "checkout" in args:
+                (false_target / "executable.sh").chmod(0o644)
+            return result
+
+        with mock.patch.object(
+            MODULE,
+            "run_git_at_directory_descriptor",
+            side_effect=checkout_then_clear_executable_mode,
+        ):
+            with redirect_stdout(io.StringIO()):
+                MODULE.apply_sync_plan(false_plan)
+        self.assertTrue((false_target / "link").is_file())
+        self.assertFalse((false_target / "link").is_symlink())
+        self.assertEqual((false_target / "link").read_bytes(), b"README.md")
+        self.assertFalse((false_target / "executable.sh").stat().st_mode & 0o111)
+        false_plan.close()
+
+    def test_checkout_payload_filemode_uses_owner_execute_bit_only(self) -> None:
+        executable = self.remote / "owner-executable.sh"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        executable.chmod(0o755)
+        run_git(self.remote, "add", "owner-executable.sh")
+        run_git(self.remote, "commit", "-m", "add owner executable fixture")
+        target_sha = run_git(self.remote, "rev-parse", "HEAD")
+        run_git(self.remote, "config", "core.filemode", "true")
+        executable.chmod(0o455)
+        try:
+            self.assertIn(
+                "100755 => 100644",
+                run_git(
+                    self.remote,
+                    "diff",
+                    "--summary",
+                    "--",
+                    "owner-executable.sh",
+                ),
+            )
+            run_git(self.remote, "config", "core.filemode", "false")
+            self.assertEqual(
+                run_git(
+                    self.remote,
+                    "diff",
+                    "--summary",
+                    "--",
+                    "owner-executable.sh",
+                ),
+                "",
+            )
+        finally:
+            executable.chmod(0o755)
+            run_git(self.remote, "config", "core.filemode", "true")
+        self.fetch_source(self.named_source_git_dir)
+
+        tree_entry = None
+        for filemode, permissions, should_reject in (
+            (True, 0o500, False),
+            (True, 0o455, True),
+            (False, 0o455, False),
+        ):
+            with self.subTest(
+                filemode=filemode,
+                permissions=oct(permissions),
+            ):
+                run_git(
+                    self.root,
+                    f"--git-dir={self.named_source_git_dir}",
+                    "config",
+                    "core.filemode",
+                    "true" if filemode else "false",
+                )
+                checkout_view = self.capture_checkout_execution_view(
+                    self.named_source_git_dir,
+                    submodule_path="owner-executable",
+                    object_roots=(target_sha,),
+                )
+                if tree_entry is None:
+                    tree_entry = next(
+                        entry
+                        for entry in MODULE.target_tree_checkout_entries(
+                            checkout_view,
+                            target_sha,
+                        )
+                        if entry.relative_parts == ("owner-executable.sh",)
+                    )
+
+                target = self.root / (
+                    f"owner-executable-{filemode}-{permissions:o}"
+                )
+                target.mkdir()
+                payload = target / "owner-executable.sh"
+                payload.write_bytes(executable.read_bytes())
+                payload.chmod(permissions)
+                target_descriptor = os.open(
+                    target,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                )
+                try:
+                    if should_reject:
+                        with self.assertRaisesRegex(
+                            MODULE.PlanError,
+                            "executable mode does not match target",
+                        ):
+                            MODULE.capture_checkout_payload_entry(
+                                target_descriptor,
+                                checkout_view,
+                                target_sha,
+                                tree_entry,
+                                filemode=MODULE.checkout_file_mode_enabled(
+                                    checkout_view
+                                ),
+                                symlinks=False,
+                                deadline=MODULE.time.monotonic()
+                                + MODULE.GIT_ENUMERATION_TIMEOUT_SECONDS,
+                            )
+                    else:
+                        MODULE.capture_checkout_payload_entry(
+                            target_descriptor,
+                            checkout_view,
+                            target_sha,
+                            tree_entry,
+                            filemode=MODULE.checkout_file_mode_enabled(
+                                checkout_view
+                            ),
+                            symlinks=False,
+                            deadline=MODULE.time.monotonic()
+                            + MODULE.GIT_ENUMERATION_TIMEOUT_SECONDS,
+                        )
+                finally:
+                    os.close(target_descriptor)
+                    checkout_view.close()
+
+    def test_new_checkout_payload_hash_input_rejects_transient_expected_bytes(self) -> None:
+        plan, _target_super, target = self.build_single_checkout_plan(
+            "payload-normalization-input-aba",
+            self.sha,
+        )
+        payload = target / "README.md"
+        expected_bytes = (self.remote / "README.md").read_bytes()
+        self.assertTrue(expected_bytes)
+        persistent_bad = bytearray(expected_bytes)
+        persistent_bad[0] ^= 1
+        persistent_bad_bytes = bytes(persistent_bad)
+        expected_oid = run_git(
+            self.remote,
+            "rev-parse",
+            f"{self.sha}:README.md",
+        )
+        observed_inputs: list[bytes] = []
+
+        def transient_expected_input(
+            _checkout_view: MODULE.CheckoutExecutionView,
+            _target_sha: str,
+            _relative_parts: tuple[str, ...],
+            input_stream: io.BufferedIOBase,
+            **_kwargs: object,
+        ) -> str:
+            # Reproduce a same-UID ABA around stdin consumption: the live path
+            # contains bad bytes before and after this call, but expected bytes
+            # exist only while the hash command reads its input stream.
+            payload.write_bytes(expected_bytes)
+            input_stream.seek(0)
+            consumed = input_stream.read()
+            observed_inputs.append(consumed)
+            payload.write_bytes(persistent_bad_bytes)
+            return expected_oid if consumed == expected_bytes else "0" * len(expected_oid)
+
+        original_run = MODULE.run_git_at_directory_descriptor
+
+        def checkout_then_corrupt_payload(
+            args: list[str],
+            directory_descriptor: int,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            result = original_run(args, directory_descriptor, **kwargs)
+            if "checkout" in args:
+                payload.write_bytes(persistent_bad_bytes)
+            return result
+
+        with mock.patch.object(
+            MODULE,
+            "run_git_at_directory_descriptor",
+            side_effect=checkout_then_corrupt_payload,
+        ):
+            with mock.patch.object(
+                MODULE,
+                "checkout_payload_blob_id",
+                side_effect=transient_expected_input,
+            ):
+                with redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(
+                        MODULE.PlanError,
+                        "checkout payload bytes do not match target blob",
+                    ):
+                        MODULE.apply_sync_plan(plan)
+
+        self.assertTrue(observed_inputs)
+        self.assertEqual(observed_inputs, [persistent_bad_bytes])
+        self.assertFalse(target.exists())
+        plan.close()
+
+    def test_new_checkout_final_payload_revalidation_ignores_times_only(self) -> None:
+        cases = ("timestamp", "content", "replacement", "access-policy")
+        original_record = MODULE.record_materialized_shared_ancestors
+        for mutation in cases:
+            with self.subTest(mutation=mutation):
+                plan, _target_super, target = self.build_single_checkout_plan(
+                    f"payload-revalidation-{mutation}",
+                    self.sha,
+                )
+                payload = target / "README.md"
+
+                def mutate_after_first_receipt(*args: object, **kwargs: object) -> None:
+                    original_record(*args, **kwargs)
+                    if mutation == "timestamp":
+                        before = payload.stat()
+                        os.utime(
+                            payload,
+                            ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000),
+                        )
+                    elif mutation == "content":
+                        payload.write_text("changed bytes\n", encoding="utf-8")
+                    elif mutation == "replacement":
+                        replacement = target / "replacement.tmp"
+                        replacement.write_bytes(payload.read_bytes())
+                        replacement.chmod(payload.stat().st_mode & 0o777)
+                        os.replace(replacement, payload)
+                    else:
+                        payload.chmod(0o640)
+
+                with mock.patch.object(
+                    MODULE,
+                    "record_materialized_shared_ancestors",
+                    side_effect=mutate_after_first_receipt,
+                ):
+                    with redirect_stdout(io.StringIO()):
+                        if mutation == "timestamp":
+                            MODULE.apply_sync_plan(plan)
+                        else:
+                            with self.assertRaisesRegex(
+                                MODULE.PlanError,
+                                "checkout payload",
+                            ):
+                                MODULE.apply_sync_plan(plan)
+
+                if mutation == "timestamp":
+                    self.assertEqual(run_git(target, "rev-parse", "HEAD"), self.sha)
+                else:
+                    self.assertFalse(target.exists())
+                plan.close()
 
     def test_managed_worktree_rejects_new_filtered_payload(self) -> None:
         target_sha = self.filtered_target_sha("managed-filter", required=False)
@@ -10525,11 +10958,20 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                     source,
                     lease.target_descriptor,
                 )
+                managed_preflight, checkout_view = (
+                    self.capture_managed_preflight_resources(
+                        source,
+                        target,
+                        entry.submodule.path,
+                        object_roots=(entry.sha,),
+                    )
+                )
                 final_state = MODULE.capture_managed_final_state_receipt(
                     entry,
                     lease,
                     control,
                     source_lease,
+                    checkout_view,
                 )
                 original_route = route.with_name("route.original")
                 route.rename(original_route)
@@ -10545,6 +10987,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                             lease,
                             control,
                             source_lease,
+                            checkout_view,
                         )
                 finally:
                     route.unlink()
@@ -10553,12 +10996,18 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         final_state.close()
                     finally:
                         try:
-                            control.close()
+                            checkout_view.close()
                         finally:
                             try:
-                                source_lease.close()
+                                managed_preflight.close()
                             finally:
-                                lease.close()
+                                try:
+                                    control.close()
+                                finally:
+                                    try:
+                                        source_lease.close()
+                                    finally:
+                                        lease.close()
 
     def test_final_state_capture_and_revalidation_close_index_validation_races(
         self,
@@ -10620,6 +11069,14 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         source,
                         lease.target_descriptor,
                     )
+                    managed_preflight, checkout_view = (
+                        self.capture_managed_preflight_resources(
+                            source,
+                            target,
+                            entry.submodule.path,
+                            object_roots=(entry.sha,),
+                        )
+                    )
                     final_state = None
                     original_validate = MODULE.validate_captured_index_matches_tree
                     mutated = False
@@ -10658,6 +11115,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                                 lease,
                                 control,
                                 source_lease,
+                                checkout_view,
                             )
                         with mock.patch.object(
                             MODULE,
@@ -10671,6 +11129,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                                         lease,
                                         control,
                                         source_lease,
+                                        checkout_view,
                                     )
                                 else:
                                     assert final_state is not None
@@ -10680,6 +11139,7 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                                         lease,
                                         control,
                                         source_lease,
+                                        checkout_view,
                                     )
                         self.assertTrue(mutated)
                     finally:
@@ -10691,12 +11151,18 @@ class SubmoduleWorktreeSyncTests(unittest.TestCase):
                         if final_state is not None:
                             final_state.close()
                         try:
-                            control.close()
+                            checkout_view.close()
                         finally:
                             try:
-                                source_lease.close()
+                                managed_preflight.close()
                             finally:
-                                lease.close()
+                                try:
+                                    control.close()
+                                finally:
+                                    try:
+                                        source_lease.close()
+                                    finally:
+                                        lease.close()
 
     def test_fresh_source_lease_bridges_preflight_before_managed_and_new_git(
         self,
