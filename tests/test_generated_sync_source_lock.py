@@ -312,6 +312,7 @@ class GeneratedSyncSourceLockTests(unittest.TestCase):
         previous_commits = (
             "b78febccb199c38c48cf9a3bd49f151723524e9d",
             "110f2df02ee6388835d1eb6635e09e7f838658fb",
+            "2a81c7add1dfdc54866d5219c0b3109c9d709f31",
         )
         for previous_commit in previous_commits:
             with self.subTest(previous_commit=previous_commit):
