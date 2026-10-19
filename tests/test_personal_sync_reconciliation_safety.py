@@ -1062,6 +1062,7 @@ class TargetPortabilityTests(unittest.TestCase):
                             MODULE,
                             "_stage_release_tree_for_install",
                         ) as stage_release,
+                        MODULE.installation_lock(root / name),
                     ):
                         with self.assertRaisesRegex(MODULE.SyncError, message):
                             MODULE._install_release_set_unlocked(
@@ -1088,16 +1089,17 @@ class TargetPortabilityTests(unittest.TestCase):
                 MODULE,
                 "_stage_release_tree_for_install",
             ) as stage_release:
-                with self.assertRaisesRegex(
-                    MODULE.SyncError,
-                    "portable owner spellings conflict",
-                ):
-                    MODULE._install_release_set_unlocked(
-                        home,
-                        [(root / "release", SHA_B, manifest)],
-                        dry_run=False,
-                        allow_cross_owner=True,
-                    )
+                with MODULE.installation_lock(home):
+                    with self.assertRaisesRegex(
+                        MODULE.SyncError,
+                        "portable owner spellings conflict",
+                    ):
+                        MODULE._install_release_set_unlocked(
+                            home,
+                            [(root / "release", SHA_B, manifest)],
+                            dry_run=False,
+                            allow_cross_owner=True,
+                        )
 
             stage_release.assert_not_called()
 
@@ -1257,6 +1259,7 @@ class PendingTransactionCapacitySafetyTests(unittest.TestCase):
                         "release staging must follow worst-case capacity validation"
                     ),
                 ) as stage_release,
+                MODULE.installation_lock(home),
                 self.assertRaisesRegex(
                     MODULE.SyncError,
                     "pending transaction has too many actions",
@@ -1503,6 +1506,10 @@ class ReleaseShaBoundaryTests(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "_installed_manifests") as installed,
             mock.patch.object(MODULE, "_stage_release_tree_for_install") as stage,
+            mock.patch.object(
+                MODULE,
+                "_recover_release_cache_repair_batches_unlocked",
+            ) as recover_cache_repair,
         ):
             with self.assertRaisesRegex(MODULE.SyncError, "release SHA must"):
                 MODULE._install_release_set_unlocked(
@@ -1514,6 +1521,7 @@ class ReleaseShaBoundaryTests(unittest.TestCase):
 
         installed.assert_not_called()
         stage.assert_not_called()
+        recover_cache_repair.assert_not_called()
         self.assertFalse(home.exists())
         self.assertFalse((self.root / "outside-release-set").exists())
 
