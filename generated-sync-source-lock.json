@@ -1,18 +1,18 @@
 {
-  "canonical_commit": "2a81c7add1dfdc54866d5219c0b3109c9d709f31",
+  "canonical_commit": "bf62452bb8dab2612d3af9b8795b2c8d67c0ec37",
   "canonical_repository": "Joey-Tools/codex-personal-sync",
   "file_set_digest": "defbefa4d2b0c016b9ca3cbdeb49ab6c9cf708562039b7f939398ebe2047958d",
   "files": [
     {
       "mode": "0755",
-      "sha256": "5b07f03d8ae0542ee956b330025023ba4ae6e4cb2d95813cdc47b788156faead",
+      "sha256": "1df1b576a72c2a77d704c5d556134d827eeb3dbe071344726223c990ba63e11c",
       "source_name": "engine",
       "source_path": "scripts/codex_personal_sync.py",
       "target_path": "scripts/codex_personal_sync.py"
     },
     {
       "mode": "0644",
-      "sha256": "b0790367f79118ad05636f9c351f8fc996987a7daf6d06fd2fc2e46af3039cae",
+      "sha256": "67bc781050f7e7b35c7a44e51c1e177a481fa300c76bd4360d6007c27bd1b716",
       "source_name": "engine_tests",
       "source_path": "tests/test_codex_personal_sync.py",
       "target_path": "tests/test_codex_personal_sync.py"
@@ -33,7 +33,7 @@
     },
     {
       "mode": "0644",
-      "sha256": "cd9a07c0a5043a47195711dc9300d8683d8313efa4fa7fe4f66971ae1ba14b0f",
+      "sha256": "84f9465f3756afdc4a7c6379aac34ee3d80345ee96773de85341cde31f7b0c9d",
       "source_name": "pending_staging_cleanup_tests",
       "source_path": "tests/test_pending_staging_cleanup.py",
       "target_path": "tests/test_pending_staging_cleanup.py"
@@ -47,7 +47,7 @@
     },
     {
       "mode": "0644",
-      "sha256": "11a8566b60cc522452156516309474a2dba32fa0c7381808d492d66a7a3ff945",
+      "sha256": "89c105b9f057e1bec3e11069c5400916184a6c148afeacee9a332037fccb296c",
       "source_name": "reconciliation_safety_tests",
       "source_path": "tests/test_personal_sync_reconciliation_safety.py",
       "target_path": "tests/test_personal_sync_reconciliation_safety.py"
@@ -68,7 +68,7 @@
     },
     {
       "mode": "0644",
-      "sha256": "b4bd72bd74e617041ec8d913045c97b8c8ec82a55857f4bf301be16d35368004",
+      "sha256": "b24352a36ccedc3a62ba1603d160d54d8c498e28bf91e6a08db05b6679783576",
       "source_name": "release_retention_tests",
       "source_path": "tests/test_release_retention.py",
       "target_path": "tests/test_release_retention.py"
@@ -88,5 +88,5 @@
   "mirror_repository": "Joey-Tools/codex-toolbox",
   "receipt_version": 1,
   "rules_contract_version": 1,
-  "tree_digest": "1e5bd4a42b6b62ef1ec5d65da725a3f9ae0152f4db5d83c79efcb48e457c8d62"
+  "tree_digest": "4e6f03d632cba7f630dcd6619da65ca68e87b29729337e3e24363e82fee6090d"
 }

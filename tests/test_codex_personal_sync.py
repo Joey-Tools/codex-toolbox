@@ -6654,6 +6654,1704 @@ while True:
         self.assertEqual(current_target(home), f"releases/{SHA1}")
         self.assertEqual((home / "AGENTS.md").read_text(encoding="utf-8"), "agent\n")
 
+    def _install_minimal_release_fixture(
+        self,
+        *,
+        suffix: str = "",
+    ) -> tuple[Path, Path, Path]:
+        label = f"-{suffix}" if suffix else ""
+        release_root = self.root / f"release{label}"
+        user_home = self.root / "home"
+        home = (user_home / f"case{label}" if suffix else user_home) / ".codex"
+        write_minimal_release(release_root)
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+        installed = home / "personal-sync" / "releases" / SHA1
+        return release_root, home, installed
+
+    def _write_public_scheduler_success_state(
+        self,
+        home: Path,
+        release_trees: dict[str, dict[str, str]],
+    ) -> dict[str, object]:
+        payload = MODULE._scheduler_runtime_payload(
+            previous=None,
+            attempt=MODULE._next_scheduler_attempt(None),
+            success=True,
+            failure_reason=None,
+            release_trees=release_trees,
+            mode="public",
+            repo=MODULE.DEFAULT_PUBLIC_RELEASE_REPO,
+            base_repo=None,
+            owner="private",
+        )
+        MODULE._write_scheduler_runtime_state(home, payload)
+        return payload
+
+    def _assert_cached_install_rejects_without_mutation(
+        self,
+        release_root: Path,
+        home: Path,
+        installed: Path,
+        *,
+        sha: str = SHA1,
+        expected_codes: tuple[str, ...] | None = None,
+    ) -> None:
+        source_before = self.exact_namespace_snapshot(release_root)
+        installed_before = self.exact_namespace_snapshot(installed)
+        home_before = snapshot_tree(home)
+        with self.assertRaises(MODULE.SyncError) as raised:
+            self.run_quietly(
+                MODULE.install_release_tree,
+                release_root,
+                home,
+                sha,
+                dry_run=False,
+            )
+        if expected_codes is not None:
+            self.assertIn(raised.exception.code, expected_codes)
+        self.assertEqual(self.exact_namespace_snapshot(release_root), source_before)
+        self.assertEqual(self.exact_namespace_snapshot(installed), installed_before)
+        self.assertEqual(snapshot_tree(home), home_before)
+
+    def _cache_repair_batches(self, installed: Path, sha: str = SHA1):
+        releases_root = installed.parent
+        prefix = f".cache-repair-{sha}-"
+        return {
+            "payloads": tuple(
+                sorted(
+                    path
+                    for path in releases_root.glob(f"{prefix}*")
+                    if path.is_dir() and not path.is_symlink()
+                )
+            ),
+            "receipts": tuple(sorted(releases_root.glob(f"{prefix}*.json"))),
+            "markers": tuple(
+                sorted(releases_root.glob(f"{prefix}*.cleanup-ready"))
+            ),
+        }
+
+    def _assert_cache_repair_receipt(self, installed: Path, sha: str = SHA1):
+        batches = self._cache_repair_batches(installed, sha)
+        self.assertEqual(len(batches["payloads"]), 1)
+        self.assertEqual(len(batches["receipts"]), 1)
+        payload = batches["payloads"][0]
+        receipt = batches["receipts"][0]
+        self.assertEqual(receipt.stem, payload.name)
+        self.assertTrue(receipt.is_file())
+        self.assertFalse(receipt.is_symlink())
+        self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
+        self.assertGreater(receipt.stat().st_size, 0)
+        return payload, receipt
+
+    def _leave_cache_repair_interrupted_after_move(
+        self,
+        source: Path,
+        home: Path,
+        installed: Path,
+        *,
+        payload: bytes = b"generated cache evidence",
+    ):
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(payload)
+        real_rename = MODULE._rename_noreplace_at
+        interrupted = False
+
+        class SimulatedProcessInterruption(BaseException):
+            pass
+
+        def interrupt_after_move(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+        ):
+            nonlocal interrupted
+            result = real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if destination_name == "item-00000" and not interrupted:
+                interrupted = True
+                raise SimulatedProcessInterruption("simulated process interruption")
+            return result
+
+        with mock.patch.object(
+            MODULE, "_rename_noreplace_at", side_effect=interrupt_after_move
+        ):
+            with self.assertRaises(MODULE.SyncError):
+                self.run_quietly(
+                    MODULE.install_release_tree,
+                    source,
+                    home,
+                    SHA1,
+                    dry_run=False,
+                )
+
+        self.assertTrue(interrupted)
+        return self._assert_cache_repair_receipt(installed)
+
+    def _downloaded_cache_repair_release(
+        self, source: Path, sha: str, repo: str
+    ):
+        return MODULE.DownloadedRelease(
+            repo=repo,
+            assets=MODULE.ReleaseAssets(
+                tag_name=f"personal-codex-cache-test-{sha[:7]}",
+                sha=sha,
+                archive_name=f"personal-codex-{sha}.tar.gz",
+                checksum_name=f"personal-codex-{sha}.sha256",
+                archive_id=101,
+                archive_size=1,
+                checksum_id=102,
+                checksum_size=1,
+            ),
+            release_root=source,
+            release_expectation=MODULE._source_release_identity(source, None),
+        )
+
+    def _private_cache_repair_upgrade_fixture(self, suffix: str):
+        public_source, home, _public_installed = self._install_minimal_release_fixture(
+            suffix=suffix
+        )
+        private_repo = "Joey-Tools/codex-private-workflows"
+        old_source = self.root / f"old-private-source-{suffix}"
+        new_source = self.root / f"new-private-source-{suffix}"
+        write_private_skill_only_release(old_source)
+        skill_relative = Path("personal_codex/skills/private-skill")
+        (old_source / skill_relative / "runtime.py").write_text(
+            'VALUE = "stable"\n', encoding="utf-8"
+        )
+        manifest_path = old_source / "personal_codex" / "sync-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["base_release"]["sha"] = SHA1
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        shutil.copytree(old_source, new_source)
+        (new_source / skill_relative / "SKILL.md").write_text(
+            "---\nname: private-skill\n---\nUpdated release.\n",
+            encoding="utf-8",
+        )
+        downloads = {
+            MODULE.DEFAULT_PUBLIC_RELEASE_REPO: self._downloaded_cache_repair_release(
+                public_source,
+                SHA1,
+                MODULE.DEFAULT_PUBLIC_RELEASE_REPO,
+            ),
+            private_repo: self._downloaded_cache_repair_release(
+                old_source,
+                SHA2,
+                private_repo,
+            ),
+        }
+
+        def download(repo, destination, *, workspace, sha=None):
+            release = downloads[repo]
+            self.assertIn(sha, (None, release.assets.sha))
+            return release
+
+        with mock.patch.object(
+            MODULE, "download_and_extract_release", side_effect=download
+        ):
+            self.run_quietly(
+                MODULE.install_private_from_github,
+                private_repo,
+                home,
+                base_repo=MODULE.DEFAULT_PUBLIC_RELEASE_REPO,
+                owner="private",
+                dry_run=False,
+            )
+
+        release_trees = MODULE._capture_scheduler_release_trees(
+            home,
+            mode="private",
+            owner="private",
+        )
+        state = MODULE._scheduler_runtime_payload(
+            previous=None,
+            attempt=MODULE._next_scheduler_attempt(None),
+            success=True,
+            failure_reason=None,
+            release_trees=release_trees,
+            mode="private",
+            repo=private_repo,
+            base_repo=MODULE.DEFAULT_PUBLIC_RELEASE_REPO,
+            owner="private",
+        )
+        MODULE._write_scheduler_runtime_state(home, state)
+        installed = home / "personal-sync/overlays/private/releases" / SHA2
+        cache = installed / skill_relative / "__pycache__"
+        cache.mkdir()
+        (cache / "runtime.cpython-313.pyc").write_bytes(b"generated")
+        downloads[private_repo] = self._downloaded_cache_repair_release(
+            new_source,
+            SHA3,
+            private_repo,
+        )
+        return home, installed, downloads, private_repo, download
+
+    def test_github_install_cache_repair_dry_run_validates_downloaded_same_sha(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        downloaded = self._downloaded_cache_repair_release(
+            source, SHA1, MODULE.DEFAULT_PUBLIC_RELEASE_REPO
+        )
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        before = self.exact_namespace_snapshot(home)
+
+        with mock.patch.object(
+            MODULE, "download_and_extract_release", return_value=downloaded
+        ) as download:
+            self.run_quietly(
+                MODULE.install_from_github,
+                MODULE.DEFAULT_PUBLIC_RELEASE_REPO,
+                home,
+                dry_run=True,
+            )
+
+        download.assert_called_once()
+        self.assertEqual(self.exact_namespace_snapshot(home), before)
+
+    def test_private_github_install_recovers_old_overlay_cache_from_baseline(self):
+        public_source, home, _installed = self._install_minimal_release_fixture()
+        private_repo = "Joey-Tools/codex-private-workflows"
+        old_source = self.root / "old-private-source"
+        new_source = self.root / "new-private-source"
+        write_private_skill_only_release(old_source)
+        skill_relative = Path("personal_codex/skills/private-skill")
+        (old_source / skill_relative / "runtime.py").write_text(
+            'VALUE = "stable"\n', encoding="utf-8"
+        )
+        manifest_path = old_source / "personal_codex" / "sync-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["base_release"]["sha"] = SHA1
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        shutil.copytree(old_source, new_source)
+        (new_source / skill_relative / "SKILL.md").write_text(
+            "---\nname: private-skill\n---\nUpdated release.\n", encoding="utf-8"
+        )
+        downloads = {
+            MODULE.DEFAULT_PUBLIC_RELEASE_REPO: self._downloaded_cache_repair_release(
+                public_source, SHA1, MODULE.DEFAULT_PUBLIC_RELEASE_REPO
+            ),
+            private_repo: self._downloaded_cache_repair_release(
+                old_source, SHA2, private_repo
+            ),
+        }
+
+        def download(repo, destination, *, workspace, sha=None):
+            self.assertIn(sha, (None, downloads[repo].assets.sha))
+            return downloads[repo]
+
+        with mock.patch.object(MODULE, "download_and_extract_release", download):
+            self.run_quietly(
+                MODULE.install_private_from_github,
+                private_repo,
+                home,
+                base_repo=MODULE.DEFAULT_PUBLIC_RELEASE_REPO,
+                owner="private",
+                dry_run=False,
+            )
+            trees = MODULE._capture_scheduler_release_trees(
+                home, mode="private", owner="private"
+            )
+            state = MODULE._scheduler_runtime_payload(
+                previous=None,
+                attempt=MODULE._next_scheduler_attempt(None),
+                success=True,
+                failure_reason=None,
+                release_trees=trees,
+                mode="private",
+                repo=private_repo,
+                base_repo=MODULE.DEFAULT_PUBLIC_RELEASE_REPO,
+                owner="private",
+            )
+            MODULE._write_scheduler_runtime_state(home, state)
+            old_installed = home / "personal-sync/overlays/private/releases" / SHA2
+            cache = old_installed / skill_relative / "__pycache__"
+            cache.mkdir()
+            (cache / "runtime.cpython-313.pyc").write_bytes(b"generated")
+            downloads[private_repo] = self._downloaded_cache_repair_release(
+                new_source, SHA3, private_repo
+            )
+            before = self.exact_namespace_snapshot(home)
+            self.run_quietly(
+                MODULE.install_private_from_github,
+                private_repo,
+                home,
+                base_repo=MODULE.DEFAULT_PUBLIC_RELEASE_REPO,
+                owner="private",
+                dry_run=True,
+            )
+            self.assertEqual(self.exact_namespace_snapshot(home), before)
+            self.run_quietly(
+                MODULE.install_private_from_github,
+                private_repo,
+                home,
+                base_repo=MODULE.DEFAULT_PUBLIC_RELEASE_REPO,
+                owner="private",
+                dry_run=False,
+            )
+
+        self.assertFalse(cache.exists())
+        self.assertEqual(
+            os.readlink(home / "personal-sync/overlays/private/current"),
+            f"releases/{SHA3}",
+        )
+        self.assertEqual(
+            (home / "skills/private-skill/SKILL.md").read_text(encoding="utf-8"),
+            "---\nname: private-skill\n---\nUpdated release.\n",
+        )
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFO support required")
+    def test_install_cache_repair_rejects_fifo_without_opening_it(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        os.mkfifo(cache / "codex_personal_sync.cpython-313.pyc", mode=0o600)
+        self._assert_cached_install_rejects_without_mutation(source, home, installed)
+
+    def test_install_cache_repair_preserves_bytecode_with_external_hardlink(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        external = self.root / "external-cache.pyc"
+        external.write_bytes(b"external data")
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        os.link(external, cache / "codex_personal_sync.cpython-313.pyc")
+        before = self.exact_path_snapshot(external)
+        self._assert_cached_install_rejects_without_mutation(source, home, installed)
+        self.assertEqual(self.exact_path_snapshot(external), before)
+
+    def test_cache_quarantine_preserves_early_parent_binding_error(self):
+        _source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        releases_root = installed.parent
+        release_fd = MODULE._open_installed_release_directory_fd(
+            home,
+            MODULE.PUBLIC_OWNER,
+            SHA1,
+        )
+        try:
+            scan, _captured = MODULE._release_cache_repair_scan_from_directory_fd(
+                release_fd,
+                installed,
+                expected_owner_uid=(os.geteuid() if sys.platform == "darwin" else None),
+            )
+            before = snapshot_tree(installed)
+            real_bound = MODULE._bound_directory_matches
+
+            def reject_releases_binding(bound_home, path, directory_fd):
+                if path == releases_root:
+                    return False
+                return real_bound(bound_home, path, directory_fd)
+
+            with (
+                MODULE.installation_lock(home),
+                MODULE._release_cache_repair_scope(home),
+                mock.patch.object(
+                    MODULE,
+                    "_bound_directory_matches",
+                    side_effect=reject_releases_binding,
+                ),
+                self.assertRaises(MODULE.SyncError) as raised,
+            ):
+                MODULE._quarantine_release_cache_artifacts(
+                    home,
+                    MODULE.PUBLIC_OWNER,
+                    SHA1,
+                    installed,
+                    release_fd,
+                    scan,
+                    trusted_tree_digest=scan.identity[2],
+                    expected_owner_uid=(
+                        os.geteuid() if sys.platform == "darwin" else None
+                    ),
+                    repair_context={"quarantines": []},
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertEqual(
+            str(raised.exception),
+            f"release parent changed before cache repair: {releases_root}",
+        )
+        self.assertIsNone(raised.exception.code)
+        self.assertEqual(snapshot_tree(installed), before)
+
+    def test_cache_quarantine_preserves_early_quarantine_creation_error(self):
+        _source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        release_fd = MODULE._open_installed_release_directory_fd(
+            home,
+            MODULE.PUBLIC_OWNER,
+            SHA1,
+        )
+        try:
+            scan, _captured = MODULE._release_cache_repair_scan_from_directory_fd(
+                release_fd,
+                installed,
+                expected_owner_uid=(os.geteuid() if sys.platform == "darwin" else None),
+            )
+            before = snapshot_tree(installed)
+            injected = MODULE.SyncError(
+                "injected quarantine-root creation failure",
+                code="cache-repair-probe",
+            )
+            with (
+                MODULE.installation_lock(home),
+                MODULE._release_cache_repair_scope(home),
+                mock.patch.object(
+                    MODULE,
+                    "_release_cache_quarantine_root",
+                    side_effect=injected,
+                ),
+                self.assertRaises(MODULE.SyncError) as raised,
+            ):
+                MODULE._quarantine_release_cache_artifacts(
+                    home,
+                    MODULE.PUBLIC_OWNER,
+                    SHA1,
+                    installed,
+                    release_fd,
+                    scan,
+                    trusted_tree_digest=scan.identity[2],
+                    expected_owner_uid=(
+                        os.geteuid() if sys.platform == "darwin" else None
+                    ),
+                    repair_context={"quarantines": []},
+                )
+        finally:
+            os.close(release_fd)
+
+        self.assertIs(raised.exception, injected)
+        self.assertEqual(raised.exception.code, "cache-repair-probe")
+        self.assertEqual(snapshot_tree(installed), before)
+
+    def test_install_cache_repair_retains_quarantine_after_later_failure(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        payload = b"generated cache evidence"
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(payload)
+        source_before = self.exact_namespace_snapshot(source)
+        verify = MODULE._verify_managed_state_current_owner_claims
+        failed_after_isolation = False
+
+        def reject_after_isolation(*args, **kwargs):
+            nonlocal failed_after_isolation
+            if not cache.exists():
+                failed_after_isolation = True
+                raise MODULE.SyncError("injected post-isolation validation failure")
+            return verify(*args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "_verify_managed_state_current_owner_claims",
+            side_effect=reject_after_isolation,
+        ):
+            with self.assertRaises(MODULE.SyncError) as raised:
+                self.run_quietly(
+                    MODULE.install_release_tree, source, home, SHA1, dry_run=False
+                )
+
+        self.assertTrue(failed_after_isolation)
+        self.assertIn(
+            "injected post-isolation validation failure", str(raised.exception)
+        )
+        payload_dir, _receipt = self._assert_cache_repair_receipt(installed)
+        self.assertIn(str(payload_dir), str(raised.exception))
+        retained_files = [path for path in payload_dir.rglob("*") if path.is_file()]
+        self.assertEqual([path.read_bytes() for path in retained_files], [payload])
+        self.assertFalse(cache.exists())
+        self.assertEqual(self.exact_namespace_snapshot(source), source_before)
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_cache_repair_rejects_content_change_after_isolation(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        payload = b"generated cache evidence"
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(payload)
+        quarantine = MODULE._quarantine_release_cache_artifacts
+        changed_source = installed / "scripts" / "codex_personal_sync.py"
+
+        def mutate_after_isolation(*args, **kwargs):
+            result = quarantine(*args, **kwargs)
+            changed_source.write_text(
+                "print('changed during repair')\n", encoding="utf-8"
+            )
+            return result
+
+        with mock.patch.object(
+            MODULE,
+            "_quarantine_release_cache_artifacts",
+            side_effect=mutate_after_isolation,
+        ):
+            with self.assertRaises(MODULE.SyncError) as raised:
+                self.run_quietly(
+                    MODULE.install_release_tree, source, home, SHA1, dry_run=False
+                )
+
+        payload_dir, _receipt = self._assert_cache_repair_receipt(installed)
+        self.assertIn(str(payload_dir), str(raised.exception))
+        self.assertEqual(raised.exception.code, "immutable-release-drift")
+        retained_files = [path for path in payload_dir.rglob("*") if path.is_file()]
+        self.assertEqual([path.read_bytes() for path in retained_files], [payload])
+        self.assertEqual(
+            changed_source.read_text(encoding="utf-8"),
+            "print('changed during repair')\n",
+        )
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_cache_repair_rejects_active_receipt_inode_replacement(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        cache_file = cache / "codex_personal_sync.cpython-313.pyc"
+        cache_file.write_bytes(b"active batch evidence")
+        quarantine = MODULE._quarantine_release_cache_artifacts
+        replaced = {}
+
+        def replace_active_receipt(*args, **kwargs):
+            active_batch = quarantine(*args, **kwargs)
+            receipt = active_batch.path.with_name(active_batch.path.name + ".json")
+            receipt_bytes = receipt.read_bytes()
+            original_metadata = receipt.stat()
+            original_identity = original_metadata.st_dev, original_metadata.st_ino
+            descriptor, temporary_name = tempfile.mkstemp(dir=self.root)
+            temporary = Path(temporary_name)
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(receipt_bytes)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                self.assertEqual(temporary.read_bytes(), receipt_bytes)
+                self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o600)
+                temporary_metadata = temporary.stat()
+                temporary_identity = (
+                    temporary_metadata.st_dev,
+                    temporary_metadata.st_ino,
+                )
+                self.assertNotEqual(temporary_identity, original_identity)
+                os.replace(temporary, receipt)
+                replacement_metadata = receipt.stat()
+                replaced.update(
+                    receipt=receipt,
+                    payload=active_batch.path,
+                    content=receipt_bytes,
+                    original_identity=original_identity,
+                    replacement_identity=(
+                        replacement_metadata.st_dev,
+                        replacement_metadata.st_ino,
+                    ),
+                )
+                self.assertEqual(replaced["replacement_identity"], temporary_identity)
+                self.assertEqual(receipt.read_bytes(), receipt_bytes)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return active_batch
+
+        with mock.patch.object(
+            MODULE,
+            "_quarantine_release_cache_artifacts",
+            side_effect=replace_active_receipt,
+        ):
+            with self.assertRaises(MODULE.SyncError) as raised:
+                self.run_quietly(
+                    MODULE.install_release_tree,
+                    source,
+                    home,
+                    SHA1,
+                    dry_run=False,
+                )
+
+        self.assertEqual(raised.exception.code, "cache-repair-recovery-invalid")
+        self.assertNotEqual(
+            replaced["original_identity"], replaced["replacement_identity"]
+        )
+        self.assertTrue(replaced["payload"].is_dir())
+        self.assertEqual(replaced["receipt"].read_bytes(), replaced["content"])
+        self.assertFalse(cache.exists())
+        retained_files = [
+            path for path in replaced["payload"].rglob("*") if path.is_file()
+        ]
+        self.assertEqual(
+            [path.read_bytes() for path in retained_files],
+            [b"active batch evidence"],
+        )
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_cache_repair_persists_receipt_before_first_cache_move(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        releases_metadata = installed.parent.stat()
+        releases_identity = releases_metadata.st_dev, releases_metadata.st_ino
+        real_fsync = MODULE.os.fsync
+        real_rename = MODULE._rename_noreplace_at
+        fsync_events: list[tuple[str, tuple[int, int]]] = []
+        first_move_checked = False
+
+        def record_fsync(file_descriptor):
+            descriptor_metadata = os.fstat(file_descriptor)
+            descriptor_identity = (
+                descriptor_metadata.st_dev,
+                descriptor_metadata.st_ino,
+            )
+            descriptor_kind = (
+                "directory" if stat.S_ISDIR(descriptor_metadata.st_mode) else "file"
+            )
+            fsync_events.append((descriptor_kind, descriptor_identity))
+            return real_fsync(file_descriptor)
+
+        def check_before_first_move(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+        ):
+            nonlocal first_move_checked
+            if destination_name == "item-00000" and not first_move_checked:
+                self._assert_cache_repair_receipt(installed)
+                receipt = self._cache_repair_batches(installed)["receipts"][0]
+                receipt_metadata = receipt.stat()
+                receipt_identity = receipt_metadata.st_dev, receipt_metadata.st_ino
+                receipt_syncs = [
+                    index
+                    for index, (kind, identity) in enumerate(fsync_events)
+                    if kind == "file" and identity == receipt_identity
+                ]
+                parent_syncs = [
+                    index
+                    for index, (kind, identity) in enumerate(fsync_events)
+                    if kind == "directory" and identity == releases_identity
+                ]
+                self.assertTrue(receipt_syncs)
+                self.assertTrue(parent_syncs)
+                self.assertLess(max(receipt_syncs), max(parent_syncs))
+                first_move_checked = True
+            return real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+
+        with mock.patch.object(MODULE.os, "fsync", side_effect=record_fsync):
+            with mock.patch.object(
+                MODULE, "_rename_noreplace_at", side_effect=check_before_first_move
+            ):
+                self.run_quietly(
+                    MODULE.install_release_tree,
+                    source,
+                    home,
+                    SHA1,
+                    dry_run=False,
+                )
+
+        self.assertTrue(first_move_checked)
+        self.assertEqual(
+            self._cache_repair_batches(installed),
+            {"payloads": (), "receipts": (), "markers": ()},
+        )
+        self.assertFalse(cache.exists())
+
+    def test_install_cache_repair_recovers_after_move_and_dry_run_is_read_only(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        payload_dir, receipt = self._leave_cache_repair_interrupted_after_move(
+            source,
+            home,
+            installed,
+        )
+        interrupted_snapshot = snapshot_tree(home)
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source,
+            home,
+            SHA1,
+            dry_run=True,
+        )
+
+        self.assertEqual(snapshot_tree(home), interrupted_snapshot)
+        self.assertTrue(payload_dir.is_dir())
+        self.assertTrue(receipt.is_file())
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+
+        self.assertEqual(
+            self._cache_repair_batches(installed),
+            {"payloads": (), "receipts": (), "markers": ()},
+        )
+        self.assertFalse((installed / "scripts" / "__pycache__").exists())
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_cache_repair_recovers_after_partial_cleanup(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        payload_dir, _receipt = self._leave_cache_repair_interrupted_after_move(
+            source,
+            home,
+            installed,
+        )
+        real_rename = MODULE._rename_noreplace_at
+        interrupted = False
+
+        class SimulatedProcessInterruption(BaseException):
+            pass
+
+        def interrupt_after_partial_cleanup(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+        ):
+            nonlocal interrupted
+            result = real_rename(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+            )
+            if (
+                source_name == "item-00000"
+                and destination_name == "cleanup-00000"
+                and not interrupted
+            ):
+                interrupted = True
+                raise SimulatedProcessInterruption(
+                    "simulated interruption during cache cleanup"
+                )
+            return result
+
+        with mock.patch.object(
+            MODULE,
+            "_rename_noreplace_at",
+            side_effect=interrupt_after_partial_cleanup,
+        ):
+            with self.assertRaises((MODULE.SyncError, SimulatedProcessInterruption)):
+                self.run_quietly(
+                    MODULE.install_release_tree,
+                    source,
+                    home,
+                    SHA1,
+                    dry_run=False,
+                )
+
+        self.assertTrue(interrupted)
+        batches = self._cache_repair_batches(installed)
+        self.assertEqual(batches["payloads"], (payload_dir,))
+        self.assertEqual(len(batches["receipts"]), 1)
+        self.assertEqual(len(batches["markers"]), 1)
+        self.assertTrue(
+            (
+                payload_dir
+                / "cleanup-00000"
+                / "codex_personal_sync.cpython-313.pyc"
+            ).is_file()
+        )
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+
+        self.assertEqual(
+            self._cache_repair_batches(installed),
+            {"payloads": (), "receipts": (), "markers": ()},
+        )
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_cache_repair_rejects_prepared_receipt_without_payload(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        payload_dir, receipt = self._leave_cache_repair_interrupted_after_move(
+            source,
+            home,
+            installed,
+        )
+        shutil.rmtree(payload_dir)
+        self.assertFalse(self._cache_repair_batches(installed)["markers"])
+
+        self._assert_cached_install_rejects_without_mutation(
+            source,
+            home,
+            installed,
+            expected_codes=("cache-repair-recovery-invalid",),
+        )
+
+        self.assertFalse(payload_dir.exists())
+        self.assertTrue(receipt.is_file())
+        self.assertFalse(self._cache_repair_batches(installed)["markers"])
+
+    def test_install_cache_repair_recovers_after_partial_member_unlink(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        first_member = cache / "codex_personal_sync.cpython-313.pyc"
+        second_member = cache / "codex_personal_sync.cpython-314.pyc"
+        first_member.write_bytes(b"first cache member")
+        second_member.write_bytes(b"second cache member")
+        cache_metadata = cache.stat()
+        cache_identity = cache_metadata.st_dev, cache_metadata.st_ino
+        real_unlink = MODULE.os.unlink
+        interrupted = False
+
+        class SimulatedProcessInterruption(BaseException):
+            pass
+
+        def interrupt_after_first_member_unlink(path, *args, **kwargs):
+            nonlocal interrupted
+            directory_fd = kwargs.get("dir_fd")
+            if directory_fd is not None and not interrupted:
+                directory_metadata = os.fstat(directory_fd)
+                directory_identity = (
+                    directory_metadata.st_dev,
+                    directory_metadata.st_ino,
+                )
+                if directory_identity == cache_identity:
+                    real_unlink(path, *args, **kwargs)
+                    interrupted = True
+                    raise SimulatedProcessInterruption(
+                        "simulated interruption after cache member unlink"
+                    )
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(
+            MODULE.os, "unlink", side_effect=interrupt_after_first_member_unlink
+        ):
+            with self.assertRaises(MODULE.SyncError):
+                self.run_quietly(
+                    MODULE.install_release_tree,
+                    source,
+                    home,
+                    SHA1,
+                    dry_run=False,
+                )
+
+        self.assertTrue(interrupted)
+        batches = self._cache_repair_batches(installed)
+        self.assertEqual(len(batches["payloads"]), 1)
+        self.assertEqual(len(batches["receipts"]), 1)
+        self.assertEqual(len(batches["markers"]), 1)
+        payload_dir = batches["payloads"][0]
+        self.assertEqual(
+            batches["receipts"][0].stem,
+            batches["markers"][0].name.removesuffix(".cleanup-ready"),
+        )
+        self.assertEqual(payload_dir.name, batches["receipts"][0].stem)
+        remaining_members = [
+            path for path in payload_dir.rglob("*") if path.is_file()
+        ]
+        self.assertEqual(len(remaining_members), 1)
+        self.assertIn(
+            remaining_members[0].read_bytes(),
+            {b"first cache member", b"second cache member"},
+        )
+        interrupted_snapshot = snapshot_tree(home)
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source,
+            home,
+            SHA1,
+            dry_run=True,
+        )
+
+        self.assertEqual(snapshot_tree(home), interrupted_snapshot)
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+
+        self.assertEqual(
+            self._cache_repair_batches(installed),
+            {"payloads": (), "receipts": (), "markers": ()},
+        )
+        self.assertFalse(cache.exists())
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_cache_repair_recovers_completion_marker_only(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        real_unlink = MODULE.os.unlink
+        interrupted = False
+
+        class SimulatedProcessInterruption(BaseException):
+            pass
+
+        def interrupt_before_marker_unlink(path, *args, **kwargs):
+            nonlocal interrupted
+            name = os.fsdecode(path)
+            if name.endswith(".cleanup-ready") and not interrupted:
+                interrupted = True
+                marker_name = Path(name).name
+                batch_name = marker_name.removesuffix(".cleanup-ready")
+                self.assertFalse((installed.parent / batch_name).exists())
+                self.assertFalse((installed.parent / f"{batch_name}.json").exists())
+                raise SimulatedProcessInterruption(
+                    "simulated interruption after receipt removal"
+                )
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(
+            MODULE.os, "unlink", side_effect=interrupt_before_marker_unlink
+        ):
+            with self.assertRaises(MODULE.SyncError):
+                self.run_quietly(
+                    MODULE.install_release_tree,
+                    source,
+                    home,
+                    SHA1,
+                    dry_run=False,
+                )
+
+        self.assertTrue(interrupted)
+        batches = self._cache_repair_batches(installed)
+        self.assertEqual(batches["payloads"], ())
+        self.assertEqual(batches["receipts"], ())
+        self.assertEqual(len(batches["markers"]), 1)
+        marker_only_snapshot = snapshot_tree(home)
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source,
+            home,
+            SHA1,
+            dry_run=True,
+        )
+
+        self.assertEqual(snapshot_tree(home), marker_only_snapshot)
+        self.assertEqual(len(self._cache_repair_batches(installed)["markers"]), 1)
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+
+        self.assertEqual(
+            self._cache_repair_batches(installed),
+            {"payloads": (), "receipts": (), "markers": ()},
+        )
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_cache_repair_round_trips_near_limit_marker_only(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        original_receipt_payload = MODULE._release_cache_repair_receipt_payload
+        original_internal_writer = MODULE._write_exclusive_internal_file
+        original_unlink = MODULE.os.unlink
+        receipt_limits: list[int] = []
+        receipt_write_limits: list[int | None] = []
+        marker_write_limits: list[int | None] = []
+        marker_observations: list[tuple[int, int, int]] = []
+        interrupted = False
+
+        class SimulatedProcessInterruption(BaseException):
+            pass
+
+        def set_exact_receipt_limit(record):
+            payload = original_receipt_payload(record)
+            receipt_limit = len(payload)
+            MODULE.MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES = receipt_limit
+            MODULE.MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES = (
+                3 * receipt_limit + 4 * 1024
+            )
+            receipt_limits.append(receipt_limit)
+            return payload
+
+        def capture_internal_write(
+            write_home,
+            path,
+            payload,
+            *,
+            maximum_bytes=None,
+        ):
+            if path.name.startswith(MODULE.RELEASE_CACHE_REPAIR_PREFIX) and path.name.endswith(
+                MODULE.RELEASE_CACHE_REPAIR_RECEIPT_SUFFIX
+            ):
+                receipt_write_limits.append(maximum_bytes)
+            if path.name.endswith(MODULE.RELEASE_CACHE_REPAIR_READY_SUFFIX):
+                marker_write_limits.append(maximum_bytes)
+            return original_internal_writer(
+                write_home,
+                path,
+                payload,
+                maximum_bytes=maximum_bytes,
+            )
+
+        def interrupt_before_marker_unlink(path, *args, **kwargs):
+            nonlocal interrupted
+            name = os.fsdecode(path)
+            if name.endswith(MODULE.RELEASE_CACHE_REPAIR_READY_SUFFIX) and not interrupted:
+                interrupted = True
+                marker_path = installed.parent / Path(name).name
+                marker_size = marker_path.stat().st_size
+                marker_observations.append(
+                    (
+                        marker_size,
+                        MODULE.MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES,
+                        MODULE.MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES,
+                    )
+                )
+                raise SimulatedProcessInterruption(
+                    "simulated interruption after receipt removal"
+                )
+            return original_unlink(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES",
+                MODULE.MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES",
+                MODULE.MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_release_cache_repair_receipt_payload",
+                side_effect=set_exact_receipt_limit,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_write_exclusive_internal_file",
+                side_effect=capture_internal_write,
+            ),
+        ):
+            with mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=interrupt_before_marker_unlink,
+            ):
+                with self.assertRaises(MODULE.SyncError):
+                    self.run_quietly(
+                        MODULE.install_release_tree,
+                        source,
+                        home,
+                        SHA1,
+                        dry_run=False,
+                    )
+
+            self.assertTrue(interrupted)
+            self.assertTrue(receipt_limits)
+            self.assertEqual(receipt_write_limits, [receipt_limits[0]])
+            self.assertTrue(marker_write_limits)
+            marker_size, receipt_limit, marker_limit = marker_observations[0]
+            self.assertEqual(receipt_limit, receipt_limits[0])
+            self.assertEqual(marker_limit, 3 * receipt_limit + 4 * 1024)
+            self.assertGreater(marker_size, receipt_limit)
+            self.assertLessEqual(marker_size, marker_limit)
+            self.assertEqual(marker_write_limits, [marker_limit])
+
+            batches = self._cache_repair_batches(installed)
+            self.assertEqual(batches["payloads"], ())
+            self.assertEqual(batches["receipts"], ())
+            self.assertEqual(len(batches["markers"]), 1)
+            marker_only_snapshot = snapshot_tree(home)
+
+            releases_fd = MODULE._open_directory_beneath(home, installed.parent)
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES",
+                        marker_size - 1,
+                    ),
+                    self.assertRaises(MODULE.SyncError),
+                ):
+                    MODULE._read_release_cache_repair_cleanup_marker(
+                        home,
+                        releases_fd,
+                        installed.parent,
+                        batches["markers"][0].name.removesuffix(
+                            MODULE.RELEASE_CACHE_REPAIR_READY_SUFFIX
+                        ),
+                    )
+            finally:
+                os.close(releases_fd)
+            self.assertEqual(snapshot_tree(home), marker_only_snapshot)
+
+            self.run_quietly(
+                MODULE.install_release_tree,
+                source,
+                home,
+                SHA1,
+                dry_run=True,
+            )
+            self.assertEqual(snapshot_tree(home), marker_only_snapshot)
+
+            self.run_quietly(
+                MODULE.install_release_tree,
+                source,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        self.assertEqual(
+            self._cache_repair_batches(installed),
+            {"payloads": (), "receipts": (), "markers": ()},
+        )
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_cache_repair_rejects_marker_over_configured_limit(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        original_receipt_payload = MODULE._release_cache_repair_receipt_payload
+
+        def set_marker_limit_to_receipt_size(record):
+            payload = original_receipt_payload(record)
+            MODULE.MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES = len(payload)
+            MODULE.MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES = len(payload)
+            return payload
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES",
+                MODULE.MAX_RELEASE_CACHE_REPAIR_RECEIPT_BYTES,
+            ),
+            mock.patch.object(
+                MODULE,
+                "MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES",
+                MODULE.MAX_RELEASE_CACHE_REPAIR_MARKER_BYTES,
+            ),
+            mock.patch.object(
+                MODULE,
+                "_release_cache_repair_receipt_payload",
+                side_effect=set_marker_limit_to_receipt_size,
+            ),
+        ):
+            with self.assertRaises(MODULE.SyncError) as raised:
+                self.run_quietly(
+                    MODULE.install_release_tree,
+                    source,
+                    home,
+                    SHA1,
+                    dry_run=False,
+                )
+
+        self.assertIn(
+            "release cache repair cleanup marker exceeds the size limit",
+            str(raised.exception),
+        )
+        payload_dir, receipt = self._assert_cache_repair_receipt(installed)
+        self.assertFalse((installed / "scripts" / "__pycache__").exists())
+        self.assertFalse(
+            (installed.parent / f"{payload_dir.name}.cleanup-ready").exists()
+        )
+        self.assertEqual(
+            [path.read_bytes() for path in payload_dir.rglob("*") if path.is_file()],
+            [b"generated"],
+        )
+        self.assertTrue(receipt.is_file())
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_cache_repair_rejects_unknown_orphan_batch(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        orphan = installed.parent / f".cache-repair-{SHA1}-unknown"
+        orphan.mkdir(mode=0o700)
+        (orphan / "item-00000").write_bytes(b"unrecognized evidence")
+
+        self._assert_cached_install_rejects_without_mutation(
+            source,
+            home,
+            installed,
+            expected_codes=("cache-repair-recovery-required",),
+        )
+        self.assertTrue(orphan.is_dir())
+        self.assertEqual(
+            (orphan / "item-00000").read_bytes(), b"unrecognized evidence"
+        )
+
+    def test_install_cache_repair_rejects_corrupt_receipt(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        payload_dir, receipt = self._leave_cache_repair_interrupted_after_move(
+            source,
+            home,
+            installed,
+        )
+        receipt.write_bytes(b"{malformed receipt")
+
+        self._assert_cached_install_rejects_without_mutation(
+            source,
+            home,
+            installed,
+            expected_codes=("cache-repair-recovery-invalid",),
+        )
+        self.assertTrue(payload_dir.is_dir())
+        self.assertEqual(receipt.read_bytes(), b"{malformed receipt")
+
+    def test_install_cache_repair_rejects_unreadable_receipt_without_cleanup(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        payload_dir, receipt = self._leave_cache_repair_interrupted_after_move(
+            source,
+            home,
+            installed,
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "_read_release_cache_repair_receipt",
+            side_effect=PermissionError("injected receipt read failure"),
+        ):
+            self._assert_cached_install_rejects_without_mutation(
+                source,
+                home,
+                installed,
+                expected_codes=("cache-repair-recovery-unreadable",),
+            )
+
+        self.assertTrue(payload_dir.is_dir())
+        self.assertTrue(receipt.is_file())
+
+    def test_install_release_tree_cache_cleanup_holds_install_lock(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        cleanup = MODULE._cleanup_release_cache_quarantine
+        locked_fds: list[int] = []
+
+        def verify_lock_during_cleanup(quarantine, **kwargs):
+            lock_fd = MODULE._locked_sync_home_fd(home)
+            self.assertIsNotNone(lock_fd)
+            locked_fds.append(lock_fd)
+            return cleanup(quarantine, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "_cleanup_release_cache_quarantine",
+            side_effect=verify_lock_during_cleanup,
+        ):
+            self.run_quietly(
+                MODULE.install_release_tree,
+                source,
+                home,
+                SHA1,
+                dry_run=False,
+            )
+
+        self.assertTrue(locked_fds)
+        self.assertFalse(cache.exists())
+
+    def test_private_install_cache_cleanup_holds_install_lock(self):
+        home, installed, downloads, private_repo, download = (
+            self._private_cache_repair_upgrade_fixture("private-cache-lock")
+        )
+        cleanup = MODULE._cleanup_release_cache_quarantine
+        locked_fds: list[int] = []
+
+        def verify_lock_during_cleanup(quarantine, **kwargs):
+            lock_fd = MODULE._locked_sync_home_fd(home)
+            self.assertIsNotNone(lock_fd)
+            locked_fds.append(lock_fd)
+            return cleanup(quarantine, **kwargs)
+
+        with mock.patch.object(
+            MODULE, "download_and_extract_release", side_effect=download
+        ):
+            with mock.patch.object(
+                MODULE,
+                "_cleanup_release_cache_quarantine",
+                side_effect=verify_lock_during_cleanup,
+            ):
+                self.run_quietly(
+                    MODULE.install_private_from_github,
+                    private_repo,
+                    home,
+                    base_repo=MODULE.DEFAULT_PUBLIC_RELEASE_REPO,
+                    owner="private",
+                    dry_run=False,
+                )
+
+        self.assertTrue(locked_fds)
+        self.assertFalse(
+            (installed / "personal_codex/skills/private-skill/__pycache__").exists()
+        )
+
+    def test_install_cache_repair_rejects_cache_recreated_after_isolation(self):
+        source, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        cache_file = cache / "codex_personal_sync.cpython-313.pyc"
+        cache_file.write_bytes(b"initial cache")
+        verify = MODULE._verify_managed_state_current_owner_claims
+        recreated = False
+
+        def recreate_after_isolation(*args, **kwargs):
+            nonlocal recreated
+            if not cache.exists() and not recreated:
+                recreated = True
+                cache.mkdir()
+                cache_file.write_bytes(b"late cache")
+            return verify(*args, **kwargs)
+
+        with mock.patch.object(
+            MODULE,
+            "_verify_managed_state_current_owner_claims",
+            side_effect=recreate_after_isolation,
+        ):
+            with self.assertRaises(MODULE.SyncError) as raised:
+                self.run_quietly(
+                    MODULE.install_release_tree,
+                    source,
+                    home,
+                    SHA1,
+                    dry_run=False,
+                )
+
+        self.assertTrue(recreated)
+        self.assertEqual(
+            raised.exception.code,
+            "immutable-release-drift",
+            str(raised.exception),
+        )
+        self.assertTrue(cache_file.is_file())
+        self.assertEqual(cache_file.read_bytes(), b"late cache")
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_release_tree_repairs_expected_python_cache_in_place(self) -> None:
+        release_root, home, installed = self._install_minimal_release_fixture()
+        source_before = snapshot_tree(release_root)
+        installed_before = snapshot_tree(installed)
+        release_metadata = installed.stat()
+        release_identity = release_metadata.st_dev, release_metadata.st_ino
+        scripts = installed / "scripts"
+        scripts_before = scripts.stat()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        for cache_name in (
+            "codex_personal_sync.cpython-313.pyc",
+            "codex_personal_sync.cpython-314.pyc",
+            "codex_personal_sync.cpython-313.opt-1.pyc",
+            "codex_personal_sync.cpython-313.opt-2.pyc",
+        ):
+            (cache / cache_name).write_bytes(b"generated")
+        os.utime(
+            scripts,
+            ns=(
+                scripts_before.st_atime_ns,
+                scripts_before.st_mtime_ns + 2_000_000_000,
+            ),
+        )
+        scripts_after = scripts.stat()
+        self.assertEqual(
+            (scripts_after.st_dev, scripts_after.st_ino),
+            (scripts_before.st_dev, scripts_before.st_ino),
+        )
+        self.assertEqual(
+            stat.S_IMODE(scripts_after.st_mode),
+            stat.S_IMODE(scripts_before.st_mode),
+        )
+        self.assertNotEqual(scripts_after.st_mtime_ns, scripts_before.st_mtime_ns)
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+
+        self.assertFalse(cache.exists())
+        self.assertEqual(snapshot_tree(installed), installed_before)
+        self.assertEqual(snapshot_tree(release_root), source_before)
+        current_metadata = installed.stat()
+        self.assertEqual(
+            (current_metadata.st_dev, current_metadata.st_ino),
+            release_identity,
+        )
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+
+    def test_install_release_tree_upgrades_with_matching_scheduler_baseline(
+        self,
+    ) -> None:
+        release_root, home, installed = self._install_minimal_release_fixture(
+            suffix="upgrade-baseline"
+        )
+        release_trees = MODULE._capture_scheduler_release_trees(
+            home,
+            mode="public",
+            owner="private",
+        )
+        state = self._write_public_scheduler_success_state(home, release_trees)
+        self.assertEqual(MODULE._read_scheduler_runtime_state(home), state)
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "codex_personal_sync.cpython-313.pyc").write_bytes(b"generated")
+        release_two = self.root / "release-upgrade-baseline-sha2"
+        write_minimal_release(release_two, agent_text="agent v2\n")
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_two,
+            home,
+            SHA2,
+            dry_run=False,
+        )
+
+        self.assertEqual(current_target(home), f"releases/{SHA2}")
+        self.assertFalse(cache.exists())
+        self.assertEqual(
+            (home / "AGENTS.md").read_text(encoding="utf-8"),
+            "agent v2\n",
+        )
+
+    def test_install_release_tree_upgrade_rejects_cache_without_baseline(
+        self,
+    ) -> None:
+        _release_one, home, installed = self._install_minimal_release_fixture(
+            suffix="upgrade-no-baseline"
+        )
+        release_two = self.root / "release-upgrade-no-baseline-sha2"
+        write_minimal_release(release_two, agent_text="agent v2\n")
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        cache_file = cache / "codex_personal_sync.cpython-313.pyc"
+        cache_file.write_bytes(b"generated")
+
+        self._assert_cached_install_rejects_without_mutation(
+            release_two,
+            home,
+            installed,
+            sha=SHA2,
+            expected_codes=("immutable-release-baseline-missing",),
+        )
+        self.assertEqual(current_target(home), f"releases/{SHA1}")
+        self.assertEqual(cache_file.read_bytes(), b"generated")
+
+    def test_install_release_tree_upgrade_rejects_mismatched_scheduler_baseline(
+        self,
+    ) -> None:
+        for mismatch in ("digest", "sha", "owner"):
+            with self.subTest(mismatch=mismatch):
+                _release_one, home, installed = self._install_minimal_release_fixture(
+                    suffix=f"upgrade-bad-{mismatch}"
+                )
+                release_trees = MODULE._capture_scheduler_release_trees(
+                    home,
+                    mode="public",
+                    owner="private",
+                )
+                if mismatch == "digest":
+                    release_trees["public"]["tree_sha256"] = "0" * 64
+                elif mismatch == "sha":
+                    release_trees["public"]["sha"] = SHA2
+                else:
+                    release_trees["private"] = release_trees.pop("public")
+                self._write_public_scheduler_success_state(home, release_trees)
+                release_two = self.root / f"release-upgrade-bad-{mismatch}-sha2"
+                write_minimal_release(release_two, agent_text="agent v2\n")
+                cache = installed / "scripts" / "__pycache__"
+                cache.mkdir()
+                cache_file = cache / "codex_personal_sync.cpython-313.pyc"
+                cache_file.write_bytes(b"generated")
+
+                self._assert_cached_install_rejects_without_mutation(
+                    release_two,
+                    home,
+                    installed,
+                    sha=SHA2,
+                )
+                self.assertEqual(current_target(home), f"releases/{SHA1}")
+                self.assertEqual(cache_file.read_bytes(), b"generated")
+
+    def test_install_release_tree_repairs_legacy_bytecode_cache_files(self) -> None:
+        release_root, home, installed = self._install_minimal_release_fixture()
+        installed_before = snapshot_tree(installed)
+        scripts = installed / "scripts"
+        legacy_cache_files = (
+            scripts / "codex_personal_sync.pyc",
+            scripts / "codex_personal_sync.pyo",
+        )
+        for cache_file in legacy_cache_files:
+            cache_file.write_bytes(b"generated")
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            release_root,
+            home,
+            SHA1,
+            dry_run=False,
+        )
+
+        self.assertTrue(all(not cache_file.exists() for cache_file in legacy_cache_files))
+        self.assertEqual(snapshot_tree(installed), installed_before)
+
+    def test_install_release_tree_cache_repair_dry_run_is_observational(self) -> None:
+        release_root, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        cache_file = cache / "codex_personal_sync.cpython-313.pyc"
+        cache_file.write_bytes(b"generated")
+        source_before = self.exact_namespace_snapshot(release_root)
+        home_before = self.exact_namespace_snapshot(home)
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            MODULE.install_release_tree(
+                release_root,
+                home,
+                SHA1,
+                dry_run=True,
+            )
+
+        self.assertIn("would", output.getvalue().casefold())
+        self.assertEqual(self.exact_namespace_snapshot(release_root), source_before)
+        self.assertEqual(self.exact_namespace_snapshot(home), home_before)
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(cache_file.read_bytes(), b"generated")
+
+    def test_install_release_tree_rejects_unknown_cache_member_without_mutation(
+        self,
+    ) -> None:
+        release_root, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        keep_file = cache / "keep.txt"
+        keep_file.write_text("user data\n", encoding="utf-8")
+
+        self._assert_cached_install_rejects_without_mutation(
+            release_root,
+            home,
+            installed,
+            expected_codes=("immutable-release-drift",),
+        )
+        self.assertEqual(keep_file.read_text(encoding="utf-8"), "user data\n")
+
+    def test_install_release_tree_rejects_unmatched_bytecode_cache_without_mutation(
+        self,
+    ) -> None:
+        release_root, home, installed = self._install_minimal_release_fixture()
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        unrelated_bytecode = cache / "unrelated.cpython-313.pyc"
+        unrelated_bytecode.write_bytes(b"unmatched generated file")
+
+        self._assert_cached_install_rejects_without_mutation(
+            release_root,
+            home,
+            installed,
+            expected_codes=("immutable-release-drift",),
+        )
+        self.assertEqual(
+            unrelated_bytecode.read_bytes(),
+            b"unmatched generated file",
+        )
+
+    def test_install_release_tree_rejects_cache_directory_symlink_without_following(
+        self,
+    ) -> None:
+        release_root, home, installed = self._install_minimal_release_fixture()
+        outside = self.root / "outside-cache"
+        outside.mkdir()
+        outside_file = outside / "keep.txt"
+        outside_file.write_text("external data\n", encoding="utf-8")
+        outside_before = self.exact_namespace_snapshot(outside)
+        cache = installed / "scripts" / "__pycache__"
+        cache.symlink_to(outside, target_is_directory=True)
+
+        self._assert_cached_install_rejects_without_mutation(
+            release_root,
+            home,
+            installed,
+        )
+        self.assertEqual(self.exact_namespace_snapshot(outside), outside_before)
+        self.assertTrue(cache.is_symlink())
+
+    def test_install_release_tree_rejects_bytecode_symlink_without_following(
+        self,
+    ) -> None:
+        release_root, home, installed = self._install_minimal_release_fixture()
+        outside_file = self.root / "outside.pyc"
+        outside_file.write_bytes(b"external data")
+        outside_before = self.exact_path_snapshot(outside_file)
+        cache_file = installed / "scripts" / "codex_personal_sync.pyc"
+        cache_file.symlink_to(outside_file)
+
+        self._assert_cached_install_rejects_without_mutation(
+            release_root,
+            home,
+            installed,
+        )
+        self.assertEqual(self.exact_path_snapshot(outside_file), outside_before)
+        self.assertTrue(cache_file.is_symlink())
+
+    def test_install_release_tree_rejects_cache_with_source_content_drift(
+        self,
+    ) -> None:
+        release_root, home, installed = self._install_minimal_release_fixture()
+        installed_agent = installed / "personal_codex" / "AGENTS.md"
+        installed_agent.write_text("tampered\n", encoding="utf-8")
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        cache_file = cache / "codex_personal_sync.cpython-313.pyc"
+        cache_file.write_bytes(b"generated")
+
+        self._assert_cached_install_rejects_without_mutation(
+            release_root,
+            home,
+            installed,
+            expected_codes=("immutable-release-drift",),
+        )
+        self.assertEqual(installed_agent.read_text(encoding="utf-8"), "tampered\n")
+        self.assertEqual(cache_file.read_bytes(), b"generated")
+
+    def test_install_release_tree_rejects_cache_with_access_mode_drift(self) -> None:
+        release_root, home, installed = self._install_minimal_release_fixture()
+        installed_agent = installed / "personal_codex" / "AGENTS.md"
+        installed_agent.chmod(0o600)
+        cache = installed / "scripts" / "__pycache__"
+        cache.mkdir()
+        cache_file = cache / "codex_personal_sync.cpython-313.pyc"
+        cache_file.write_bytes(b"generated")
+
+        self._assert_cached_install_rejects_without_mutation(
+            release_root,
+            home,
+            installed,
+        )
+        self.assertEqual(stat.S_IMODE(installed_agent.stat().st_mode), 0o600)
+        self.assertEqual(cache_file.read_bytes(), b"generated")
+
     def test_doctor_classifies_unexpected_release_cache_as_immutable_drift(
         self,
     ) -> None:
@@ -6676,7 +8374,7 @@ while True:
 
         with self.assertRaisesRegex(
             MODULE.SyncError,
-            "immutable release drift: unexpected cache artifacts",
+            "immutable release drift: cache artifact has no published source file",
         ) as raised:
             self.run_quietly(
                 MODULE.install_release_tree,
@@ -6693,6 +8391,7 @@ while True:
         )
         self.assertEqual((cache / "guard.cpython-313.pyc").read_bytes(), b"pyc-313")
         self.assertEqual((cache / "guard.cpython-314.pyc").read_bytes(), b"pyc-314")
+        installed_before_doctor = snapshot_tree(installed)
         with contextlib.redirect_stdout(io.StringIO()):
             _report, issues = MODULE.doctor(
                 home,
@@ -6703,6 +8402,11 @@ while True:
         self.assertTrue(drift)
         self.assertTrue(
             any("unexpected cache artifacts" in issue.detail for issue in drift)
+        )
+        self.assertEqual(
+            snapshot_tree(installed),
+            installed_before_doctor,
+            "doctor must remain diagnostic and preserve unexpected cache files",
         )
 
     def test_install_rejects_source_release_cache_artifacts(self) -> None:
@@ -14139,6 +15843,30 @@ while True:
             )
         self.assertEqual(published.payload, b"12345")
         self.assertEqual(source.stat().st_ino, destination.stat().st_ino)
+
+    def test_exclusive_internal_file_uses_default_and_explicit_size_limits(self) -> None:
+        home = self.root / "home" / ".codex"
+        path = home / "personal-sync" / "evidence" / "authority.json"
+        path.parent.mkdir(parents=True)
+
+        with (
+            mock.patch.object(MODULE, "MAX_MANAGED_STATE_BYTES", 4),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "exclusive internal authority exceeds 4 bytes",
+            ),
+        ):
+            MODULE._write_exclusive_internal_file(home, path, b"12345")
+        self.assertFalse(os.path.lexists(path))
+
+        with mock.patch.object(MODULE, "MAX_MANAGED_STATE_BYTES", 4):
+            snapshot = MODULE._write_exclusive_internal_file(
+                home,
+                path,
+                b"12345",
+                maximum_bytes=8,
+            )
+        self.assertEqual(snapshot.payload, b"12345")
 
     def test_regular_reconcile_publication_quarantines_destination_replacement(
         self,

@@ -130,6 +130,101 @@ class ReleaseRetentionTests(unittest.TestCase):
         metadata = self.release_path(sha).lstat()
         return metadata.st_dev, metadata.st_ino
 
+    def leave_cache_repair_prepared(self):
+        source_a = self.root / "source-a"
+        write_release(source_a, marker="release-a")
+        (source_a / "personal_codex/skills/retention/retention.py").write_text(
+            "VALUE = 1\n",
+            encoding="utf-8",
+        )
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source_a,
+            self.home,
+            SHA_A,
+            dry_run=False,
+        )
+        self.install_release(SHA_B, "release-b")
+        installed = self.release_path(SHA_A)
+        cache = (
+            installed
+            / "personal_codex"
+            / "skills"
+            / "retention"
+            / "__pycache__"
+        )
+        cache.mkdir()
+        (cache / "retention.cpython-313.pyc").write_bytes(b"generated cache")
+        manifest = MODULE.load_manifest_data(source_a)
+        with MODULE.installation_lock(self.home):
+            with self.assertRaisesRegex(MODULE.SyncError, "injected after isolation"):
+                with MODULE._release_cache_repair_scope(self.home):
+                    MODULE._prepare_installed_release_cache_repairs(
+                        self.home,
+                        [(source_a, SHA_A, manifest)],
+                        mutate=True,
+                    )
+                    raise MODULE.SyncError("injected after isolation")
+
+        releases_root = installed.parent
+        batch_names = [
+            path.name
+            for path in releases_root.iterdir()
+            if MODULE.RELEASE_CACHE_REPAIR_BATCH_RE.fullmatch(path.name)
+        ]
+        self.assertEqual(len(batch_names), 1)
+        batch_name = batch_names[0]
+        payload = releases_root / batch_name
+        receipt = releases_root / (
+            batch_name + MODULE.RELEASE_CACHE_REPAIR_RECEIPT_SUFFIX
+        )
+        marker = releases_root / (
+            batch_name + MODULE.RELEASE_CACHE_REPAIR_READY_SUFFIX
+        )
+        self.assertTrue(payload.is_dir())
+        self.assertTrue(receipt.is_file())
+        self.assertFalse(marker.exists())
+        self.assertFalse(cache.exists())
+        return source_a, installed, batch_name, payload, receipt, marker
+
+    def leave_cache_repair_marker_only(self):
+        fixture = self.leave_cache_repair_prepared()
+        _source_a, _installed, batch_name, payload, receipt, marker = fixture
+        real_unlink = MODULE.os.unlink
+        interrupted = False
+
+        class SimulatedProcessInterruption(BaseException):
+            pass
+
+        def interrupt_before_marker_unlink(path, *args, **kwargs):
+            nonlocal interrupted
+            name = os.fsdecode(path)
+            if name.endswith(MODULE.RELEASE_CACHE_REPAIR_READY_SUFFIX):
+                interrupted = True
+                self.assertFalse(payload.exists())
+                self.assertFalse(receipt.exists())
+                raise SimulatedProcessInterruption(
+                    "simulated interruption after receipt retirement"
+                )
+            return real_unlink(path, *args, **kwargs)
+
+        with MODULE.installation_lock(self.home):
+            with mock.patch.object(
+                MODULE.os,
+                "unlink",
+                side_effect=interrupt_before_marker_unlink,
+            ):
+                with self.assertRaises(SimulatedProcessInterruption):
+                    MODULE._recover_release_cache_repair_batches_unlocked(
+                        self.home
+                    )
+
+        self.assertTrue(interrupted)
+        self.assertFalse(payload.exists())
+        self.assertFalse(receipt.exists())
+        self.assertTrue(marker.is_file())
+        return fixture
+
     def interrupt_before_move(self) -> MODULE.ReleaseRetentionTransaction:
         with (
             mock.patch.object(
@@ -489,6 +584,311 @@ class ReleaseRetentionTests(unittest.TestCase):
         )
         self.assertEqual(removed, [(MODULE.PUBLIC_OWNER, SHA_A)])
         self.assertTrue(self.release_path(SHA_B).is_dir())
+
+    def test_cache_repair_receipt_retains_inactive_release_until_recovery(self):
+        source_a, installed, batch_name, payload, receipt, _marker = (
+            self.leave_cache_repair_prepared()
+        )
+
+        references = MODULE._retained_release_references(
+            self.home,
+            extra_owners={MODULE.PUBLIC_OWNER},
+        )
+        self.assertIn(
+            "cache-repair-recovery",
+            references[(MODULE.PUBLIC_OWNER, SHA_A)],
+        )
+        self.assertEqual(
+            self.run_quietly(
+                MODULE.prune_releases,
+                self.home,
+                dry_run=False,
+            ),
+            [],
+        )
+        self.assertTrue(installed.is_dir())
+        self.assertTrue(payload.is_dir())
+        self.assertTrue(receipt.is_file())
+
+        self.run_quietly(
+            MODULE.install_release_tree,
+            source_a,
+            self.home,
+            SHA_A,
+            dry_run=False,
+        )
+
+        self.assertFalse(
+            any(
+                path.name.startswith(MODULE.RELEASE_CACHE_REPAIR_PREFIX)
+                for path in installed.parent.iterdir()
+            )
+        )
+        self.assertFalse(
+            (
+                installed
+                / "personal_codex"
+                / "skills"
+                / "retention"
+                / "__pycache__"
+            ).exists()
+        )
+        self.assertEqual(
+            self.run_quietly(
+                MODULE.prune_releases,
+                self.home,
+                dry_run=False,
+            ),
+            [(MODULE.PUBLIC_OWNER, SHA_B)],
+        )
+        self.assertTrue(self.release_path(SHA_A).is_dir())
+        self.assertFalse(self.release_path(SHA_B).exists())
+        self.assertTrue(batch_name.startswith(MODULE.RELEASE_CACHE_REPAIR_PREFIX))
+
+    def test_marker_only_cache_repair_reference_survives_prune_then_recovers(self):
+        _source_a, installed, _batch_name, payload, receipt, marker = (
+            self.leave_cache_repair_marker_only()
+        )
+
+        references = MODULE._retained_release_references(
+            self.home,
+            extra_owners={MODULE.PUBLIC_OWNER},
+        )
+        self.assertIn(
+            "cache-repair-recovery",
+            references[(MODULE.PUBLIC_OWNER, SHA_A)],
+        )
+        self.assertEqual(
+            self.run_quietly(
+                MODULE.prune_releases,
+                self.home,
+                dry_run=False,
+            ),
+            [],
+        )
+        self.assertTrue(installed.is_dir())
+        self.assertFalse(payload.exists())
+        self.assertFalse(receipt.exists())
+        self.assertTrue(marker.is_file())
+
+        with MODULE.installation_lock(self.home):
+            MODULE._recover_release_cache_repair_batches_unlocked(self.home)
+
+        self.assertFalse(marker.exists())
+        self.assertEqual(
+            self.run_quietly(
+                MODULE.prune_releases,
+                self.home,
+                dry_run=False,
+            ),
+            [(MODULE.PUBLIC_OWNER, SHA_A)],
+        )
+        self.assertFalse(self.release_path(SHA_A).exists())
+        self.assertTrue(self.release_path(SHA_B).is_dir())
+
+    def test_committed_retention_recovery_restores_cache_referenced_release(self):
+        _source_a, installed, _batch_name, payload, receipt, _marker = (
+            self.leave_cache_repair_prepared()
+        )
+        with (
+            mock.patch.object(MODULE, "_retained_release_references", return_value={}),
+            mock.patch.object(
+                MODULE,
+                "_delete_quarantined_release",
+                side_effect=MODULE.SyncError("injected committed deletion interruption"),
+            ),
+            self.assertRaisesRegex(
+                MODULE.SyncError,
+                "injected committed deletion interruption",
+            ),
+        ):
+            self.run_quietly(
+                MODULE.prune_releases,
+                self.home,
+                dry_run=False,
+            )
+
+        transaction = MODULE._load_release_retention_transaction(self.home)
+        self.assertIsNotNone(transaction)
+        assert transaction is not None
+        self.assertTrue(transaction.committed)
+        self.assertTrue(transaction.deletion_started)
+        self.assertIsNone(MODULE._release_entry_identity(self.release_path(SHA_A)))
+        self.assertIsNotNone(MODULE._quarantined_release_path(self.home, transaction))
+
+        removed = self.run_quietly(
+            MODULE.prune_releases,
+            self.home,
+            dry_run=False,
+        )
+
+        self.assertEqual(removed, [])
+        self.assertIsNone(MODULE._load_release_retention_transaction(self.home))
+        self.assertTrue(installed.is_dir())
+        self.assertTrue(payload.is_dir())
+        self.assertTrue(receipt.is_file())
+
+    def test_prune_fails_closed_for_corrupt_cache_repair_receipt(self):
+        _source_a, installed, _batch_name, payload, receipt, _marker = (
+            self.leave_cache_repair_prepared()
+        )
+        receipt.write_bytes(b"{broken")
+
+        with self.assertRaises(MODULE.SyncError) as raised:
+            self.run_quietly(
+                MODULE.prune_releases,
+                self.home,
+                dry_run=False,
+            )
+
+        self.assertEqual(raised.exception.code, "cache-repair-recovery-invalid")
+        self.assertTrue(installed.is_dir())
+        self.assertTrue(payload.is_dir())
+        self.assertTrue(receipt.is_file())
+
+    def test_prune_fails_closed_for_unreadable_cache_repair_receipt(self):
+        _source_a, installed, _batch_name, payload, receipt, _marker = (
+            self.leave_cache_repair_prepared()
+        )
+        receipt.chmod(0)
+
+        with self.assertRaises(MODULE.SyncError) as raised:
+            self.run_quietly(
+                MODULE.prune_releases,
+                self.home,
+                dry_run=False,
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "cache-repair-recovery-unreadable",
+        )
+        self.assertTrue(installed.is_dir())
+        self.assertTrue(payload.is_dir())
+        self.assertTrue(receipt.is_file())
+
+    def test_prune_fails_closed_for_unknown_cache_repair_orphan(self):
+        self.install_pair()
+        orphan = self.release_path(SHA_A).parent / (
+            f"{MODULE.RELEASE_CACHE_REPAIR_PREFIX}{SHA_A}-unknown"
+        )
+        orphan.mkdir(mode=0o700)
+
+        with self.assertRaises(MODULE.SyncError) as raised:
+            self.run_quietly(
+                MODULE.prune_releases,
+                self.home,
+                dry_run=False,
+            )
+
+        self.assertEqual(raised.exception.code, "cache-repair-recovery-required")
+        self.assertTrue(self.release_path(SHA_A).is_dir())
+        self.assertTrue(orphan.is_dir())
+
+    def test_cache_repair_reference_scan_ignores_unrelated_release_sibling_churn(
+        self,
+    ):
+        _source_a, installed, _batch_name, _payload, _receipt, _marker = (
+            self.leave_cache_repair_prepared()
+        )
+        releases_root = installed.parent
+        real_read = MODULE._read_release_cache_repair_receipt
+        created_sibling = False
+
+        def create_unrelated_sibling_after_read(*args, **kwargs):
+            nonlocal created_sibling
+            result = real_read(*args, **kwargs)
+            if result is not None and not created_sibling:
+                (releases_root / SHA_C).mkdir()
+                created_sibling = True
+            return result
+
+        with mock.patch.object(
+            MODULE,
+            "_read_release_cache_repair_receipt",
+            side_effect=create_unrelated_sibling_after_read,
+        ):
+            references = MODULE._retained_release_references(
+                self.home,
+                extra_owners={MODULE.PUBLIC_OWNER},
+            )
+
+        self.assertTrue(created_sibling)
+        self.assertIn(
+            "cache-repair-recovery",
+            references[(MODULE.PUBLIC_OWNER, SHA_A)],
+        )
+
+    def test_cache_repair_reference_scan_rejects_receipt_replacement(self):
+        _source_a, installed, _batch_name, payload, receipt, _marker = (
+            self.leave_cache_repair_prepared()
+        )
+        real_read = MODULE._read_release_cache_repair_receipt
+        replaced = False
+
+        def replace_receipt_after_read(*args, **kwargs):
+            nonlocal replaced
+            result = real_read(*args, **kwargs)
+            if result is not None and not replaced:
+                replacement = receipt.with_name(receipt.name + ".replacement")
+                replacement.write_bytes(result.payload)
+                replacement.chmod(0o600)
+                os.replace(replacement, receipt)
+                replaced = True
+            return result
+
+        with mock.patch.object(
+            MODULE,
+            "_read_release_cache_repair_receipt",
+            side_effect=replace_receipt_after_read,
+        ):
+            with self.assertRaises(MODULE.SyncError) as raised:
+                MODULE._retained_release_references(
+                    self.home,
+                    extra_owners={MODULE.PUBLIC_OWNER},
+                )
+
+        self.assertTrue(replaced)
+        self.assertEqual(raised.exception.code, "cache-repair-recovery-invalid")
+        self.assertTrue(installed.is_dir())
+        self.assertTrue(payload.is_dir())
+        self.assertTrue(receipt.is_file())
+
+    def test_cache_repair_reference_scan_rejects_marker_replacement(self):
+        _source_a, installed, _batch_name, payload, receipt, marker = (
+            self.leave_cache_repair_marker_only()
+        )
+        real_read = MODULE._read_release_cache_repair_cleanup_marker
+        replaced = False
+
+        def replace_marker_after_read(*args, **kwargs):
+            nonlocal replaced
+            result = real_read(*args, **kwargs)
+            if result is not None and not replaced:
+                replacement = marker.with_name(marker.name + ".replacement")
+                replacement.write_bytes(result.payload)
+                replacement.chmod(0o600)
+                os.replace(replacement, marker)
+                replaced = True
+            return result
+
+        with mock.patch.object(
+            MODULE,
+            "_read_release_cache_repair_cleanup_marker",
+            side_effect=replace_marker_after_read,
+        ):
+            with self.assertRaises(MODULE.SyncError) as raised:
+                MODULE._retained_release_references(
+                    self.home,
+                    extra_owners={MODULE.PUBLIC_OWNER},
+                )
+
+        self.assertTrue(replaced)
+        self.assertEqual(raised.exception.code, "cache-repair-recovery-invalid")
+        self.assertTrue(installed.is_dir())
+        self.assertFalse(payload.exists())
+        self.assertFalse(receipt.exists())
+        self.assertTrue(marker.is_file())
 
     def test_strict_pending_before_and_after_release_records_are_preserved(
         self,
@@ -1400,6 +1800,7 @@ class ReleaseRetentionTests(unittest.TestCase):
             home: Path,
             *,
             exclude_retention: tuple[str, str] | None = None,
+            extra_owners: set[str] | None = None,
         ):
             nonlocal scans
             scans += 1
@@ -1425,6 +1826,7 @@ class ReleaseRetentionTests(unittest.TestCase):
             return real_references(
                 home,
                 exclude_retention=exclude_retention,
+                extra_owners=extra_owners,
             )
 
         with (

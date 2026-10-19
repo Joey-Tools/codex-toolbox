@@ -2979,6 +2979,7 @@ class PendingStagingCleanupTests(unittest.TestCase):
                             MODULE,
                             "_stage_release_tree_for_install",
                         ) as stage,
+                        MODULE.installation_lock(case_home),
                         self.assertRaisesRegex(
                             MODULE.SyncError,
                             rf"ticket v{version}",
