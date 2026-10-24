@@ -197,6 +197,8 @@ class GeneratedMirrorConsumerContractTests(unittest.TestCase):
             "platform-safety": ("Run platform personal sync safety tests",),
         }
         self.assertEqual(set(jobs), set(consumers_by_job))
+        self.assertIn("    runs-on: ubuntu-latest\n", jobs["test"])
+        self.assertIn("    runs-on: ubuntu-24.04\n", jobs["python-39-compatibility"])
 
         for job_name, consumer_step_names in consumers_by_job.items():
             with self.subTest(job=job_name):

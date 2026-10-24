@@ -19,6 +19,7 @@ superseded_by:
 ## Current State
 
 - 两份 consumer workflow 与 canonical v2.2.12 verifier/controller 成对文件逐字节一致；保留浮动 `@v2`、请求 token、自动请求及限制配置变量，并维持默认 hosted runner。
+- Python 3.9 compatibility job 使用 `ubuntu-24.04`，因为最新 Ubuntu 26.04 上 `setup-python@v5` 找不到 Python 3.9.25；普通 Python 3.x 测试 job 仍使用 `ubuntu-latest`。这只修正兼容性 job 的 runner，不改变测试覆盖。
 - 本地 canonical 字节比对与 `git diff --check` 通过。GitHub CI 和 PR review 仍是独立 PR 门槛；本记录不声称已运行 live canary。
 
 ## Next Steps
