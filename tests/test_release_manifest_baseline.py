@@ -1913,7 +1913,7 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
         sha = "a" * 40
         payload = manifest("keep")
         tree_digest = "0" * 64
-        expanded_bytes_per_pair = 16 * 1024 * 1024
+        expanded_bytes_per_pair = 32 * 1024 * 1024
         self.assertEqual(
             MODULE.MAX_RELEASE_EXPANDED_SCAN_TOTAL_BYTES,
             MODULE.MAX_COMPLETE_RELEASES * expanded_bytes_per_pair,
@@ -1988,6 +1988,95 @@ class ReleaseManifestBaselineTests(unittest.TestCase):
         self.assertEqual(
             self.archive_manifest_reader.call_args_list[-1].args[2],
             expanded_bytes_per_pair,
+        )
+
+    def test_release_archive_expanded_budget_covers_observed_history_profile(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        payload = manifest("keep")
+        tree_digest = "0" * 64
+        observed_complete_pairs = 207
+        observed_expanded_bytes = 4_313_047_040
+        peak_pairs_after_observation = 49
+        peak_expanded_bytes_per_pair = 52_101_120
+        expected_total = (
+            observed_expanded_bytes
+            + peak_pairs_after_observation * peak_expanded_bytes_per_pair
+        )
+        self.assertEqual(
+            observed_complete_pairs + peak_pairs_after_observation,
+            MODULE.MAX_COMPLETE_RELEASES,
+        )
+        self.assertEqual(expected_total, 6_866_001_920)
+
+        identities = []
+        for index in range(MODULE.MAX_COMPLETE_RELEASES):
+            identity = MODULE._complete_release_identity(
+                complete_release(
+                    sha,
+                    archive_id=index * 2 + 1,
+                    checksum_id=index * 2 + 2,
+                )
+            )
+            self.assertIsNotNone(identity)
+            assert identity is not None
+            identities.append(identity)
+
+        observed_bytes_per_pair, final_observed_pair_bytes = divmod(
+            observed_expanded_bytes,
+            observed_complete_pairs,
+        )
+        expanded_bytes_by_pair = [
+            observed_bytes_per_pair
+        ] * (observed_complete_pairs - 1)
+        expanded_bytes_by_pair.append(
+            observed_bytes_per_pair + final_observed_pair_bytes
+        )
+        expanded_bytes_by_pair.extend(
+            [peak_expanded_bytes_per_pair] * peak_pairs_after_observation
+        )
+
+        def profile_reader(
+            _repository: str,
+            _identity: object,
+            _remaining: int,
+        ) -> tuple[dict[str, object], int, str]:
+            expanded_bytes = expanded_bytes_by_pair[
+                self.archive_manifest_reader.call_count - 1
+            ]
+            return payload, expanded_bytes, tree_digest
+
+        self.archive_manifest_reader.side_effect = profile_reader
+        with (
+            mock.patch.object(
+                MODULE,
+                "MAX_RELEASE_EXPANDED_SCAN_TOTAL_BYTES",
+                4 * 1024 * 1024 * 1024,
+            ),
+            self.assertRaisesRegex(
+                MODULE.ValidationError,
+                "exceeded its expanded byte budget",
+            ),
+        ):
+            MODULE._verify_release_archive_manifests(
+                "owner/repo",
+                identities,
+                {sha: payload},
+                {sha: tree_digest},
+            )
+
+        self.archive_manifest_reader.reset_mock()
+        self.archive_manifest_reader.side_effect = profile_reader
+        MODULE._verify_release_archive_manifests(
+            "owner/repo",
+            identities,
+            {sha: payload},
+            {sha: tree_digest},
+        )
+        self.assertEqual(
+            self.archive_manifest_reader.call_count,
+            MODULE.MAX_COMPLETE_RELEASES,
         )
 
     def test_runtime_sync_error_is_normalized(self) -> None:
