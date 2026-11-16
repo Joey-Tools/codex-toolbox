@@ -53855,10 +53855,11 @@ def _release_cache_repair_parse_receipt_record(
     release_access_policy = _release_cache_repair_parse_access_policy(
         record["release_access_policy"]
     )
+    # Only the quarantine payload requires a private mode. The existing release
+    # parent retains its recorded access policy, checked against its live binding.
     if (
         root_evidence.identity != release_identity
         or root_evidence.access_policy != release_access_policy
-        or releases_root_access_policy[0] != 0o700
         or payload_access_policy[0] != 0o700
     ):
         raise ValueError("receipt root or private directory evidence is inconsistent")
