@@ -7372,6 +7372,7 @@ while True:
 
     def test_install_cache_repair_recovers_after_move_and_dry_run_is_read_only(self):
         source, home, installed = self._install_minimal_release_fixture()
+        installed.parent.chmod(0o755)
         payload_dir, receipt = self._leave_cache_repair_interrupted_after_move(
             source,
             home,
@@ -7405,6 +7406,7 @@ while True:
         )
         self.assertFalse((installed / "scripts" / "__pycache__").exists())
         self.assertEqual(current_target(home), f"releases/{SHA1}")
+        self.assertEqual(stat.S_IMODE(installed.parent.stat().st_mode), 0o755)
 
     def test_install_cache_repair_recovers_after_partial_cleanup(self):
         source, home, installed = self._install_minimal_release_fixture()

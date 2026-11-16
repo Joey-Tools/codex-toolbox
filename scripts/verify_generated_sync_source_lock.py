@@ -27,9 +27,9 @@ from typing import (
 REPOSITORY_ROOT = Path(os.path.abspath(__file__)).parent.parent
 RECEIPT_PATH = PurePosixPath("generated-sync-source-lock.json")
 EXPECTED_RECEIPT_SHA256 = (
-    "689569f14015a72f65108d01aa3ee50c27dfffbcba94d2b303acdcabf53d3770"
+    "e136c266f31ac80d105da2d46496cccf4efd9bee982404b6139f395454d66767"
 )
-EXPECTED_CANONICAL_COMMIT = "bf62452bb8dab2612d3af9b8795b2c8d67c0ec37"
+EXPECTED_CANONICAL_COMMIT = "9f43c8e1c06f1fb765a6aa0665ac2734ba7d52ef"
 EXPECTED_CANONICAL_REPOSITORY = "Joey-Tools/codex-personal-sync"
 EXPECTED_MIRROR = "toolbox"
 EXPECTED_MIRROR_REPOSITORY = "Joey-Tools/codex-toolbox"

@@ -1,18 +1,18 @@
 {
-  "canonical_commit": "bf62452bb8dab2612d3af9b8795b2c8d67c0ec37",
+  "canonical_commit": "9f43c8e1c06f1fb765a6aa0665ac2734ba7d52ef",
   "canonical_repository": "Joey-Tools/codex-personal-sync",
   "file_set_digest": "defbefa4d2b0c016b9ca3cbdeb49ab6c9cf708562039b7f939398ebe2047958d",
   "files": [
     {
       "mode": "0755",
-      "sha256": "1df1b576a72c2a77d704c5d556134d827eeb3dbe071344726223c990ba63e11c",
+      "sha256": "bcac2e7d7c69d08c462e2b4155f01e320de9f13a4e93d5c319e610f1f83c45f2",
       "source_name": "engine",
       "source_path": "scripts/codex_personal_sync.py",
       "target_path": "scripts/codex_personal_sync.py"
     },
     {
       "mode": "0644",
-      "sha256": "67bc781050f7e7b35c7a44e51c1e177a481fa300c76bd4360d6007c27bd1b716",
+      "sha256": "0dfb4e17bea55dba4946e609f59fd95f20bf7e06069c8ee943d0ff4859af0e83",
       "source_name": "engine_tests",
       "source_path": "tests/test_codex_personal_sync.py",
       "target_path": "tests/test_codex_personal_sync.py"
@@ -88,5 +88,5 @@
   "mirror_repository": "Joey-Tools/codex-toolbox",
   "receipt_version": 1,
   "rules_contract_version": 1,
-  "tree_digest": "4e6f03d632cba7f630dcd6619da65ca68e87b29729337e3e24363e82fee6090d"
+  "tree_digest": "7d3d8005cf2476e9b582d8c1cce862d36e5ce91861b6d7e3ad4639f287cfb4a0"
 }
